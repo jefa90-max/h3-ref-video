@@ -41,5 +41,8 @@
   "demo_video": "视频是标有 DEMO 的静态占位画面，仅用于检查播放和下载流程。",
   "demo_done": "离线演示完成，报告：{path}",
   "one_report": "# 一条片段\n\n视频：{path}\n\n费用：¥{cost}\nGPU 秒数：{gpu}\n\n字幕检查：\n{checks}\n",
-  "unchecked": "未检查"
+  "unchecked": "未检查",
+  "reference_board": "场景／道具总表",
+  "reference_required": "请先上传这些参考图：{names}。",
+  "reference_upload_missing": "参考位「{slot}」的上传文件不存在或无效，请重新上传。"
 }

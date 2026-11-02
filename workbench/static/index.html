@@ -60,11 +60,11 @@
 
           <div id="film-fields" role="tabpanel" aria-labelledby="tab-film" hidden>
             <div class="label-heading"><label for="film-json" data-i18n="filmJsonLabel"></label><div class="button-row"><label class="button text-button file-button"><span data-i18n="importJson"></span><input id="film-import" type="file" accept=".json,application/json"></label><button id="reset-example" type="button" class="button text-button" data-i18n="resetExample"></button></div></div>
-            <textarea id="film-json" class="json-editor" rows="12" spellcheck="false" aria-describedby="film-path-hint"></textarea>
-            <p id="film-path-hint" class="hint" data-i18n="filmPathHint"></p>
-            <label><span data-i18n="filmBaseDir"></span><input id="film-base-dir" spellcheck="false" data-i18n-placeholder="filmBasePlaceholder"></label>
-            <div class="field-grid film-assets"><label><span data-i18n="bindTarget"></span><select id="film-target"></select></label><label class="button secondary file-button"><span data-i18n="uploadAndBind"></span><input id="film-upload" type="file" accept="image/png,image/jpeg,image/webp"></label></div>
-            <p id="film-binding-result" class="hint" aria-live="polite"></p>
+            <textarea id="film-json" class="json-editor" rows="12" spellcheck="false" aria-describedby="film-reference-hint film-parse-status"></textarea>
+            <p id="film-reference-hint" class="hint" data-i18n="filmReferenceHint"></p>
+            <p id="film-parse-status" class="hint" aria-live="polite"></p>
+            <section class="film-reference-section" aria-labelledby="film-references-title"><h3 id="film-references-title" data-i18n="filmReferencesTitle"></h3><p class="hint" data-i18n="filmReferencesHint"></p><div id="film-reference-list"></div><p id="film-missing-references" class="hint" aria-live="polite"></p></section>
+            <label id="demo-placeholders-field" class="checkbox-field"><input id="demo-placeholders" type="checkbox" checked><span data-i18n="demoPlaceholders"></span></label>
             <label><span data-i18n="frameMode"></span><select id="frames"><option value="shot" data-i18n="framesShot"></option><option value="first" data-i18n="framesFirst"></option><option value="none" data-i18n="framesNone"></option></select></label>
             <p id="frame-mode-hint" class="hint"></p>
           </div>

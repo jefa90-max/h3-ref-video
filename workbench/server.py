@@ -15,6 +15,7 @@ from .i18n import InputError, message
 from .inputs import invalid, text, verify_image
 from .jobs import Jobs
 from .settings import save_env
+from .references import bind_references, describe_references
 
 KEYS = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY")
 FIELDS = (*KEYS, "LLM_BASE_URL", "LLM_MODEL")
@@ -125,7 +126,7 @@ def create_app(storage=None, env_path=None):
                 saved.append(path)
                 uploaded.save(path)
                 verify_image(path)
-                result.append({"name": uploaded.filename, "path": str(path), "url": f"/api/uploads/{path.name}"})
+                result.append({"id": path.name, "name": uploaded.filename, "path": str(path), "url": f"/api/uploads/{path.name}"})
         except Exception:
             for path in saved:
                 path.unlink(missing_ok=True)
@@ -143,7 +144,17 @@ def create_app(storage=None, env_path=None):
     @app.post("/api/jobs")
     def create_job():
         with jobs.lock:
-            return jsonify(jobs.create(request.get_json(), dict(env), language())), 201
+            payload = request.get_json()
+            if isinstance(payload, dict) and payload.get("kind") == "film" and "reference_bindings" in payload:
+                payload = bind_references(payload, storage / "uploads", language())
+            return jsonify(jobs.create(payload, dict(env), language())), 201
+
+    @app.post("/api/film/references")
+    def film_references():
+        payload = request.get_json()
+        if not isinstance(payload, dict):
+            invalid("request", payload, "object")
+        return jsonify(describe_references(payload.get("film")))
 
     @app.get("/api/jobs/<identifier>")
     def get_job(identifier):

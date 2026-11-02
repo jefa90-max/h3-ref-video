@@ -6,7 +6,7 @@
 
 默认离线演示：不联网、不收费，复用 film.load / plan / refs / compile_prompt 校验与生成计划，Pillow 生成明确标为 DEMO 的分镜占位图，有 ffmpeg 时输出占位视频；没有 ffmpeg 时也成功输出报告并明确说明无视频。演示绝不写真实 state.json 或冒充 AI 成片。
 
-输入：one 提示词、按顺序上传的 1–9 张图、5–15 整数秒、画幅、输出目录；film JSON 编辑/导入/恢复示例，shot/first/none，上传图映射到 cast.picture / board。JSON 内相对图路径按界面填写的 JSON 所在目录解析；浏览器不能自动获知导入文件原目录，也可上传重新绑定图片。示例演示允许用占位图替换缺失参考，真实任务必须存在图片。
+输入：one 提示词、按顺序上传的 1–9 张图、5–15 整数秒、画幅、输出目录；film JSON 编辑/导入/恢复示例，shot/first/none，上传图映射到 cast.picture / board。JSON 导入后解析 cast 和 board 参考位，逐项上传绑定；不要求用户填写图片路径或原目录。上传映射独立于故事 JSON，服务端在启动时写入 CLI 绝对路径。示例演示允许用占位图替换缺失参考，真实任务必须存在图片。
 
 配置：读取已有 .env / 进程环境，界面可将设置保存到被忽略的本机 .env（0600、原子替换、保留其它行），也可只保留服务内存；key 仅返回是否存在，不回传值。提供 RunningHub/APIMart/LLM key、LLM URL / model。真实任务按需求检查 key、ffmpeg/ffprobe。配置检查不是远程鉴权或余额检查。
 

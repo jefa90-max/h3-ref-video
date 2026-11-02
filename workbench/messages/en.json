@@ -41,5 +41,8 @@
   "demo_video": "The video contains static DEMO placeholders, solely for testing playback and downloads.",
   "demo_done": "Offline demo complete. Report: {path}",
   "one_report": "# Single clip\n\nVideo: {path}\n\nCost: ¥{cost}\nGPU seconds: {gpu}\n\nSubtitle check:\n{checks}\n",
-  "unchecked": "Not checked"
+  "unchecked": "Not checked",
+  "reference_board": "Scene / prop board",
+  "reference_required": "Upload the required references first: {names}.",
+  "reference_upload_missing": "The uploaded file for \"{slot}\" is missing or invalid. Please upload it again."
 }

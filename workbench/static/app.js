@@ -5,8 +5,10 @@ const state = {
   language: "zh-CN", messages: {}, kind: "one", demo: true,
   config: null, example: null, images: [], jobs: [], selectedJob: null,
   submitting: false, uploading: false, ready: false, pollTimer: null,
-  artifactSignature: "", pollError: false, exampleBaseDir: "examples",
+  artifactSignature: "", pollError: false,
   artifactNodes: new Map(), storyboardSignature: "", frameDrafts: new Map(),
+  film: null, filmSlots: [], filmBindings: new Map(), filmRevision: 0,
+  filmParsing: false, filmImporting: false, filmError: null,
 };
 
 function t(key, values = {}) {
@@ -85,7 +87,6 @@ async function loadLanguage(language) {
   state.messages = await response.json();
   state.language = language;
   clearNotices();
-  $("film-binding-result").textContent = "";
   document.documentElement.lang = language;
   document.title = t("pageTitle");
   $("language").value = language;
@@ -103,7 +104,7 @@ async function loadLanguage(language) {
   renderMode();
   renderReferences();
   updateFrameHint();
-  if (state.example) refreshTargets(false);
+  renderFilmReferences();
   renderHistory();
   state.artifactSignature = "";
   renderJob(state.selectedJob);
@@ -139,12 +140,24 @@ function renderMode() {
   $("mode-hint").textContent = t(state.demo ? "demoHint" : "liveHint");
   $("start-label").textContent = t(state.submitting ? "starting" : state.demo ? "startDemo" : "startLive");
   $("submit-hint").textContent = t(busy() ? "submitHintBusy" : state.demo ? "submitHintDemo" : "submitHintLive");
-  $("start-job").disabled = !state.ready || state.submitting || state.uploading || busy();
+  const filmBlocked = state.kind === "film" && (!state.film || state.filmParsing || state.filmImporting || missingFilmReferences().length > 0);
+  $("start-job").disabled = !state.ready || state.submitting || state.uploading || busy() || filmBlocked;
   $("start-frames").hidden = state.kind !== "film" || $("frames").value === "none";
   $("start-frames").disabled = $("start-job").disabled || $("start-frames").hidden;
   $("start-frames").textContent = t(state.demo ? "startFramesDemo" : "startFramesLive");
   $("resume-job").disabled = state.submitting || busy();
   $("continue-job").disabled = state.submitting || busy();
+  const inputsLocked = state.uploading || state.filmImporting || state.submitting;
+  $("film-json").readOnly = inputsLocked;
+  $("film-import").disabled = inputsLocked;
+  $("reset-example").disabled = inputsLocked;
+  $("one-upload").disabled = inputsLocked;
+  document.querySelectorAll(".film-reference-upload, .film-reference-remove").forEach((input) => {
+    input.disabled = inputsLocked || state.filmParsing || !state.film;
+  });
+  $("demo-placeholders-field").hidden = !state.demo;
+  const missing = missingFilmReferences();
+  $("film-missing-references").textContent = missing.length ? t("filmMissingReferences", { names: missing.map(filmSlotName).join(t("listSeparator")) }) : "";
   for (const button of document.querySelectorAll(".regenerate-frame")) {
     button.disabled = state.submitting || busy() || button.dataset.editable !== "true";
   }
@@ -194,29 +207,108 @@ function parseFilm() {
   return film;
 }
 
-function refreshTargets(reportError = true) {
-  let film;
-  try { film = parseFilm(); }
-  catch (error) {
-    if (reportError) showError(error);
+function filmSlotName(slot) {
+  return slot.kind === "board" ? t("filmBoardName") : t("filmCastName", { name: slot.name });
+}
+
+function missingFilmReferences() {
+  if (state.demo && $("demo-placeholders").checked) return [];
+  return state.filmSlots.filter((slot) => slot.required && !state.filmBindings.has(slot.id));
+}
+
+function invalidateFilmReferences(clearBindings = false) {
+  state.filmRevision += 1;
+  state.film = null;
+  state.filmSlots = [];
+  state.filmError = null;
+  if (clearBindings) state.filmBindings.clear();
+  renderFilmReferences();
+  return state.filmRevision;
+}
+
+async function refreshFilmReferences({ reset = false, format = false } = {}) {
+  state.filmParsing = true;
+  const revision = invalidateFilmReferences(reset);
+  try {
+    const result = await post("/api/film/references", { film: parseFilm() });
+    if (revision !== state.filmRevision) return false;
+    state.film = result.film;
+    state.filmSlots = result.slots;
+    const retained = new Map();
+    for (const slot of result.slots) {
+      const binding = state.filmBindings.get(slot.id);
+      if (binding && binding.name === slot.name) retained.set(slot.id, binding);
+    }
+    state.filmBindings = retained;
+    if (format) $("film-json").value = JSON.stringify(result.film, null, 2);
+    return true;
+  } catch (error) {
+    if (revision !== state.filmRevision) return false;
+    state.filmError = error.message;
     return false;
+  } finally {
+    if (revision === state.filmRevision) {
+      state.filmParsing = false;
+      renderFilmReferences();
+    }
   }
-  const selector = $("film-target");
-  const selected = selector.value;
-  selector.replaceChildren();
-  if (Array.isArray(film.cast)) {
-    film.cast.forEach((character, index) => {
-      if (!character || typeof character !== "object") return;
-      const option = element("option", "", t("bindCast", { name: character.name || String(index + 1) }));
-      option.value = `cast:${index}`;
-      selector.append(option);
+}
+
+function renderFilmReferences() {
+  $("film-parse-status").textContent = state.filmImporting ? t("filmImporting") : state.filmParsing ? t("filmParsing") : state.filmError || "";
+  $("film-parse-status").classList.toggle("field-error", Boolean(state.filmError));
+  $("film-json").setAttribute("aria-invalid", String(Boolean(state.filmError)));
+  const list = $("film-reference-list");
+  list.replaceChildren();
+  for (const slot of state.filmSlots) {
+    const binding = state.filmBindings.get(slot.id);
+    const name = filmSlotName(slot);
+    const card = element("article", "film-reference-card");
+    const heading = element("div", "label-heading");
+    heading.append(element("strong", "", name), element("span", "subtle", t(slot.required ? "referenceRequired" : "optional")));
+    card.append(heading);
+    if (slot.description) card.append(element("p", "hint film-reference-description", slot.description));
+    card.append(element("p", `film-reference-state${binding ? " uploaded" : ""}`, t(binding ? "referenceUploaded" : "referencePending")));
+    if (binding) {
+      const preview = element("img", "film-reference-preview");
+      preview.src = binding.file.url;
+      preview.alt = t("filmReferencePreview", { name });
+      card.append(preview, element("p", "hint film-reference-filename", binding.file.name));
+    }
+    const actions = element("div", "button-row");
+    const uploadLabel = element("label", "button secondary file-button");
+    uploadLabel.append(element("span", "", t(binding ? "replaceReference" : "uploadReference")));
+    const upload = element("input", "film-reference-upload");
+    upload.type = "file";
+    upload.accept = "image/png,image/jpeg,image/webp";
+    upload.setAttribute("aria-label", t(binding ? "replaceNamedReference" : "uploadNamedReference", { name }));
+    upload.addEventListener("change", async () => {
+      const file = upload.files[0];
+      if (!file || state.uploading || state.filmParsing || !state.film) return;
+      try {
+        const [uploaded] = await uploadFiles([file]);
+        state.filmBindings.set(slot.id, { name: slot.name, file: uploaded });
+        renderFilmReferences();
+        showMessage(t("referenceBound", { name }));
+      } catch (error) { showError(error); }
+      finally { upload.value = ""; }
     });
+    uploadLabel.append(upload);
+    actions.append(uploadLabel);
+    if (binding) {
+      const remove = element("button", "button text-button film-reference-remove", t("removeImage"));
+      remove.type = "button";
+      remove.setAttribute("aria-label", t("removeNamedReference", { name }));
+      remove.addEventListener("click", () => {
+        state.filmBindings.delete(slot.id);
+        renderFilmReferences();
+      });
+      actions.append(remove);
+    }
+    card.append(actions);
+    list.append(card);
   }
-  const boardOption = element("option", "", t("bindBoard"));
-  boardOption.value = "board";
-  selector.append(boardOption);
-  if ([...selector.options].some((option) => option.value === selected)) selector.value = selected;
-  return true;
+  renderMode();
 }
 
 function updateFrameHint() {
@@ -229,15 +321,11 @@ async function uploadFiles(files) {
   const form = new FormData();
   files.forEach((file) => form.append("images", file));
   state.uploading = true;
-  $("one-upload").disabled = true;
-  $("film-upload").disabled = true;
   renderMode();
   showMessage(t("uploading"));
   try { return (await request("/api/uploads", { method: "POST", body: form })).files; }
   finally {
     state.uploading = false;
-    $("one-upload").disabled = false;
-    $("film-upload").disabled = false;
     renderMode();
   }
 }
@@ -467,13 +555,11 @@ async function refreshBootstrap(fillInputs = true) {
   const firstLoad = !state.example;
   state.config = result.config;
   state.example = result.example;
-  state.exampleBaseDir = result.example_base_dir || "examples";
   state.jobs = result.jobs;
   state.ready = true;
   if (firstLoad) {
     $("film-json").value = JSON.stringify(state.example, null, 2);
-    $("film-base-dir").value = state.exampleBaseDir;
-    refreshTargets();
+    await refreshFilmReferences({ reset: true, format: true });
   }
   renderConfig(fillInputs);
   renderHistory();
@@ -506,7 +592,8 @@ for (const kind of ["one", "film"]) {
 $("mode-demo").addEventListener("click", () => { state.demo = true; renderMode(); });
 $("mode-live").addEventListener("click", () => { state.demo = false; renderMode(); });
 $("frames").addEventListener("change", updateFrameHint);
-$("film-json").addEventListener("change", () => refreshTargets());
+$("film-json").addEventListener("input", () => { refreshFilmReferences(); });
+$("demo-placeholders").addEventListener("change", renderMode);
 
 $("config-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -543,58 +630,31 @@ $("one-upload").addEventListener("change", async (event) => {
   finally { event.target.value = ""; }
 });
 
-$("film-upload").addEventListener("change", async (event) => {
-  const file = event.target.files[0];
-  if (!file) return;
-  try {
-    const film = parseFilm();
-    const target = $("film-target").value;
-    const targetLabel = $("film-target").selectedOptions[0].textContent;
-    // Keep the JSON being edited unchanged while the reference upload is pending.
-    $("film-json").readOnly = true;
-    $("film-import").disabled = true;
-    $("reset-example").disabled = true;
-    const [uploaded] = await uploadFiles([file]);
-    if (target === "board") film.board = uploaded.path;
-    else film.cast[Number(target.split(":")[1])].picture = uploaded.path;
-    $("film-json").value = JSON.stringify(film, null, 2);
-    refreshTargets();
-    $("film-binding-result").textContent = t("bindingDone", { target: targetLabel, name: uploaded.name });
-    showMessage($("film-binding-result").textContent);
-  } catch (error) { showError(error); }
-  finally {
-    event.target.value = "";
-    $("film-json").readOnly = false;
-    $("film-import").disabled = false;
-    $("reset-example").disabled = false;
-  }
-});
-
 $("film-import").addEventListener("change", async (event) => {
   const file = event.target.files[0];
-  if (!file) return;
+  if (!file || state.uploading || state.filmImporting) return;
+  state.filmImporting = true;
+  state.filmParsing = false;
+  const revision = invalidateFilmReferences(true);
   try {
     if (file.size > 2 * 1024 * 1024) throw new Error(t("jsonTooLarge"));
     const text = await file.text();
-    let parsed;
-    try { parsed = JSON.parse(text); }
-    catch (error) { throw new Error(t("jsonInvalid", { error: error.message })); }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(t("jsonObjectRequired"));
-    $("film-json").value = JSON.stringify(parsed, null, 2);
-    $("film-base-dir").value = "";
-    $("film-binding-result").textContent = "";
-    refreshTargets();
-    showMessage(t("jsonImported", { name: file.name }));
-  } catch (error) { showError(error); }
-  finally { event.target.value = ""; }
+    if (revision !== state.filmRevision) return;
+    $("film-json").value = text;
+    if (await refreshFilmReferences({ reset: true, format: true })) showMessage(t("jsonImported", { name: file.name }));
+  } catch (error) {
+    state.filmError = error.message;
+    showError(error);
+  } finally {
+    event.target.value = "";
+    state.filmImporting = false;
+    renderFilmReferences();
+  }
 });
 
-$("reset-example").addEventListener("click", () => {
+$("reset-example").addEventListener("click", async () => {
   $("film-json").value = JSON.stringify(state.example, null, 2);
-  $("film-base-dir").value = state.exampleBaseDir;
-  $("film-binding-result").textContent = "";
-  refreshTargets();
-  showMessage(t("exampleRestored"));
+  if (await refreshFilmReferences({ reset: true, format: true })) showMessage(t("exampleRestored"));
 });
 
 $("job-form").addEventListener("submit", async (event) => {
@@ -614,7 +674,14 @@ $("job-form").addEventListener("submit", async (event) => {
       if (seed !== null && !Number.isSafeInteger(seed)) throw new Error(t("seedInvalid"));
       Object.assign(payload, { seconds, seed, check: $("check-subtitles").checked, aspect: $("aspect").value, prompt: $("prompt").value.trim(), images: state.images.map((file) => file.path) });
     } else {
-      Object.assign(payload, { film: parseFilm(), frames: $("frames").value, film_base_dir: $("film-base-dir").value.trim() || "." });
+      if (!state.film || state.filmParsing || state.filmImporting) throw new Error(state.filmError || t("filmNotReady"));
+      const missing = missingFilmReferences();
+      if (missing.length) throw new Error(t("filmMissingReferences", { names: missing.map(filmSlotName).join(t("listSeparator")) }));
+      Object.assign(payload, {
+        film: state.film, frames: $("frames").value,
+        reference_bindings: Object.fromEntries([...state.filmBindings].map(([id, binding]) => [id, binding.file.id])),
+        demo_placeholders: state.demo && $("demo-placeholders").checked,
+      });
     }
     state.submitting = true;
     renderMode();
