@@ -1,4 +1,5 @@
 .env
+.env-*
 __pycache__/
 *.pyc
 .venv/
@@ -8,3 +9,6 @@ examples/cast/
 *.part
 .DS_Store
 !docs/media/*.mp4
+!workbench/static/vendor/plyr/blank.mp4
+tasks/todo.md
+.workbench/

@@ -51,6 +51,26 @@ H3 这条用的 7 张分镜图，第一张画好以后，后面每张都带着�
 
 用 Claude Code 或 Codex 的话，把仓库放进 skills 目录（比如 `~/.claude/skills/h3-ref-video`），直接说「用 H3 把这个分镜做成片」，它会照 `SKILL.md` 写 film.json、跑、看报告。
 
+## 本地工作台（不用记命令）
+
+可选的轻量 Web 界面，沿用下方 `one` / `film` CLI 流水线：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-web.txt
+python workbench.py
+```
+
+打开 **http://127.0.0.1:7860**（端口被占用可加 `--port 7862`）。只监听本机，不需要 Node 或 `pnpm dev`。
+
+- **先试演示**：保持「离线演示」开启 → 选「一条片段」，填写提示词后启动；或选「整条片」，加载示例 JSON、选择 `shot / first / none` 后启动 → 右侧查看日志、报告、播放/下载 DEMO 视频及分镜占位图。无需 key，不联网、不扣费；缺 ffmpeg 时仍可产出计划和报告。
+- **真实生成**：环境配置填写 RunningHub / APIMart key，勾选保存到本机 `.env`（也可预先手动配置；取消勾选则只用当前服务）→ 上传并绑定参考图 → 关闭离线演示 → 启动。工作台固定用 `H3_REWRITER=llm`，默认通过 APIMart 改写，不调用 Claude。自定义模型可填 LLM key、URL 和 model。
+- **先审图再出片**：整条片选 shot/first → 先生成分镜 → 在单张卡片改画图提示词并仅重出该图 → 满意后继续生成整片。已有视频会标为待更新；视频使用本地 Plyr 播放器。
+- **看结果/续跑**：任务区展示状态、真实日志和产物完整路径；失败或中断后，从任务历史选择原任务续跑。新任务使用新目录，避免复用旧状态；默认输出到 `jobs/`。
+
+key 仅按选择写入被 git 忽略的本机 `.env`（权限 0600），不会进入版本控制或浏览器存储。界面的环境检查只验证配置是否齐全，不代表远端 key 有效。详细流程、JSON 图片路径和续跑说明见 [本地工作台使用说明](docs/workbench.md)，逐步骤核对见 [CLI 一致性说明](docs/workbench-cli-parity.md)。
+
 ## 一条片段：`one`
 
 提示词就按 Seedance 的写法：画面描述、分镜时间、台词、「参考图片N 是谁」。工具先改写成官方格式（结果存在 `--out` 目录的 `prompt.h3.txt`），再连同参考图提交，大约 4–6 分钟出一条 544×960（竖屏）或 960×544（横屏）的片子，带模型自己生成的声音。已经是六段式的提示词原样提交。台词里有中文、日文、韩文时，生成后会自动查一次有没有烧字幕。

@@ -33,7 +33,7 @@ def _num(x) -> str:
 
 # ------------------------------------------------------------------ the storyboard
 
-def load(path: Path) -> dict:
+def load(path: Path, check_images: bool = True) -> dict:
     film = json.loads(path.read_text(encoding="utf-8"))
     base = path.parent
     if film.get("aspect", "9:16") not in config.SIZES:
@@ -42,7 +42,7 @@ def load(path: Path) -> dict:
     for c in film.get("cast") or []:
         p = Path(c["picture"]).expanduser()
         c["picture"] = str(p if p.is_absolute() else (base / p).resolve())
-        if not Path(c["picture"]).is_file():
+        if check_images and not Path(c["picture"]).is_file():
             raise SystemExit(f"找不到 {c['name']} 的参考图：{c['picture']}")
     if film.get("board"):
         p = Path(film["board"]).expanduser()
@@ -349,6 +349,16 @@ def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Pa
     return p
 
 
+def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
+    """The --redo invalidation rule, shared with the workbench's reviewed-frame continuation."""
+    for n in redo or []:                                # a new seed for these segments (and, chained, everything after)
+        for k in [k for k in job.state["segs"] if int(k) == n - 1 or (mode != "shot" and int(k) > n - 1)]:
+            rec = job.state["segs"][k]
+            job.state["segs"][k] = {"zh": rec.get("zh"), "h3": rec.get("h3")}
+            (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
+    job.save()
+
+
 def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None) -> Path:
     job = Job(job_dir)
     if film_path:
@@ -360,11 +370,7 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     film = load(Path(job.state["film_path"]))
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}
-    for n in redo or []:                                # a new seed for these segments (and, chained, everything after)
-        for k in [k for k in job.state["segs"] if int(k) == n - 1 or (mode != "shot" and int(k) > n - 1)]:
-            rec = job.state["segs"][k]
-            job.state["segs"][k] = {"zh": rec.get("zh"), "h3": rec.get("h3")}
-            (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
+    invalidate_segments(job, mode, redo)
     job.state["t_start"] = time.time()
     job.save()
     job.log("plan", f"{len(segs)} segments", " / ".join(f"{s['seconds']}s·{len(s['shots'])} shots·{len(pics[s['idx']])} pictures" for s in segs))
