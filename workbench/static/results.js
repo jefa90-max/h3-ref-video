@@ -136,6 +136,15 @@ function renderArtifacts(job) {
   const final = artifacts.find((file) => file.kind === "video" && file.role === "final");
   $("final-video-section").hidden = !final;
   $("final-video-version").textContent = t(job.pending_video || job.pending_assembly ? "videoOlderVersion" : "videoCurrentVersion");
+  const download = $("download-final-video");
+  download.hidden = !final;
+  if (final) {
+    const url = new URL(final.url, window.location.href);
+    url.searchParams.set("download", "1");
+    download.href = url.href;
+    download.download = final.name;
+    download.textContent = t(job.pending_video || job.pending_assembly ? "downloadPreviousFinalVideo" : "downloadFinalVideo");
+  } else download.removeAttribute("href");
   const videoSignature = JSON.stringify([final?.url, state.language]);
   if (state.videoSignature !== videoSignature) {
     state.videoSignature = videoSignature;

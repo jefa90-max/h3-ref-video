@@ -1,7 +1,7 @@
 "use strict";
 
 Object.assign(state, {
-  kind: "one", demo: false, example: null, images: [], submitting: false,
+  kind: "film", demo: false, images: [], submitting: false,
   uploading: false, pollTimer: null, film: null, filmSlots: [],
   filmBindings: new Map(), filmRevision: 0, filmParsing: false,
   filmImporting: false, filmError: null, choosingOutput: false,
@@ -23,7 +23,6 @@ function renderMode() {
   const inputsLocked = state.uploading || state.filmImporting || state.submitting;
   $("film-json").readOnly = inputsLocked;
   $("film-import").disabled = inputsLocked;
-  $("reset-example").disabled = inputsLocked;
   $("one-upload").disabled = inputsLocked;
   document.querySelectorAll(".film-reference-upload, .film-reference-remove").forEach((input) => {
     input.disabled = inputsLocked || state.filmParsing || !state.film;
@@ -72,7 +71,7 @@ function renderReferences() {
 
 function parseFilm() {
   let film;
-  try { film = JSON.parse($("film-json").value); }
+  try { film = JSON.parse($("film-json").value.replace(/^\uFEFF/, "")); }
   catch (error) { throw new Error(t("jsonInvalid", { error: error.message })); }
   if (!film || typeof film !== "object" || Array.isArray(film)) throw new Error(t("jsonObjectRequired"));
   return film;
@@ -101,6 +100,10 @@ async function refreshFilmReferences({ reset = false, format = false } = {}) {
   state.filmParsing = true;
   const revision = invalidateFilmReferences(reset);
   try {
+    if (!$("film-json").value.trim()) {
+      state.filmBindings.clear();
+      return false;
+    }
     const result = await post("/api/film/references", { film: parseFilm() });
     if (revision !== state.filmRevision) return false;
     state.film = result.film;
@@ -220,16 +223,10 @@ function renderHistory() {
 
 async function refreshBootstrap(fillInputs = true) {
   const result = await request("/api/bootstrap");
-  const firstLoad = !state.example;
   state.config = result.config;
   $("output-dir").value = result.config.output_root;
-  state.example = result.example;
   state.jobs = result.jobs;
   state.ready = true;
-  if (firstLoad) {
-    $("film-json").value = JSON.stringify(state.example, null, 2);
-    await refreshFilmReferences({ reset: true, format: true });
-  }
   renderConfig(fillInputs);
   renderHistory();
   renderMode();
@@ -304,11 +301,6 @@ $("film-import").addEventListener("change", async (event) => {
   }
 });
 
-$("reset-example").addEventListener("click", async () => {
-  $("film-json").value = JSON.stringify(state.example, null, 2);
-  if (await refreshFilmReferences({ reset: true, format: true })) showMessage(t("exampleRestored"));
-});
-
 $("job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (state.submitting || state.uploading || state.choosingOutput || busy()) return;
@@ -370,6 +362,7 @@ renderPage = (previousSample) => {
 async function initializeCreate() {
   try {
     await loadLanguage(state.language);
+    switchWorkflow(state.kind);
     await refreshBootstrap();
   } catch (error) { showError(error); }
 }

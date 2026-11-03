@@ -62,13 +62,11 @@
   "uploaded": "已添加 {count} 张参考图片。",
   "tooManyImages": "参考图最多 9 张；当前 {current} 张，准备添加 {added} 张。",
   "filmJsonLabel": "分镜脚本 / film.json",
-  "importJson": "导入 JSON",
-  "resetExample": "恢复示例",
+  "importJson": "导入 .json / .txt",
   "jsonInvalid": "film JSON 格式有误：{error}",
   "jsonObjectRequired": "film JSON 顶层必须是对象。",
   "jsonTooLarge": "JSON 文件超过 2 MB，请缩小后重试。",
   "jsonImported": "已导入 {name}。请按下方参考图清单逐项上传；旧图片绑定已清空。",
-  "exampleRestored": "已恢复仓库示例并清空旧图片绑定，请查看下方参考图清单。",
   "frameMode": "分镜图模式",
   "framesShot": "shot · 每个镜头一张（推荐）",
   "framesFirst": "first · 每段首镜头一张",
@@ -311,5 +309,9 @@
   "stageAssembling": "正在重新拼接完整视频",
   "stageAssemblingHint": "使用当前全部片段在本机拼接；原成片在新结果成功前保持可用。",
   "stageAwaitingAssembly": "片段已更新，等待重新拼接",
-  "stageAwaitingAssemblyHint": "请预览新的片段，满意后点击“重新拼接完整视频”。"
+  "stageAwaitingAssemblyHint": "请预览新的片段，满意后点击“重新拼接完整视频”。",
+  "downloadExample": "下载示例 JSON",
+  "filmJsonPlaceholder": "粘贴 JSON 分镜脚本，或导入 UTF-8 编码的 .json / .txt 文件。可先下载示例参考格式。",
+  "downloadFinalVideo": "下载完整视频",
+  "downloadPreviousFinalVideo": "下载完整视频（旧版）"
 }

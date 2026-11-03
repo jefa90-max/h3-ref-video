@@ -62,13 +62,11 @@
   "uploaded": "Added {count} reference image(s).",
   "tooManyImages": "Maximum 9 reference images: {current} already added, {added} selected.",
   "filmJsonLabel": "Storyboard / film.json",
-  "importJson": "Import JSON",
-  "resetExample": "Reset example",
+  "importJson": "Import .json / .txt",
   "jsonInvalid": "Invalid film JSON: {error}",
   "jsonObjectRequired": "The top level of film JSON must be an object.",
   "jsonTooLarge": "JSON exceeds 2 MB. Use a smaller file.",
   "jsonImported": "Imported {name}. Upload images using the checklist below; previous bindings were cleared.",
-  "exampleRestored": "Repository example restored and previous image bindings cleared. Review the reference checklist below.",
   "frameMode": "Storyboard frame mode",
   "framesShot": "shot · One per shot (recommended)",
   "framesFirst": "first · One per segment",
@@ -311,5 +309,9 @@
   "stageAssembling": "Reassembling the full video",
   "stageAssemblingHint": "Joining all current clips locally. The previous full video remains available until the new one succeeds.",
   "stageAwaitingAssembly": "Segment updated — ready to reassemble",
-  "stageAwaitingAssemblyHint": "Preview the new segment, then select Reassemble full video."
+  "stageAwaitingAssemblyHint": "Preview the new segment, then select Reassemble full video.",
+  "downloadExample": "Download example JSON",
+  "filmJsonPlaceholder": "Paste a JSON storyboard or import a UTF-8 .json / .txt file. Download an example to see the format.",
+  "downloadFinalVideo": "Download full video",
+  "downloadPreviousFinalVideo": "Download full video (previous version)"
 }

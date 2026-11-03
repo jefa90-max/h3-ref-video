@@ -11,9 +11,9 @@
 <div class="create-workspace">
       <section class="editor-card panel">
         <div class="section-heading"><div><p class="eyebrow" data-i18n="createEyebrow"></p><h2 data-i18n="createTitle"></h2></div><span class="section-index">02</span></div>
-        <div class="workflow-tabs" role="tablist" data-i18n-aria="workflowLabel"><button id="tab-one" type="button" role="tab" aria-selected="true" aria-controls="one-fields" class="active"><span data-i18n="oneTitle"></span><small data-i18n="oneTabHint"></small></button><button id="tab-film" type="button" role="tab" aria-selected="false" aria-controls="film-fields" tabindex="-1"><span data-i18n="filmTitle"></span><small data-i18n="filmTabHint"></small></button></div>
+        <div class="workflow-tabs" role="tablist" data-i18n-aria="workflowLabel"><button id="tab-one" type="button" role="tab" aria-selected="false" aria-controls="one-fields" tabindex="-1"><span data-i18n="oneTitle"></span><small data-i18n="oneTabHint"></small></button><button id="tab-film" type="button" role="tab" aria-selected="true" aria-controls="film-fields" class="active"><span data-i18n="filmTitle"></span><small data-i18n="filmTabHint"></small></button></div>
         <form id="job-form">
-          <div id="one-fields" role="tabpanel" aria-labelledby="tab-one">
+          <div id="one-fields" role="tabpanel" aria-labelledby="tab-one" hidden>
             <label><span class="label-heading"><span data-i18n="promptLabel"></span><span class="subtle" data-i18n="promptHint"></span></span><textarea id="prompt" rows="5" data-i18n-placeholder="promptPlaceholder"></textarea></label>
             <div class="field-grid">
               <label><span data-i18n="secondsLabel"></span><input id="seconds" type="number" min="5" max="15" step="1" value="12"></label>
@@ -23,9 +23,9 @@
             <div class="field-block"><div class="label-heading"><span data-i18n="referencesLabel"></span><span id="image-count" class="subtle"></span></div><label class="upload-zone"><input id="one-upload" type="file" accept="image/png,image/jpeg,image/webp" multiple><span class="upload-symbol" aria-hidden="true">+</span><strong data-i18n="uploadReferences"></strong><span class="hint" data-i18n="uploadReferencesHint"></span></label><p class="hint" data-i18n="referenceOrder"></p><div id="reference-list" class="reference-list"></div></div>
           </div>
 
-          <div id="film-fields" role="tabpanel" aria-labelledby="tab-film" hidden>
-            <div class="label-heading"><label for="film-json" data-i18n="filmJsonLabel"></label><div class="button-row"><label class="button text-button file-button"><span data-i18n="importJson"></span><input id="film-import" type="file" accept=".json,application/json"></label><button id="reset-example" type="button" class="button text-button" data-i18n="resetExample"></button></div></div>
-            <textarea id="film-json" class="json-editor" rows="12" spellcheck="false" aria-describedby="film-reference-hint film-parse-status"></textarea>
+          <div id="film-fields" role="tabpanel" aria-labelledby="tab-film">
+            <div class="label-heading"><label for="film-json" data-i18n="filmJsonLabel"></label><div class="button-row"><label class="button text-button file-button"><span data-i18n="importJson"></span><input id="film-import" type="file" accept=".json,.txt,application/json,text/plain"></label><a id="download-example" href="/api/film/example" download="film.example.json" class="button text-button" data-i18n="downloadExample"></a></div></div>
+            <textarea id="film-json" class="json-editor" rows="12" spellcheck="false" data-i18n-placeholder="filmJsonPlaceholder" aria-describedby="film-reference-hint film-parse-status"></textarea>
             <p id="film-reference-hint" class="hint" data-i18n="filmReferenceHint"></p>
             <p id="film-parse-status" class="hint" aria-live="polite"></p>
             <section class="film-reference-section" aria-labelledby="film-references-title"><h3 id="film-references-title" data-i18n="filmReferencesTitle"></h3><p class="hint" data-i18n="filmReferencesHint"></p><div id="film-reference-list"></div><p id="film-missing-references" class="hint" aria-live="polite"></p></section>

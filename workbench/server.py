@@ -88,6 +88,13 @@ def create_app(storage=None, env_path=None):
         return jsonify(config=settings(), example=json.loads((root / "examples" / "film.example.json").read_text(encoding="utf-8")),
                        example_base_dir="examples", jobs=jobs.summaries())
 
+    @app.get("/api/film/example")
+    def download_film_example():
+        source = json.loads((root / "examples" / "film.example.json").read_text(encoding="utf-8"))
+        example = describe_references(source)["film"]
+        return app.response_class(json.dumps(example, ensure_ascii=False, indent=2) + "\n", mimetype="application/json",
+                                  headers={"Content-Disposition": 'attachment; filename="film.example.json"'})
+
     @app.post("/api/config")
     def configure():
         values = request.get_json()
@@ -230,6 +237,6 @@ def create_app(storage=None, env_path=None):
         artifact = matches[0]
         if artifact["kind"] in ("report", "file"):
             return app.response_class(jobs.redact(Path(artifact["path"]).read_text(encoding="utf-8")), mimetype="text/plain")
-        return send_file(artifact["path"], conditional=True)
+        return send_file(artifact["path"], conditional=True, as_attachment=request.args.get("download") == "1")
 
     return app
