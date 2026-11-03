@@ -56,5 +56,15 @@
   "output_picker_failed": "无法打开系统目录选择器：{detail}",
   "output_picker_busy": "已有目录选择窗口打开，请先完成或取消选择。",
   "open_browser_help": "启动后打开浏览器",
-  "server_started": "本地工作台已启动：{url}；使用期间请保留此窗口，按 Ctrl+C 退出。"
+  "server_started": "本地工作台已启动：{url}；使用期间请保留此窗口，按 Ctrl+C 退出。",
+  "segment_operation": "请先完成或续跑当前任务，再从结果页重生成片段或拼接视频。",
+  "segment_number": "片段编号 {number} 无效；当前共有 {count} 段。",
+  "segment_changed": "第 {number} 段已更新或文件缺失，请刷新后重试。",
+  "segment_prompt": "第 {number} 段缺少原视频提示词，无法单段重生成。",
+  "segment_ffmpeg": "片段操作需要 ffmpeg 和 ffprobe，请安装后重启工作台。",
+  "segment_media": "视频结果缺失或无法读取：{path}",
+  "segment_done": "第 {number} 段已更新，其它片段保持不变。请预览后重新拼接完整视频。",
+  "assembly_missing": "视频片段尚未全部生成或文件缺失，无法拼接。",
+  "assembly_changed": "视频片段版本已变化，请刷新后重新发起拼接。",
+  "assembly_done": "完整视频已重新拼接：{path}"
 }

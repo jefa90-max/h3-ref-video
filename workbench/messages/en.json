@@ -56,5 +56,15 @@
   "output_picker_failed": "Could not open the system folder picker: {detail}",
   "output_picker_busy": "A folder picker is already open. Complete or cancel that selection first.",
   "open_browser_help": "Open the browser after startup",
-  "server_started": "Workbench ready at {url}. Keep this window open; press Ctrl+C to exit."
+  "server_started": "Workbench ready at {url}. Keep this window open; press Ctrl+C to exit.",
+  "segment_operation": "Finish or resume the current task before regenerating a segment or assembling the film from its results page.",
+  "segment_number": "Invalid segment number {number}; this film has {count} segments.",
+  "segment_changed": "Segment {number} changed or its file is missing. Refresh and try again.",
+  "segment_prompt": "Segment {number} has no saved video prompt and cannot be regenerated independently.",
+  "segment_ffmpeg": "Segment operations require ffmpeg and ffprobe. Install them and restart the workbench.",
+  "segment_media": "The video is missing or unreadable: {path}",
+  "segment_done": "Segment {number} updated. Other clips are unchanged. Preview it, then reassemble the full video.",
+  "assembly_missing": "Some video segments are missing or not yet generated. The film cannot be assembled.",
+  "assembly_changed": "Video segment versions changed. Refresh before starting a new assembly.",
+  "assembly_done": "Full video reassembled: {path}"
 }

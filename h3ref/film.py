@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import check, config, frames, http, media, rewrite, rh
+from .i18n import message
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
 LANG = {"zh": "中文", "en": "英文", "ja": "日文", "ko": "韩文", "es": "西班牙文", "pt": "葡萄牙文"}
@@ -258,22 +259,33 @@ def _picture_paths(job: Job, seg: dict, pics: list[dict]) -> list[Path]:
     return out
 
 
-def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict]) -> dict:
+def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None,
+                guard_submission: bool = False) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
     rec = job.state["segs"].get(str(i)) or {}
     if out.exists() and rec.get("cny") is not None:
         return rec
     if not rec.get("task"):
-        paths = _picture_paths(job, seg, pics)
+        if rec.get("submission_unknown"):
+            raise RuntimeError(message("submission_unknown", number=i + 1, path=str(job.file)))
+        paths = _picture_paths(job, seg, pics) if reference_paths is None else reference_paths
         missing = [str(p) for p in paths if not p.exists()]
         if missing:
             raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
         names = [rh.upload(p) for p in paths]
         seed = int(rec.get("seed") or random.randrange(10 ** 14, 10 ** 15))
         g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
-        task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail))
-        job.put("segs", str(i), task=task, seed=seed, submitted=time.time())
+        if guard_submission:
+            job.put("segs", str(i), submission_unknown=True, seed=seed)
+        try:
+            task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail))
+        except rh.SubmissionRejected:
+            if guard_submission:
+                job.put("segs", str(i), submission_unknown=False)
+            raise
+        job.put("segs", str(i), task=task, seed=seed, submitted=time.time(),
+                **({"submission_unknown": False} if guard_submission else {}))
         job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
         rec = job.state["segs"][str(i)]
     while True:

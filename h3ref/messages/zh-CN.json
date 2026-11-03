@@ -2,5 +2,6 @@
   "submission_rejected": "RunningHub 没有接下任务：{reason}",
   "submission_retry": "RunningHub 第 {attempt}/{limit} 次提交被拒绝：{reason}；{seconds} 秒后重试。",
   "submission_exhausted": "RunningHub 第 {attempt}/{limit} 次提交失败，已达到 {limit} 次上限：{reason}。问题解决后可续跑原任务。",
-  "submission_failed": "RunningHub 提交失败：{reason}"
+  "submission_failed": "RunningHub 提交失败：{reason}",
+  "submission_unknown": "第 {number} 段上次提交的结果未知，已停止自动重提，避免重复付费。请在 RunningHub 核对任务，再恢复本地任务记录：{path}"
 }

@@ -23,7 +23,11 @@ RUN_SECONDS_PER_OUTPUT_SECOND = 22     # measured 198–330 s for 10–15 s clip
 COINS_PER_RUN_SECOND = 0.2             # member key, standard machine
 
 
-class QueueFull(RuntimeError):
+class SubmissionRejected(RuntimeError):
+    """The server explicitly confirmed it did not accept a task."""
+
+
+class QueueFull(SubmissionRejected):
     """Submission was rejected because queue (421) or machine (415) capacity is full; safe to retry."""
 
 
@@ -86,7 +90,8 @@ def submit(g: dict) -> str:
     if out.get("code") in (421, 415) or "QUEUE_MAXED" in str(out.get("msg") or ""):
         raise QueueFull(json.dumps(out, ensure_ascii=False)[:200])
     if out.get("code") != 0 or not task:
-        raise RuntimeError(message("submission_rejected", reason=json.dumps(out, ensure_ascii=False)[:300]))
+        error = SubmissionRejected if isinstance(out.get("code"), int) and out["code"] != 0 else RuntimeError
+        raise error(message("submission_rejected", reason=json.dumps(out, ensure_ascii=False)[:300]))
     return str(task)
 
 
@@ -99,7 +104,7 @@ def submit_with_retry(g: dict, log) -> str:
             if attempt == 5:
                 detail = message("submission_exhausted", attempt=attempt, limit=5, reason=exc)
                 log(detail)
-                raise RuntimeError(detail) from exc
+                raise SubmissionRejected(detail) from exc
             log(message("submission_retry", attempt=attempt, limit=5, seconds=60, reason=exc))
             time.sleep(60)
         except RuntimeError as exc:

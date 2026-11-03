@@ -24,6 +24,14 @@ def placeholder(path, label, aspect):
     return path
 
 
+def render_clip(output, seconds, aspect, label):
+    still = placeholder(output.with_suffix(".png"), label, aspect)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-i", str(still),
+                    "-t", str(seconds), "-r", "24", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)], check=True, timeout=120)
+
+
 def run(request):
     out = Path(request["output_dir"])
     lang = request["lang"]
