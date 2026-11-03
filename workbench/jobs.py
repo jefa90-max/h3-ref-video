@@ -48,6 +48,10 @@ def command(request, root):
 def process_alive(pid):
     if not pid:
         return False
+    if os.name == "nt":
+        from .processes import windows_process_alive
+
+        return windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
