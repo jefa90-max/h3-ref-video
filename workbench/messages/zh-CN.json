@@ -44,5 +44,8 @@
   "unchecked": "未检查",
   "reference_board": "场景／道具总表",
   "reference_required": "请先上传这些参考图：{names}。",
-  "reference_upload_missing": "参考位「{slot}」的上传文件不存在或无效，请重新上传。"
+  "reference_upload_missing": "参考位「{slot}」的上传文件不存在或无效，请重新上传。",
+  "review_request": "确认请求需要 approved=true 与当前分镜版本号。",
+  "review_changed": "分镜已变化或尚未生成，请刷新并重新检查当前图片。",
+  "review_required": "请先确认当前全部分镜或脚本计划，再生成视频。"
 }

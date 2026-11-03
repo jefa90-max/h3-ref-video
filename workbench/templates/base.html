@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title></title>
+  {% block head %}{% endblock %}
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js" defer></script>
+  {% block scripts %}{% endblock %}
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="H3"><span class="brand-mark">H3<span class="brand-dot"></span></span><span data-i18n="brandSubtitle"></span></a>
+    <div class="header-tools"><span class="local-badge"><span></span><span data-i18n="localOnly"></span></span><select id="language" data-i18n-aria="languageLabel"><option value="zh-CN" data-i18n="languageChinese"></option><option value="en" data-i18n="languageEnglish"></option></select></div>
+  </header>
+  <main class="shell">
+    {% block intro %}{% endblock %}
+    <div id="global-error" class="notice error" role="alert" hidden></div>
+    <div id="global-message" class="notice success" role="status" hidden></div>
+    <details id="configuration" class="config-card">
+      <summary><div class="config-heading"><span class="step-number">01</span><span data-i18n="configTitle"></span><span id="config-summary" class="subtle"></span></div><span class="details-action" data-i18n="configEdit"></span></summary>
+      <div class="config-body">
+        <p class="hint" data-i18n="configHint"></p>
+        <div id="environment" class="environment"></div>
+        <form id="config-form">
+          <div class="config-grid">
+            <label><span><span data-i18n="rhKey"></span> <span id="rh-key-status" class="key-state"></span></span><input id="rh-key" name="RUNNINGHUB_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder"></label>
+            <label><span><span data-i18n="apimartKey"></span> <span id="apimart-key-status" class="key-state"></span></span><input id="apimart-key" name="APIMART_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder"></label>
+            <label><span data-i18n="llmKey"></span><input id="llm-key" name="LLM_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="llmKeyPlaceholder"><span id="llm-key-status" class="hint"></span></label>
+            <label><span data-i18n="llmModel"></span><input id="llm-model" name="LLM_MODEL" spellcheck="false" required></label>
+            <label class="wide"><span data-i18n="llmBase"></span><input id="llm-base" name="LLM_BASE_URL" type="url" spellcheck="false" required></label>
+          </div>
+          <label class="checkbox-field"><input id="persist-config" type="checkbox" checked><span data-i18n="persistConfig"></span></label>
+          <p id="config-storage" class="hint"></p>
+          <div class="config-footer"><span class="hint" data-i18n="rewriterHint"></span><div class="button-row"><button id="refresh-config" class="button secondary" type="button" data-i18n="refreshConfig"></button><button id="save-config" class="button" type="submit" data-i18n="saveConfig"></button></div></div>
+        </form>
+      </div>
+    </details>
+
+    {% block content %}{% endblock %}
+    <footer><span data-i18n="footer"></span><span data-i18n="footerTech"></span></footer>
+  </main>
+</body>
+</html>

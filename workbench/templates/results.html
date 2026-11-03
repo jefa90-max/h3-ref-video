@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block head %}<link rel="stylesheet" href="/static/vendor/plyr/plyr.css">{% endblock %}
+{% block scripts %}<script src="/static/vendor/plyr/plyr.min.js" defer></script><script src="/static/results.js" defer></script>{% endblock %}
+{% block intro %}
+<section class="intro results-intro"><div><a class="back-link" href="/" data-i18n="backToCreate"></a><p class="eyebrow" data-i18n="resultEyebrow"></p><h1 data-i18n="resultTitle"></h1><p class="intro-copy" data-i18n="resultIntro"></p></div><span id="job-status" class="status-badge"></span></section>
+{% endblock %}
+{% block content %}
+<div id="results-page" data-job-id="{{ job_id }}">
+  <p id="job-loading" class="hint" data-i18n="loadingJob"></p>
+  <div id="job-detail" hidden>
+    <section class="result-summary panel">
+      <div class="job-identity"><div><span id="job-kind" class="tag"></span><span id="job-mode" class="tag"></span><span id="job-operation" class="tag"></span></div><time id="job-created"></time></div>
+      <h2 id="stage-title"></h2><p id="stage-hint" class="hint"></p>
+      <div id="job-error" class="notice error" role="alert" hidden></div>
+      <div class="progress-stats"><div><strong id="frames-count">0</strong><span data-i18n="framesComplete"></span></div><div><strong id="clips-count">0</strong><span data-i18n="clipsComplete"></span></div><div><strong id="files-count">0</strong><span data-i18n="artifactCount"></span></div></div>
+      <button id="resume-job" type="button" class="button secondary resume-button" data-i18n="resumeJob" hidden></button><p id="resume-hint" class="hint" data-i18n="resumeHint" hidden></p>
+    </section>
+
+    <section id="review-section" class="review-section panel" hidden>
+      <div class="section-heading"><div><h2 data-i18n="reviewTitle"></h2><p id="review-progress" class="hint" aria-live="polite"></p></div><span id="review-badge" class="status-badge"></span></div>
+      <div id="storyboard-section" hidden>
+        <p class="hint" data-i18n="reviewPageHint"></p>
+        <p class="hint" data-i18n="storyboardHint"></p><p class="hint" data-i18n="anchorHint"></p>
+        <p id="review-empty" class="empty-review hint" hidden></p>
+        <div id="storyboard-cards" class="storyboard-grid"></div>
+        <nav class="review-pagination" data-i18n-aria="reviewPagination"><button id="page-previous" type="button" class="button secondary" data-i18n="previousPage"></button><span id="page-label" class="hint" aria-live="polite"></span><button id="page-next" type="button" class="button secondary" data-i18n="nextPage"></button></nav>
+      </div>
+      <div id="script-section" hidden><p class="hint" data-i18n="scriptReviewHint"></p><div id="script-plan"></div></div>
+      <p id="video-stale" class="notice warning" data-i18n="videoStale" hidden></p>
+      <div id="continue-section" class="continue-section"><button id="continue-job" type="button" class="button primary" disabled></button><p id="continue-hint" class="hint"></p></div>
+    </section>
+
+    <section id="final-video-section" class="result-video panel" hidden><div class="section-heading"><h2 data-i18n="finalVideoTitle"></h2><span id="final-video-version" class="hint"></span></div><div id="final-video" class="artifact video"></div></section>
+
+    <section class="result-details panel">
+      <details id="artifact-section"><summary data-i18n="artifactsTitle"></summary><p class="hint" data-i18n="artifactsHint"></p><div id="artifact-links" class="artifact-links"></div></details>
+      <details class="logs-section"><summary data-i18n="logsTitle"></summary><p id="progress-note" class="hint"></p><span class="live-indicator" id="log-live" hidden><i></i><span data-i18n="liveLog"></span></span><pre id="job-logs" class="log-output" tabindex="0"></pre></details>
+      <details id="report-section" hidden><summary data-i18n="reportTitle"></summary><pre id="job-report" tabindex="0"></pre></details>
+      <div class="path-display"><span data-i18n="jobOutput"></span><code id="job-output"></code></div>
+    </section>
+    <p class="workspace-note" data-i18n="workspaceNote"></p>
+  </div>
+</div>
+{% endblock %}

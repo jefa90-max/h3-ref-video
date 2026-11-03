@@ -1,5 +1,6 @@
 """Review individual frames using the original film/frames APIs, never a second generator."""
 import json
+import hashlib
 import shutil
 import sys
 from pathlib import Path
@@ -58,6 +59,29 @@ def review_state(out):
     return read_json(out / "inputs" / "review.json", {"dirty_segments": []})
 
 
+def review_status(request, descriptions):
+    out = Path(request["output_dir"])
+    saved = review_state(out)
+    versions = []
+    for description in descriptions:
+        path = Path(description["path"])
+        stat = path.stat() if path.is_file() else None
+        version = f"{stat.st_mtime_ns}:{stat.st_size}" if stat else None
+        description["version"] = version
+        versions.append((description["key"], version))
+    script = request["film"]
+    signature = json.dumps([script, request["frames"], versions], ensure_ascii=False, sort_keys=True)
+    version = hashlib.sha256(signature.encode()).hexdigest()
+    segments = film.plan(script["shots"])
+    total = sum(p["kind"] == "frame" for segment in segments for p in film.refs(script, segment, request["frames"]))
+    has_frames = total > 0
+    ready = len(descriptions) == total and all(d["version"] and d["url"] for d in descriptions)
+    complete = ready and saved.get("confirmed_version") == version
+    return {"kind": "frames" if has_frames else "script", "total": total, "ready": ready, "version": version,
+            "complete": complete,
+            "plan": {"title": script.get("title", ""), "seconds": sum(s["seconds"] for s in segments), "segments": segments}}
+
+
 def regenerate(request):
     out = Path(request["output_dir"])
     pending_path = out / "inputs" / "frame-edit.json"
@@ -92,6 +116,7 @@ def regenerate(request):
     # without paying again; the old image stays available until download succeeds.
     review = review_state(out)
     review["dirty_segments"] = sorted(set(review["dirty_segments"]) | {description["segment"]})
+    review.pop("confirmed_version", None)
     write_json(out / "inputs" / "review.json", review)
     backup = out / "inputs" / f"previous-frame-{pending['revision']}.png"
     if target.exists() and not backup.exists():

@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
 
 from h3ref import config
@@ -73,7 +73,11 @@ def create_app(storage=None, env_path=None):
 
     @app.get("/")
     def index():
-        return app.send_static_file("index.html")
+        return render_template("index.html")
+
+    @app.get("/jobs/<identifier>")
+    def result_page(identifier):
+        return render_template("results.html", job_id=identifier)
 
     @app.get("/api/bootstrap")
     def bootstrap():
@@ -175,8 +179,11 @@ def create_app(storage=None, env_path=None):
 
     @app.post("/api/jobs/<identifier>/continue")
     def continue_film(identifier):
+        confirmation = request.get_json()
+        if not isinstance(confirmation, dict):
+            raise InputError("review_request")
         with jobs.lock:
-            return jsonify(jobs.continue_film(identifier, dict(env)))
+            return jsonify(jobs.continue_film(identifier, dict(env), confirmation))
 
     @app.get("/api/jobs/<identifier>/files/<path:name>")
     def artifact(identifier, name):
