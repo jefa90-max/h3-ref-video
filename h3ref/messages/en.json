@@ -1,0 +1,6 @@
+{
+  "submission_rejected": "RunningHub rejected the task: {reason}",
+  "submission_retry": "RunningHub submission {attempt}/{limit} rejected: {reason}; retrying in {seconds} seconds.",
+  "submission_exhausted": "RunningHub submission {attempt}/{limit} failed; stopped after {limit} attempts: {reason}. Resume this task after the issue is resolved.",
+  "submission_failed": "RunningHub submission failed: {reason}"
+}

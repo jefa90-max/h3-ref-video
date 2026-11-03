@@ -44,13 +44,7 @@ def cmd_one(a):
         names = [rh.upload(p) for p in images]
         st["seed"] = a.seed or random.randrange(10 ** 14, 10 ** 15)
         g = rh.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
-        while True:
-            try:
-                st["task"] = rh.submit(g)
-                break
-            except rh.QueueFull:
-                print("RunningHub 队列满，一分钟后再交", flush=True)
-                time.sleep(60)
+        st["task"] = rh.submit_with_retry(g, log=lambda detail: print(detail, flush=True))
         save()
         print(f"已提交，预计 ¥{rh.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
     while True:

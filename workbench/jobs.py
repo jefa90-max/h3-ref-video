@@ -289,7 +289,7 @@ class Jobs:
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(message("started", lang, kind=record["kind"], mode=message("demo" if record["demo"] else "live", lang), path=record["output_dir"]) + "\n")
                 log.flush()
-                env.update(H3_REWRITER="llm", PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+                env.update(H3_REWRITER="llm", H3_LANG=lang, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
                 with self.lock:
                     if self.closing:
                         raise RuntimeError(message("interrupted", lang))

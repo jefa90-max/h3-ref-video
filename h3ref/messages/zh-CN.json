@@ -1,0 +1,6 @@
+{
+  "submission_rejected": "RunningHub 没有接下任务：{reason}",
+  "submission_retry": "RunningHub 第 {attempt}/{limit} 次提交被拒绝：{reason}；{seconds} 秒后重试。",
+  "submission_exhausted": "RunningHub 第 {attempt}/{limit} 次提交失败，已达到 {limit} 次上限：{reason}。问题解决后可续跑原任务。",
+  "submission_failed": "RunningHub 提交失败：{reason}"
+}

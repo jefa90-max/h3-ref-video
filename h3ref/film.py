@@ -272,12 +272,7 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict]) -> dict:
         names = [rh.upload(p) for p in paths]
         seed = int(rec.get("seed") or random.randrange(10 ** 14, 10 ** 15))
         g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
-        while True:
-            try:
-                task = rh.submit(g)
-                break
-            except rh.QueueFull:
-                time.sleep(60)
+        task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail))
         job.put("segs", str(i), task=task, seed=seed, submitted=time.time())
         job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
         rec = job.state["segs"][str(i)]

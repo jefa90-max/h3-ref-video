@@ -7,9 +7,11 @@ RH coins (0.2 a second on the standard machine), an enterprise key pays its wall
 resumes the task instead of paying twice.
 """
 import json
+import time
 from pathlib import Path
 
 from . import config, http
+from .i18n import message
 
 # nodes of the workflow we fill in, and their types (checked when the graph is loaded)
 PROMPT, LENGTH, SIZE, STEPS, SEED = "250", "205", "230", "124", "129"
@@ -22,7 +24,7 @@ COINS_PER_RUN_SECOND = 0.2             # member key, standard machine
 
 
 class QueueFull(RuntimeError):
-    """The key runs as many tasks as it may (421 on a member key, 605 when a wallet runs short); nothing was billed."""
+    """Submission was rejected because queue (421) or machine (415) capacity is full; safe to retry."""
 
 
 def _post(path: str, body: dict, timeout: float = 60) -> dict:
@@ -81,11 +83,28 @@ def estimate_cny(seconds: float) -> float:
 def submit(g: dict) -> str:
     out = _post("/task/openapi/create", {"workflowId": config.RH_WORKFLOW_ID, "workflow": json.dumps(g, ensure_ascii=False), "addMetadata": False})
     task = (out.get("data") or {}).get("taskId")
-    if out.get("code") in (421, 605, 415) or any(w in str(out.get("msg") or "") for w in ("QUEUE_MAXED", "NOT_ENOUGH_BALANCE")):
+    if out.get("code") in (421, 415) or "QUEUE_MAXED" in str(out.get("msg") or ""):
         raise QueueFull(json.dumps(out, ensure_ascii=False)[:200])
     if out.get("code") != 0 or not task:
-        raise RuntimeError("RunningHub 没有接下任务：" + json.dumps(out, ensure_ascii=False)[:300])
+        raise RuntimeError(message("submission_rejected", reason=json.dumps(out, ensure_ascii=False)[:300]))
     return str(task)
+
+
+def submit_with_retry(g: dict, log) -> str:
+    """Retry only explicit capacity rejections; never retry an ambiguous network failure."""
+    for attempt in range(1, 6):
+        try:
+            return submit(g)
+        except QueueFull as exc:
+            if attempt == 5:
+                detail = message("submission_exhausted", attempt=attempt, limit=5, reason=exc)
+                log(detail)
+                raise RuntimeError(detail) from exc
+            log(message("submission_retry", attempt=attempt, limit=5, seconds=60, reason=exc))
+            time.sleep(60)
+        except RuntimeError as exc:
+            log(message("submission_failed", reason=exc))
+            raise
 
 
 def poll(task: str) -> dict:
