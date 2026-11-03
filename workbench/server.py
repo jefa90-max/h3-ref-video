@@ -3,6 +3,7 @@ import json
 import os
 import platform
 import shutil
+import threading
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -16,6 +17,7 @@ from .inputs import invalid, text, verify_image
 from .jobs import Jobs
 from .settings import save_env
 from .references import bind_references, describe_references
+from .directories import choose_output_folder, saved_output_root, save_output_root
 
 KEYS = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY")
 FIELDS = (*KEYS, "LLM_BASE_URL", "LLM_MODEL")
@@ -27,6 +29,7 @@ def create_app(storage=None, env_path=None):
     app = Flask(__name__, static_folder="static")
     app.config.update(MAX_CONTENT_LENGTH=32 * 1024 * 1024, TRUSTED_HOSTS=["127.0.0.1", "localhost", "[::1]"])
     jobs = Jobs(root, storage)
+    folder_picker_lock = threading.Lock()
     env_path = Path(env_path or root / ".env")
     app.extensions["jobs"] = jobs
     env = dict(os.environ)
@@ -41,7 +44,8 @@ def create_app(storage=None, env_path=None):
     def settings():
         return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS}, "LLM_BASE_URL": env["LLM_BASE_URL"],
                 "LLM_MODEL": env["LLM_MODEL"], "rewriter": "llm", "python": platform.python_version(),
-                "ffmpeg": bool(shutil.which("ffmpeg")), "ffprobe": bool(shutil.which("ffprobe")), "saved_to_env": env_path.is_file()}
+                "ffmpeg": bool(shutil.which("ffmpeg")), "ffprobe": bool(shutil.which("ffprobe")), "saved_to_env": env_path.is_file(),
+                "output_root": str(saved_output_root(root, storage))}
 
     @app.before_request
     def local_requests():
@@ -113,6 +117,20 @@ def create_app(storage=None, env_path=None):
             jobs.remember_secrets(env)
         return jsonify(settings())
 
+    @app.post("/api/output-folder/pick")
+    def pick_output_folder():
+        if not folder_picker_lock.acquire(blocking=False):
+            raise InputError("output_picker_busy")
+        try:
+            selected = choose_output_folder(saved_output_root(root, storage), language())
+            if selected is None:
+                return jsonify(cancelled=True, output_root=str(saved_output_root(root, storage)))
+            with jobs.lock:
+                folder = save_output_root(selected, root, storage)
+            return jsonify(cancelled=False, output_root=str(folder))
+        finally:
+            folder_picker_lock.release()
+
     @app.post("/api/uploads")
     def upload():
         images = request.files.getlist("images")
@@ -149,6 +167,8 @@ def create_app(storage=None, env_path=None):
     def create_job():
         with jobs.lock:
             payload = request.get_json()
+            if isinstance(payload, dict) and not payload.get("output_dir"):
+                payload.setdefault("output_root", str(saved_output_root(root, storage)))
             if isinstance(payload, dict) and payload.get("kind") == "film" and "reference_bindings" in payload:
                 payload = bind_references(payload, storage / "uploads", language())
             return jsonify(jobs.create(payload, dict(env), language())), 201

@@ -76,10 +76,10 @@
   "framesShotHint": "Draw a frame for each shot. Segments can run in parallel; useful for multiple characters, shots or precise staging.",
   "framesFirstHint": "One first frame per segment. Later segments use the previous final frame and run sequentially.",
   "framesNoneHint": "Use character references only and chain segments with their final frames. No storyboard image charges.",
-  "outputLabel": "Output directory",
+  "outputLabel": "Output folder",
   "optional": "Optional",
-  "outputPlaceholder": "Leave blank for a unique directory under jobs",
-  "outputHint": "Absolute paths or paths relative to the repository root. Use a new directory for new jobs; resume failed jobs from history.",
+  "outputPlaceholder": "Loading the saved output folder…",
+  "outputHint": "This folder is remembered. New tasks get a dated subfolder; resumed tasks keep their original folder.",
   "runMode": "How should this run?",
   "demoMode": "Offline demo",
   "liveMode": "Real generation",
@@ -277,5 +277,8 @@
   "confirmScriptDemo": "Confirm script & generate demo video",
   "confirmScriptLive": "Confirm script & generate video · paid",
   "scriptPlanForReview": "Review the script plan before confirming",
-  "frameDraftUnapplied": "This prompt has unapplied edits. The image is unchanged; regenerate it before using the revised prompt in the video."
+  "frameDraftUnapplied": "This prompt has unapplied edits. The image is unchanged; regenerate it before using the revised prompt in the video.",
+  "chooseOutputFolder": "Choose folder",
+  "choosingOutputFolder": "Choose in the system dialog…",
+  "outputFolderSaved": "Output folder saved for the next launch. Each new task will get its own dated subfolder."
 }

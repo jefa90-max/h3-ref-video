@@ -1,0 +1,29 @@
+{
+  "python": {
+    "version": "3.13.17",
+    "url": "https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.zip",
+    "sha256": "b26ca4b4ee51e157836049934d2b8eabd55939be296f3130254251b6df96ec2f",
+    "directory": "python-3.13.17",
+    "archive_root": "",
+    "executables": ["python.exe"],
+    "source": "https://www.python.org/ftp/python/3.13.17/windows-3.13.17.json"
+  },
+  "ffmpeg": {
+    "version": "9.0.2",
+    "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip",
+    "sha256": "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba",
+    "directory": "ffmpeg-9.0.2",
+    "archive_root": "ffmpeg-9.0.2-essentials_build",
+    "executables": ["bin/ffmpeg.exe", "bin/ffprobe.exe"],
+    "source": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256"
+  },
+  "curl": {
+    "version": "8.23.0_8",
+    "url": "https://curl.se/windows/dl-8.23.0_8/curl-8.23.0_8-win64-mingw.zip",
+    "sha256": "ca5b0fd6e7a6dbde210281f545c73a89784f2e88104a2cdfe0b73ea3dfed5b3a",
+    "directory": "curl-8.23.0_8",
+    "archive_root": "curl-8.23.0_8-win64-mingw",
+    "executables": ["bin/curl.exe"],
+    "source": "https://curl.se/windows/dl-8.23.0_8/curl-8.23.0_8-win64-mingw.zip.txt"
+  }
+}

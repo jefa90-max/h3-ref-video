@@ -1,10 +1,10 @@
 "use strict";
 
 Object.assign(state, {
-  kind: "one", demo: true, example: null, images: [], submitting: false,
+  kind: "one", demo: false, example: null, images: [], submitting: false,
   uploading: false, pollTimer: null, film: null, filmSlots: [],
   filmBindings: new Map(), filmRevision: 0, filmParsing: false,
-  filmImporting: false, filmError: null,
+  filmImporting: false, filmError: null, choosingOutput: false,
 });
 
 function renderMode() {
@@ -17,7 +17,9 @@ function renderMode() {
   $("start-label").textContent = t(state.submitting ? "starting" : state.kind === "film" ? ($("frames").value === "none" ? "prepareScriptReview" : "prepareFrameReview") : state.demo ? "startDemo" : "startLive");
   $("submit-hint").textContent = t(busy() ? "submitHintBusy" : state.demo ? "submitHintDemo" : "submitHintLive");
   const filmBlocked = state.kind === "film" && (!state.film || state.filmParsing || state.filmImporting || missingFilmReferences().length > 0);
-  $("start-job").disabled = !state.ready || state.submitting || state.uploading || busy() || filmBlocked;
+  $("start-job").disabled = !state.ready || state.submitting || state.uploading || state.choosingOutput || busy() || filmBlocked;
+  $("choose-output-folder").disabled = !state.ready || state.submitting || state.choosingOutput;
+  $("choose-output-folder").textContent = t(state.choosingOutput ? "choosingOutputFolder" : "chooseOutputFolder");
   const inputsLocked = state.uploading || state.filmImporting || state.submitting;
   $("film-json").readOnly = inputsLocked;
   $("film-import").disabled = inputsLocked;
@@ -220,6 +222,7 @@ async function refreshBootstrap(fillInputs = true) {
   const result = await request("/api/bootstrap");
   const firstLoad = !state.example;
   state.config = result.config;
+  $("output-dir").value = result.config.output_root;
   state.example = result.example;
   state.jobs = result.jobs;
   state.ready = true;
@@ -251,6 +254,20 @@ $("mode-live").addEventListener("click", () => { state.demo = false; renderMode(
 $("frames").addEventListener("change", updateFrameHint);
 $("film-json").addEventListener("input", () => { refreshFilmReferences(); });
 $("demo-placeholders").addEventListener("change", renderMode);
+
+$("choose-output-folder").addEventListener("click", async () => {
+  if (state.choosingOutput || state.submitting) return;
+  state.choosingOutput = true;
+  renderMode();
+  clearNotices();
+  try {
+    const selected = await post("/api/output-folder/pick", {});
+    state.config.output_root = selected.output_root;
+    $("output-dir").value = selected.output_root;
+    if (!selected.cancelled) showMessage(t("outputFolderSaved"));
+  } catch (error) { showError(error); }
+  finally { state.choosingOutput = false; renderMode(); }
+});
 
 $("one-upload").addEventListener("change", async (event) => {
   const files = [...event.target.files];
@@ -294,11 +311,11 @@ $("reset-example").addEventListener("click", async () => {
 
 $("job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (state.submitting || state.uploading || busy()) return;
+  if (state.submitting || state.uploading || state.choosingOutput || busy()) return;
   clearNotices();
   try {
     const operation = state.kind === "film" ? "frames" : "pipeline";
-    const payload = { kind: state.kind, demo: state.demo, output_dir: $("output-dir").value.trim(), operation };
+    const payload = { kind: state.kind, demo: state.demo, output_root: $("output-dir").value, operation };
     if (state.kind === "one") {
       const seconds = Number($("seconds").value);
       if (!Number.isInteger(seconds) || seconds < 5 || seconds > 15) throw new Error(t("secondsInvalid", { value: $("seconds").value }));

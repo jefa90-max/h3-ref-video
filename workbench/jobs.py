@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from .i18n import InputError, message
 from .inputs import preflight, validate
+from .directories import create_output_directory
 
 ARTIFACT_TYPES = {".mp4": "video", ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
                   ".md": "report", ".txt": "file", ".json": "file"}
@@ -186,7 +187,10 @@ class Jobs:
         with self.lock:
             self.available()
             identifier = uuid.uuid4().hex[:12]
-            output = Path(request["output_dir"]).expanduser() if request["output_dir"] else self.root / "jobs" / ("demo" if request["demo"] else "web") / identifier
+            if request.get("output_root") and not request["output_dir"]:
+                output = create_output_directory(request["output_root"], self.root, self.storage)
+            else:
+                output = Path(request["output_dir"]).expanduser() if request["output_dir"] else self.root / "jobs" / ("demo" if request["demo"] else "web") / identifier
             output = (output if output.is_absolute() else self.root / output).resolve()
             if output.is_relative_to(self.storage) or self.storage.is_relative_to(output):
                 raise InputError("output_reserved", path=str(output))

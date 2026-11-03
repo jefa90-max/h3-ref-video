@@ -34,8 +34,12 @@
             <p id="frame-mode-hint" class="hint"></p>
           </div>
 
-          <div class="output-field"><label><span class="label-heading"><span data-i18n="outputLabel"></span><span class="subtle" data-i18n="optional"></span></span><input id="output-dir" spellcheck="false" data-i18n-placeholder="outputPlaceholder"></label><p class="hint" data-i18n="outputHint"></p></div>
-          <div class="run-settings"><div class="mode-heading"><span data-i18n="runMode"></span><div class="mode-toggle"><button id="mode-demo" type="button" aria-pressed="true" class="active" data-i18n="demoMode"></button><button id="mode-live" type="button" aria-pressed="false" data-i18n="liveMode"></button></div></div><p id="mode-hint" class="hint"></p></div>
+          <div class="output-field">
+            <label for="output-dir" data-i18n="outputLabel"></label>
+            <div class="output-picker"><input id="output-dir" readonly spellcheck="false" data-i18n-placeholder="outputPlaceholder"><button id="choose-output-folder" type="button" class="button secondary" data-i18n="chooseOutputFolder"></button></div>
+            <p class="hint" data-i18n="outputHint"></p>
+          </div>
+          <div class="run-settings live"><div class="mode-heading"><span data-i18n="runMode"></span><div class="mode-toggle"><button id="mode-demo" type="button" aria-pressed="false" data-i18n="demoMode"></button><button id="mode-live" type="button" aria-pressed="true" class="active" data-i18n="liveMode"></button></div></div><p id="mode-hint" class="hint"></p></div>
           <div class="submit-row"><div class="button-row run-buttons"><button id="start-job" class="button primary" type="submit" disabled><span id="start-label"></span><span aria-hidden="true">↗</span></button></div><span id="submit-hint" class="hint"></span></div>
         </form>
       </section>

@@ -76,10 +76,10 @@
   "framesShotHint": "每镜画分镜图，各段可并行生成；适合多角色、多镜头或需要明确站位的片子。",
   "framesFirstHint": "每段一张首帧，后段衔接上一段尾帧；图更少，各段顺序生成。",
   "framesNoneHint": "仅使用角色参考图，各段衔接前段尾帧；不产生分镜图费用。",
-  "outputLabel": "输出目录",
+  "outputLabel": "成果保存文件夹",
   "optional": "可选",
-  "outputPlaceholder": "留空自动创建 jobs 下的独立任务目录",
-  "outputHint": "支持绝对路径或相对仓库根目录的路径。新任务请用新目录；失败任务从右侧历史记录续跑。",
+  "outputPlaceholder": "正在读取本机保存位置…",
+  "outputHint": "自动记住此文件夹。新任务按时间创建独立子文件夹；续跑仍使用原任务目录。",
   "runMode": "这次如何运行？",
   "demoMode": "离线演示",
   "liveMode": "真实生成",
@@ -277,5 +277,8 @@
   "confirmScriptDemo": "确认脚本计划并生成演示视频",
   "confirmScriptLive": "确认脚本计划并生成视频 · 付费",
   "scriptPlanForReview": "请浏览脚本计划后统一确认",
-  "frameDraftUnapplied": "有尚未应用的提示词草稿；当前图片未改变。先重生成才能把改词用于视频。"
+  "frameDraftUnapplied": "有尚未应用的提示词草稿；当前图片未改变。先重生成才能把改词用于视频。",
+  "chooseOutputFolder": "选择文件夹",
+  "choosingOutputFolder": "请在系统窗口中选择…",
+  "outputFolderSaved": "保存位置已记住，下次打开会自动使用。每个新任务会在其中创建按时间命名的子文件夹。"
 }

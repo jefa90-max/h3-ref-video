@@ -68,6 +68,8 @@ def validate(payload, root):
     if not isinstance(job.get("demo"), bool):
         invalid("demo", job.get("demo"), "choice")
     job["output_dir"] = text(job.get("output_dir", ""), "output_dir", empty=True)
+    if "output_root" in job:
+        job["output_root"] = text(job["output_root"], "output_root")
     job["operation"] = choice(job.get("operation", "pipeline"), "operation", ("pipeline", "frames", "frame"))
     if job["kind"] == "one":
         choice(job["operation"], "operation", ("pipeline",))

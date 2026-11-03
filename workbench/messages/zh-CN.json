@@ -47,5 +47,14 @@
   "reference_upload_missing": "参考位「{slot}」的上传文件不存在或无效，请重新上传。",
   "review_request": "确认请求需要 approved=true 与当前分镜版本号。",
   "review_changed": "分镜已变化或尚未生成，请刷新并重新检查当前图片。",
-  "review_required": "请先确认当前全部分镜或脚本计划，再生成视频。"
+  "review_required": "请先确认当前全部分镜或脚本计划，再生成视频。",
+  "output_root_missing": "输出根目录不存在或不是文件夹：{path}。请重新选择目录。",
+  "output_root_unwritable": "无法写入输出目录 {path}：{detail}",
+  "output_picker_title": "选择存放分镜和视频的文件夹",
+  "output_picker_unsupported": "当前系统不支持此目录选择器，请在 Windows 或 macOS 本机运行工作台。",
+  "output_picker_timeout": "目录选择已超时，请重新点击选择文件夹。",
+  "output_picker_failed": "无法打开系统目录选择器：{detail}",
+  "output_picker_busy": "已有目录选择窗口打开，请先完成或取消选择。",
+  "open_browser_help": "启动后打开浏览器",
+  "server_started": "本地工作台已启动：{url}；使用期间请保留此窗口，按 Ctrl+C 退出。"
 }

@@ -90,6 +90,9 @@ h3{font-size:13px;font-weight:650}
 .reference-item button{position:absolute;top:4px;right:4px;display:flex;align-items:center;justify-content:center;width:19px;height:19px;border:0;border-radius:50%;background:#fff;color:#536957;font-size:13px;box-shadow:0 1px 4px #0002}
 .output-field{margin-top:23px}
 .output-field>.hint{margin-top:7px}
+.output-picker{display:flex;align-items:center;gap:8px;margin-top:7px;flex-wrap:wrap}
+.output-picker input{flex:1;min-width:180px}
+.output-picker .button{flex-shrink:0}
 .run-settings{background:#f5f7f2;border:1px solid #e6ebe2;border-radius:8px;padding:13px 14px;margin-top:22px}
 .mode-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:11px;font-weight:600}
 .mode-toggle{display:flex;padding:3px;background:#e9eee4;border-radius:6px;gap:3px}
