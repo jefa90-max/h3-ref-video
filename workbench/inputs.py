@@ -70,7 +70,7 @@ def validate(payload, root):
     job["output_dir"] = text(job.get("output_dir", ""), "output_dir", empty=True)
     if "output_root" in job:
         job["output_root"] = text(job["output_root"], "output_root")
-    job["operation"] = choice(job.get("operation", "pipeline"), "operation", ("pipeline", "frames", "frame"))
+    job["operation"] = choice(job.get("operation", "pipeline"), "operation", ("pipeline", "frames", "frame", "segment", "assemble"))
     if job["kind"] == "one":
         choice(job["operation"], "operation", ("pipeline",))
         job["prompt"] = text(job.get("prompt"), "prompt")
@@ -153,6 +153,10 @@ def validate(payload, root):
 
 
 def preflight(job, env):
+    if job.get("operation") in ("segment", "assemble"):
+        from .segments import preflight as segment_preflight
+        segment_preflight(job, env)
+        return
     if job["demo"]:
         return
     import shutil

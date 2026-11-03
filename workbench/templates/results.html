@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block head %}<link rel="stylesheet" href="/static/vendor/plyr/plyr.css">{% endblock %}
-{% block scripts %}<script src="/static/vendor/plyr/plyr.min.js" defer></script><script src="/static/results.js" defer></script>{% endblock %}
+{% block scripts %}<script src="/static/vendor/plyr/plyr.min.js" defer></script><script src="/static/video-segments.js" defer></script><script src="/static/results.js" defer></script>{% endblock %}
 {% block intro %}
 <section class="intro results-intro"><div><a class="back-link" href="/" data-i18n="backToCreate"></a><p class="eyebrow" data-i18n="resultEyebrow"></p><h1 data-i18n="resultTitle"></h1><p class="intro-copy" data-i18n="resultIntro"></p></div><span id="job-status" class="status-badge"></span></section>
 {% endblock %}
@@ -16,6 +16,11 @@
       <button id="resume-job" type="button" class="button secondary resume-button" data-i18n="resumeJob" hidden></button><p id="resume-hint" class="hint" data-i18n="resumeHint" hidden></p>
     </section>
 
+    <div id="result-tabs" class="result-tabs" role="tablist" data-i18n-aria="resultTabs" hidden>
+      <button id="tab-storyboard" type="button" role="tab" aria-controls="storyboard-panel" aria-selected="true" data-i18n="storyboardTab"></button>
+      <button id="tab-segments" type="button" role="tab" aria-controls="segments-panel" aria-selected="false" tabindex="-1" data-i18n="segmentsTab"></button>
+    </div>
+    <div id="storyboard-panel" role="tabpanel" aria-labelledby="tab-storyboard">
     <section id="review-section" class="review-section panel" hidden>
       <div class="section-heading"><div><h2 data-i18n="reviewTitle"></h2><p id="review-progress" class="hint" aria-live="polite"></p></div><span id="review-badge" class="status-badge"></span></div>
       <div id="storyboard-section" hidden>
@@ -29,8 +34,18 @@
       <p id="video-stale" class="notice warning" data-i18n="videoStale" hidden></p>
       <div id="continue-section" class="continue-section"><button id="continue-job" type="button" class="button primary" disabled></button><p id="continue-hint" class="hint"></p></div>
     </section>
+    </div>
 
+    <div id="segments-panel" role="tabpanel" aria-labelledby="tab-segments">
+    <section id="segments-section" class="segments-section panel" hidden>
+      <div class="section-heading"><div><h2 data-i18n="segmentsTitle"></h2><p class="hint" data-i18n="segmentsHint"></p></div><span id="segments-summary" class="hint" aria-live="polite"></span></div>
+      <p id="assembly-notice" class="notice warning" hidden></p>
+      <div id="segment-cards" class="segment-grid"></div>
+      <nav class="review-pagination" data-i18n-aria="segmentPagination"><button id="segments-previous" type="button" class="button secondary" data-i18n="previousPage"></button><span id="segments-page-label" class="hint" aria-live="polite"></span><button id="segments-next" type="button" class="button secondary" data-i18n="nextPage"></button></nav>
+      <div class="continue-section"><button id="assemble-job" type="button" class="button primary" data-i18n="assembleVideo" disabled></button><p id="assembly-hint" class="hint"></p></div>
+    </section>
     <section id="final-video-section" class="result-video panel" hidden><div class="section-heading"><h2 data-i18n="finalVideoTitle"></h2><span id="final-video-version" class="hint"></span></div><div id="final-video" class="artifact video"></div></section>
+    </div>
 
     <section class="result-details panel">
       <details id="artifact-section"><summary data-i18n="artifactsTitle"></summary><p class="hint" data-i18n="artifactsHint"></p><div id="artifact-links" class="artifact-links"></div></details>

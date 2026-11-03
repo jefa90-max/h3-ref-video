@@ -205,6 +205,22 @@ def create_app(storage=None, env_path=None):
         with jobs.lock:
             return jsonify(jobs.continue_film(identifier, dict(env), confirmation))
 
+    @app.post("/api/jobs/<identifier>/segments/<int:number>/regenerate")
+    def regenerate_segment(identifier, number):
+        values = request.get_json()
+        if not isinstance(values, dict):
+            invalid("segment", values, "object")
+        with jobs.lock:
+            return jsonify(jobs.start_video_operation(identifier, "segment", dict(env), values.get("version"), number))
+
+    @app.post("/api/jobs/<identifier>/assemble")
+    def assemble_film(identifier):
+        values = request.get_json()
+        if not isinstance(values, dict):
+            invalid("assembly", values, "object")
+        with jobs.lock:
+            return jsonify(jobs.start_video_operation(identifier, "assemble", dict(env), values.get("version")))
+
     @app.get("/api/jobs/<identifier>/files/<path:name>")
     def artifact(identifier, name):
         with jobs.lock:

@@ -319,3 +319,24 @@ a.history-row{text-decoration:none;color:inherit}
 }
 
 .frame-draft-note{color:#94732d;margin-top:9px}
+
+.result-tabs{display:flex;gap:8px;border-bottom:1px solid var(--border);margin-bottom:22px}
+.result-tabs button{border:0;border-bottom:3px solid transparent;background:transparent;color:var(--muted);padding:13px 22px;font:inherit;font-weight:600;cursor:pointer}
+.result-tabs button[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--accent)}
+.result-tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.segments-section{padding:25px;margin-bottom:24px}
+.segment-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin-top:20px;align-items:start}
+.segment-card{min-width:0;border:1px solid var(--border);border-radius:8px;padding:16px}
+.segment-card .label-heading{gap:10px;margin-bottom:6px}
+.segment-card h3{font-size:14px;margin:0}
+.segment-card .artifact{margin:14px 0}
+.segment-card .artifact .plyr video{max-height:320px}
+.segment-placeholder{display:flex;align-items:center;justify-content:center;min-height:200px;background:var(--wash);border-radius:6px;margin:14px 0}
+.segment-actions{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 8px}
+.segment-actions .button{font-size:11px;text-decoration:none}
+.segment-seam{color:#94732d;margin-top:8px}
+@media(max-width:760px){
+.segments-section{padding:18px}
+.segment-grid{grid-template-columns:1fr}
+.result-tabs button{flex:1;padding:12px}
+}

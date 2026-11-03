@@ -27,6 +27,8 @@ def write_json(path, value):
 
 def command(request, root):
     out = Path(request["output_dir"])
+    if request.get("operation") in ("segment", "assemble"):
+        return [sys.executable, "-u", "-m", "workbench.segments", str(out / "inputs" / "request.json")]
     if request.get("operation", "pipeline") != "pipeline" or request.get("redo"):
         return [sys.executable, "-u", "-m", "workbench.storyboard", str(out / "inputs" / "request.json")]
     if request["demo"]:
@@ -150,7 +152,8 @@ class Jobs:
                                   "clips": sum(a["name"].startswith("clips/") and a["kind"] == "video" for a in artifacts)}
             if record["kind"] == "one" and any(a["name"] == "clip.mp4" for a in artifacts):
                 result["progress"]["clips"] = 1
-            result.update(storyboard=[], pending_video=False, can_continue=False, review=None, review_needed=False)
+            result.update(storyboard=[], pending_video=False, can_continue=False, review=None, review_needed=False,
+                          segments=[], assembly=None, pending_assembly=False, can_assemble=False)
             if record["kind"] == "film":
                 from .storyboard import review_state, review_status, view
                 out = Path(record["output_dir"])
@@ -160,6 +163,12 @@ class Jobs:
                 result["pending_video"] = bool(review_state(out)["dirty_segments"])
                 result["can_continue"] = record["status"] == "succeeded" and (saved.get("operation") == "frames" or result["pending_video"])
                 result["review_needed"] = result["can_continue"]
+                from . import segments
+                editable = record["status"] == "succeeded" and result["review"]["complete"] and not result["pending_video"]
+                result["segments"] = segments.view(saved, artifacts, editable)
+                result["assembly"] = segments.assembly_status(saved)
+                result["pending_assembly"] = result["assembly"]["pending"]
+                result["can_assemble"] = editable and result["assembly"]["ready"]
             return result
 
     def summaries(self):
@@ -178,6 +187,8 @@ class Jobs:
         request = validate(payload, self.root)
         if request["operation"] == "frame":
             raise InputError("frame_operation")
+        if request["operation"] in ("segment", "assemble"):
+            raise InputError("segment_operation")
         if request["kind"] == "film":
             # Creation always stops after frames. Only the reviewed continuation can generate a film.
             request["operation"] = "frames"
@@ -263,10 +274,34 @@ class Jobs:
 
     def restart(self, record, request, env):
         write_json(Path(record["output_dir"]) / "inputs" / "request.json", request)
-        record.update(status="queued", error=None, operation=request["operation"])
+        record.update(status="queued", error=None, operation=request["operation"], operation_id=uuid.uuid4().hex)
         self.save(record)
         self.launch(record, request, env)
         return self.snapshot(record["id"])
+
+    def start_video_operation(self, identifier, operation, env, version, number=None):
+        from . import segments
+        with self.lock:
+            self.available()
+            record = self.find(identifier)
+            if record["kind"] != "film" or record["status"] != "succeeded":
+                raise InputError("segment_operation")
+            snapshot = self.snapshot(identifier)
+            if not snapshot["review"]["complete"] or snapshot["pending_video"]:
+                raise InputError("review_required")
+            out = Path(record["output_dir"])
+            request = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
+            request.update(operation=operation)
+            for key in ("redo", "reset_applied", "segment_revision"):
+                request.pop(key, None)
+            if operation == "segment":
+                request["segment"] = number
+            preflight(request, env)
+            if operation == "segment":
+                request["segment_revision"] = segments.prepare_regeneration(request, number, version)
+            else:
+                segments.prepare_assembly(request, version)
+            return self.restart(record, request, env)
 
     def resume(self, identifier, env):
         with self.lock:
@@ -275,7 +310,12 @@ class Jobs:
                 raise InputError("resume")
             self.available()
             request = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
-            request = validate(request, self.root)
+            if request.get("operation") in ("segment", "assemble"):
+                snapshot = self.snapshot(identifier)
+                if not snapshot["review"]["complete"] or snapshot["pending_video"]:
+                    raise InputError("review_required")
+            else:
+                request = validate(request, self.root)
             if request["kind"] == "film" and request["operation"] == "pipeline" and not self.snapshot(identifier)["review"]["complete"]:
                 # Old/interrupted jobs cannot bypass the newly required review via resume.
                 request["operation"] = "frames"
@@ -326,6 +366,8 @@ class Jobs:
                     review = review_state(out)
                     review["dirty_segments"] = []
                     write_json(out / "inputs" / "review.json", review)
+                    from .segments import record_assembly
+                    record_assembly(request)
                 with self.lock:
                     record.update(status="succeeded", error=None)
         except Exception as exc:

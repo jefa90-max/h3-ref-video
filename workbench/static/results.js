@@ -5,6 +5,7 @@ Object.assign(state, {
   page: 1, pageSize: 12, frameDrafts: new Map(), expandedFrames: new Set(),
   storyboardSignature: "", planSignature: "", linksSignature: "", videoSignature: "",
   player: null, pollTimer: null, jobRevision: 0,
+  resultTab: null, lastVideoOperation: null, segmentPage: 1, segmentPageSize: 6, segmentCards: new Map(),
 });
 
 function canGenerateVideo(job) {
@@ -19,6 +20,10 @@ function renderResultActions() {
   const locked = state.submitting || running(job);
   $("resume-job").disabled = locked;
   $("continue-job").disabled = locked || !canGenerateVideo(job);
+  $("assemble-job").disabled = locked || !job.can_assemble;
+  document.querySelectorAll(".regenerate-segment").forEach((button) => {
+    button.disabled = locked || button.dataset.enabled !== "true";
+  });
   document.querySelectorAll(".regenerate-frame").forEach((button) => {
     button.disabled = locked || button.dataset.enabled !== "true";
   });
@@ -130,7 +135,7 @@ function renderArtifacts(job) {
   const artifacts = job.artifacts || [];
   const final = artifacts.find((file) => file.kind === "video" && file.role === "final");
   $("final-video-section").hidden = !final;
-  $("final-video-version").textContent = t(job.pending_video ? "videoOlderVersion" : "videoCurrentVersion");
+  $("final-video-version").textContent = t(job.pending_video || job.pending_assembly ? "videoOlderVersion" : "videoCurrentVersion");
   const videoSignature = JSON.stringify([final?.url, state.language]);
   if (state.videoSignature !== videoSignature) {
     state.videoSignature = videoSignature;
@@ -144,12 +149,9 @@ function renderArtifacts(job) {
       video.playsInline = true;
       video.src = final.url;
       $("final-video").append(video);
-      if (typeof Plyr !== "function") showError(t("playerUnavailable"));
-      else state.player = new Plyr(video, {
-        iconUrl: "/static/vendor/plyr/plyr.svg", loadSprite: true,
-        blankVideo: "/static/vendor/plyr/blank.mp4", storage: { enabled: false }, i18n: state.messages.player,
-        controls: ["play-large", "play", "progress", "current-time", "mute", "volume", "settings", "pip", "fullscreen"],
-        settings: ["speed"],
+      state.player = createVideoPlayer(video);
+      video.addEventListener("play", () => {
+        for (const card of state.segmentCards.values()) card.video?.pause();
       });
     }
   }
@@ -174,15 +176,17 @@ function renderJob(job) {
   $("job-loading").hidden = Boolean(job);
   $("job-detail").hidden = !job;
   if (!job) return;
+  renderResultTabs(job);
   const review = job.review || {};
   $("job-status").textContent = t(`status_${job.status}`);
   $("job-status").className = `status-badge ${job.status}`;
   $("job-kind").textContent = t(job.kind === "one" ? "oneTitle" : "filmTitle");
   $("job-mode").textContent = t(job.demo ? "demoMode" : "liveMode");
-  $("job-operation").textContent = t({ frames: "operationFrames", frame: "operationFrame" }[job.operation] || "operationPipeline");
+  $("job-operation").textContent = t({ frames: "operationFrames", frame: "operationFrame", segment: "operationSegment", assemble: "operationAssemble" }[job.operation] || "operationPipeline");
   $("job-created").textContent = dateLabel(job.created_at);
   const failed = ["failed", "interrupted"].includes(job.status);
-  const stage = failed ? "stageFailed" : running(job) ? (job.operation === "pipeline" ? "stageGeneratingVideo" : "stageGeneratingFrames") : job.review_needed ? "stageReview" : "stageFinished";
+  const activeStage = { pipeline: "stageGeneratingVideo", segment: "stageRegeneratingSegment", assemble: "stageAssembling" }[job.operation] || "stageGeneratingFrames";
+  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.review_needed ? "stageReview" : job.pending_assembly ? "stageAwaitingAssembly" : "stageFinished";
   $("stage-title").textContent = t(stage);
   $("stage-hint").textContent = t(stage === "stageReview" && review.kind === "script" ? "stageScriptReviewHint" : `${stage}Hint`);
   $("job-error").hidden = !job.error;
@@ -214,6 +218,7 @@ function renderJob(job) {
   renderStoryboard(job);
   renderScriptPlan(job);
   renderArtifacts(job);
+  renderVideoSegments(job);
   renderResultActions();
 }
 
@@ -282,4 +287,5 @@ async function initializeResults() {
     await refreshJob();
   } catch (error) { showError(error); }
 }
+initializeVideoSegments();
 initializeResults();
