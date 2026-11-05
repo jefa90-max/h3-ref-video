@@ -175,7 +175,15 @@ class Job:
         with self.lock:
             tmp = self.file.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1))
-            tmp.replace(self.file)
+            for attempt in range(10):
+                try:
+                    tmp.replace(self.file)
+                    break
+                except PermissionError as exc:
+                    # Windows readers can briefly block replacement of the state file.
+                    if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 9:
+                        raise
+                    time.sleep(min(0.05 * 2 ** attempt, 0.5))
 
     def put(self, kind: str, key: str, **rec):
         with self.lock:
