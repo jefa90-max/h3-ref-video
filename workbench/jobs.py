@@ -152,13 +152,14 @@ class Jobs:
                                   "clips": sum(a["name"].startswith("clips/") and a["kind"] == "video" for a in artifacts)}
             if record["kind"] == "one" and any(a["name"] == "clip.mp4" for a in artifacts):
                 result["progress"]["clips"] = 1
-            result.update(storyboard=[], pending_video=False, can_continue=False, review=None, review_needed=False,
+            result.update(storyboard=[], character_references=[], pending_video=False, can_continue=False, review=None, review_needed=False,
                           segments=[], assembly=None, pending_assembly=False, can_assemble=False)
             if record["kind"] == "film":
-                from .storyboard import review_state, review_status, view
+                from .storyboard import character_references, review_state, review_status, view
                 out = Path(record["output_dir"])
                 saved = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
-                result["storyboard"] = view(saved, artifacts, record["status"] == "succeeded")
+                result["character_references"] = character_references(saved, identifier)
+                result["storyboard"] = view(saved, artifacts, record["status"] == "succeeded", identifier)
                 result["review"] = review_status(saved, result["storyboard"])
                 result["pending_video"] = bool(review_state(out)["dirty_segments"])
                 result["can_continue"] = record["status"] == "succeeded" and (saved.get("operation") == "frames" or result["pending_video"])
@@ -223,8 +224,8 @@ class Jobs:
             self.launch(record, request, env)
             return self.snapshot(identifier)
 
-    def edit_frame(self, identifier, key, prompt, env):
-        from .inputs import text
+    def edit_frame(self, identifier, key, prompt, env, character_reference_paths=None):
+        from .inputs import array, invalid, text, verify_image
         from .storyboard import frame_records, plan
         with self.lock:
             self.available()
@@ -234,15 +235,32 @@ class Jobs:
             out = Path(record["output_dir"])
             request = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
             try:
-                description = next((item for item in plan(request)[3] if item["key"] == key), None)
+                script, _, _, descriptions = plan(request, check_images=False)
+                description = next((item for item in descriptions if item["key"] == key), None)
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
             if not description or not Path(description["path"]).is_file():
                 raise InputError("not_found", value=key)
             prompt = text(prompt, "prompt")
+            current_characters = [r["path"] for r in description["references"] if r["kind"] == "character"]
+            characters = current_characters if character_reference_paths is None else array(character_reference_paths, "character_reference_paths")
+            allowed = {Path(c["picture"]).resolve() for c in script.get("cast") or []}
+            characters = [str(Path(text(p, "character_reference_paths")).resolve()) for p in characters]
+            if len(characters) != len(set(characters)):
+                invalid("character_reference_paths", characters, "choice")
+            for path in map(Path, characters):
+                if path not in allowed:
+                    invalid("character_reference_paths", str(path), "choice")
+            reference_paths = ([r["path"] for r in description["references"] if r["kind"] == "board"]
+                               + characters + [r["path"] for r in description["references"] if r["kind"] == "anchor"])
+            for path in map(Path, reference_paths):
+                if not path.is_file():
+                    raise InputError("missing_image", path=str(path))
+                verify_image(path)
             request.update(operation="frame")
             preflight(request, env)
             pending = {"key": key, "prompt": prompt, "revision": uuid.uuid4().hex,
+                       "character_reference_paths": characters, "reference_paths": reference_paths,
                        "previous": frame_records(request).get(key, {}), "task": None, "applied": False}
             write_json(out / "inputs" / "frame-edit.json", pending)
             return self.restart(record, request, env)
@@ -314,7 +332,7 @@ class Jobs:
                 snapshot = self.snapshot(identifier)
                 if not snapshot["review"]["complete"] or snapshot["pending_video"]:
                     raise InputError("review_required")
-            else:
+            elif request.get("operation") != "frame":
                 request = validate(request, self.root)
             if request["kind"] == "film" and request["operation"] == "pipeline" and not self.snapshot(identifier)["review"]["complete"]:
                 # Old/interrupted jobs cannot bypass the newly required review via resume.

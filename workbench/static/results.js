@@ -3,6 +3,7 @@
 Object.assign(state, {
   jobId: $("results-page").dataset.jobId, selectedJob: null, submitting: false,
   page: 1, pageSize: 12, frameDrafts: new Map(), expandedFrames: new Set(),
+  frameReferenceDrafts: new Map(), frameSubmissions: new Map(),
   storyboardSignature: "", planSignature: "", linksSignature: "", videoSignature: "",
   player: null, pollTimer: null, jobRevision: 0,
   resultTab: null, lastVideoOperation: null, segmentPage: 1, segmentPageSize: 6, segmentCards: new Map(),
@@ -27,10 +28,23 @@ function renderResultActions() {
   document.querySelectorAll(".regenerate-frame").forEach((button) => {
     button.disabled = locked || button.dataset.enabled !== "true";
   });
+  document.querySelectorAll(".frame-reference-action").forEach((control) => {
+    control.disabled = locked || control.dataset.enabled !== "true";
+  });
+  document.querySelectorAll(".frame-prompt").forEach((editor) => { editor.disabled = locked; });
 }
 
 function renderStoryboard(job) {
   const frames = job.storyboard || [];
+  for (const frame of frames) {
+    const submitted = state.frameSubmissions.get(frame.key);
+    if (!submitted || job.status !== "succeeded" || frame.version === submitted.version) continue;
+    const paths = (frame.references || []).filter((reference) => reference.kind === "character").map((reference) => reference.path);
+    if (frame.prompt !== submitted.prompt || JSON.stringify(paths) !== JSON.stringify(submitted.character_reference_paths)) continue;
+    if (state.frameDrafts.get(frame.key)?.trim() === submitted.prompt) state.frameDrafts.delete(frame.key);
+    if (JSON.stringify(frameCharacterReferences(frame).map((reference) => reference.path)) === JSON.stringify(paths)) state.frameReferenceDrafts.delete(frame.key);
+    state.frameSubmissions.delete(frame.key);
+  }
   $("storyboard-section").hidden = job.review?.kind !== "frames";
   const pages = Math.max(1, Math.ceil(frames.length / state.pageSize));
   state.page = Math.min(state.page, pages);
@@ -40,7 +54,7 @@ function renderStoryboard(job) {
   $("page-next").disabled = state.page >= pages;
   $("review-empty").hidden = visible.length > 0;
   $("review-empty").textContent = t("framesNotReady");
-  const signature = JSON.stringify([visible, job.status, state.language, state.page ]);
+  const signature = JSON.stringify([visible, job.character_references, job.status, state.language, state.page ]);
   if (state.storyboardSignature === signature) return;
   state.storyboardSignature = signature;
   $("storyboard-cards").replaceChildren();
@@ -63,7 +77,10 @@ function renderStoryboard(job) {
       card.append(link);
     } else card.append(element("p", "frame-placeholder hint", t("frameWaiting")));
     const draftNote = element("p", "hint frame-draft-note", t("frameDraftUnapplied"));
-    draftNote.hidden = !state.frameDrafts.has(frame.key) || state.frameDrafts.get(frame.key).trim() === (frame.prompt || "").trim();
+    function updateDraftNote() {
+      draftNote.hidden = (!state.frameDrafts.has(frame.key) || state.frameDrafts.get(frame.key).trim() === (frame.prompt || "").trim()) && !frameReferencesChanged(frame);
+    }
+    updateDraftNote();
     const details = element("details", "frame-editor");
     details.append(element("summary", "", t("editFramePrompt")));
     let editor;
@@ -76,17 +93,24 @@ function renderStoryboard(job) {
       editor.value = state.frameDrafts.get(frame.key) ?? frame.prompt;
       editor.addEventListener("input", () => {
         state.frameDrafts.set(frame.key, editor.value);
-        draftNote.hidden = editor.value.trim() === (frame.prompt || "").trim();
+        updateDraftNote();
       });
       label.append(editor);
       details.append(label);
-      if (frame.missing_references?.length) details.append(element("p", "notice error", t("frameMissingReferences", { paths: frame.missing_references.join(t("listSeparator")) })));
       const regenerate = element("button", "button secondary regenerate-frame", t(job.demo ? "regenerateDemo" : "regenerateLive"));
       regenerate.type = "button";
-      regenerate.dataset.enabled = String(frame.editable && job.status === "succeeded");
+      function updateReferences() {
+        regenerate.dataset.enabled = String(frame.references_editable && job.status === "succeeded" && frameGenerationReferences(frame).every((reference) => reference.url));
+        updateDraftNote();
+      }
+      details.append(createFrameReferenceEditor(frame, updateReferences));
+      updateReferences();
       regenerate.addEventListener("click", async () => {
+        if (regenerate.disabled) return;
         if (!editor.value.trim()) { showError(t("framePromptRequired")); return; }
-        await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/frames/${encodeURIComponent(frame.key)}`, { prompt: editor.value.trim() });
+        const payload = { prompt: editor.value.trim(), character_reference_paths: frameCharacterReferences(frame).map((reference) => reference.path) };
+        state.frameSubmissions.set(frame.key, { ...payload, version: frame.version });
+        await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/frames/${encodeURIComponent(frame.key)}`, payload);
       });
       details.append(regenerate, element("p", "hint", t(job.demo ? "regenerateDemoHint" : "regenerateLiveHint")));
       renderResultActions();

@@ -13,7 +13,7 @@ from werkzeug.exceptions import HTTPException
 
 from h3ref import config
 from .i18n import InputError, message
-from .inputs import invalid, text, verify_image
+from .inputs import array, invalid, text, verify_image
 from .jobs import Jobs
 from .settings import save_env
 from .references import bind_references, describe_references
@@ -201,8 +201,44 @@ def create_app(storage=None, env_path=None):
         values = request.get_json()
         if not isinstance(values, dict):
             invalid("frame", values, "object")
+        for field in values:
+            if field not in ("prompt", "character_reference_paths"):
+                invalid("frame", field, "choice")
+        characters = array(values["character_reference_paths"], "character_reference_paths") if "character_reference_paths" in values else None
         with jobs.lock:
-            return jsonify(jobs.edit_frame(identifier, key, values.get("prompt"), dict(env)))
+            return jsonify(jobs.edit_frame(identifier, key, values.get("prompt"), dict(env), characters))
+
+    @app.get("/api/jobs/<identifier>/characters/<int:index>")
+    def character_reference(identifier, index):
+        from .storyboard import character_references
+        with jobs.lock:
+            record = jobs.find(identifier)
+            if record["kind"] != "film":
+                raise InputError("not_found", value=index)
+            saved = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
+            references = character_references(saved, identifier)
+            if index >= len(references) or not references[index]["url"]:
+                raise InputError("not_found", value=index)
+            path = Path(references[index]["path"])
+            verify_image(path)
+            return send_file(path)
+
+    @app.get("/api/jobs/<identifier>/frames/<key>/references/<int:index>")
+    def frame_reference(identifier, key, index):
+        from .storyboard import plan
+        with jobs.lock:
+            record = jobs.find(identifier)
+            if record["kind"] != "film":
+                raise InputError("not_found", value=key)
+            saved = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
+            description = next((item for item in plan(saved, check_images=False)[3] if item["key"] == key), None)
+            if not description or index >= len(description["reference_paths"]):
+                raise InputError("not_found", value=f"{key}/{index}")
+            path = Path(description["reference_paths"][index])
+            if not path.is_file():
+                raise InputError("not_found", value=f"{key}/{index}")
+            verify_image(path)
+            return send_file(path)
 
     @app.post("/api/jobs/<identifier>/continue")
     def continue_film(identifier):

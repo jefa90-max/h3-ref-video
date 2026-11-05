@@ -22,14 +22,21 @@ def plan(request, check_images=True):
     pictures = {s["idx"]: film.refs(script, s, request["frames"]) for s in segments}
     wanted = [(s["idx"], p["shot"]) for s in segments for p in pictures[s["idx"]] if p["kind"] == "frame"]
     descriptions = []
+    records = frame_records(request)
+    character_names = {c["picture"]: c["name"] for c in script.get("cast") or []}
     for index, (segment, shot) in enumerate(wanted):
         key = f"s{segment + 1}-{shot + 1}"
         who = [c for c in script.get("cast") or [] if film.in_shots(c, [segments[segment]["shots"][shot]])]
         anchor = out / "frames" / f"s{wanted[0][0] + 1}-{wanted[0][1] + 1}.png" if index else None
-        refs = ([script["board"]] if script.get("board") else []) + [c["picture"] for c in who] + ([str(anchor)] if anchor else [])
+        characters = records.get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
+        references = ([{"kind": "board", "path": script["board"], "name": ""}] if script.get("board") else [])
+        references += [{"kind": "character", "path": p, "name": character_names.get(p, "")} for p in characters]
+        if anchor:
+            references.append({"kind": "anchor", "path": str(anchor), "name": ""})
         prompt = frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), bool(anchor))
         descriptions.append({"key": key, "segment": segment + 1, "shot": shot + 1, "prompt": prompt,
-                             "reference_paths": refs, "path": str(out / "frames" / f"{key}.png")})
+                             "references": references, "reference_paths": [r["path"] for r in references],
+                             "path": str(out / "frames" / f"{key}.png")})
     return script, segments, pictures, descriptions
 
 
@@ -39,7 +46,19 @@ def frame_records(request):
     return read_json(path, {"frames": {}}).get("frames", {})
 
 
-def view(request, artifacts, editable):
+def character_references(request, identifier):
+    inputs = Path(request["output_dir"]) / "inputs"
+    source = inputs / "demo-film.json" if request["demo"] and (inputs / "demo-film.json").exists() else inputs / "film.json"
+    script = film.load(source, check_images=False)
+    references = []
+    for index, character in enumerate(script.get("cast") or []):
+        path = Path(character["picture"])
+        url = f"/api/jobs/{identifier}/characters/{index}?v={path.stat().st_mtime_ns}" if path.is_file() else None
+        references.append({"kind": "character", "path": str(path), "name": character["name"], "url": url})
+    return references
+
+
+def view(request, artifacts, editable, identifier=None):
     out = Path(request["output_dir"])
     source = out / "inputs" / ("demo-film.json" if request["demo"] else "film.json")
     if not source.exists():
@@ -51,7 +70,12 @@ def view(request, artifacts, editable):
         rec = records.get(description["key"], {})
         missing = [p for p in description["reference_paths"] if not Path(p).is_file()]
         description.update(prompt=rec.get("prompt", description["prompt"]), url=urls.get(description["path"]),
-                           editable=editable and description["path"] in urls and not missing, missing_references=missing)
+                           editable=editable and description["path"] in urls and not missing, missing_references=missing,
+                           references_editable=editable and description["path"] in urls)
+        for index, reference in enumerate(description["references"]):
+            path = Path(reference["path"])
+            reference["url"] = (f"/api/jobs/{identifier}/frames/{description['key']}/references/{index}?v={path.stat().st_mtime_ns}"
+                                if identifier and path.is_file() else None)
     return descriptions
 
 
@@ -88,7 +112,7 @@ def regenerate(request):
     pending = read_json(pending_path, {})
     if pending.get("applied"):
         return
-    script, _, _, descriptions = plan(request)
+    script, _, _, descriptions = plan(request, check_images=False)
     description = next((item for item in descriptions if item["key"] == pending.get("key")), None)
     if not description:
         raise InputError("not_found", value=pending.get("key"))
@@ -108,7 +132,7 @@ def regenerate(request):
             # Resume an uncertain task; only a confirmed terminal failure gets a new submission.
             if pending.get("task") and frames.poll(pending["task"])["state"] == "failed":
                 record(task=None)
-            cost = frames.draw(pending["prompt"], [Path(p) for p in description["reference_paths"]], script["aspect"], temporary,
+            cost = frames.draw(pending["prompt"], [Path(p) for p in pending.get("reference_paths", description["reference_paths"])], script["aspect"], temporary,
                                record=record, task=pending.get("task"))
         record(downloaded=True, cny=cost)
 
@@ -128,6 +152,8 @@ def regenerate(request):
     previous = pending["previous"]
     updated = {**previous, "prompt": pending["prompt"], "file": str(target), "task": pending.get("task"),
                "cny": float(previous.get("cny") or 0) + float(pending["cny"]), "revision": pending["revision"]}
+    if "character_reference_paths" in pending:
+        updated["character_reference_paths"] = pending["character_reference_paths"]
     if request["demo"]:
         records = frame_records(request)
         records[pending["key"]] = updated
