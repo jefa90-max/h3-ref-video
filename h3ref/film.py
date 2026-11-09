@@ -364,6 +364,8 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
     rec = job.state["segs"].get(str(i)) or {}
     if out.exists() and rec.get("cny") is not None:
         return rec
+    if rec.get("terminal_failed"):
+        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
     if not rec.get("task"):
         if rec.get("submission_unknown"):
             raise RuntimeError(message("submission_unknown", number=i + 1, path=str(job.file)))
@@ -387,8 +389,8 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
             break
         time.sleep(20)
     if st["state"] == "failed":
-        job.put("segs", str(i), task=None, error=st.get("error"))
-        raise RuntimeError(f"第 {i + 1} 段生成失败：{st.get('error')}（再跑一次 run 会重新提交）")
+        job.put("segs", str(i), terminal_failed=True, error=st.get("error"))
+        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
     http.download(st["url"], out)
     media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
     job.put("segs", str(i), file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),

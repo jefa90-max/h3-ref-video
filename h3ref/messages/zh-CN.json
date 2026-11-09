@@ -47,5 +47,6 @@
   "staging_invalid": "调度字段 {path}={value}；要求 {expected}。",
   "staging_known_layout": "逐字复用场景 {scene_id} 的已知固定布局",
   "staging_plan_failed": "STAGING_INVALID {frame_key} schema=2 model={model}，记录 {path}：{detail}。文字规划请求可能已收费；请手动修改此图提示词后仅重生成图片，不要自动重试规划。",
-  "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}；记录 {path}。其它镜头已处理；请在工作台手动修复失败图后继续。"
+  "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}；记录 {path}。其它镜头已处理；请在工作台手动修复失败图后继续。",
+  "segment_terminal_failed": "TERMINAL_FAILED 第 {number} 段远端任务已终态失败，续跑不会重新付费。请在片段卡片明确发起新一次生成；记录 {path}。"
 }
