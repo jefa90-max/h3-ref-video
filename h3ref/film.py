@@ -202,39 +202,56 @@ def _frame_key(i: int, j: int) -> str:
 
 
 def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict):
-    """Draw every frame the plan needs; the film's first frame first, then the rest with it as the anchor."""
+    """Attempt every frame, retaining failures for manual repair; return failed frame keys."""
     (job.dir / "frames").mkdir(exist_ok=True)
     wanted = [(i, p["shot"]) for i, seg in enumerate(segs) for p in pics[i] if p["kind"] == "frame"]
     if not wanted:
-        return
+        job.state["frame_failures"] = []
+        job.save()
+        return []
 
     def one(ij, anchor):
         i, j = ij
         key = _frame_key(i, j)
         out = job.dir / "frames" / f"{key}.png"
         rec = job.state["frames"].get(key) or {}
+        if rec.get("error") or rec.get("moderation_error"):
+            return
         if out.exists():
             return
         shot = segs[i]["shots"][j]
         who = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
         refs = ([film["board"]] if film.get("board") else []) + [c["picture"] for c in who] + ([anchor] if anchor else [])
         text = frames.prompt(film, shot, who, bool(film.get("board")), bool(anchor))
-        for attempt in range(2):
-            try:
-                cny = frames.draw(text, refs, film["aspect"], out, record=lambda **k: job.put("frames", key, prompt=text, **k),
-                                  task=rec.get("task") if attempt == 0 else None)
-                job.put("frames", key, file=str(out), cny=cny)
-                job.log("frame", key, f"¥{cny:.3f}")
-                return
-            except RuntimeError as exc:
-                job.log("frame failed", key, exc)
-        raise SystemExit(f"分镜图 {key} 画了两次都没成")
+        job.put("frames", key, prompt=text, anchor_reference_path=anchor)
+        try:
+            cny = frames.draw(text, refs, film["aspect"], out, record=lambda **k: job.put("frames", key, **k),
+                              task=rec.get("task"))
+            if not out.is_file():
+                raise RuntimeError(message("frame_output_missing", path=out))
+        except Exception as exc:
+            # This item boundary records generation errors so unrelated frames can continue.
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            job.put("frames", key, error=failure_reason,
+                    moderation_error=exc.reason if isinstance(exc, frames.ContentPolicyError) else None)
+            job.log("frame failed", key, failure_reason)
+            return
+        job.put("frames", key, file=str(out), cny=cny, error=None, moderation_error=None)
+        job.log("frame", key, f"¥{cny:.3f}")
 
     first = wanted[0]
     one(first, None)
-    anchor = str(job.dir / "frames" / f"{_frame_key(*first)}.png")
+    anchor_path = job.dir / "frames" / f"{_frame_key(*first)}.png"
+    anchor = str(anchor_path) if anchor_path.is_file() else None
     with ThreadPoolExecutor(4) as pool:
         list(pool.map(lambda ij: one(ij, anchor), wanted[1:]))
+    failures = [_frame_key(i, j) for i, j in wanted
+                if job.state["frames"].get(_frame_key(i, j), {}).get("error")
+                or job.state["frames"].get(_frame_key(i, j), {}).get("moderation_error")
+                or not (job.dir / "frames" / f"{_frame_key(i, j)}.png").is_file()]
+    job.state["frame_failures"] = failures
+    job.save()
+    return failures
 
 
 def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
@@ -284,14 +301,9 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
         names = [rh.upload(p) for p in paths]
         seed = int(rec.get("seed") or random.randrange(10 ** 14, 10 ** 15))
         g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
-        if guard_submission:
-            job.put("segs", str(i), submission_unknown=True, seed=seed)
-        try:
-            task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail))
-        except rh.SubmissionRejected:
-            if guard_submission:
-                job.put("segs", str(i), submission_unknown=False)
-            raise
+        record_submission = (lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed)) if guard_submission else None
+        task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail),
+                                    record_submission=record_submission)
         job.put("segs", str(i), task=task, seed=seed, submitted=time.time(),
                 **({"submission_unknown": False} if guard_submission else {}))
         job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
@@ -325,17 +337,23 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
 
 def stage_check(job: Job, film: dict, segs: list[dict]):
     """Burned-subtitle check on every segment with lines (and every segment when the film has any lines)."""
+    if not config.SUBTITLE_CHECKS_ENABLED:
+        return
     if not film.get("speech") or not any((s.get("line") or "").strip() for s in film["shots"]):
         return
+    total_segments = len(plan(film["shots"]))
     for seg in segs:
         rec = job.state["segs"].get(str(seg["idx"])) or {}
         if "subtitles" in rec or not rec.get("file"):
             continue
+        job.log("check", message("subtitle_check_start", number=seg["idx"] + 1, total=total_segments))
         try:
             res = check.subtitles(Path(rec["file"]))
         except Exception as exc:                        # a check that can't run is reported, not fatal
             res = {"checked": False, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
         job.put("segs", str(seg["idx"]), subtitles=res)
+        job.log("check", message("subtitle_check_failed", number=seg["idx"] + 1, error=res["error"]) if res.get("error")
+                else message("subtitle_check_done", number=seg["idx"] + 1))
         if res.get("burned_text"):
             job.log("SUBTITLES", f"seg{seg['idx'] + 1}", res.get("text"))
 
@@ -391,12 +409,17 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     job.log("plan", f"{len(segs)} segments", " / ".join(f"{s['seconds']}s·{len(s['shots'])} shots·{len(pics[s['idx']])} pictures" for s in segs))
     for s in segs:
         job.put("segs", str(s["idx"]), pics=[p["kind"] for p in pics[s["idx"]]])
-    stage_frames(job, film, segs, pics)
+    failures = stage_frames(job, film, segs, pics)
+    if failures:
+        job.log("frames", message("frames_partial", count=len(failures)))
+        return job.dir
     stage_prompts(job, film, segs, pics)
     stage_generate(job, film, segs, pics, mode)
-    stage_check(job, film, segs)
     final = job.dir / "film.mp4"
+    job.log("assemble", message("film_assembly_start", count=len(segs)))
     media.join([Path(job.state["segs"][str(s["idx"])]["file"]) for s in segs], final)
+    job.log("assembled", message("film_assembly_done", path=final))
+    stage_check(job, film, segs)
     rep = report(job, film, segs, mode, final)
     job.log("film", final, "report", rep)
     return final

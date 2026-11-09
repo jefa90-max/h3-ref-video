@@ -3,5 +3,15 @@
   "submission_retry": "RunningHub submission {attempt}/{limit} rejected: {reason}; retrying in {seconds} seconds.",
   "submission_exhausted": "RunningHub submission {attempt}/{limit} failed; stopped after {limit} attempts: {reason}. Resume this task after the issue is resolved.",
   "submission_failed": "RunningHub submission failed: {reason}",
-  "submission_unknown": "The previous submission result for segment {number} is unknown. Automatic resubmission is blocked to avoid duplicate charges. Check the task in RunningHub before restoring the local task record: {path}"
+  "submission_unknown": "The previous submission result for segment {number} is unknown. Automatic resubmission is blocked to avoid duplicate charges. Check the task in RunningHub before restoring the local task record: {path}",
+  "film_assembly_start": "All {count} clips are ready. Assembling the full video…",
+  "film_assembly_done": "Full video saved and ready to preview: {path}",
+  "subtitle_check_help": "Always check for burned subtitles after generation",
+  "subtitle_check_paused_help": "Subtitle checking is paused; this option currently skips the check",
+  "subtitle_check_start": "Checking subtitles for clip {number}/{total}…",
+  "subtitle_check_done": "Subtitle check finished for clip {number}.",
+  "subtitle_check_failed": "Subtitle check could not finish for clip {number}; continuing: {error}",
+  "frame_moderation_failed": "Frame content review failed. Automatic retries are blocked. Edit the prompt and manually regenerate this frame. Original error: {reason}",
+  "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video.",
+  "frame_output_missing": "Frame output is missing: {path}"
 }

@@ -63,22 +63,45 @@ def process_alive(pid):
 
 
 def stop_child(child):
-    if child.poll() is not None:
+    if os.name == "nt":
+        child.windows_job.stop(child)
         return
+    # All cleanup callers share this lock, even when the leader already exited.
+    lock = vars(child).setdefault("_workbench_group_lock", threading.Lock())
+    with lock:
+        if vars(child).get("_workbench_group_stopped", False):
+            return
+        stop_posix_group(child)
+        child._workbench_group_stopped = True
+
+
+def stop_posix_group(child):
     try:
-        if os.name == "nt":
-            child.terminate()
-        else:
-            os.killpg(child.pid, signal.SIGTERM)
+        os.killpg(child.pid, signal.SIGTERM)
         child.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            child.kill()
-        else:
-            os.killpg(child.pid, signal.SIGKILL)
+        os.killpg(child.pid, signal.SIGKILL)
         child.wait()
     except ProcessLookupError:
         child.wait()
+        return
+    # The group can outlive its leader, including descendants that ignore TERM.
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while True:
+            os.killpg(child.pid, 0)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Task process group={child.pid} has not exited")
+            time.sleep(0.01)
+    except ProcessLookupError:
+        return
+
+
+def stop_posix_descendants_on_exit(child):
+    child.wait()
+    # Descendants can retain stdout after the leader dies; do not wait for EOF.
+    stop_child(child)
 
 
 class Jobs:
@@ -155,14 +178,18 @@ class Jobs:
             result.update(storyboard=[], character_references=[], pending_video=False, can_continue=False, review=None, review_needed=False,
                           segments=[], assembly=None, pending_assembly=False, can_assemble=False)
             if record["kind"] == "film":
-                from .storyboard import character_references, review_state, review_status, view
+                from .storyboard import can_edit_frames, character_references, review_state, review_status, view
                 out = Path(record["output_dir"])
                 saved = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
                 result["character_references"] = character_references(saved, identifier)
-                result["storyboard"] = view(saved, artifacts, record["status"] == "succeeded", identifier)
+                result["storyboard"] = view(saved, artifacts, can_edit_frames(saved, record["status"]), identifier,
+                                            failed_only=record["status"] != "succeeded")
                 result["review"] = review_status(saved, result["storyboard"])
+                result["frame_failures"] = sum(bool(frame.get("error")) for frame in result["storyboard"])
                 result["pending_video"] = bool(review_state(out)["dirty_segments"])
-                result["can_continue"] = record["status"] == "succeeded" and (saved.get("operation") == "frames" or result["pending_video"])
+                result["can_continue"] = record["status"] == "succeeded" and result["review"]["ready"] and (saved.get("operation") == "frames" or result["pending_video"])
+                result["can_resume_frames"] = record["status"] == "succeeded" and saved.get("operation") == "frame" and any(
+                    not frame["url"] and not frame.get("error") for frame in result["storyboard"])
                 result["review_needed"] = result["can_continue"]
                 from . import segments
                 editable = record["status"] == "succeeded" and result["review"]["complete"] and not result["pending_video"]
@@ -178,7 +205,7 @@ class Jobs:
             return [self.snapshot(record["id"], False) for record in newest]
 
     def available(self):
-        if self.closing or any(r["status"] in ("queued", "running") for r in self.records.values()):
+        if self.closing or self.children or any(r["status"] in ("queued", "running") for r in self.records.values()):
             raise InputError("busy")
         for record in self.records.values():
             if process_alive(record.get("pid")):
@@ -226,22 +253,29 @@ class Jobs:
 
     def edit_frame(self, identifier, key, prompt, env, character_reference_paths=None):
         from .inputs import array, invalid, text, verify_image
-        from .storyboard import frame_records, plan
+        from .storyboard import can_edit_frames, frame_records, plan
         with self.lock:
             self.available()
             record = self.find(identifier)
-            if record["kind"] != "film" or record["status"] != "succeeded":
+            if record["kind"] != "film" or record["status"] not in ("succeeded", "failed", "interrupted"):
                 raise InputError("frame_operation")
             out = Path(record["output_dir"])
             request = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
+            if not can_edit_frames(request, record["status"]):
+                raise InputError("frame_operation")
             try:
                 script, _, _, descriptions = plan(request, check_images=False)
                 description = next((item for item in descriptions if item["key"] == key), None)
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
-            if not description or not Path(description["path"]).is_file():
+            previous = frame_records(request).get(key, {})
+            if record["status"] != "succeeded" and not (previous.get("error") or previous.get("moderation_error")):
+                raise InputError("frame_operation")
+            if not description or not (Path(description["path"]).is_file() or previous.get("error") or previous.get("moderation_error")):
                 raise InputError("not_found", value=key)
             prompt = text(prompt, "prompt")
+            if previous.get("moderation_error") and prompt == (previous.get("failed_prompt") or previous.get("prompt", "")).strip():
+                raise InputError("frame_prompt_unchanged")
             current_characters = [r["path"] for r in description["references"] if r["kind"] == "character"]
             characters = current_characters if character_reference_paths is None else array(character_reference_paths, "character_reference_paths")
             allowed = {Path(c["picture"]).resolve() for c in script.get("cast") or []}
@@ -261,7 +295,7 @@ class Jobs:
             preflight(request, env)
             pending = {"key": key, "prompt": prompt, "revision": uuid.uuid4().hex,
                        "character_reference_paths": characters, "reference_paths": reference_paths,
-                       "previous": frame_records(request).get(key, {}), "task": None, "applied": False}
+                       "previous": previous, "task": None, "applied": False}
             write_json(out / "inputs" / "frame-edit.json", pending)
             return self.restart(record, request, env)
 
@@ -324,10 +358,13 @@ class Jobs:
     def resume(self, identifier, env):
         with self.lock:
             record = self.find(identifier)
-            if record["status"] not in ("failed", "interrupted"):
+            remaining_frames = record["status"] == "succeeded" and self.snapshot(identifier).get("can_resume_frames")
+            if record["status"] not in ("failed", "interrupted") and not remaining_frames:
                 raise InputError("resume")
             self.available()
             request = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
+            if remaining_frames:
+                request["operation"] = "frames"
             if request.get("operation") in ("segment", "assemble"):
                 snapshot = self.snapshot(identifier)
                 if not snapshot["review"]["complete"] or snapshot["pending_video"]:
@@ -359,12 +396,18 @@ class Jobs:
                 with self.lock:
                     if self.closing:
                         raise RuntimeError(message("interrupted", lang))
-                    child = subprocess.Popen(command(request, self.root), cwd=self.root, env=env, stdout=subprocess.PIPE,
-                                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                                             start_new_session=(os.name != "nt"))
+                    start = subprocess.Popen
+                    if os.name == "nt":
+                        from .processes import start_windows_child
+                        start = start_windows_child
+                    child = start(command(request, self.root), cwd=self.root, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                  start_new_session=(os.name != "nt"))
                     self.children[identifier] = child
                     record.update(status="running", pid=child.pid)
                     self.save(record)
+                    if os.name != "nt":
+                        threading.Thread(target=stop_posix_descendants_on_exit, args=(child,), daemon=True).start()
                 for line in child.stdout:
                     with self.lock:
                         log.write(self.redact(line))
@@ -379,13 +422,19 @@ class Jobs:
                                      checks=json.dumps(state.get("subtitles", message("unchecked", lang)), ensure_ascii=False, indent=2))
                     (out / "report.md").write_text(self.redact(report), encoding="utf-8")
                 if request["kind"] == "film" and request.get("operation", "pipeline") == "pipeline":
-                    from .storyboard import review_state
+                    from .storyboard import read_json, review_state
                     out = Path(record["output_dir"])
-                    review = review_state(out)
-                    review["dirty_segments"] = []
-                    write_json(out / "inputs" / "review.json", review)
-                    from .segments import record_assembly
-                    record_assembly(request)
+                    if read_json(out / "state.json", {}).get("frame_failures"):
+                        request["operation"] = "frames"
+                        write_json(out / "inputs" / "request.json", request)
+                        with self.lock:
+                            record["operation"] = "frames"
+                    else:
+                        review = review_state(out)
+                        review["dirty_segments"] = []
+                        write_json(out / "inputs" / "review.json", review)
+                        from .segments import record_assembly
+                        record_assembly(request)
                 with self.lock:
                     record.update(status="succeeded", error=None)
         except Exception as exc:

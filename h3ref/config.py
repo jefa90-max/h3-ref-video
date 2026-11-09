@@ -58,6 +58,7 @@ LLM_BASE = env("LLM_BASE_URL", APIMART_BASE).rstrip("/")
 LLM_MODEL = env("LLM_MODEL", "deepseek-v4-pro")
 VISION_BASE = env("VISION_BASE_URL", APIMART_BASE).rstrip("/")
 VISION_MODEL = env("VISION_MODEL", "gemini-3.8-flash")
+SUBTITLE_CHECKS_ENABLED = False
 
 # the official prompt guide is MiniMax's; it is read from their repository, not copied here (see README)
 GUIDE_URL = env("H3_GUIDE_URL", "https://raw.githubusercontent.com/MiniMax-AI/MiniMax-H3/main/skills/h3-prompt-writing/references/ref-en.txt")

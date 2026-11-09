@@ -77,7 +77,7 @@ def create_app(storage=None, env_path=None):
 
     @app.get("/")
     def index():
-        return render_template("index.html")
+        return render_template("index.html", subtitle_checks_enabled=config.SUBTITLE_CHECKS_ENABLED)
 
     @app.get("/jobs/<identifier>")
     def result_page(identifier):

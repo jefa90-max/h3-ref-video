@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from h3ref import check, config, film, http, media, rewrite, rh  # noqa: E402
+from h3ref.i18n import message  # noqa: E402
 
 
 def cmd_one(a):
@@ -59,7 +60,7 @@ def cmd_one(a):
     clip = out / "clip.mp4"
     http.download(res["url"], clip)
     st.update(cny=res["cny"], run_s=res.get("run_seconds"), wall_s=round(time.time() - t0))
-    if any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check:      # dialogue in Chinese/Japanese/Korean: look for burned subtitles
+    if config.SUBTITLE_CHECKS_ENABLED and (any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check):
         st["subtitles"] = check.subtitles(clip)
     save()
     print(f"成片 {clip}，{media.duration(clip):.1f} 秒，¥{res['cny']:.3f}，GPU {res.get('run_seconds')} 秒")
@@ -76,7 +77,7 @@ def main():
     o.add_argument("--seconds", type=int, default=12)
     o.add_argument("--aspect", default="9:16", choices=list(config.SIZES))
     o.add_argument("--seed", type=int)
-    o.add_argument("--check", action="store_true", help="生成后一定查一次烧字幕")
+    o.add_argument("--check", action="store_true", help=message("subtitle_check_help" if config.SUBTITLE_CHECKS_ENABLED else "subtitle_check_paused_help"))
     o.add_argument("--out", required=True, help="输出目录（断了再跑同一个目录会接着查结果）")
     f = sub.add_parser("film", help="一份分镜脚本出整条片")
     f.add_argument("job", type=Path)

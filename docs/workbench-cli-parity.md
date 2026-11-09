@@ -4,16 +4,16 @@
 
 | 步骤 | 原仓库实现 | 工作台行为与修正 |
 | --- | --- | --- |
-| one 输入 | 默认 12 秒，5–15 秒，三种画幅，参考图顺序，seed/check | 同参数调用 `h3ref.py one`；已改回默认 12 秒，补 seed/check |
+| one 输入 | 默认 12 秒，5–15 秒，三种画幅，参考图顺序，seed/check | 同参数调用 `h3ref.py one`；字幕检查目前暂停，check 参数保留兼容但不执行检查，页面选项禁用 |
 | one 改写 | 已有六段式原样使用；否则 rewrite 模块读取官方指南、RULES、示例并调用改写器 | 完全复用；不拼另一套系统提示词；界面根据缓存和最终提示词判断配置需求 |
 | film 解析 | `film.load` 过滤空 action、默认 2 秒、至少 0.5 秒、时间归一化 | 删除 UI 重复时间算法，直接使用原 load；页面从角色/总表清单绑定上传文件，启动时保存绝对路径 |
 | 切段与参考图 | `film.plan / refs / compile_prompt`，总数不超过 9 张，shot/first/none | 直接使用相同函数；显示实际参与生成的分镜，不承诺超出参考图预算的镜头都有图 |
 | 画图 | `film.stage_frames` → `frames.prompt / draw` | 完整出片和“先生成分镜”使用同一阶段；图像模型、参数、总表→角色→首图锚点顺序一致 |
 | 视频提示词 | `stage_rewrite` → 原 rewrite，官方六段式 | 真实流水线完全沿用；单镜编辑框只修改图像生成提示词，不冒充视频提示词编辑 |
-| 出片与检查 | 原 RunningHub 工作流、轮询、拼接、字幕检查、report | one 直接调用 CLI；film 先调用 stage_frames，全部确认后才调用原 CLI / film.run，未另写生成器 |
+| 出片与检查 | 原 RunningHub 工作流、轮询、拼接、report；字幕检查目前暂停 | one 直接调用 CLI；film 先调用 stage_frames，全部确认后才调用原 CLI / film.run；整片及单段重生成均跳过字幕检查 |
 | 单镜重出 | `frames.draw` 是原图像 API；CLI 的 `--redo` 只重做视频 | 单镜用原 draw，仅新建该图的任务；成功后替换，失败保留旧图，续跑复用新 task |
 | 更新成片 | `--redo`：shot 只重做所属段；first/none 从该段向后重做 | 抽取原失效逻辑为 `film.invalidate_segments`，CLI 与 UI 共用；失效只应用一次，网络失败续跑不会清掉刚提交的新 task |
-| 配置与恢复 | 根目录 .env / 环境变量；state.json 恢复 | 同配置入口与状态；按当前阶段和缓存预检，先画图只需 APIMart；film 字幕检查缺 key 沿用原 unchecked 记录行为 |
+| 配置与恢复 | 根目录 .env / 环境变量；state.json 恢复 | 同配置入口与状态；按当前阶段和缓存预检，先画图只需 APIMart；暂停字幕检查期间不要求视觉模型密钥，也不新增字幕检查记录 |
 
 ## 有意保留的 UI 差异
 

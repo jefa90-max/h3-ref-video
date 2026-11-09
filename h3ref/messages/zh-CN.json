@@ -3,5 +3,15 @@
   "submission_retry": "RunningHub 第 {attempt}/{limit} 次提交被拒绝：{reason}；{seconds} 秒后重试。",
   "submission_exhausted": "RunningHub 第 {attempt}/{limit} 次提交失败，已达到 {limit} 次上限：{reason}。问题解决后可续跑原任务。",
   "submission_failed": "RunningHub 提交失败：{reason}",
-  "submission_unknown": "第 {number} 段上次提交的结果未知，已停止自动重提，避免重复付费。请在 RunningHub 核对任务，再恢复本地任务记录：{path}"
+  "submission_unknown": "第 {number} 段上次提交的结果未知，已停止自动重提，避免重复付费。请在 RunningHub 核对任务，再恢复本地任务记录：{path}",
+  "film_assembly_start": "全部 {count} 个片段已就绪，正在拼接完整视频…",
+  "film_assembly_done": "完整视频已保存，可直接预览：{path}",
+  "subtitle_check_help": "生成后一定查一次烧字幕",
+  "subtitle_check_paused_help": "字幕检查已暂停；指定此选项也会跳过检查",
+  "subtitle_check_start": "正在检查字幕：第 {number}/{total} 段…",
+  "subtitle_check_done": "第 {number} 段字幕检查完成。",
+  "subtitle_check_failed": "第 {number} 段字幕检查未完成，继续处理：{error}",
+  "frame_moderation_failed": "分镜图内容审核未通过，已记为失败且不会自动重试。请手工修改提示词后，从该分镜卡片重新生成。原始错误：{reason}",
+  "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。",
+  "frame_output_missing": "分镜图输出文件缺失：{path}"
 }

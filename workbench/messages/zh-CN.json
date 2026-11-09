@@ -66,5 +66,7 @@
   "segment_done": "第 {number} 段已更新，其它片段保持不变。请预览后重新拼接完整视频。",
   "assembly_missing": "视频片段尚未全部生成或文件缺失，无法拼接。",
   "assembly_changed": "视频片段版本已变化，请刷新后重新发起拼接。",
-  "assembly_done": "完整视频已重新拼接：{path}"
+  "assembly_done": "完整视频已重新拼接：{path}",
+  "frame_prompt_unchanged": "这张分镜图内容审核未通过。请先手工修改提示词，再点击重新生成。",
+  "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。"
 }

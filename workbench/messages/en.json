@@ -66,5 +66,7 @@
   "segment_done": "Segment {number} updated. Other clips are unchanged. Preview it, then reassemble the full video.",
   "assembly_missing": "Some video segments are missing or not yet generated. The film cannot be assembled.",
   "assembly_changed": "Video segment versions changed. Refresh before starting a new assembly.",
-  "assembly_done": "Full video reassembled: {path}"
+  "assembly_done": "Full video reassembled: {path}",
+  "frame_prompt_unchanged": "This frame failed content review. Edit its prompt before manually regenerating it.",
+  "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video."
 }

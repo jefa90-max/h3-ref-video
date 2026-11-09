@@ -171,7 +171,7 @@ def preflight(job, env):
         needs_rh = True
         h3 = state.get("h3") or (job["prompt"] if is_rewritten(job["prompt"]) else "")
         needs_rewrite = not h3
-        needs_vision = job.get("check", False) or any(ord(ch) > 0x2E80 for ch in h3)
+        needs_vision = config.SUBTITLE_CHECKS_ENABLED and (job.get("check", False) or any(ord(ch) > 0x2E80 for ch in h3))
     else:
         segments = film.plan(job["film"]["shots"])
         for segment in segments:

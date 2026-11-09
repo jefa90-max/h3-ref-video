@@ -95,12 +95,16 @@ def submit(g: dict) -> str:
     return str(task)
 
 
-def submit_with_retry(g: dict, log) -> str:
+def submit_with_retry(g: dict, log, *, record_submission=None) -> str:
     """Retry only explicit capacity rejections; never retry an ambiguous network failure."""
     for attempt in range(1, 6):
+        if record_submission:
+            record_submission(True)
         try:
             return submit(g)
         except QueueFull as exc:
+            if record_submission:
+                record_submission(False)
             if attempt == 5:
                 detail = message("submission_exhausted", attempt=attempt, limit=5, reason=exc)
                 log(detail)
@@ -108,6 +112,8 @@ def submit_with_retry(g: dict, log) -> str:
             log(message("submission_retry", attempt=attempt, limit=5, seconds=60, reason=exc))
             time.sleep(60)
         except RuntimeError as exc:
+            if isinstance(exc, SubmissionRejected) and record_submission:
+                record_submission(False)
             log(message("submission_failed", reason=exc))
             raise
 
