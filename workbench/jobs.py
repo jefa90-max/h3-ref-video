@@ -189,7 +189,8 @@ class Jobs:
                 saved = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
                 result["character_references"] = character_references(saved, identifier)
                 result["storyboard"] = view(saved, artifacts, can_edit_frames(saved, record["status"]), identifier,
-                                            failed_only=record["status"] != "succeeded")
+                                            failed_only=record["status"] != "succeeded",
+                                            records=None if saved["demo"] else context["state"].get("frames", {}))
                 result["review"] = review_status(saved, result["storyboard"])
                 result["frame_failures"] = sum(bool(frame.get("error")) for frame in result["storyboard"])
                 result["pending_video"] = bool(review_state(out)["dirty_segments"])
@@ -199,11 +200,11 @@ class Jobs:
                     not frame["url"] and not frame.get("error") for frame in result["storyboard"])))
                 result["review_needed"] = result["can_continue"]
                 from . import segments
-                editable = record["status"] == "succeeded" and result["review"]["complete"] and not result["pending_video"]
+                editable = segments.can_edit_segments(saved, record["status"], context) and result["review"]["complete"] and not result["pending_video"]
                 result["segments"] = segments.view(saved, artifacts, editable, context=context)
                 result["assembly"] = segments.assembly_status(saved, context=context)
                 result["pending_assembly"] = result["assembly"]["pending"]
-                result["can_assemble"] = editable and result["assembly"]["ready"]
+                result["can_assemble"] = record["status"] == "succeeded" and editable and result["assembly"]["ready"]
             return result
 
     def summaries(self):
@@ -344,12 +345,12 @@ class Jobs:
         self.launch(record, request, env)
         return self.snapshot(record["id"])
 
-    def start_video_operation(self, identifier, operation, env, version, number=None):
+    def start_video_operation(self, identifier, operation, env, version, number=None, *, prompt=None, prompt_format=None, prompt_version=None):
         from . import segments
         with self.lock:
             self.available()
             record = self.find(identifier)
-            if record["kind"] != "film" or record["status"] != "succeeded":
+            if record["kind"] != "film" or (record["status"] != "succeeded" and operation == "assemble") or record["status"] not in ("succeeded", "failed", "interrupted"):
                 raise InputError("segment_operation")
             snapshot = self.snapshot(identifier)
             if not snapshot["review"]["complete"] or snapshot["pending_video"]:
@@ -361,9 +362,11 @@ class Jobs:
                 request.pop(key, None)
             if operation == "segment":
                 request["segment"] = number
+                request["_segment_preparation"] = segments.regeneration_plan(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
             preflight(request, env)
+            request.pop("_segment_preparation", None)
             if operation == "segment":
-                request["segment_revision"] = segments.prepare_regeneration(request, number, version)
+                request["segment_revision"] = segments.prepare_regeneration(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
             else:
                 segments.prepare_assembly(request, version)
             return self.restart(record, request, env)

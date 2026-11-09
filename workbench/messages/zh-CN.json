@@ -72,5 +72,20 @@
   "assembly_done": "完整视频已重新拼接：{path}",
   "frame_prompt_unchanged": "这张分镜图内容审核未通过。请先手工修改提示词，再点击重新生成。",
   "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。",
-  "segment_publishing": "第 {number} 段发布未提交，请先续跑完成发布；此步骤不会再次生成。"
+  "segment_publishing": "第 {number} 段发布未提交，请先续跑完成发布；此步骤不会再次生成。",
+  "segment_value": "字段 {field}={value}；要求 {expected}。",
+  "segment_prompt_changed": "第 {number} 段提示词版本已变化，请保留草稿并复核当前版本后重试。",
+  "segment_h3_invalid": "H3 提示词本地校验失败：{detail}",
+  "segment_locked": "第 {number} 段已有未决任务或提交结果未知。请恢复原任务或人工核对接单结果，不能用新词覆盖。",
+  "segment_terminal": "第 {number} 段已终态失败；续跑不再付费，请从卡片明确新建一次生成。",
+  "segment_attempt_failed": "第 {number} 段本次尝试失败（阶段 {phase}，版本 {revision}）。旧视频和提示词仍保留；请查看恢复指引。",
+  "segment_recovery_manual_check": "接单结果未知，请先在供应商后台核对并恢复任务号；禁止重复提交。",
+  "segment_recovery_new_revision": "远端已终态失败。修改后明确发起新一次生成，会产生新费用。",
+  "segment_recovery_resume": "续跑仅恢复本次任务或完成发布，不新建生成任务。",
+  "segment_recovery_edit_prompt": "本次尚未接到生成任务。检查配置或修改提示词后重试；已完成的文字请求可能收费。",
+  "segment_problem_title": "视频片段操作失败",
+  "segment_internal": "第 {number} 段操作遇到本地错误。关联编号 {instance}；请保留草稿并检查任务日志。",
+  "segment_expected_prompt": "非空字符串",
+  "segment_expected_prompt_format": "source 或 h3",
+  "segment_expected_prompt_version": "当前提示词版本"
 }

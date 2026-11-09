@@ -182,7 +182,9 @@ def preflight(job, env):
                 rec = state.get("segs", {}).get(str(segment["idx"]), {})
                 if not film.frozen_segment(rec) and (rec.get("prompt_override") or {}).get("format") != "h3":
                     zh = film.segment_prompt_text(rec, film.compile_prompt(job["film"], segment, pics, len(segments), compositions=compositions))
-                    needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh)
+                    from types import SimpleNamespace
+                    reference = film.reference_version(film._picture_paths(SimpleNamespace(dir=out), segment, pics))
+                    needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference))
                 needs_rh |= not (out and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists() and rec.get("cny") is not None)
         if operation == "frame":
             needs_frames = True

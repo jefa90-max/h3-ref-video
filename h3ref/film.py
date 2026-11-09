@@ -214,17 +214,22 @@ def frame_reference_paths(film: dict, shot: dict, record: dict) -> list[str]:
     return ([film["board"]] if film.get("board") else []) + characters
 
 
-def reference_version(paths) -> str:
+def reference_version(paths, *, metadata=None) -> str:
     sources = []
+    metadata = {} if metadata is None else metadata
     for source in paths:
-        path = Path(source)
-        stat = path.stat() if path.is_file() else None
-        sources.append((str(path.resolve()), (stat.st_mtime_ns, stat.st_size) if stat else None))
+        key = str(source)
+        if key not in metadata:
+            path = Path(source)
+            stat = path.stat() if path.is_file() else None
+            metadata[key] = (str(path.resolve()), (stat.st_mtime_ns, stat.st_size) if stat else None)
+        sources.append(metadata[key])
     return hashlib.sha256(json.dumps(sources, ensure_ascii=False).encode()).hexdigest()
 
 
 def frame_reference_versions(film: dict, segs: list[dict], records: dict) -> dict[str, str]:
-    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {})))
+    metadata = {}
+    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {})), metadata=metadata)
             for s in segs for j, shot in enumerate(s['shots'])}
 
 
@@ -334,12 +339,13 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
         if (rec.get('prompt_override') or {}).get('format') == 'h3':
             return
         zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
-        if rec.get('h3') and rec.get('zh') == zh:
+        reference = reference_version(_picture_paths(job, seg, pics[i]))
+        if rec.get('h3') and rec.get('zh') == zh and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference):
             return
         h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
         (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
         (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(h3, encoding='utf-8')
-        job.put('segs', str(i), zh=zh, h3=h3, h3_source=zh)
+        job.put('segs', str(i), zh=zh, h3=h3, h3_source=zh, h3_reference_version=reference)
         job.log('prompt', f'seg{i + 1}', f'{len(pics[i])} pictures')
     with ThreadPoolExecutor(3) as pool:
         list(pool.map(one, segs))
@@ -373,16 +379,19 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
         missing = [str(p) for p in paths if not p.exists()]
         if missing:
             raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
+        job.put("segs", str(i), phase="upload")
         names = [rh.upload(p) for p in paths]
         seed = int(rec.get("seed") or random.randrange(10 ** 14, 10 ** 15))
         g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
         record_submission = (lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed)) if guard_submission else None
+        job.put("segs", str(i), phase="submit")
         task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail),
                                     record_submission=record_submission)
         job.put("segs", str(i), task=task, seed=seed, submitted=time.time(),
                 **({"submission_unknown": False} if guard_submission else {}))
         job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
         rec = job.state["segs"][str(i)]
+    job.put("segs", str(i), phase="poll")
     while True:
         st = rh.poll(rec["task"])
         if st["state"] != "running":
@@ -391,7 +400,9 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
     if st["state"] == "failed":
         job.put("segs", str(i), terminal_failed=True, error=st.get("error"))
         raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
+    job.put("segs", str(i), phase="download")
     http.download(st["url"], out)
+    job.put("segs", str(i), phase="tail")
     media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
     job.put("segs", str(i), file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
             wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)

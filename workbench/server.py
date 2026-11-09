@@ -63,9 +63,25 @@ def create_app(storage=None, env_path=None):
         response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self'; style-src-attr 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         return response
 
+    def segment_problem(code, detail, status, *, field=None, instance=None):
+        body = dict(type='urn:workbench:error:' + code, title=message('segment_problem_title', language()), status=status,
+                    detail=jobs.redact(detail), error=jobs.redact(detail), code=code, doc_anchor='docs/workbench.md#video-prompt-errors')
+        if field:
+            body['field'] = field
+        if instance:
+            body['instance'] = instance
+        response = jsonify(body)
+        response.status_code = status
+        response.mimetype = 'application/problem+json'
+        return response
+
     @app.errorhandler(InputError)
     def input_error(exc):
-        return jsonify(error=jobs.redact(exc.localized(language()))), 404 if exc.key == "not_found" else 400
+        status = 404 if exc.key == 'not_found' else 400
+        if request.endpoint == 'regenerate_segment':
+            field = exc.values.get('field') or {'segment_changed': 'version', 'segment_number': 'number'}.get(exc.key)
+            return segment_problem(exc.key, exc.localized(language()), status, field=field)
+        return jsonify(error=jobs.redact(exc.localized(language()))), status
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
@@ -73,6 +89,17 @@ def create_app(storage=None, env_path=None):
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
+        if request.endpoint in ('regenerate_segment', 'get_job'):
+            import traceback
+            instance = uuid.uuid4().hex
+            number = (request.view_args or {}).get('number', '?')
+            identifier = (request.view_args or {}).get('identifier', '?')
+            trace = '; '.join(f'{Path(frame.filename).name}:{frame.lineno}:{frame.name}' for frame in traceback.extract_tb(exc.__traceback__)[-5:])
+            # No exception messages/URLs or user script contents enter this trace.
+            storage_path = storage / 'jobs' / f'{identifier}.log'
+            with storage_path.open('a', encoding='utf-8') as log:
+                log.write(f'correlation={instance} segment={number} error={type(exc).__name__} trace={trace}\n')
+            return segment_problem('segment_internal', message('segment_internal', language(), number=number, instance=instance), 500, instance=instance)
         return jsonify(error=message("internal", language(), detail=jobs.redact(f"{type(exc).__name__}: {exc}"))), 500
 
     @app.get("/")
@@ -254,7 +281,10 @@ def create_app(storage=None, env_path=None):
         if not isinstance(values, dict):
             invalid("segment", values, "object")
         with jobs.lock:
-            return jsonify(jobs.start_video_operation(identifier, "segment", dict(env), values.get("version"), number))
+            edited = any(key in values for key in ('prompt', 'prompt_format', 'prompt_version'))
+            return jsonify(jobs.start_video_operation(identifier, 'segment', dict(env), values.get('version'), number,
+                prompt=values.get('prompt'), prompt_format=values.get('prompt_format', '') if edited else None,
+                prompt_version=values.get('prompt_version', '') if edited else None))
 
     @app.post("/api/jobs/<identifier>/assemble")
     def assemble_film(identifier):
@@ -272,10 +302,11 @@ def create_app(storage=None, env_path=None):
             out = Path(record['output_dir'])
             context = segments.read_context({'output_dir': str(out)})
             matches = [a for a in jobs.artifacts(record, context) if a['name'] == name]
-            source = segments.visible_file(out, name, context, request.args.get('v')) if matches else None
+            mapped = name in context['pending'].get('files', {})
+            source = segments.visible_file(out, name, context, request.args.get('v')) if matches or mapped else None
         if not source:
             raise InputError('not_found', value=name)
-        if matches[0]['kind'] in ('report', 'file'):
+        if (matches and matches[0]['kind'] in ('report', 'file')) or (not matches and source.suffix == '.txt'):
             return app.response_class(jobs.redact(source.read_text(encoding='utf-8')), mimetype='text/plain')
         return send_file(source, conditional=True, as_attachment=request.args.get('download') == '1')
 

@@ -72,5 +72,20 @@
   "assembly_done": "Full video reassembled: {path}",
   "frame_prompt_unchanged": "This frame failed content review. Edit its prompt before manually regenerating it.",
   "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video.",
-  "segment_publishing": "Segment {number} publication is uncommitted. Resume publication first; this does not generate again."
+  "segment_publishing": "Segment {number} publication is uncommitted. Resume publication first; this does not generate again.",
+  "segment_value": "Field {field}={value}; expected {expected}.",
+  "segment_prompt_changed": "Segment {number} prompt version changed. Keep your draft and review the current version before retrying.",
+  "segment_h3_invalid": "H3 prompt failed local validation: {detail}",
+  "segment_locked": "Segment {number} has an unresolved task or unknown submission. Resume the original task or verify acceptance manually; a new prompt cannot replace it.",
+  "segment_terminal": "Segment {number} reached terminal failure. Resume will not pay again; explicitly start a new attempt from the card.",
+  "segment_attempt_failed": "Segment {number} attempt failed (phase {phase}, revision {revision}). Previous video and prompts remain available; follow the recovery guidance.",
+  "segment_recovery_manual_check": "Acceptance is unknown. Verify the task with the provider and restore its ID before proceeding; duplicate submission is blocked.",
+  "segment_recovery_new_revision": "The remote task has terminally failed. Explicitly start a new attempt after editing; new charges apply.",
+  "segment_recovery_resume": "Resume this attempt or finish publication without creating a new generation task.",
+  "segment_recovery_edit_prompt": "No generation task was accepted. Check configuration or edit the prompt and retry; completed text requests may have been charged.",
+  "segment_problem_title": "Video segment operation failed",
+  "segment_internal": "A local error occurred for segment {number}. Correlation ID {instance}; keep your draft and check the task log.",
+  "segment_expected_prompt": "nonempty string",
+  "segment_expected_prompt_format": "source or h3",
+  "segment_expected_prompt_version": "current prompt version"
 }

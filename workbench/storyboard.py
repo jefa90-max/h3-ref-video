@@ -14,7 +14,7 @@ def read_json(path, default):
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
 
-def plan(request, check_images=True):
+def plan(request, check_images=True, *, records=None):
     out = Path(request["output_dir"])
     source = out / "inputs" / ("demo-film.json" if request["demo"] else "film.json")
     script = film.load(source, check_images=check_images)
@@ -22,7 +22,7 @@ def plan(request, check_images=True):
     pictures = {s["idx"]: film.refs(script, s, request["frames"]) for s in segments}
     wanted = [(s["idx"], p["shot"]) for s in segments for p in pictures[s["idx"]] if p["kind"] == "frame"]
     descriptions = []
-    records = frame_records(request)
+    records = frame_records(request) if records is None else records
     compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records))
     character_names = {c["picture"]: c["name"] for c in script.get("cast") or []}
     for segment, shot in wanted:
@@ -67,13 +67,13 @@ def can_edit_frames(request, status):
     return request.get("operation") != "frame" or bool(pending.get("moderation_error") or pending.get("task_failed"))
 
 
-def view(request, artifacts, editable, identifier=None, failed_only=False):
+def view(request, artifacts, editable, identifier=None, failed_only=False, *, records=None):
     out = Path(request["output_dir"])
     source = out / "inputs" / ("demo-film.json" if request["demo"] else "film.json")
     if not source.exists():
         return []
-    _, _, _, descriptions = plan(request, check_images=False)
-    records = frame_records(request)
+    records = frame_records(request) if records is None else records
+    _, _, _, descriptions = plan(request, check_images=False, records=records)
     urls = {a["path"]: a["url"] for a in artifacts if a["kind"] == "image"}
     for description in descriptions:
         rec = records.get(description["key"], {})
