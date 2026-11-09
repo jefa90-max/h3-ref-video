@@ -106,6 +106,9 @@ def main():
         cmd_one(a)
     elif a.cmd == "film":
         film.run(a.job, a.film, a.frames, a.redo)
+        failed = film.Job(a.job).state.get("frame_failures") or []
+        if failed:
+            raise SystemExit(message("frames_cli_incomplete", keys=", ".join(failed), path=a.job / "state.json"))
     elif a.cmd == "rewrite":
         print(rewrite.rewrite(Path(a.prompt).read_text(encoding="utf-8"), a.images, a.seconds, a.aspect))
     else:
