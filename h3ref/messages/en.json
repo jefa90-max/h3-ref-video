@@ -45,5 +45,7 @@
   "staging_framing": "Framing and movement",
   "staging_axis_side": "Axis side",
   "staging_invalid": "Staging field {path}={value}; expected {expected}.",
-  "staging_known_layout": "exact known layout of scene {scene_id}"
+  "staging_known_layout": "exact known layout of scene {scene_id}",
+  "staging_plan_failed": "STAGING_INVALID {frame_key} schema=2 model={model}, record {path}: {detail}. This text request may have been charged. Edit this frame prompt and regenerate only its image; do not automatically replan.",
+  "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}; record {path}. Other shots were processed. Manually repair failed frames in the workbench before continuing."
 }

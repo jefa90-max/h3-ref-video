@@ -8,6 +8,8 @@ Frame modes (--frames):
   first  one frame per segment for its first shot; later segments also get the previous segment's last frame
   none   no frames: characters and setting from words and pictures alone, segments chained on the last frame
 """
+import copy
+import hashlib
 import json
 import math
 import random
@@ -16,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import check, config, frames, http, media, rewrite, rh
+from . import check, config, frames, http, media, rewrite, rh, staging
 from .i18n import message
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
@@ -201,57 +203,105 @@ def _frame_key(i: int, j: int) -> str:
     return f"s{i + 1}-{j + 1}"
 
 
+def frame_reference_paths(film: dict, shot: dict, record: dict) -> list[str]:
+    characters = record.get("character_reference_paths", [c["picture"] for c in film.get("cast") or [] if in_shots(c, [shot])])
+    return ([film["board"]] if film.get("board") else []) + characters
+
+
+def reference_version(paths) -> str:
+    sources = []
+    for source in paths:
+        path = Path(source)
+        stat = path.stat() if path.is_file() else None
+        sources.append((str(path.resolve()), (stat.st_mtime_ns, stat.st_size) if stat else None))
+    return hashlib.sha256(json.dumps(sources, ensure_ascii=False).encode()).hexdigest()
+
+
+def frame_reference_versions(film: dict, segs: list[dict], records: dict) -> dict[str, str]:
+    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {})))
+            for s in segs for j, shot in enumerate(s['shots'])}
+
+
+def saved_compositions(records: dict, *, reference_versions: dict[str, str]) -> dict[str, dict]:
+    return {key: rec['composition'] for key, rec in records.items()
+            if isinstance(rec.get('composition'), dict) and rec['composition'].get('version') == 2
+            and isinstance(rec.get('prompt'), str) and rec['prompt'].strip()
+            and rec.get('composition_prompt') == rec['prompt']
+            and rec.get('composition_reference_version')
+            and rec['composition_reference_version'] == reference_versions.get(key)}
+
+
 def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False):
-    """Attempt every frame, retaining failures for manual repair; return failed frame keys."""
+    """Plan in shot order, save before dispatch, and collect every independent drawing."""
     (job.dir / "frames").mkdir(exist_ok=True)
-    wanted = [(i, p["shot"]) for i, seg in enumerate(segs) for p in pics[i] if p["kind"] == "frame"]
-    if not wanted:
-        job.state["frame_failures"] = []
-        job.save()
-        return []
+    wanted = [(i, p['shot']) for i, seg in enumerate(segs) for p in pics[i] if p['kind'] == 'frame']
+    versions = frame_reference_versions(film, segs, job.state['frames'])
+    effective = saved_compositions(job.state['frames'], reference_versions=versions)
+    known_scenes, previous, previous_key = {}, None, None
 
-    def one(ij):
-        i, j = ij
-        key = _frame_key(i, j)
-        out = job.dir / "frames" / f"{key}.png"
-        rec = job.state["frames"].get(key) or {}
-        if (rec.get("error") or rec.get("moderation_error")) and not (resume_tasks and frames.task_pending(rec)):
-            return
-        if out.exists() and not frames.task_pending(rec):
-            return
-        shot = segs[i]["shots"][j]
-        who = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
-        refs = ([film["board"]] if film.get("board") else []) + [c["picture"] for c in who]
+    def failure(key, exc):
+        reason = f"{type(exc).__name__}: {exc}"
+        job.put('frames', key, error=reason, moderation_error=exc.reason if isinstance(exc, frames.ContentPolicyError) else None)
+        job.log('frame failed', key, reason)
+
+    def draw(key, text, references, task):
+        out = job.dir / 'frames' / f'{key}.png'
         try:
-            if rec.get("submission_unknown") and not rec.get("task"):
-                raise RuntimeError(message("frame_submission_unknown", path=job.file))
-            if rec.get("task"):
-                text = rec.get("prompt") or frames.prompt(film, shot, who, bool(film.get("board")), rec.get("composition"))
-            else:
-                composition = rec.get("composition") or frames.describe_composition(film, shot)
-                text = frames.prompt(film, shot, who, bool(film.get("board")), composition)
-                job.put("frames", key, prompt=text, composition=composition)
-            cny = frames.draw(text, refs, film["aspect"], out, record=lambda **k: job.put("frames", key, **k),
-                              task=rec.get("task"))
+            cny = frames.draw(text, references, film['aspect'], out, record=lambda **k: job.put('frames', key, **k), task=task)
             if not out.is_file():
-                raise RuntimeError(message("frame_output_missing", path=out))
+                raise RuntimeError(message('frame_output_missing', path=out))
+            job.put('frames', key, file=str(out), cny=cny, error=None, moderation_error=None)
+            job.log('frame', key, f'¥{cny:.3f}')
         except Exception as exc:
-            # This item boundary records generation errors so unrelated frames can continue.
-            failure_reason = f"{type(exc).__name__}: {exc}"
-            job.put("frames", key, error=failure_reason,
-                    moderation_error=exc.reason if isinstance(exc, frames.ContentPolicyError) else None)
-            job.log("frame failed", key, failure_reason)
-            return
-        job.put("frames", key, file=str(out), cny=cny, error=None, moderation_error=None)
-        job.log("frame", key, f"¥{cny:.3f}")
+            failure(key, exc)
 
+    futures = []
     with ThreadPoolExecutor(4) as pool:
-        list(pool.map(one, wanted))
+        for i, segment in enumerate(segs):
+            for j, shot in enumerate(segment['shots']):
+                key = _frame_key(i, j)
+                rec = job.state['frames'].get(key) or {}
+                composition = effective.get(key)
+                out = job.dir / 'frames' / f'{key}.png'
+                skip = ((i, j) not in wanted or (out.exists() and not frames.task_pending(rec))
+                        or ((rec.get('error') or rec.get('moderation_error')) and not (resume_tasks and frames.task_pending(rec))))
+                if not skip:
+                    who = [c for c in film.get('cast') or [] if in_shots(c, [shot])]
+                    references = frame_reference_paths(film, shot, rec)
+                    try:
+                        if rec.get('submission_unknown') and not rec.get('task'):
+                            raise RuntimeError(message('frame_submission_unknown', path=job.file))
+                        if rec.get('task'):
+                            text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
+                            references = rec.get('reference_paths', references)
+                        elif rec.get('prompt') or rec.get('composition'):
+                            text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
+                            job.log('staging cache', key, 'source', previous_key)
+                        else:
+                            job.log('staging plan', key, 'source', previous_key)
+                            planned = frames.describe_composition(film, shot, previous_composition=copy.deepcopy(previous), known_scenes=copy.deepcopy(known_scenes))
+                            composition = staging.validate_composition(planned, film, shot, known_scenes)
+                            text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
+                            job.put('frames', key, composition=composition, prompt=text, composition_prompt=text,
+                                    composition_reference_version=versions[key], reference_paths=references)
+                        futures.append(pool.submit(draw, key, text, references, rec.get('task')))
+                    except Exception as exc:
+                        if not rec.get('prompt'):
+                            job.put('frames', key, prompt=frames.prompt(film, shot, who, bool(film.get('board'))))
+                        contextual = RuntimeError(message('staging_plan_failed', frame_key=key, model=config.LLM_MODEL,
+                                                          path=job.file, detail=str(exc))) if not rec.get('task') and not rec.get('submission_unknown') else exc
+                        failure(key, contextual)
+                        composition = None
+                if composition:
+                    known_scenes[composition['scene_id']] = {k: copy.deepcopy(composition[k]) for k in ('world_frame','fixed_objects')}
+                    previous, previous_key = composition, key
+        for future in futures:
+            future.result()
     failures = [_frame_key(i, j) for i, j in wanted
-                if job.state["frames"].get(_frame_key(i, j), {}).get("error")
-                or job.state["frames"].get(_frame_key(i, j), {}).get("moderation_error")
-                or not (job.dir / "frames" / f"{_frame_key(i, j)}.png").is_file()]
-    job.state["frame_failures"] = failures
+                if job.state['frames'].get(_frame_key(i,j), {}).get('error')
+                or job.state['frames'].get(_frame_key(i,j), {}).get('moderation_error')
+                or not (job.dir / 'frames' / f'{_frame_key(i,j)}.png').is_file()]
+    job.state['frame_failures'] = failures
     job.save()
     return failures
 

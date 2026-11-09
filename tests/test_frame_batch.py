@@ -18,8 +18,7 @@ from workbench.server import create_app
 
 class FrameBatch(unittest.TestCase):
     def setUp(self):
-        description = patch.object(frames, "describe_composition", return_value={
-            "scene": "A room.", "frame": "An object starts moving.", "orientation": "The object's side faces the camera."})
+        description = patch.object(frames, "describe_composition", return_value=json.loads((Path(__file__).parent / 'fixtures/staging.json').read_text(encoding='utf-8'))['transfer_start'])
         description.start()
         self.addCleanup(description.stop)
 
@@ -182,8 +181,7 @@ class FrameBatch(unittest.TestCase):
 
 class BatchTaskRecovery(unittest.TestCase):
     def setUp(self):
-        description = patch.object(frames, "describe_composition", return_value={
-            "scene": "A room.", "frame": "A ball starts rolling.", "orientation": "The ball's side faces the camera."})
+        description = patch.object(frames, "describe_composition", return_value=json.loads((Path(__file__).parent / 'fixtures/staging.json').read_text(encoding='utf-8'))['transfer_start'])
         description.start()
         self.addCleanup(description.stop)
         temporary = tempfile.TemporaryDirectory()

@@ -16,8 +16,7 @@ from workbench.server import create_app
 
 class FrameModeration(unittest.TestCase):
     def setUp(self):
-        description = patch.object(frames, "describe_composition", return_value={
-            "scene": "A room.", "frame": "A person starts walking.", "orientation": "The person's back faces the camera."})
+        description = patch.object(frames, "describe_composition", return_value=json.loads((Path(__file__).parent / 'fixtures/staging.json').read_text(encoding='utf-8'))['transfer_start'])
         description.start()
         self.addCleanup(description.stop)
         key = patch.object(frames.config, "apimart_key", return_value="synthetic-apimart-key")
