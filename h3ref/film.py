@@ -115,8 +115,11 @@ def refs(film: dict, seg: dict, mode: str) -> list[dict]:
     return out
 
 
-def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int) -> str:
+def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compositions: dict[str, dict] | None = None) -> str:
     """The segment's prompt in Chinese, written the way you would for Seedance; rewrite.py turns it into H3's format."""
+    compositions = {key: value for key, value in (compositions or {}).items()
+                    if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
+    covered = {c['name'] for comp in compositions.values() for c in comp['characters']}
     aspect = film["aspect"]
     head = (f"根据下面文字分镜生成一段{seg['seconds']}秒{ORIENT[aspect]}视频，{aspect}。"
             + (f"这是一条连续短片的第{seg['idx'] + 1}段。" if count > 1 else "")
@@ -128,7 +131,7 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int) -> str:
         if p["kind"] == "board":
             lines.append(f"参考图片{k}是本片的角色、道具和场景参考总表，只用来统一外观，不要把总表、白底、文字标注画进画面。")
         elif p["kind"] == "cast":
-            look = (p["cast"].get("look") or "").strip().rstrip("。")
+            look = "" if p["cast"]["name"] in covered else (p["cast"].get("look") or "").strip().rstrip("。")
             lines.append(f"参考图片{k}只约束{p['cast']['name']}身份" + (f"：{look}。" if look else "。"))
         elif p["kind"] == "frame":
             s = seg["shots"][p["shot"]]
@@ -143,14 +146,17 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int) -> str:
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
     out = [head, "".join(lines)]
-    if (film.get("setting") or "").strip():
+    if not compositions and (film.get("setting") or "").strip():
         out.append("场景与关键道具（全片统一）：" + film["setting"].strip())
     speech = film.get("speech") or ""
     shot_lines = []
-    for s in seg["shots"]:
+    for j, s in enumerate(seg["shots"]):
+        composition = compositions.get(_frame_key(seg["idx"], j))
         cam = (s.get("camera") or "").strip().strip("【】")
         text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
-            + (s.get("action") or "").strip().rstrip("。") + "。"
+            + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
+        if compositions and not composition and (film.get("setting") or "").strip():
+            text += "场景参考：" + film["setting"].strip()
         if speech and (s.get("line") or "").strip():
             text += "台词：" + s["line"].strip()
         shot_lines.append(text)
@@ -306,20 +312,35 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
     return failures
 
 
+def segment_prompt_text(record: dict, automatic: str) -> str:
+    override = record.get('prompt_override') or {}
+    return override.get('text', automatic) if override.get('format') == 'source' else automatic
+
+
+def frozen_segment(record: dict) -> bool:
+    return bool(record.get('task') or record.get('submission_unknown') or record.get('terminal_failed')
+                or (record.get('file') and record.get('cny') is not None))
+
+
 def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
-    (job.dir / "prompts").mkdir(exist_ok=True)
+    (job.dir / 'prompts').mkdir(exist_ok=True)
+    compositions = saved_compositions(job.state['frames'], reference_versions=frame_reference_versions(film, segs, job.state['frames']))
 
     def one(seg):
-        i = seg["idx"]
-        zh = compile_prompt(film, seg, pics[i], len(segs))
-        (job.dir / "prompts" / f"seg{i + 1}.zh.txt").write_text(zh, encoding="utf-8")
-        rec = job.state["segs"].get(str(i)) or {}
-        if rec.get("h3") and rec.get("zh") == zh:
+        i = seg['idx']
+        rec = job.state['segs'].get(str(i)) or {}
+        if frozen_segment(rec):
             return
-        h3 = rewrite.rewrite(zh, len(pics[i]), seg["seconds"], film["aspect"])
-        (job.dir / "prompts" / f"seg{i + 1}.h3.txt").write_text(h3, encoding="utf-8")
-        job.put("segs", str(i), zh=zh, h3=h3)
-        job.log("prompt", f"seg{i + 1}", f"{len(pics[i])} pictures")
+        if (rec.get('prompt_override') or {}).get('format') == 'h3':
+            return
+        zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
+        if rec.get('h3') and rec.get('zh') == zh:
+            return
+        h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
+        (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+        (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(h3, encoding='utf-8')
+        job.put('segs', str(i), zh=zh, h3=h3, h3_source=zh)
+        job.log('prompt', f'seg{i + 1}', f'{len(pics[i])} pictures')
     with ThreadPoolExecutor(3) as pool:
         list(pool.map(one, segs))
 

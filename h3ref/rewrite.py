@@ -29,7 +29,7 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
    - an image that 只约束某角色身份 defines one <Subject> (carry over every look detail from the input: hair, eyes, outfit, props);
    - a key-frame image (「…」这个画面的样子) is the composition reference for the matching shot when that shot is in this segment,
      otherwise say it maps to no shot in this part;
-   - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: the shot starts from that picture;
+   - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: use its opening composition as guidance, not as a hard timed keyframe;
    - the previous segment's last frame (上一段的最后一个画面) is the first frame of [Shot 1] when [Shot 1] continues the same
      place and moment, otherwise a continuity reference for the set, light and characters' state.
 3. Keep every storyboard beat, in order, with its camera and action. The first shot has no timestamp; each later beat
@@ -45,7 +45,12 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
    一本正经, say plainly that the face stays blank and serious the whole time. Big reactions (shock, pain, laughing) get
    specific details: eyes snapping wide, jaw dropping, wincing with a hand on the cheek, doubled over laughing.
 8. Open detailed_description with one or two sentences of style taken from the input's style sentence, including the
-   aspect ratio, then [Shot 1]."""
+   aspect ratio, then [Shot 1].
+9. Preserve each shot's world frame and fixed objects independently of camera reversals and screen cropping. Keep body facing,
+   gaze, pose and visible appearance separate; identity references cannot replace shot-specific posture or held objects.
+   Keep prop opening direction, base direction and knot position on the object distinct from screen position/visibility.
+   Preserve the full transfer contact chain, release and landing order. Expected ends are textual plans, not generated evidence.
+   ReferenceToVideo images are composition references, not guaranteed hard timed keyframes."""
 
 NEGATIVE = re.compile(r"\b(no|not|without|never|avoid|don't|do not|free of)\b[^.\n]{0,40}\b(music|soundtrack|score|subtitles?|captions?|"
                       r"on-screen text|text overlays?|watermarks?|logos?|brands?|narration|voice-?over|singing)\b", re.I)

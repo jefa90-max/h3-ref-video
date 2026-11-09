@@ -23,6 +23,7 @@ def plan(request, check_images=True):
     wanted = [(s["idx"], p["shot"]) for s in segments for p in pictures[s["idx"]] if p["kind"] == "frame"]
     descriptions = []
     records = frame_records(request)
+    compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records))
     character_names = {c["picture"]: c["name"] for c in script.get("cast") or []}
     for segment, shot in wanted:
         key = f"s{segment + 1}-{shot + 1}"
@@ -30,7 +31,9 @@ def plan(request, check_images=True):
         characters = records.get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
         references = ([{"kind": "board", "path": script["board"], "name": ""}] if script.get("board") else [])
         references += [{"kind": "character", "path": p, "name": character_names.get(p, "")} for p in characters]
-        prompt = frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), records.get(key, {}).get("composition"))
+        cached = records.get(key, {})
+        composition = compositions.get(key) or (cached.get("composition") if (cached.get("composition") or {}).get("version") != 2 else None)
+        prompt = cached.get("prompt") or frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition)
         descriptions.append({"key": key, "segment": segment + 1, "shot": shot + 1, "prompt": prompt,
                              "references": references, "reference_paths": [r["path"] for r in references],
                              "path": str(out / "frames" / f"{key}.png")})

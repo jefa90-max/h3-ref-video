@@ -174,12 +174,15 @@ def preflight(job, env):
         needs_vision = config.SUBTITLE_CHECKS_ENABLED and (job.get("check", False) or any(ord(ch) > 0x2E80 for ch in h3))
     else:
         segments = film.plan(job["film"]["shots"])
+        compositions = film.saved_compositions(state.get("frames", {}), reference_versions=film.frame_reference_versions(job["film"], segments, state.get("frames", {})))
         for segment in segments:
             pics = film.refs(job["film"], segment, job["frames"])
             needs_frames |= any(p["kind"] == "frame" and (not out or not (out / "frames" / f"s{segment['idx'] + 1}-{p['shot'] + 1}.png").exists()) for p in pics)
             if operation == "pipeline":
                 rec = state.get("segs", {}).get(str(segment["idx"]), {})
-                needs_rewrite |= not (rec.get("h3") and rec.get("zh") == film.compile_prompt(job["film"], segment, pics, len(segments)))
+                if not film.frozen_segment(rec) and (rec.get("prompt_override") or {}).get("format") != "h3":
+                    zh = film.segment_prompt_text(rec, film.compile_prompt(job["film"], segment, pics, len(segments), compositions=compositions))
+                    needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh)
                 needs_rh |= not (out and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists() and rec.get("cny") is not None)
         if operation == "frame":
             needs_frames = True
