@@ -22,6 +22,7 @@ def clip_version(path, out):
 def read_context(request):
     """One immutable read context per snapshot, including an interrupted publication."""
     out = Path(request['output_dir'])
+    pending_stamp = clip_version(out / 'inputs' / 'segment-edit.json', out)
     state = read_json(out / 'state.json', {'frames': {}, 'segs': {}})
     pending = read_json(out / 'inputs' / 'segment-edit.json', {})
     records = dict(state.get('segs', {}))
@@ -32,7 +33,7 @@ def read_context(request):
         records[str(pending['number'] - 1)] = pending['previous']
     elif pending.get('applied') and pending.get('active') and publication_current:
         records[str(pending['number'] - 1)] = pending['active']
-    return {'state': state, 'records': records, 'pending': pending, 'publication_current': publication_current, 'automatic': {}, 'path_versions': {}, 'file_versions': {}}
+    return {'pending_stamp': pending_stamp, 'state': state, 'records': records, 'pending': pending, 'publication_current': publication_current, 'automatic': {}, 'path_versions': {}, 'file_versions': {}}
 
 
 def file_version(path, out, context):
@@ -109,10 +110,14 @@ def prompt_pair(record, out, number, context):
     return {'source': source, 'h3': h3, 'paired': paired}
 
 
-def segment_prompt_version(record: dict, version: str | None, pending: dict | None = None) -> str:
+def segment_prompt_version(record: dict, version: str | None, pending: dict | None = None, *, reference_version=None) -> str:
     attempt = {key: (pending or {}).get(key) for key in ('revision', 'prompt', 'prompt_format', 'applied')}
-    payload = [version, record.get('zh'), record.get('h3'), record.get('prompt_override'), record.get('revision'), attempt]
+    payload = [version, record.get('zh'), record.get('h3'), record.get('prompt_override'), record.get('revision'), attempt, reference_version]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def source_rewrite_required(record, pair, reference_version):
+    return not (pair['paired'] and (not record.get('h3_reference_version') or record['h3_reference_version'] == reference_version))
 
 
 def automatic_inputs(request, number, context):
@@ -207,8 +212,9 @@ def view(request, artifacts, editable, *, context=None):
                       'shots': len(segment['shots']), 'url': urls.get(str(out / f'clips/seg{number}.mp4')) if version else None,
                       'version': version, 'can_regenerate': can_generate, 'editable': bool(editable and recoverable and not task_pending and not unknown and not publishing),
                       'chained_next': request['frames'] != 'shot' and number < len(planned),
-                      'prompt': prompt or '', 'prompt_format': fmt, 'prompt_version': segment_prompt_version({**record, 'zh': pair['source'], 'h3': pair['h3']}, version, pending),
+                      'prompt': prompt or '', 'prompt_format': fmt, 'prompt_version': segment_prompt_version({**record, 'zh': pair['source'], 'h3': pair['h3']}, version, pending, reference_version=automatic['reference_version']),
                       'source_prompt': pair['source'] if version else '', 'h3_prompt': pair['h3'] if version else '',
+                      'source_rewrite_required': source_rewrite_required(record, pair, automatic['reference_version']),
                       'automatic_source_prompt': automatic['source'], 'source_changed': bool(override.get('source_version') and override['source_version'] != automatic['source_version']),
                       'error': error, 'attempt_error': pending.get('attempt_error'), 'task_pending': task_pending,
                       'submission_unknown': unknown, 'terminal_failed': terminal, 'attempt_revision': pending.get('revision') or record.get('revision'),
@@ -283,6 +289,7 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
     previous = {**previous, 'zh': pair['source'], 'h3': pair['h3']}
     if current != version:
         raise InputError('segment_changed', number=number)
+    automatic = automatic_inputs(request, number, context)
     edited = any(value is not None for value in (prompt, prompt_format, prompt_version))
     if edited:
         for field, value, valid, expected in (
@@ -291,7 +298,7 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
                 ('prompt_version', prompt_version, isinstance(prompt_version, str) and bool(prompt_version), 'current prompt version')):
             if not valid:
                 raise InputError('segment_value', field=field, value=json.dumps(value, ensure_ascii=False)[:100], expected=message("segment_expected_" + field, request["lang"]))
-        if prompt_version != segment_prompt_version(previous, current, pending):
+        if prompt_version != segment_prompt_version(previous, current, pending, reference_version=automatic['reference_version']):
             raise InputError('segment_prompt_changed', field='prompt_version', number=number)
         if not current and not (attempted.get('terminal_failed') or attempted.get('error') or pending.get('error')):
             raise InputError('segment_prompt', number=number)
@@ -300,13 +307,13 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
             raise InputError('segment_prompt', number=number)
         prompt_format = 'source' if pair['source'] else 'h3'
         prompt = pair['source'] if pair['source'] else pair['h3']
-    automatic = automatic_inputs(request, number, context)
     if prompt_format == 'h3' and edited:
         issues = film.rewrite.problems(prompt, len(automatic['pictures']))
         if issues:
             raise InputError('segment_h3_invalid', field='prompt', detail='; '.join(issues)[:250])
-    matched_refs = not previous.get('h3_reference_version') or previous['h3_reference_version'] == automatic['reference_version']
-    reuse = bool(prompt_format == 'source' and pair['paired'] and prompt == pair['source'] and matched_refs)
+    reuse = bool(prompt_format == 'source' and previous.get('h3')
+                 and (not edited or (prompt == pair['source']
+                 and not source_rewrite_required(previous, pair, automatic['reference_version']))))
     return {'number': number, 'revision': uuid.uuid4().hex, 'version': version, 'prompt_version': prompt_version,
             'prompt': prompt, 'prompt_format': prompt_format, 'previous': previous, 'applied': False,
             'source_version': automatic['source_version'], 'reference_version': automatic['reference_version'],
@@ -326,9 +333,11 @@ def prepare_prompt(staged, request, pending, segment):
     number, index = pending['number'], str(segment['idx'])
     prompt_format = pending.get('prompt_format')
     previous = pending['previous']
+    legacy = pending.get('explicit_prompt') is False
     rec = staged.state['segs'].get(index, {})
     if not rec:
-        if not prompt_format:  # An interrupted edit created by an older release.
+        if not prompt_format or legacy:  # Existing version-only requests reuse their saved H3.
+
             rec = {key: previous[key] for key in ('zh', 'h3', 'pics', 'prompt_override', 'h3_source', 'h3_reference_version') if key in previous}
         elif prompt_format == 'h3':
             rec = {'zh': '', 'h3': pending['prompt'], 'h3_source': None}
@@ -337,7 +346,7 @@ def prepare_prompt(staged, request, pending, segment):
             if pending.get('reuse_h3'):
                 rec.update(h3=previous['h3'], h3_source=pending['prompt'])
         staged.put('segs', index, **rec)
-    if prompt_format == 'source' and not rec.get('h3'):
+    if prompt_format == 'source' and not rec.get('h3') and not legacy:
         pictures = film.refs(request['film'], segment, request['frames'])
         if request['demo']:
             h3 = ''
@@ -345,9 +354,10 @@ def prepare_prompt(staged, request, pending, segment):
             staged.log('segment rewrite', pending['revision'], 'format', prompt_format, 'cache miss')
             h3 = film.rewrite.rewrite(pending['prompt'], len(pictures), segment['seconds'], request['film']['aspect'])
         staged.put('segs', index, h3=h3, h3_source=pending['prompt'])
-    if prompt_format:
-        staged.put('segs', index, prompt_override={'format': prompt_format, 'text': pending['prompt'], 'source_version': pending['source_version']},
-                   h3_reference_version=pending['reference_version'])
+    if prompt_format and not legacy:
+        if prompt_format == 'h3' or pending['prompt'] != previous.get('zh') or previous.get('prompt_override'):
+            staged.put('segs', index, prompt_override={'format': prompt_format, 'text': pending['prompt'], 'source_version': pending['source_version']})
+        staged.put('segs', index, h3_reference_version=pending['reference_version'])
     (staged.dir / 'prompts').mkdir(exist_ok=True)
     current = staged.state['segs'][index]
     for suffix, key in (('zh', 'zh'), ('h3', 'h3')):

@@ -339,7 +339,8 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
         if (rec.get('prompt_override') or {}).get('format') == 'h3':
             return
         zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
-        reference = reference_version(_picture_paths(job, seg, pics[i]))
+        paths = _picture_paths(job, seg, pics[i])
+        reference = reference_version(paths) if all(path.is_file() for path in paths) else None
         if rec.get('h3') and rec.get('zh') == zh and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference):
             return
         h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
@@ -365,6 +366,18 @@ def _picture_paths(job: Job, seg: dict, pics: list[dict]) -> list[Path]:
 
 def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None,
                 guard_submission: bool = True) -> dict:
+    try:
+        return _generate_segment(job, film, seg, pics, reference_paths=reference_paths, guard_submission=guard_submission)
+    except (Exception, SystemExit) as exc:
+        rec = job.state['segs'].get(str(seg['idx']), {})
+        if not rec.get('terminal_failed'):
+            job.put('segs', str(seg['idx']), error=message('segment_generation_failed', number=seg['idx'] + 1,
+                    phase=rec.get('phase', 'prepare'), error_type=type(exc).__name__), error_code='SEGMENT_GENERATION_FAILED')
+        raise
+
+
+def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None,
+                      guard_submission: bool = True) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
     rec = job.state["segs"].get(str(i)) or {}
@@ -379,7 +392,7 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
         missing = [str(p) for p in paths if not p.exists()]
         if missing:
             raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
-        job.put("segs", str(i), phase="upload")
+        job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
         names = [rh.upload(p) for p in paths]
         seed = int(rec.get("seed") or random.randrange(10 ** 14, 10 ** 15))
         g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)

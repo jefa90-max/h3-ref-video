@@ -49,5 +49,8 @@
   "staging_plan_failed": "STAGING_INVALID {frame_key} schema=2 model={model}, record {path}: {detail}. This text request may have been charged. Edit this frame prompt and regenerate only its image; do not automatically replan.",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}; record {path}. Other shots were processed. Manually repair failed frames in the workbench before continuing.",
   "segment_terminal_failed": "TERMINAL_FAILED Segment {number} reached remote terminal failure. Resume will not pay again. Explicitly start a new attempt from its card; record {path}.",
-  "segment_publication_pending": "Clip publication is uncommitted. Resume it in the workbench first: {path}."
+  "segment_publication_pending": "Clip publication is uncommitted. Resume it in the workbench first: {path}.",
+  "segment_generation_failed": "Segment {number} generation failed during {phase} ({error_type}). The failure is saved; inspect the log before editing or resuming its original task.",
+  "rewrite_picture_token": "Invalid image reference {value}; expected <Picture N> with a positive integer N.",
+  "rewrite_picture_bound": "Image reference <Picture {number}> is outside the actual range 1..{count}."
 }

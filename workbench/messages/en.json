@@ -87,5 +87,6 @@
   "segment_internal": "A local error occurred for segment {number}. Correlation ID {instance}; keep your draft and check the task log.",
   "segment_expected_prompt": "nonempty string",
   "segment_expected_prompt_format": "source or h3",
-  "segment_expected_prompt_version": "current prompt version"
+  "segment_expected_prompt_version": "current prompt version",
+  "segment_snapshot_changed": "Clip versions are changing. Refresh the results; your draft is preserved."
 }

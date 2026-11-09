@@ -259,9 +259,9 @@ function renderJob(job) {
   $("frames-count").textContent = job.progress?.frames ?? 0;
   $("clips-count").textContent = job.progress?.clips ?? 0;
   $("files-count").textContent = job.artifacts?.length ?? 0;
-  $("resume-job").hidden = !failed && !job.can_resume_frames;
+  $("resume-job").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
   $("resume-job").textContent = t(job.can_resume_frames ? "resumeFrames" : "resumeJob");
-  $("resume-hint").hidden = !failed && !job.can_resume_frames;
+  $("resume-hint").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
   const blockedSegment = (job.segments || []).find(segment => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || segment.terminal_failed));
   $("resume-hint").textContent = t(job.can_resume_video === false && blockedSegment ? (blockedSegment.submission_unknown ? "segmentSubmissionUnknown" : "segmentTerminalFailed") : "resumeHint");
   $("review-section").hidden = job.kind !== "film";

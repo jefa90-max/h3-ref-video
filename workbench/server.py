@@ -297,17 +297,44 @@ def create_app(storage=None, env_path=None):
     @app.get("/api/jobs/<identifier>/files/<path:name>")
     def artifact(identifier, name):
         from . import segments
-        with jobs.lock:
-            record = jobs.find(identifier)
-            out = Path(record['output_dir'])
-            context = segments.read_context({'output_dir': str(out)})
-            matches = [a for a in jobs.artifacts(record, context) if a['name'] == name]
-            mapped = name in context['pending'].get('files', {})
-            source = segments.visible_file(out, name, context, request.args.get('v')) if matches or mapped else None
-        if not source:
-            raise InputError('not_found', value=name)
-        if (matches and matches[0]['kind'] in ('report', 'file')) or (not matches and source.suffix == '.txt'):
-            return app.response_class(jobs.redact(source.read_text(encoding='utf-8')), mimetype='text/plain')
-        return send_file(source, conditional=True, as_attachment=request.args.get('download') == '1')
+        # The worker is a separate process. Pin an opened file, then validate that
+        # descriptor; a path/version check alone races with atomic replacement.
+        for _ in range(2):
+            with jobs.lock:
+                record = jobs.find(identifier)
+                out = Path(record['output_dir'])
+                context = segments.read_context({'output_dir': str(out)})
+                matches = [a for a in jobs.artifacts(record, context) if a['name'] == name]
+                mapped = name in context['pending'].get('files', {})
+                source = segments.visible_file(out, name, context, request.args.get('v')) if matches or mapped else None
+            if not source:
+                break
+            try:
+                stream = source.open('rb')
+            except FileNotFoundError:
+                continue  # Publication removed/replaced this path; resolve once more.
+            stat = os.fstat(stream.fileno())
+            token = f'{stat.st_mtime_ns}:{stat.st_size}'
+            expected = request.args.get('v') or segments.file_version(source, out, context)
+            if expected not in (token, token.split(':')[0]):
+                stream.close()
+                continue
+            try:
+                if (matches and matches[0]['kind'] in ('report', 'file')) or (not matches and source.suffix == '.txt'):
+                    with stream:
+                        content = jobs.redact(stream.read().decode('utf-8'))
+                    return app.response_class(content, mimetype='text/plain')
+                response = send_file(stream, download_name=Path(name).name, conditional=False,
+                                     as_attachment=request.args.get('download') == '1')
+                response.content_length = stat.st_size
+                response.last_modified = stat.st_mtime
+                response.set_etag(token)
+                response.make_conditional(request.environ, accept_ranges=True, complete_length=stat.st_size)
+                response.call_on_close(stream.close)
+                return response
+            except BaseException:
+                stream.close()
+                raise
+        raise InputError('not_found', value=name)
 
     return app

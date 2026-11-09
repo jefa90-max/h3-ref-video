@@ -87,5 +87,6 @@
   "segment_internal": "第 {number} 段操作遇到本地错误。关联编号 {instance}；请保留草稿并检查任务日志。",
   "segment_expected_prompt": "非空字符串",
   "segment_expected_prompt_format": "source 或 h3",
-  "segment_expected_prompt_version": "当前提示词版本"
+  "segment_expected_prompt_version": "当前提示词版本",
+  "segment_snapshot_changed": "视频片段正在切换版本，请刷新结果；草稿会保留。"
 }

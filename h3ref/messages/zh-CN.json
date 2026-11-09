@@ -49,5 +49,8 @@
   "staging_plan_failed": "STAGING_INVALID {frame_key} schema=2 model={model}，记录 {path}：{detail}。文字规划请求可能已收费；请手动修改此图提示词后仅重生成图片，不要自动重试规划。",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}；记录 {path}。其它镜头已处理；请在工作台手动修复失败图后继续。",
   "segment_terminal_failed": "TERMINAL_FAILED 第 {number} 段远端任务已终态失败，续跑不会重新付费。请在片段卡片明确发起新一次生成；记录 {path}。",
-  "segment_publication_pending": "视频片段发布尚未提交，请先在工作台续跑完成发布：{path}。"
+  "segment_publication_pending": "视频片段发布尚未提交，请先在工作台续跑完成发布：{path}。",
+  "segment_generation_failed": "第 {number} 段生成在 {phase} 阶段失败（{error_type}）。失败已保存；请检查日志后修词或恢复原任务。",
+  "rewrite_picture_token": "无效图片引用 {value}；要求 <Picture N>，N 为正整数。",
+  "rewrite_picture_bound": "图片引用 <Picture {number}> 超出实际范围 1..{count}。"
 }

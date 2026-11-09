@@ -129,11 +129,11 @@ RunningHub 视频生成或单段重生成已保存云端任务号时，续跑继
 
 ```bash
 curl -H 'X-Workbench: 1' -H 'Accept-Language: zh-CN' \
-  'http://127.0.0.1:8765/api/jobs/JOB_ID'
+  'http://127.0.0.1:7860/api/jobs/JOB_ID'
 # 读取 segments[1].version 和 segments[1].prompt_version，然后使用源词：
 curl -X POST -H 'X-Workbench: 1' -H 'Accept-Language: zh-CN' \
   -H 'Content-Type: application/json' \
-  'http://127.0.0.1:8765/api/jobs/JOB_ID/segments/2/regenerate' \
+  'http://127.0.0.1:7860/api/jobs/JOB_ID/segments/2/regenerate' \
   --data '{"version":"GET中的视频版本","prompt_version":"开始编辑时的提示词版本","prompt":"按当前机位，接收者跪地侧身托袋。","prompt_format":"source"}'
 ```
 
@@ -141,14 +141,18 @@ curl -X POST -H 'X-Workbench: 1' -H 'Accept-Language: zh-CN' \
 
 ```bash
 curl -H 'X-Workbench: 1' -H 'Accept-Language: en' \
-  'http://127.0.0.1:8765/api/jobs/JOB_ID'
+  'http://127.0.0.1:7860/api/jobs/JOB_ID'
 # 重新读取相应段版本；此示例没有 Picture 引用，实际脚本应保留自己的全部镜头和台词：
 curl -X POST -H 'X-Workbench: 1' -H 'Accept-Language: en' \
   -H 'Content-Type: application/json' \
-  'http://127.0.0.1:8765/api/jobs/JOB_ID/segments/2/regenerate' \
+  'http://127.0.0.1:7860/api/jobs/JOB_ID/segments/2/regenerate' \
   --data '{"version":"CLIP_VERSION_FROM_GET","prompt_version":"PROMPT_VERSION_AT_EDIT_START","prompt":"subject_definitions:\n<Subject 1> The recipient.\n\nsummary:\nA careful handover.\n\nretention_analysis:\nThe recipient keeps the same clothing.\n\ndetailed_description:\n[Shot 1] The recipient kneels beside the counter and supports the upright bag.\n\noverall_soundscape:\nFabric rustles.\n\nnon_diegetic_music:\nN/A","prompt_format":"h3"}'
 ```
 
 校验与冲突沿用 HTTP 400，任务不存在 404，意外本地异常 500。此 POST 返回 `application/problem+json`：`type=urn:workbench:error:<code>`、`title/status/detail/code/doc_anchor`，字段问题带 `field`，意外异常带 `instance` 关联本地脱敏日志；兼容保留 `error=detail`。异步改写／生成失败保存在对应片段 `error/attempt_error`，包含阶段、revision、恢复动作和费用副作用，不将 POST 接收成功当作视频已成功。
 
 升级前先停下正在运行的任务并备份任务输出目录（尤其 `state.json`、`inputs/`、`clips/`、`prompts/`）。旧任务不会自动迁移或重新规划。Python 和语言 JSON 已修改，**请自行重启工作台**后体验；本次没有启动或重启服务。
+
+单段修复完成后，若原整片仍有未决任务或未开始片段，全局「续跑」会继续原整片范围：已接单段只轮询原 task，完成段不重画、不重生成，未开始段按原计划继续。终态失败和未知接单仍各自受门禁保护。原词的旧 `{version}` 请求只复用旧 H3，不增加文字改写；未改源词也不会被自动标成手改覆盖。
+
+`prompt_version` 包含本段当前实际有序参考版本；参考变更后旧草稿必须复核。新增 `source_rewrite_required` 是后端共享缓存判定，前端以它及实际草稿差异显示费用，单纯“源输入待复核”不会被误算成必需文字改写。first/none 的来源标记在首次实际上传引用时绑定，避免把尚未生成的前段尾帧当作已用素材。媒体响应先打开并校验文件描述符再发送；快照遇到发布变化会重试，保证提示词与媒体属于同一可见版本。

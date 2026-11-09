@@ -113,7 +113,7 @@ function refreshSegmentControls(card, job, syncText = false) {
   card.regenerate.dataset.enabled = String(enabled);
   card.regenerate.disabled = !enabled;
   card.regenerate.textContent = t(segment.terminal_failed ? "segmentRetryCurrent" : job.demo ? "regenerateSegmentDemo" : "regenerateSegmentLive");
-  card.cost.textContent = t(job.demo ? "segmentDemoHint" : format === "source" && (text !== segment.source_prompt || !segment.h3_prompt || segment.source_changed) ? "segmentSourceCost" : "segmentVideoCost");
+  card.cost.textContent = t(job.demo ? "segmentDemoHint" : format === "source" && (text !== segment.source_prompt || !segment.h3_prompt || segment.source_rewrite_required) ? "segmentSourceCost" : "segmentVideoCost");
   if (card.editor) {
     card.conflict.textContent = t("segmentDraftConflict");
     card.conflict.hidden = !conflict;

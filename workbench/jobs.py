@@ -159,6 +159,13 @@ class Jobs:
         return result
 
     def snapshot(self, identifier, full=True):
+        for _ in range(3):
+            result = self._snapshot(identifier, full)
+            if result is not None:
+                return result
+        raise InputError('segment_snapshot_changed')
+
+    def _snapshot(self, identifier, full=True):
         with self.lock:
             record = self.find(identifier)
             result = {k: v for k, v in record.items() if k not in ("pid", "lang")}
@@ -203,11 +210,19 @@ class Jobs:
                 editable = segments.can_edit_segments(saved, record["status"], context) and result["review"]["complete"] and not result["pending_video"]
                 result["segments"] = segments.view(saved, artifacts, editable, context=context)
                 result["segment_number"] = saved.get("segment") if saved.get("operation") == "segment" else None
+                unfinished = [card for card in result['segments'] if not card['url'] or card['task_pending']]
+                result['can_resume_pipeline'] = bool(saved.get('operation') == 'segment' and context['pending'].get('applied')
+                        and unfinished and result['review']['complete'] and not result['pending_video'])
+                if result['can_resume_pipeline']:
+                    result['segment_number'] = None
                 targets = [card for card in result["segments"] if result["segment_number"] is None or card["number"] == result["segment_number"]]
                 result["can_resume_video"] = not any(card["submission_unknown"] or card["terminal_failed"] for card in targets)
                 result["assembly"] = segments.assembly_status(saved, context=context)
                 result["pending_assembly"] = result["assembly"]["pending"]
                 result["can_assemble"] = record["status"] == "succeeded" and editable and result["assembly"]["ready"]
+            out = Path(record['output_dir'])
+            if segments.clip_version(out / 'inputs' / 'segment-edit.json', out) != context['pending_stamp']:
+                return None
             return result
 
     def summaries(self):
@@ -377,12 +392,18 @@ class Jobs:
     def resume(self, identifier, env):
         with self.lock:
             record = self.find(identifier)
-            remaining_frames = record["status"] == "succeeded" and self.snapshot(identifier).get("can_resume_frames")
-            if record["status"] not in ("failed", "interrupted") and not remaining_frames:
+            snapshot = self.snapshot(identifier)
+            remaining_frames = record['status'] == 'succeeded' and snapshot.get('can_resume_frames')
+            remaining_pipeline = snapshot.get('can_resume_pipeline')
+            if record["status"] not in ("failed", "interrupted") and not remaining_frames and not remaining_pipeline:
                 raise InputError("resume")
             self.available()
             request = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
-            if remaining_frames:
+            if remaining_pipeline:
+                request['operation'] = 'pipeline'
+                for key in ('segment', 'segment_revision', 'redo', 'reset_applied'):
+                    request.pop(key, None)
+            elif remaining_frames:
                 request["operation"] = "frames"
             if request.get("operation") in ("segment", "assemble"):
                 snapshot = self.snapshot(identifier)

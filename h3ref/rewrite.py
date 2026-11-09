@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 
 from . import config, http
+from .i18n import message
 
 SECTIONS = ["subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music"]
 EXAMPLES = config.ROOT / "prompts/h3_examples.md"
@@ -113,10 +114,13 @@ def problems(text: str, n_images: int) -> list[str]:
     for name in ("detailed_description", "overall_soundscape"):
         for m in NEGATIVE.finditer(parts[name]):
             out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
-    used = {int(n) for n in re.findall(r"<Picture (\d+)>", text)}
-    for number in sorted(used):
+    for token in re.findall(r"<Picture([^>]*)>", text):
+        if not re.fullmatch(r"\s+[0-9]+\s*", token):
+            out.append(message('rewrite_picture_token', value=('<Picture' + token + '>')[:100]))
+            continue
+        number = int(token)
         if not 1 <= number <= n_images:
-            out.append(f"<Picture {number}> is outside the actual reference range 1..{n_images}")
+            out.append(message('rewrite_picture_bound', number=number, count=n_images))
     if "[Shot 1]" not in parts["detailed_description"]:
         out.append("detailed_description has no [Shot 1]")
     return out
