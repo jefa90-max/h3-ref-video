@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config, http, media
+from . import config, http, media, staging
 from .i18n import message
 
 ORIENT = {"9:16": "竖屏", "16:9": "横屏", "1:1": "方形"}
@@ -56,23 +56,33 @@ def without_anchor_reference(text: str) -> str:
     return re.sub(r"参考图片\d+是同一部片子另一个镜头的画面：人物的长相、妆容、服装和场景的样子与它保持一致，构图按上面的画面描述来。(?:\r?\n)?", "", text)
 
 
-def describe_composition(film: dict, shot: dict) -> dict:
+def describe_composition(film: dict, shot: dict, *, previous_composition: dict | None = None,
+                         known_scenes: dict | None = None) -> dict:
     """Describe only this shot's opening image, using earlier shots for continuity."""
     shots = film.get("shots") or [shot]
     number = shots.index(shot) + 1
     visible = lambda item: {key: item.get(key, "") for key in ("camera", "action", "line")}
     context = {"shot_number": number, "current_shot": visible(shot),
-               "previous_shots": [visible(item) for item in shots[:number - 1]], "key_scenes": film.get("setting") or ""}
-    rules = ("你是分镜美术指导，为当前分镜刚开始的一瞬间编写图片生成描述。只输出JSON对象，三个非空中文字符串字段："
-             "scene（当前可见的场景和必要道具）、frame（符合当前机位的具体画面和动作起始状态）、"
-             "orientation（逐一明确当前人物或物体相对镜头的朝向）。"
-             "当前镜头的机位和动作优先，前文仅用于理解场景和道具状态的连续性。关键场景参考只提供外观线索，"
-             "按当前镜头需要选择，不能整段照抄或把不同地点的道具都放进画面；没有换场依据时沿用当前场景。"
-             "不提前展示尚未发生的动作结果、未打开容器内的物品或此刻不可见的道具，不添加剧情。"
-             "按机位与动作推断朝向，不默认人物或物体正对镜头。背后跟拍、从身后看或背影要明确写主体背对镜头，"
-             "展示后背、后脑勺；物体背向镜头时写明其背面朝向镜头。不能把背对其他人物或窗户等同于背对镜头。"
-             "角色参考图只用于外观，不能覆盖镜头朝向。分镜号仅用于查找参考图对应的关键场景，不画进图片。"
-             "不要引用首镜参考图，不输出参考图片编号，不输出说明或Markdown。")
+               "previous_shots": [visible(item) for item in shots[:number - 1]], "key_scenes": film.get("setting") or "",
+               "cast": film.get("cast") or [], "previous_composition": previous_composition,
+               "known_scenes": known_scenes or {}}
+    rules = ("你是分镜美术指导。只输出 composition v2 JSON 对象，不输出 Markdown。必填 version=2；非空字符串 "
+             "scene/frame/orientation/scene_id/world_frame/action；fixed_objects 是 {name,position} 数组；"
+             "camera 是 {position,view_direction,framing,axis_side}，轴线不适用要明确写不适用；"
+             "characters 是人物状态数组，props 是道具状态数组；expected_end={characters:[],props:[]}。"
+             "characters 每项必填非空字符串字段：" + ",".join(staging.CHARACTER_FIELDS) + "。props 每项必填字段："
+             + ",".join(staging.PROP_FIELDS) + "。除 opening_direction/base_direction/knot_position 在无对应部件时允许 null，"
+             "其余为非空字符串；visibility 只能 visible/cropped/occluded/offscreen。所有数组必填，允许无人/无道具。"
+             "name 使用 cast 正式姓名，未绑定人物保留原身份，不新增参考图。appearance 只含本镜可见稳定外貌衣着；"
+             "cast.look 中旧姿势/持物/毛巾位置不能当作稳定身份，本镜动作、位置、身体朝向、视线优先。"
+             "characters/props/frame 只写首帧动作起点，不提前展示交接完成；action 保留原镜头完整多拍动作、"
+             "接触者、接触方式、释放和落点，结束状态只放 expected_end。expected_end 是计划而非图片事实。"
+             "previous_composition 是最近可信前镜计划，原剧本补充中间缺失动作，不伪造失败镜头的结果。"
+             "known_scenes 的 world_frame/fixed_objects 逐字复用；反打只改机位/画面左右，不能移动固定物。"
+             "换场新 scene_id，返回已知地点复用其 ID/布局，不能把另一地点的人物持物强加当前场景。"
+             "世界位置与 screen_position/visibility 分开；袋口、袋底、结扣各写物体方向，裁切不能清除已知方向。"
+             "机位、景别、运镜、台词与原动作不改；背影不要求露脸，转头视线允许与身体不同。"
+             "不把参考图的正面姿势当成当前姿势，不引用首镜或其它生成图，不输出参考编号，不画文字。")
     out = http.request(config.LLM_BASE + "/chat/completions", config.llm_key(),
                        {"model": config.LLM_MODEL, "messages": [{"role": "system", "content": rules},
                         {"role": "user", "content": json.dumps(context, ensure_ascii=False)}], "max_tokens": 8000, "stream": False},
@@ -81,10 +91,7 @@ def describe_composition(film: dict, shot: dict) -> dict:
         composition = json.loads(out["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])) from exc
-    if not isinstance(composition, dict) or any(not isinstance(composition.get(key), str) or not composition[key].strip()
-                                              for key in ("scene", "frame", "orientation")):
-        raise RuntimeError(message("frame_composition_invalid", detail=json.dumps(composition, ensure_ascii=False)[:300]))
-    return {key: value.strip() for key, value in composition.items() if key in ("scene", "frame", "orientation")}
+    return staging.validate_composition(composition, film, shot, known_scenes)
 
 
 def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None) -> str:
@@ -98,13 +105,17 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
         lines.append(f"参考图片1是本片的角色、道具和场景参考总表，优先查找第{number}镜对应的关键场景，只采用当前镜头需要的外观线索。不要把其他场景、总表、白底和文字标注画进画面。")
         k = 2
     cam = (shot.get("camera") or "").strip().strip("【】")
-    if composition:
+    structured = composition and composition.get("version") == 2
+    if structured:
+        lines.append(staging.render_opening(composition))
+    elif composition:
         lines.append("场景与关键道具：" + composition["scene"])
         lines.append("主体朝向（相对镜头）：" + composition["orientation"])
-    lines.append("画面：" + (f"【{cam}】" if cam else "") + (composition["frame"] if composition else (shot.get("action") or "").strip()).rstrip("。")
+    if not structured:
+        lines.append("画面：" + (f"【{cam}】" if cam else "") + (composition["frame"] if composition else (shot.get("action") or "").strip()).rstrip("。")
                  + "。画的是这个镜头刚开始的一瞬间，动作还没做完。")
     for c in who:
-        look = (c.get("look") or "").strip().rstrip("。")
+        look = "" if structured else (c.get("look") or "").strip().rstrip("。")
         lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
         k += 1
     lines.append(TAIL)
