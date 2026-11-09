@@ -168,6 +168,42 @@ class ReviewFlow(unittest.TestCase):
         self.assertNotIn("confirmed_version", storyboard.review_state(out))
         self.assertEqual(Path(job["storyboard"][0]["path"]).read_bytes(), unchanged)
 
+    def test_video_override_survives_real_frame_edit_review_and_pipeline(self):
+        from h3ref import film, frames, media, rewrite, rh
+        from workbench import segments
+        job = self.confirm(self.create_film())
+        out = Path(job['output_dir']); (out / 'clips').mkdir(exist_ok=True)
+        (out / 'clips/seg1.mp4').write_bytes(b'old clip')
+        (out / 'clips/seg1-last.jpg').write_bytes(b'old tail')
+        (out / 'film.mp4').write_bytes(b'old film')
+        h3 = '\n\n'.join(name + ':\n' + ('[Shot 1] The recipient kneels.' if name == 'detailed_description' else 'N/A') for name in rewrite.SECTIONS)
+        film.Job(out).put('segs', '0', zh='old source', h3=h3, file=str(out / 'clips/seg1.mp4'), cny=1)
+        self.jobs.find(job['id'])['status'] = 'succeeded'
+        card = self.jobs.snapshot(job['id'])['segments'][0]
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            response = self.client.post(f"/api/jobs/{job['id']}/segments/1/regenerate", json=dict(version=card['version'], prompt_version=card['prompt_version'], prompt=h3, prompt_format='h3'), headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        submitted = []
+        with patch.object(rh, 'upload', return_value='uploaded'), patch.object(rh, 'submit_with_retry', side_effect=lambda graph, **kw: submitted.append(graph) or 'edited-task'), patch.object(rh, 'poll', return_value=dict(state='done', url='offline://video', cny=1)), patch.object(film.http, 'download', side_effect=lambda url, path: path.write_bytes(f'new video {len(submitted)}'.encode())), patch.object(media, 'last_frame', side_effect=lambda clip, path: path.write_bytes(b'new tail')), patch.object(media, 'duration', return_value=4), patch.object(media, 'join', side_effect=lambda paths, path: path.write_bytes(b'assembled')), patch.object(rewrite, 'rewrite', side_effect=AssertionError('rewrote H3 override')):
+            segments.regenerate(json.loads((out / 'inputs/request.json').read_text()))
+            self.jobs.find(job['id'])['status'] = 'succeeded'
+            with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+                response = self.client.post(f"/api/jobs/{job['id']}/frames/s1-1", json={'prompt':'changed opening'}, headers=self.headers)
+            self.assertEqual(response.status_code, 200, response.json)
+            with patch.object(frames, 'draw', side_effect=lambda text, refs, aspect, path, **kw: (Image.new('RGB', (10, 10), 'blue').save(path) or 0)):
+                storyboard.regenerate(json.loads((out / 'inputs/request.json').read_text()))
+            self.jobs.find(job['id'])['status'] = 'succeeded'
+            current = self.jobs.snapshot(job['id'])
+            self.assertTrue(current['pending_video'])
+            self.assertTrue(current['segments'][0]['source_changed'])
+            self.confirm(current)
+            storyboard.run(json.loads((out / 'inputs/request.json').read_text()))
+        with self.client.get(self.jobs.snapshot(job['id'])['segments'][0]['url']) as response:
+            self.assertEqual(response.data, b'new video 2')
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(submitted[-1][rh.PROMPT]['inputs']['prompt'], h3)
+        self.assertEqual(film.Job(out).state['segs']['0']['prompt_override']['text'], h3)
+
 
 if __name__ == "__main__":
     unittest.main()

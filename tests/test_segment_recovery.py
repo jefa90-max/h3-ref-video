@@ -123,6 +123,15 @@ class SegmentRecovery(unittest.TestCase):
         self.prepare_clip()
         self.assertTrue(segments.assembly_status(self.request)['pending'])
 
+    def test_uncommitted_publication_blocks_assembly_without_consuming_mixed_clips(self):
+        write_json(self.out / 'inputs/segment-edit.json', {'number': 1, 'publishing': True, 'applied': False, 'previous': film.Job(self.out).state['segs']['0']})
+        with patch.object(media, 'join', side_effect=AssertionError('assembled mixed version')):
+            with self.assertRaises(ValueError):
+                segments.prepare_assembly(self.request, 'old-version')
+            with self.assertRaises(ValueError):
+                segments.assemble(self.request)
+        self.assertEqual(self.final.read_bytes(), b'ORIGINAL COMPLETE FILM')
+
 
 if __name__ == '__main__':
     unittest.main()

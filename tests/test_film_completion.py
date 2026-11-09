@@ -104,6 +104,21 @@ class FilmCompletion(unittest.TestCase):
                 self.assertIn("vision unavailable", log)
                 self.assertTrue(all(not record["subtitles"]["checked"] for record in film.Job(self.out).state["segs"].values()))
 
+    def test_pipeline_resume_stops_at_terminal_paid_failure(self):
+        job = film.Job(self.out)
+        (self.out / 'clips/seg1.mp4').unlink()
+        job.put('segs', '0', terminal_failed=True, error='remote failed')
+        with self.assertRaisesRegex(RuntimeError, 'TERMINAL_FAILED'):
+            film.run(self.out, self.source, 'none')
+        self.assertFalse((self.out / 'film.mp4').exists())
+
+    def test_cli_pipeline_cannot_consume_half_published_root_files(self):
+        (self.out / 'inputs').mkdir()
+        (self.out / 'inputs/segment-edit.json').write_text(json.dumps({'publishing': True, 'applied': False}))
+        with self.assertRaisesRegex(RuntimeError, 'publication|发布'):
+            film.run(self.out, self.source, 'none')
+        self.assertFalse((self.out / 'film.mp4').exists())
+
 
 if __name__ == "__main__":
     unittest.main()

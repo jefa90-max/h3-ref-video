@@ -129,6 +129,16 @@ class SubmissionRetry(unittest.TestCase):
                 self.generate()
         self.assertEqual(self.job.state["segs"]["0"]["task"], "existing-task")
 
+    def test_terminal_poll_failure_retains_paid_task_and_blocks_new_submission(self):
+        self.job.put('segs', '0', task='paid-terminal-task')
+        with patch.object(rh, 'poll', return_value={'state': 'failed', 'error': 'terminal'}):
+            with self.assertRaisesRegex(RuntimeError, 'TERMINAL_FAILED'):
+                self.generate()
+        with patch.object(rh, '_post', side_effect=AssertionError('duplicate paid task')), patch.object(rh, 'poll', side_effect=AssertionError('terminal repoll')):
+            with self.assertRaisesRegex(RuntimeError, 'TERMINAL_FAILED'):
+                self.generate()
+        self.assertEqual(self.job.state['segs']['0']['task'], 'paid-terminal-task')
+
     def test_network_failure_is_logged_without_repeating_submission(self):
         with patch.object(rh, "_post", side_effect=RuntimeError("connection timed out")) as request:
             with self.assertRaisesRegex(RuntimeError, "connection timed out"):
