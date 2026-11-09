@@ -171,3 +171,244 @@ class FrameBatch(unittest.TestCase):
                 self.assertFalse(film.Job(out).state["frames"]["s1-2"].get("error"))
             finally:
                 jobs.close()
+
+
+class BatchTaskRecovery(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        app = create_app(root / "storage", root / ".env")
+        self.jobs = app.extensions["jobs"]
+        self.addCleanup(self.jobs.close)
+        self.client = app.test_client()
+        self.headers = {"X-Workbench": "1"}
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post("/api/jobs", json={"kind": "film", "demo": False, "frames": "shot",
+                "film": {"shots": [{"start": 0, "end": 5, "action": "A ball rolls."}]},
+                "output_dir": str(root / "output")}, headers=self.headers)
+        self.assertEqual(response.status_code, 201, response.json)
+        self.identifier = response.json["id"]
+        self.out = Path(response.json["output_dir"])
+        self.request_path = self.out / "inputs" / "request.json"
+        self.request = json.loads(self.request_path.read_text(encoding="utf-8"))
+
+    def failed_batch(self, terminal=False):
+        polling = {"return_value": {"state": "failed", "error": "remote task failed"}} if terminal else {
+            "side_effect": RuntimeError("temporary polling outage")}
+        with patch.object(frames, "submit", return_value="accepted-frame-task"), patch.object(frames, "poll", **polling):
+            storyboard.run(self.request)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        saved = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertEqual(saved["task"], "accepted-frame-task")
+        self.assertTrue(saved.get("error"))
+
+    def test_unknown_batch_task_cannot_be_overwritten_by_a_manual_edit(self):
+        self.failed_batch()
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A new image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 400, "An unknown cloud task was replaced by a new edit")
+        launch.assert_not_called()
+        self.assertFalse((self.out / "inputs" / "frame-edit.json").exists())
+        snapshot = self.jobs.snapshot(self.identifier)
+        self.assertTrue(snapshot["can_resume_frames"])
+        self.assertFalse(snapshot["storyboard"][0]["references_editable"])
+
+    def test_explicit_resume_only_queries_the_original_task_until_its_terminal_state(self):
+        for terminal in ("done", "failed"):
+            with self.subTest(terminal=terminal):
+                self.failed_batch()
+                with patch.object(frames, "poll", side_effect=AssertionError("ordinary rerun queried a failed item")):
+                    storyboard.run(self.request)
+                with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+                    response = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+                self.assertEqual(response.status_code, 200, response.json)
+                resumed = json.loads(self.request_path.read_text(encoding="utf-8"))
+                result = {"state": terminal, "url": "fake://image", "cny": 0.1, "error": "remote task failed"}
+                with patch.object(frames, "submit", side_effect=AssertionError("paid for another image")), \
+                        patch.object(frames, "poll", return_value=result) as poll, \
+                        patch.object(frames.http, "download", side_effect=lambda url, output: Image.new("RGB", (8, 8)).save(output)):
+                    storyboard.run(resumed)
+                poll.assert_called_once_with("accepted-frame-task")
+                self.jobs.find(self.identifier)["status"] = "succeeded"
+                saved = film.Job(self.out).state["frames"]["s1-1"]
+                self.assertEqual(saved["task"], "accepted-frame-task")
+                self.assertEqual(bool(saved.get("error")), terminal == "failed")
+                self.assertEqual(bool(saved.get("task_failed")), terminal == "failed")
+                snapshot = self.jobs.snapshot(self.identifier)
+                self.assertFalse(snapshot["can_resume_frames"])
+                self.assertTrue(snapshot["storyboard"][0]["references_editable"])
+                # Reset the owned fixture for the other remote terminal state.
+                (self.out / "frames" / "s1-1.png").unlink(missing_ok=True)
+                film.Job(self.out).put("frames", "s1-1", error=None, task_failed=False)
+
+    def test_confirmed_remote_failure_allows_a_new_manual_generation(self):
+        self.failed_batch(terminal=True)
+        self.assertTrue(film.Job(self.out).state["frames"]["s1-1"].get("task_failed"))
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A new image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        with patch.object(frames, "submit", return_value="replacement-task") as create, \
+                patch.object(frames, "poll", return_value={"state": "done", "url": "fake://image", "cny": 0.1}), \
+                patch.object(frames.http, "download", side_effect=lambda url, output: Image.new("RGB", (8, 8)).save(output)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        create.assert_called_once()
+        self.assertEqual(film.Job(self.out).state["frames"]["s1-1"]["task"], "replacement-task")
+
+    def test_png_published_before_error_cleanup_can_still_resume_the_saved_task(self):
+        self.failed_batch()
+        Image.new("RGB", (8, 8)).save(self.out / "frames" / "s1-1.png")
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        with patch.object(frames, "submit", side_effect=AssertionError("paid for another image")), \
+                patch.object(frames, "poll", return_value={"state": "done", "url": "fake://image", "cny": 0.1}) as poll, \
+                patch.object(frames.http, "download", side_effect=lambda url, output: Image.new("RGB", (8, 8)).save(output)):
+            storyboard.run(json.loads(self.request_path.read_text(encoding="utf-8")))
+        poll.assert_called_once_with("accepted-frame-task")
+        saved = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertFalse(saved.get("error"))
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        self.assertTrue(self.jobs.snapshot(self.identifier)["can_continue"])
+
+    def test_batch_create_response_loss_cannot_be_replaced_by_a_new_manual_edit(self):
+        with patch.object(frames, "submit", side_effect=RuntimeError("acceptance response lost")) as create:
+            storyboard.run(self.request)
+            self.jobs.find(self.identifier)["status"] = "succeeded"
+            with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+                response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                    json={"prompt": "A new image."}, headers=self.headers)
+            self.assertEqual(response.status_code, 400, "An unknown accepted image may be submitted twice")
+            storyboard.run(self.request)
+        self.assertEqual(create.call_count, 1)
+        saved = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertTrue(saved.get("submission_unknown"))
+        self.assertFalse(saved.get("task"))
+        self.assertFalse(self.jobs.snapshot(self.identifier)["storyboard"][0]["references_editable"])
+
+    def test_single_frame_create_response_loss_cannot_repeat_a_paid_submission_on_resume(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        previous = target.read_bytes()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A new image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        request = json.loads(self.request_path.read_text(encoding="utf-8"))
+        with patch.object(frames, "submit", side_effect=RuntimeError("acceptance response lost")) as create:
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    storyboard.regenerate(request)
+        self.assertEqual(create.call_count, 1, "Single-frame resume submitted another paid image")
+        self.assertEqual(target.read_bytes(), previous)
+
+    def test_explicit_image_submission_rejection_does_not_leave_an_unknown_submission(self):
+        saved = {}
+        with patch.object(frames.config, "apimart_key", return_value="synthetic"), \
+                patch.object(frames.http, "request", return_value={"error": {"code": "insufficient_balance"}}):
+            with self.assertRaises(RuntimeError):
+                frames.draw("A ball rolls.", [], "9:16", self.out / "candidate.png", record=lambda **values: saved.update(values))
+        self.assertIs(saved.get("submission_unknown"), False)
+        self.assertFalse(saved.get("task"))
+        self.assertFalse((self.out / "candidate.png").exists())
+
+    def test_single_frame_resume_stops_at_remote_failure_until_a_new_manual_edit(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        previous = target.read_bytes()
+        film.Job(self.out).put("frames", "s1-1", prompt="previously rejected", moderation_error="older content rejection")
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A new image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        request = json.loads(self.request_path.read_text(encoding="utf-8"))
+        with patch.object(frames, "submit", return_value="failed-image-task") as create:
+            with patch.object(frames, "poll", side_effect=RuntimeError("temporary polling outage")):
+                with self.assertRaises(RuntimeError):
+                    storyboard.regenerate(request)
+            with patch.object(frames, "poll", return_value={"state": "failed", "error": "remote task failed"}):
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError):
+                        storyboard.regenerate(request)
+        self.assertEqual(create.call_count, 1, "Recovering a failed task silently paid for a new image")
+        self.assertEqual(target.read_bytes(), previous)
+        self.jobs.find(self.identifier)["status"] = "failed"
+        snapshot = self.jobs.snapshot(self.identifier)
+        self.assertTrue(snapshot["storyboard"][0]["references_editable"])
+        self.assertFalse(snapshot["storyboard"][0]["moderation_failed"], "An older moderation error leaked into the new ordinary failure")
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A new image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+
+    def test_resume_reconciles_terminal_pending_before_accepting_a_new_manual_edit(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        previous = target.read_bytes()
+        for moderation_error in (None, "content_policy_violation"):
+            with self.subTest(moderation_error=moderation_error):
+                film.Job(self.out).put("frames", "s1-1", prompt="original", task="original-task",
+                    error=None, moderation_error=None, failed_prompt=None, task_failed=False)
+                self.jobs.find(self.identifier)["status"] = "succeeded"
+                with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+                    response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                        json={"prompt": "A new image."}, headers=self.headers)
+                self.assertEqual(response.status_code, 200, response.json)
+
+                pending_path = self.out / "inputs" / "frame-edit.json"
+                pending = json.loads(pending_path.read_text(encoding="utf-8"))
+                pending.update(task="failed-image-task", task_failed=True,
+                    error="remote task failed", moderation_error=moderation_error)
+                pending_path.write_text(json.dumps(pending), encoding="utf-8")
+                request = json.loads(self.request_path.read_text(encoding="utf-8"))
+                self.jobs.find(self.identifier)["status"] = "interrupted"
+                with patch.object(frames, "submit", side_effect=AssertionError("paid for another image")):
+                    for _ in range(2):
+                        with self.assertRaises(RuntimeError):
+                            storyboard.regenerate(request)
+                saved = film.Job(self.out).state["frames"]["s1-1"]
+                self.assertTrue(saved.get("error"), "Pending terminal state was never mirrored to the frame")
+                self.assertEqual(saved["task"], "failed-image-task")
+                self.assertEqual(saved["moderation_error"], moderation_error)
+                self.assertEqual(target.read_bytes(), previous)
+                with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+                    response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                        json={"prompt": "Another image."}, headers=self.headers)
+                self.assertEqual(response.status_code, 200, response.json)
+
+
+    def test_moderation_classification_survives_interruption_while_recording_terminal_state(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A new image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        pending_path = self.out / "inputs" / "frame-edit.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        pending["task"] = "rejected-task"
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        request = json.loads(self.request_path.read_text(encoding="utf-8"))
+        write_json = storyboard.write_json
+        def interrupt_after_terminal_write(path, values):
+            write_json(path, values)
+            if Path(path) == pending_path and values.get("task_failed"):
+                raise SystemExit("process interrupted after terminal publication")
+        with patch.object(storyboard, "write_json", side_effect=interrupt_after_terminal_write), \
+                patch.object(frames, "poll", return_value={"state": "failed", "error": "content_policy_violation", "moderation_failed": True}):
+            with self.assertRaises(SystemExit):
+                storyboard.regenerate(request)
+        with patch.object(frames, "submit", side_effect=AssertionError("paid for another image")):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(request)
+        self.jobs.find(self.identifier)["status"] = "interrupted"
+        self.assertTrue(self.jobs.snapshot(self.identifier)["storyboard"][0]["moderation_failed"])

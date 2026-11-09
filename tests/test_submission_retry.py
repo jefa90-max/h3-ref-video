@@ -138,6 +138,49 @@ class SubmissionRetry(unittest.TestCase):
         self.assertTrue((self.job.dir / "run.log").exists(), "submission failure was not logged")
         self.assertIn("connection timed out", (self.job.dir / "run.log").read_text())
 
+    def test_normal_film_resume_does_not_repeat_an_ambiguous_submission(self):
+        with patch.object(rh, "_post", side_effect=RuntimeError("acceptance response lost")) as create:
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    film.gen_segment(film.Job(self.job.dir), self.story, self.segment, self.pictures)
+        self.assertEqual(create.call_count, 1, "Resume submitted another paid task after a lost response")
+        saved = film.Job(self.job.dir).state["segs"]["0"]
+        self.assertTrue(saved["submission_unknown"])
+        self.assertNotIn("task", saved)
+
+    def test_one_resume_does_not_repeat_an_ambiguous_submission(self):
+        self.job.file.write_text(json.dumps({"h3": "cached H3 prompt"}), encoding="utf-8")
+        prompt = self.job.dir / "input.txt"
+        prompt.write_text("original prompt", encoding="utf-8")
+        args = SimpleNamespace(out=str(self.job.dir), image=[str(self.frame)], prompt=str(prompt),
+                               seed=7, seconds=5, aspect="9:16", check=False)
+        with patch.object(rh, "_post", side_effect=RuntimeError("acceptance response lost")) as create:
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    CLI.cmd_one(args)
+        self.assertEqual(create.call_count, 1, "Single-clip resume submitted another paid task")
+        self.assertTrue(json.loads(self.job.file.read_text(encoding="utf-8"))["submission_unknown"])
+
+    def test_one_explicit_rejection_can_resume_and_persists_task_before_polling(self):
+        self.job.file.write_text(json.dumps({"h3": "cached H3 prompt"}), encoding="utf-8")
+        prompt = self.job.dir / "input.txt"
+        prompt.write_text("original prompt", encoding="utf-8")
+        args = SimpleNamespace(out=str(self.job.dir), image=[str(self.frame)], prompt=str(prompt),
+                               seed=7, seconds=5, aspect="9:16", check=False)
+        responses = [{"code": 605, "msg": "NOT_ENOUGH_BALANCE"},
+                     {"code": 0, "data": {"taskId": "accepted-after-rejection"}}]
+        with patch.object(rh, "_post", side_effect=responses) as create:
+            with self.assertRaises(rh.SubmissionRejected):
+                CLI.cmd_one(args)
+            self.assertFalse(json.loads(self.job.file.read_text(encoding="utf-8")).get("submission_unknown"))
+            with patch.object(rh, "poll", side_effect=RuntimeError("poll interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "poll interrupted"):
+                    CLI.cmd_one(args)
+        self.assertEqual(create.call_count, 2)
+        saved = json.loads(self.job.file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["task"], "accepted-after-rejection")
+        self.assertIs(saved.get("submission_unknown"), False)
+
     def test_balance_errors_are_terminal_and_keys_are_redacted(self):
         for code, reason in [(605, "NOT_ENOUGH_BALANCE"), (416, "TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET"),
                              (812, "CORPAPIKEY_INSUFFICIENT_FUNDS"), (999, "NOT_ENOUGH_BALANCE")]:

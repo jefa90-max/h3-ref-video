@@ -132,6 +132,18 @@ for (const language of ["en", "zh-CN"]) {
       state.selectedJob.status = "running";
       editor.events.input();
       assert.equal(button.disabled, true);
+      state.selectedJob.status = "succeeded";
+      frame.task_pending = true;
+      frame.references_editable = false;
+      const pendingCard = context.createStoryboardCard(frame, state.selectedJob, true);
+      assert.ok(descendants(pendingCard).some((node) => node.textContent === messages.frameTaskPending),
+        "Unknown task status must point to recovery of the saved task");
+      assert.equal(descendants(pendingCard).find((node) => node.className.split(" ").includes("regenerate-frame")).disabled, true);
+      frame.submission_unknown = true;
+      frame.task_pending = false;
+      const unknownCard = context.createStoryboardCard(frame, state.selectedJob, true);
+      assert.ok(descendants(unknownCard).some((node) => node.textContent === messages.frameSubmissionUnknown));
+      assert.equal(descendants(unknownCard).find((node) => node.className.split(" ").includes("regenerate-frame")).disabled, true);
     });
   }
 }

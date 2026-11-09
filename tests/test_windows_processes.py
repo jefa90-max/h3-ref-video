@@ -88,6 +88,38 @@ class WindowsProcesses(unittest.TestCase):
 
 
 class WindowsTreeCleanup(unittest.TestCase):
+    def test_worker_overrides_disabled_utf8_mode_in_the_actual_child_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(__file__).resolve().parents[1]
+            folder = Path(directory)
+            worker = folder / "encoding.py"
+            worker.write_text("import json, locale, os, sys\n"
+                              "print(json.dumps({'utf8_mode': sys.flags.utf8_mode, "
+                              "'encoding': locale.getpreferredencoding(False), "
+                              "'pythonutf8': os.environ.get('PYTHONUTF8')}), flush=True)\n", encoding="utf-8")
+            runner = jobs.Jobs(root, folder / "storage")
+            self.addCleanup(runner.close)
+            record = {"id": "utf8-worker", "status": "queued", "kind": "one", "demo": True,
+                      "output_dir": str(folder), "lang": "en"}
+            runner.records[record["id"]] = record
+            original_popen = subprocess.Popen
+            environments = []
+
+            def start_worker(*args, **options):
+                environments.append(dict(options["env"]))
+                child = original_popen(*args, **options)
+                self.addCleanup(child.stdout.close)
+                return child
+
+            with patch.object(jobs, "command", return_value=[sys.executable, "-u", str(worker)]), \
+                 patch.object(jobs.subprocess, "Popen", side_effect=start_worker):
+                runner.run(record, {"kind": "one", "demo": True}, {**os.environ, "PYTHONUTF8": "0"})
+            self.assertEqual(record["status"], "succeeded", record.get("error"))
+            log = (runner.storage / "jobs" / "utf8-worker.log").read_text(encoding="utf-8")
+            observed = next(json.loads(line) for line in log.splitlines() if line.startswith("{"))
+            self.assertEqual(observed, {"utf8_mode": 1, "encoding": "utf-8", "pythonutf8": "1"})
+            self.assertEqual(environments[0]["PYTHONUTF8"], "1")
+
     def test_exited_posix_worker_still_stops_its_process_group(self):
         child = Mock(pid=12345)
         child.poll.return_value = 0

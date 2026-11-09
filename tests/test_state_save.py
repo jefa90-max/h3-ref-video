@@ -1,14 +1,30 @@
 """A Windows reader must not lose an accepted paid task during atomic state publication."""
 import errno
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from h3ref import film
+from workbench import storyboard
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("h3ref_encoding_cli", ROOT / "h3ref.py")
+CLI = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(CLI)
+
+
+@contextlib.contextmanager
+def legacy_windows_text_encoding():
+    with patch.object(io, "text_encoding", side_effect=lambda encoding, *args: "cp936" if encoding in (None, "locale") else encoding):
+        yield
 
 
 class StateSave(unittest.TestCase):
@@ -24,6 +40,54 @@ class StateSave(unittest.TestCase):
         error = PermissionError(errno.EACCES, "state file is in use", str(self.temporary))
         error.winerror = code
         return error
+
+    def test_chinese_frame_state_stays_utf8_when_windows_default_is_cp936(self):
+        expected = {"prompt": "小林走进厨房", "task": "accepted-frame-task"}
+        with legacy_windows_text_encoding():
+            self.job.put("frames", "s1-1", **expected)
+            try:
+                published = storyboard.frame_records({"output_dir": str(self.job.dir), "demo": False})
+                resumed = film.Job(self.job.dir).state["frames"]
+            except UnicodeError as exc:
+                self.fail(f"Windows locale broke UTF-8 state publication or resume: {exc}")
+        self.assertEqual(published["s1-1"], expected)
+        self.assertEqual(resumed["s1-1"], expected)
+
+    def test_single_clip_resumes_and_saves_utf8_state_when_windows_default_is_cp936(self):
+        state = {"h3": "小林走进厨房"}
+        self.job.file.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        prompt = self.job.dir / "input.txt"
+        prompt.write_text("小林走进厨房", encoding="utf-8")
+        args = SimpleNamespace(out=str(self.job.dir), image=[], prompt=str(prompt),
+                               seed=7, seconds=5, aspect="9:16", check=False)
+        graph_prompts = []
+
+        def graph(prompt, images, seconds, aspect, seed):
+            graph_prompts.append(prompt)
+            return {}
+
+        with legacy_windows_text_encoding(), contextlib.redirect_stdout(io.StringIO()), \
+             patch.object(CLI.rh, "graph", side_effect=graph), \
+             patch.object(CLI.rh, "submit_with_retry", return_value="accepted-clip-task"), \
+             patch.object(CLI.rh, "poll", return_value={"state": "done", "url": "fake://clip", "cny": 0.1}), \
+             patch.object(CLI.http, "download", side_effect=lambda url, path: path.write_bytes(b"saved video")), \
+             patch.object(CLI.media, "duration", return_value=5):
+            try:
+                CLI.cmd_one(args)
+                published = storyboard.read_json(self.job.file, {})
+            except UnicodeError as exc:
+                self.fail(f"Windows locale broke UTF-8 single-clip state: {exc}")
+        self.assertEqual(graph_prompts, ["小林走进厨房"])
+        self.assertEqual(published["h3"], "小林走进厨房")
+        self.assertEqual(published["task"], "accepted-clip-task")
+        self.assertEqual((self.job.dir / "clip.mp4").read_bytes(), b"saved video")
+
+    def test_legacy_non_utf8_state_is_rejected_without_rewriting_it(self):
+        previous = json.dumps({"frames": {"s1-1": {"prompt": "小林走进厨房"}}, "segs": {}}, ensure_ascii=False).encode("cp936")
+        self.job.file.write_bytes(previous)
+        with legacy_windows_text_encoding(), self.assertRaises(UnicodeDecodeError):
+            film.Job(self.job.dir)
+        self.assertEqual(self.job.file.read_bytes(), previous)
 
     def test_temporary_windows_conflict_preserves_old_state_until_task_is_published(self):
         replace = Path.replace
