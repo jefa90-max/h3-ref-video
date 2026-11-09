@@ -460,7 +460,7 @@ def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
     for n in redo or []:                                # a new seed for these segments (and, chained, everything after)
         for k in [k for k in job.state["segs"] if int(k) == n - 1 or (mode != "shot" and int(k) > n - 1)]:
             rec = job.state["segs"][k]
-            job.state["segs"][k] = {"zh": rec.get("zh"), "h3": rec.get("h3")}
+            job.state["segs"][k] = {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override") if key in rec}
             (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
     job.save()
 
