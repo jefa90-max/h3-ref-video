@@ -114,8 +114,9 @@ def problems(text: str, n_images: int) -> list[str]:
         for m in NEGATIVE.finditer(parts[name]):
             out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
     used = {int(n) for n in re.findall(r"<Picture (\d+)>", text)}
-    if used and max(used) > n_images:
-        out.append(f"there are only {n_images} reference images but the rewrite cites <Picture {max(used)}>")
+    for number in sorted(used):
+        if not 1 <= number <= n_images:
+            out.append(f"<Picture {number}> is outside the actual reference range 1..{n_images}")
     if "[Shot 1]" not in parts["detailed_description"]:
         out.append("detailed_description has no [Shot 1]")
     return out
