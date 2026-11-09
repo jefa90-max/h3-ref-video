@@ -32,7 +32,11 @@ MODERATION = re.compile(r"content[_ -]?(?:policy|filter|moderation)|moderation[_
                         r"nsfw|内容审核|审核[未不]通过|敏感内容|内容违规|违反.{0,12}(?:政策|安全)", re.I)
 
 
-class ContentPolicyError(RuntimeError):
+class SubmissionRejected(RuntimeError):
+    """The image API explicitly rejected creation of a new task."""
+
+
+class ContentPolicyError(SubmissionRejected):
     def __init__(self, reason):
         self.reason = str(reason)
         super().__init__(message("frame_moderation_failed", reason=self.reason))
@@ -40,6 +44,11 @@ class ContentPolicyError(RuntimeError):
 
 def is_moderation_error(error) -> bool:
     return bool(MODERATION.search(json.dumps(error, ensure_ascii=False) if isinstance(error, (dict, list)) else str(error)))
+
+
+def task_pending(record) -> bool:
+    return bool(record.get("task") and record.get("error")
+                and not record.get("task_failed") and not record.get("moderation_error"))
 
 
 def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, with_anchor: bool) -> str:
@@ -93,7 +102,8 @@ def submit(text: str, refs: list[Path], aspect: str) -> str:
         raise ContentPolicyError(json.dumps(out, ensure_ascii=False))
     task = ((out.get("data") or [{}])[0] or {}).get("task_id")
     if not task:
-        raise RuntimeError("APIMart gave no task id: " + json.dumps(out, ensure_ascii=False)[:200])
+        error = SubmissionRejected if out.get("error") or (isinstance(out.get("code"), int) and out["code"] != 0) else RuntimeError
+        raise error("APIMart gave no task id: " + json.dumps(out, ensure_ascii=False)[:200])
     return task
 
 
@@ -126,8 +136,14 @@ def poll(task: str) -> dict:
 def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k: None, task: str | None = None) -> float:
     """Draw one frame to `out`; `record(task=…)` is called with the task id before waiting, so a rerun resumes it.
     Returns the cost in CNY."""
-    task = task or submit(text, refs, aspect)
-    record(task=task)
+    if not task:
+        record(submission_unknown=True)
+        try:
+            task = submit(text, refs, aspect)
+        except SubmissionRejected:
+            record(submission_unknown=False)
+            raise
+    record(task=task, task_failed=False, submission_unknown=False)
     while True:
         st = poll(task)
         if st["state"] == "done":
@@ -135,6 +151,10 @@ def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k:
             return float(st.get("cny") or 0)
         if st["state"] == "failed":
             if st.get("moderation_failed") or is_moderation_error(st.get("error")):
-                raise ContentPolicyError(st.get("error"))
-            raise RuntimeError("frame failed: " + str(st.get("error")))
+                error = ContentPolicyError(st.get("error"))
+                record(task_failed=True, moderation_error=error.reason, error=str(error))
+                raise error
+            error = "frame failed: " + str(st.get("error"))
+            record(task_failed=True, moderation_error=None, error=error)
+            raise RuntimeError(error)
         time.sleep(6)

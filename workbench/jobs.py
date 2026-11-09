@@ -188,8 +188,9 @@ class Jobs:
                 result["frame_failures"] = sum(bool(frame.get("error")) for frame in result["storyboard"])
                 result["pending_video"] = bool(review_state(out)["dirty_segments"])
                 result["can_continue"] = record["status"] == "succeeded" and result["review"]["ready"] and (saved.get("operation") == "frames" or result["pending_video"])
-                result["can_resume_frames"] = record["status"] == "succeeded" and saved.get("operation") == "frame" and any(
-                    not frame["url"] and not frame.get("error") for frame in result["storyboard"])
+                result["can_resume_frames"] = record["status"] == "succeeded" and (any(
+                    frame["task_pending"] for frame in result["storyboard"]) or (saved.get("operation") == "frame" and any(
+                    not frame["url"] and not frame.get("error") for frame in result["storyboard"])))
                 result["review_needed"] = result["can_continue"]
                 from . import segments
                 editable = record["status"] == "succeeded" and result["review"]["complete"] and not result["pending_video"]
@@ -222,6 +223,7 @@ class Jobs:
             request["operation"] = "frames"
         request.pop("redo", None)
         request.pop("reset_applied", None)
+        request.pop("resume_frame_tasks", None)
         preflight(request, env)
         with self.lock:
             self.available()
@@ -269,6 +271,11 @@ class Jobs:
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
             previous = frame_records(request).get(key, {})
+            if previous.get("submission_unknown") and not previous.get("task"):
+                raise InputError("frame_submission_unknown", path=str(out / "state.json"))
+            from h3ref.frames import task_pending
+            if task_pending(previous):
+                raise InputError("frame_task_pending", task=previous["task"])
             if record["status"] != "succeeded" and not (previous.get("error") or previous.get("moderation_error")):
                 raise InputError("frame_operation")
             if not description or not (Path(description["path"]).is_file() or previous.get("error") or previous.get("moderation_error")):
@@ -376,6 +383,8 @@ class Jobs:
                 request["operation"] = "frames"
                 request.pop("redo", None)
                 request.pop("reset_applied", None)
+            if request["kind"] == "film" and request["operation"] == "frames":
+                request["resume_frame_tasks"] = True
             preflight(request, env)
             return self.restart(record, request, env)
 
@@ -392,7 +401,7 @@ class Jobs:
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(message("started", lang, kind=record["kind"], mode=message("demo" if record["demo"] else "live", lang), path=record["output_dir"]) + "\n")
                 log.flush()
-                env.update(H3_REWRITER="llm", H3_LANG=lang, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+                env.update(H3_REWRITER="llm", H3_LANG=lang, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
                 with self.lock:
                     if self.closing:
                         raise RuntimeError(message("interrupted", lang))

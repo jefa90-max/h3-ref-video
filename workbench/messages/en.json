@@ -1,4 +1,7 @@
 {
+  "frame_task_failed": "Image task {task} failed. Manually regenerate its card to start a new task. {reason}",
+  "frame_submission_unknown": "The image submission result is unknown. Resubmission is blocked to avoid duplicate charges. Check the task in APIMart before restoring its task ID or clearing the uncertainty marker: {path}",
+  "frame_task_pending": "Frame task {task} has no confirmed terminal result. Continue the remaining storyboard frames to query this task before editing or starting another paid generation.",
   "frame_operation": "Finish or resume the current film/storyboard operation before regenerating a frame from its card.",
   "continue_operation": "There is no storyboard ready to continue. Finish the current operation first.",
   "frame_missing": "Downloaded frame artifact is missing: {path}",

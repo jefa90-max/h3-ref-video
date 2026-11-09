@@ -1,6 +1,6 @@
 # 工作台与 CLI 对照
 
-核对范围：`h3ref.py`、`h3ref/*`、`SKILL.md`、`prompts/h3_examples.md`、`examples/film.example.json`。核对日期：2026-11-02。
+核对范围：`h3ref.py`、`h3ref/*`、`workbench/*`、`SKILL.md`、`prompts/h3_examples.md`、`examples/film.example.json`。核对日期：2026-11-08。
 
 | 步骤 | 原仓库实现 | 工作台行为与修正 |
 | --- | --- | --- |
@@ -11,20 +11,21 @@
 | 画图 | `film.stage_frames` → `frames.prompt / draw` | 完整出片和“先生成分镜”使用同一阶段；图像模型、参数、总表→角色→首图锚点顺序一致 |
 | 视频提示词 | `stage_rewrite` → 原 rewrite，官方六段式 | 真实流水线完全沿用；单镜编辑框只修改图像生成提示词，不冒充视频提示词编辑 |
 | 出片与检查 | 原 RunningHub 工作流、轮询、拼接、report；字幕检查目前暂停 | one 直接调用 CLI；film 先调用 stage_frames，全部确认后才调用原 CLI / film.run；整片及单段重生成均跳过字幕检查 |
-| 单镜重出 | `frames.draw` 是原图像 API；CLI 的 `--redo` 只重做视频 | 单镜用原 draw，仅新建该图的任务；成功后替换，失败保留旧图，续跑复用新 task |
+| 单镜重出 | `frames.draw` 是原图像 API；CLI 的 `--redo` 只重做视频 | 单镜用原 draw；成功后替换，失败保留旧图。已有 task 但结果未知时只查询原任务，不能用新编辑覆盖；明确终止失败后才允许卡片新生成，审核拒绝须先改词 |
 | 更新成片 | `--redo`：shot 只重做所属段；first/none 从该段向后重做 | 抽取原失效逻辑为 `film.invalidate_segments`，CLI 与 UI 共用；失效只应用一次，网络失败续跑不会清掉刚提交的新 task |
-| 配置与恢复 | 根目录 .env / 环境变量；state.json 恢复 | 同配置入口与状态；按当前阶段和缓存预检，先画图只需 APIMart；暂停字幕检查期间不要求视觉模型密钥，也不新增字幕检查记录 |
+| 配置与恢复 | 根目录 .env / 环境变量；state.json 恢复 | 同配置入口与状态；按当前阶段和缓存预检，先画图只需 APIMart。RunningHub 提交结果未知时阻止重提，须核对远端并补回 task；分镜轮询网络故障继续其它图，用户续跑仅查询原 task。暂停字幕检查期间不要求视觉模型密钥，也不新增字幕检查记录 |
 
 ## 有意保留的 UI 差异
 
 - 用户要求 Claude 暂不可用，工作台固定 `H3_REWRITER=llm`，不探测 Claude；CLI 自身默认选择规则未改。
 - 页面不要求本地路径：导入后提取 cast 与 board 上传清单，绑定与故事 JSON 分开；启动前写绝对路径给原 CLI。旧路径转成待上传位，board:true 是工作台的必需总表标记，不进入 CLI。底层兼容接口仍保留旧 film_base_dir 行为供已有任务使用。
-- HTTP 边界增加类型、有限数值、图片内容与输出目录校验；单任务互斥；默认离线演示。演示是占位媒体，不能验证模型效果。
-- key 可保存到忽略的本机 `.env`（权限 0600），也可只放当前服务内存；不进入浏览器存储或任务请求记录。
+- HTTP 边界增加类型、有限数值、图片内容与输出目录校验；单任务互斥。默认选中整条片、真实生成，JSON 输入框为空；离线演示需主动选择。演示是占位媒体，不能验证模型效果。
+- key 可保存到忽略的本机 `.env`（支持 POSIX 权限的平台使用 0600），也可只放当前服务内存；已保存的 key 不回传浏览器、不进入浏览器存储或任务 JSON。
 - film 工作台固定先分镜、统一确认当前整批分镜后再出片；none 先确认脚本计划。服务端验证当前图片版本的确认记录，未审核旧任务续跑会返回分镜阶段；原 CLI 不增加 UI 审核限制。
 - 新增独立结果页、每页 12 张的审图卡片、旧视频待更新提示、Plyr 播放器；one 的工作台报告是展示补充，不更改 CLI 产物。
 - `film.load` 新增默认开启的 `check_images` 参数，仅历史结果预览关闭图片存在性检查；源参考图被移动后，旧视频仍可看，缺图分镜禁止重出。CLI 校验默认不变。
+- Windows worker 显式使用 UTF-8 处理标准输入输出和文件。旧版本以系统编码写出的 `state.json` 不自动迁移或覆盖；遇到编码错误，先保留原文件，核对原编码和远端任务记录后再处理。
 
 ## 验证
 
-原 14 项测试全部通过；新增 10 项回归覆盖 CLI 时间/路径/key/参数一致性、单图失败恢复、改图后的重出范围、重出失败保留新 task、历史缺参考图与 .env 权限。额外通过本地 HTTP 假 API 验证真实阶段进入原供应商客户端并显示 401；未进行付费生成。详细证据见 [验证记录](workbench-verification.md)。
+当前完整开发测试需在 Python 虚拟环境中安装 `requirements-web.txt`，并使用 Node.js 22；执行 `python -m unittest discover -s tests -v` 和 `node --test tests/test_results.js tests/test_frame_character_picker.js`。初次核对的离线与假 API 证据见 [验证记录](workbench-verification.md)，不代表真实鉴权、余额或模型效果已验证。

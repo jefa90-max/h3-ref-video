@@ -65,7 +65,7 @@ def can_edit_frames(request, status):
     if status not in ("failed", "interrupted"):
         return False
     pending = read_json(Path(request["output_dir"]) / "inputs" / "frame-edit.json", {})
-    return request.get("operation") != "frame" or bool(pending.get("moderation_error"))
+    return request.get("operation") != "frame" or bool(pending.get("moderation_error") or pending.get("task_failed"))
 
 
 def view(request, artifacts, editable, identifier=None, failed_only=False):
@@ -81,9 +81,12 @@ def view(request, artifacts, editable, identifier=None, failed_only=False):
         missing = [p for p in description["reference_paths"] if not Path(p).is_file()]
         error = rec.get("error") or rec.get("moderation_error")
         available = description["path"] in urls or bool(error)
-        can_edit = editable and available and (not failed_only or bool(error))
+        task_pending = frames.task_pending(rec)
+        submission_unknown = bool(rec.get("submission_unknown") and not rec.get("task"))
+        can_edit = editable and available and not task_pending and not submission_unknown and (not failed_only or bool(error))
         description.update(prompt=rec.get("failed_prompt") or rec.get("prompt", description["prompt"]),
                            url=urls.get(description["path"]), error=error, moderation_failed=bool(rec.get("moderation_error")),
+                           task_pending=task_pending, submission_unknown=submission_unknown,
                            editable=can_edit and not missing, missing_references=missing,
                            references_editable=can_edit)
         for index, reference in enumerate(description["references"]):
@@ -120,6 +123,14 @@ def review_status(request, descriptions):
             "plan": {"title": script.get("title", ""), "seconds": sum(s["seconds"] for s in segments), "segments": segments}}
 
 
+def save_frame_failure(request, pending, error, moderation_error):
+    out = Path(request["output_dir"])
+    pending.update(error=error, task_failed=True, moderation_error=moderation_error)
+    write_json(out / "inputs" / "frame-edit.json", pending)
+    film.Job(out).put("frames", pending["key"], error=error, task=pending.get("task"),
+                      task_failed=True, moderation_error=moderation_error, failed_prompt=pending["prompt"])
+
+
 def regenerate(request):
     out = Path(request["output_dir"])
     pending_path = out / "inputs" / "frame-edit.json"
@@ -127,7 +138,15 @@ def regenerate(request):
     if pending.get("applied"):
         return
     if pending.get("moderation_error"):
-        raise frames.ContentPolicyError(pending["moderation_error"])
+        error = frames.ContentPolicyError(pending["moderation_error"])
+        save_frame_failure(request, pending, str(error), pending["moderation_error"])
+        raise error
+    if pending.get("submission_unknown") and not pending.get("task"):
+        raise RuntimeError(message("frame_submission_unknown", request["lang"], path=pending_path))
+    if pending.get("task_failed"):
+        error = pending.get("error") or message("frame_task_failed", request["lang"], task=pending.get("task"), reason="")
+        save_frame_failure(request, pending, error, None)
+        raise RuntimeError(error)
     script, _, _, descriptions = plan(request, check_images=False)
     description = next((item for item in descriptions if item["key"] == pending.get("key")), None)
     if not description:
@@ -145,19 +164,23 @@ def regenerate(request):
             placeholder(temporary, f"{pending['key']} / {pending['revision'][:6]}", script["aspect"])
             cost = 0
         else:
-            # Resume an uncertain task; only a confirmed terminal failure gets a new submission.
+            # Resume the saved task; a terminal failure waits for a new manual edit.
             try:
                 if pending.get("task"):
                     status = frames.poll(pending["task"])
                     if status["state"] == "failed":
                         if status.get("moderation_failed") or frames.is_moderation_error(status.get("error")):
                             raise frames.ContentPolicyError(status.get("error"))
-                        record(task=None)
+                        record(task_failed=True, error=str(status.get("error")))
+                        raise RuntimeError(str(status.get("error")))
                 cost = frames.draw(pending["prompt"], [Path(p) for p in pending.get("reference_paths", description["reference_paths"])], script["aspect"], temporary,
                                    record=record, task=pending.get("task"))
             except frames.ContentPolicyError as exc:
-                record(moderation_error=exc.reason)
-                film.Job(out).put("frames", pending["key"], error=str(exc), moderation_error=exc.reason, failed_prompt=pending["prompt"])
+                save_frame_failure(request, pending, str(exc), exc.reason)
+                raise
+            except RuntimeError as exc:
+                if pending.get("task_failed"):
+                    save_frame_failure(request, pending, str(exc), None)
                 raise
         record(downloaded=True, cny=cost)
 
@@ -180,7 +203,7 @@ def regenerate(request):
     previous = pending["previous"]
     updated = {**previous, "prompt": pending["prompt"], "file": str(target), "task": pending.get("task"),
                "cny": float(previous.get("cny") or 0) + float(pending["cny"]), "revision": pending["revision"],
-               "error": None, "moderation_error": None, "failed_prompt": None}
+               "error": None, "moderation_error": None, "failed_prompt": None, "task_failed": False}
     if "character_reference_paths" in pending:
         updated["character_reference_paths"] = pending["character_reference_paths"]
     if request["demo"]:
@@ -207,7 +230,7 @@ def run(request):
         job = film.Job(out)
         job.state.update(film_path=str(out / "inputs" / "film.json"), mode=request["frames"])
         job.save()
-        failures = film.stage_frames(job, script, segments, pictures)
+        failures = film.stage_frames(job, script, segments, pictures, resume_tasks=request.get("resume_frame_tasks", False))
         print(message("frames_partial", request["lang"], count=len(failures)) if failures else message("frames_ready", request["lang"]), flush=True)
     else:
         # Apply the CLI's --redo rule once, before any new paid generation. Retries

@@ -97,7 +97,7 @@ function createStoryboardCard(frame, job, carousel) {
     media.append(link);
   } else media.append(element("p", "frame-placeholder hint", t("frameWaiting")));
   if (frame.error) {
-    const failureMessage = t(frame.moderation_failed ? "frameModerationFailed" : "frameGenerationFailed");
+    const failureMessage = t(frame.submission_unknown ? "frameSubmissionUnknown" : frame.task_pending ? "frameTaskPending" : frame.moderation_failed ? "frameModerationFailed" : "frameGenerationFailed");
     if (!frame.url) media.replaceChildren(element("p", "frame-placeholder hint", failureMessage));
     information.append(element("p", "hint", failureMessage),
       element("p", "hint", t("frameGenerationReason", { reason: frame.error })));

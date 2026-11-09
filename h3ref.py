@@ -28,8 +28,8 @@ def cmd_one(a):
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     state_file = out / "state.json"
-    st = json.loads(state_file.read_text()) if state_file.exists() else {}
-    save = lambda: state_file.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    st = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+    save = lambda: state_file.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
     images = [Path(p).expanduser().resolve() for p in a.image]
     for p in images:
         if not p.is_file():
@@ -42,10 +42,17 @@ def cmd_one(a):
         save()
         print("改写好了：", out / "prompt.h3.txt")
     if not st.get("task"):
+        if st.get("submission_unknown"):
+            raise RuntimeError(message("submission_unknown", number=1, path=state_file))
         names = [rh.upload(p) for p in images]
         st["seed"] = a.seed or random.randrange(10 ** 14, 10 ** 15)
         g = rh.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
-        st["task"] = rh.submit_with_retry(g, log=lambda detail: print(detail, flush=True))
+        def record_submission(unknown):
+            st["submission_unknown"] = unknown
+            save()
+        st["task"] = rh.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
+                                           record_submission=record_submission)
+        st["submission_unknown"] = False
         save()
         print(f"已提交，预计 ¥{rh.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
     while True:

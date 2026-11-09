@@ -1,4 +1,7 @@
 {
+  "frame_task_failed": "图片任务 {task} 已失败，请从卡片手动重新生成后再发起新任务。{reason}",
+  "frame_submission_unknown": "图片提交结果未知，已阻止重提以免重复付费。请先在 APIMart 核对任务，再恢复任务号或清除未知标记：{path}",
+  "frame_task_pending": "分镜任务 {task} 尚未确认结束。请点击继续生成剩余分镜，查询原任务后再编辑或发起新的付费生成。",
   "frame_operation": "请先完成或续跑当前整片/分镜任务，再从分镜卡片单独重生成。",
   "continue_operation": "当前任务没有可继续生成的分镜；请先完成当前操作。",
   "frame_missing": "新图下载后找不到产物：{path}",

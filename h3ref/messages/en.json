@@ -1,4 +1,5 @@
 {
+  "frame_submission_unknown": "The image submission result is unknown. Resubmission is blocked to avoid duplicate charges. Check the task in APIMart before restoring its task ID or clearing the uncertainty marker: {path}",
   "submission_rejected": "RunningHub rejected the task: {reason}",
   "submission_retry": "RunningHub submission {attempt}/{limit} rejected: {reason}; retrying in {seconds} seconds.",
   "submission_exhausted": "RunningHub submission {attempt}/{limit} failed; stopped after {limit} attempts: {reason}. Resume this task after the issue is resolved.",

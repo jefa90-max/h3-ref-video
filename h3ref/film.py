@@ -168,13 +168,13 @@ class Job:
         self.dir = path.resolve()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.file = self.dir / "state.json"
-        self.state = json.loads(self.file.read_text()) if self.file.exists() else {"frames": {}, "segs": {}}
+        self.state = json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists() else {"frames": {}, "segs": {}}
         self.lock = threading.RLock()
 
     def save(self):
         with self.lock:
             tmp = self.file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1))
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1), encoding="utf-8")
             for attempt in range(10):
                 try:
                     tmp.replace(self.file)
@@ -201,7 +201,7 @@ def _frame_key(i: int, j: int) -> str:
     return f"s{i + 1}-{j + 1}"
 
 
-def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict):
+def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False):
     """Attempt every frame, retaining failures for manual repair; return failed frame keys."""
     (job.dir / "frames").mkdir(exist_ok=True)
     wanted = [(i, p["shot"]) for i, seg in enumerate(segs) for p in pics[i] if p["kind"] == "frame"]
@@ -215,16 +215,21 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict):
         key = _frame_key(i, j)
         out = job.dir / "frames" / f"{key}.png"
         rec = job.state["frames"].get(key) or {}
-        if rec.get("error") or rec.get("moderation_error"):
+        if (rec.get("error") or rec.get("moderation_error")) and not (resume_tasks and frames.task_pending(rec)):
             return
-        if out.exists():
+        if out.exists() and not frames.task_pending(rec):
             return
         shot = segs[i]["shots"][j]
         who = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
+        if rec.get("task"):
+            anchor = rec.get("anchor_reference_path", anchor)
         refs = ([film["board"]] if film.get("board") else []) + [c["picture"] for c in who] + ([anchor] if anchor else [])
-        text = frames.prompt(film, shot, who, bool(film.get("board")), bool(anchor))
+        text = rec.get("prompt") if rec.get("task") else None
+        text = text or frames.prompt(film, shot, who, bool(film.get("board")), bool(anchor))
         job.put("frames", key, prompt=text, anchor_reference_path=anchor)
         try:
+            if rec.get("submission_unknown") and not rec.get("task"):
+                raise RuntimeError(message("frame_submission_unknown", path=job.file))
             cny = frames.draw(text, refs, film["aspect"], out, record=lambda **k: job.put("frames", key, **k),
                               task=rec.get("task"))
             if not out.is_file():
@@ -285,7 +290,7 @@ def _picture_paths(job: Job, seg: dict, pics: list[dict]) -> list[Path]:
 
 
 def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None,
-                guard_submission: bool = False) -> dict:
+                guard_submission: bool = True) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
     rec = job.state["segs"].get(str(i)) or {}

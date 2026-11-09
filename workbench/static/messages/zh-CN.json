@@ -1,4 +1,6 @@
 {
+  "frameSubmissionUnknown": "图片请求可能已接单，但未取得任务号。已阻止新生成以免重复付费，请先在 APIMart 核对任务记录，再恢复本地记录。",
+  "frameTaskPending": "原图片任务尚未确认结果。请点击“继续生成剩余分镜”查询原任务，确认结束前暂不能编辑，以免重复付费。",
   "frameMissingReferences": "原始参考图已移动或删除，恢复后才能重出图；已有产物仍可查看：{paths}",
   "pageTitle": "H3 · 本地出片工作台",
   "brandSubtitle": "REFERENCE VIDEO STUDIO",

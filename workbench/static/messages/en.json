@@ -1,4 +1,6 @@
 {
+  "frameSubmissionUnknown": "The image request may have been accepted, but its task ID is unknown. New generation is blocked to avoid duplicate charges. Check APIMart's task history before restoring the saved record.",
+  "frameTaskPending": "The existing image task has no confirmed result. Use Generate remaining frames to query it. Editing is locked to avoid duplicate charges.",
   "frameMissingReferences": "Restore missing reference images before regenerating. Existing outputs remain viewable: {paths}",
   "pageTitle": "H3 · Local Video Workbench",
   "brandSubtitle": "REFERENCE VIDEO STUDIO",
