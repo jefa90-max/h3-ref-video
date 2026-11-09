@@ -80,7 +80,7 @@ class FrameBatch(unittest.TestCase):
             prompts.assert_not_called()
             video.assert_not_called()
 
-    def test_missing_first_frame_keeps_board_and_character_references_for_later_frames(self):
+    def test_existing_first_frame_keeps_only_board_and_character_references_for_later_frames(self):
         with tempfile.TemporaryDirectory() as temporary:
             out = Path(temporary)
             board, actor = out / "board.png", out / "actor.png"
@@ -90,15 +90,16 @@ class FrameBatch(unittest.TestCase):
             script.update(board=str(board), cast=[{"name": "Object", "picture": str(actor)}])
             segments = film.plan(script["shots"])
             pictures = {segment["idx"]: film.refs(script, segment, "shot") for segment in segments}
+            (out / "frames").mkdir()
+            Image.new("RGB", (8, 8), "red").save(out / "frames" / "s1-1.png")
             def draw(prompt, references, aspect, output, **kwargs):
                 self.assertEqual(list(map(str, references)), [str(board), str(actor)])
-                if output.stem == "s1-1":
-                    raise frames.ContentPolicyError("Rejected")
+                self.assertNotIn("另一个镜头的画面", prompt)
                 Image.new("RGB", (8, 8), "red").save(output)
                 return 0
             with patch.object(frames, "draw", side_effect=draw) as drawing:
-                self.assertEqual(film.stage_frames(film.Job(out), script, segments, pictures), ["s1-1"])
-            self.assertEqual(drawing.call_count, 4)
+                self.assertEqual(film.stage_frames(film.Job(out), script, segments, pictures), [])
+            self.assertEqual(drawing.call_count, 3)
 
     def test_partial_pipeline_does_not_clear_dirty_segments_or_record_an_assembly(self):
         with tempfile.TemporaryDirectory() as temporary:
