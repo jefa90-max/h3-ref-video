@@ -24,17 +24,13 @@ def plan(request, check_images=True):
     descriptions = []
     records = frame_records(request)
     character_names = {c["picture"]: c["name"] for c in script.get("cast") or []}
-    for index, (segment, shot) in enumerate(wanted):
+    for segment, shot in wanted:
         key = f"s{segment + 1}-{shot + 1}"
         who = [c for c in script.get("cast") or [] if film.in_shots(c, [segments[segment]["shots"][shot]])]
-        first_frame = out / "frames" / f"s{wanted[0][0] + 1}-{wanted[0][1] + 1}.png"
-        anchor = records.get(key, {}).get("anchor_reference_path", str(first_frame) if index and first_frame.is_file() else None)
         characters = records.get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
         references = ([{"kind": "board", "path": script["board"], "name": ""}] if script.get("board") else [])
         references += [{"kind": "character", "path": p, "name": character_names.get(p, "")} for p in characters]
-        if anchor:
-            references.append({"kind": "anchor", "path": str(anchor), "name": ""})
-        prompt = frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), bool(anchor))
+        prompt = frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), records.get(key, {}).get("composition"))
         descriptions.append({"key": key, "segment": segment + 1, "shot": shot + 1, "prompt": prompt,
                              "references": references, "reference_paths": [r["path"] for r in references],
                              "path": str(out / "frames" / f"{key}.png")})
@@ -84,7 +80,7 @@ def view(request, artifacts, editable, identifier=None, failed_only=False):
         task_pending = frames.task_pending(rec)
         submission_unknown = bool(rec.get("submission_unknown") and not rec.get("task"))
         can_edit = editable and available and not task_pending and not submission_unknown and (not failed_only or bool(error))
-        description.update(prompt=rec.get("failed_prompt") or rec.get("prompt", description["prompt"]),
+        description.update(prompt=frames.without_anchor_reference(rec.get("failed_prompt") or rec.get("prompt", description["prompt"])),
                            url=urls.get(description["path"]), error=error, moderation_failed=bool(rec.get("moderation_error")),
                            task_pending=task_pending, submission_unknown=submission_unknown,
                            editable=can_edit and not missing, missing_references=missing,
@@ -157,6 +153,12 @@ def regenerate(request):
     def record(**values):
         pending.update(values)
         write_json(pending_path, pending)
+
+    if not pending.get("task") and not pending.get("downloaded"):
+        references = description["references"]
+        characters = pending.get("character_reference_paths", [r["path"] for r in references if r["kind"] == "character"])
+        record(prompt=frames.without_anchor_reference(pending["prompt"]),
+               reference_paths=[r["path"] for r in references if r["kind"] == "board"] + characters)
 
     if not pending.get("downloaded"):
         if request["demo"]:

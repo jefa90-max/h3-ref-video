@@ -1,6 +1,6 @@
 # h3-ref-video：H3 参考图出片
 
-像给 Seedance 写提示词、给参考图那样，在 RunningHub 上用 MiniMax H3 出视频：你照常写中文分镜和「参考图片1、参考图片2…」，工具把它改写成 MiniMax 官方的六段式格式再提交；一份分镜脚本还能整条出片，每个镜头先用 GPT Image 2.5 画一张分镜图垫给 H3，人物、道具、比例照图来。
+像给 Seedance 写提示词、给参考图那样，在 RunningHub 上用 MiniMax H3 出视频：你照常写中文分镜和「参考图片1、参考图片2…」，工具把它改写成 MiniMax 官方的六段式格式再提交；一份分镜脚本还能整条出片，每个镜头先用 GPT Image 2.6 画一张分镜图垫给 H3，人物、道具、比例照图来。
 
 为什么折腾这个：H3 在 RunningHub 上按机器时间收费，标准机型每输出一秒大约 ¥0.009，Seedance 2.0 mini 480p 是 ¥0.102，差了十倍多。一条 27 秒、11 个镜头的竖屏短片，用这个仓库的 `film` 命令跑：11 张 1K 分镜图 ¥1.85，H3 两段并行生成 ¥0.27，一共 ¥2.12，从开始到出片 9 分钟；同长度 Seedance mini 约 ¥2.8。
 
@@ -45,7 +45,7 @@ H3 这条用的 7 张分镜图，第一张画好以后，后面每张都带着�
 1. **Python 3.10+、ffmpeg**，`pip install -r requirements.txt`。
 2. **两个 key**，复制 `.env.example` 成 `.env` 填上：
    - `RUNNINGHUB_API_KEY`：[RunningHub](https://www.runninghub.cn) 控制台「API 调用」。本项目使用工作流 API；消费级会员 key 扣积分，企业共享 key 扣钱包。默认同时跑 3 段，可通过 `RUNNINGHUB_CONCURRENCY` 按实际 API 额度调整。
-   - `APIMART_API_KEY`：[APIMart](https://apimart.ai)，画分镜图（GPT Image 2.5）和查烧字幕（Gemini 3.8 Flash）。
+   - `APIMART_API_KEY`：[APIMart](https://apimart.ai)，画分镜图（GPT Image 2.6），默认也用于逐镜头文字描述和视频提示词改写。
 3. **改写提示词的模型**：装了 [Claude Code](https://claude.com/claude-code) 并登录过，默认就用它（我们一直用的是这个）；没装就走 APIMart 上的模型（`H3_REWRITER=llm`，默认 `deepseek-v4-pro`，也可以换成任何 OpenAI 兼容接口）。DeepSeek 改写我们试过，格式检查能过；上 H3 出片对比过的只有 Claude 改写的版本。
 4. **MiniMax 官方提示词指南**：工具运行时从 [MiniMax-AI/MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing) 现取 `ref-en.txt` 并缓存，没有随仓库分发（它属于 MiniMax H3 Community License 下的文档）。网络不通就自己下载，用 `H3_GUIDE_FILE` 指过去。
 
@@ -83,7 +83,7 @@ key 仅按选择写入被 git 忽略的本机 `.env`（权限 0600），不会�
 
 工具按镜头边界切成每段不超过 15 秒，然后：
 
-1. **画分镜图**（`--frames shot`，默认）：每个镜头画一张「这个镜头刚开始那一瞬」的图。全片第一张先画，后面每张都把它当参考，演员和场景就前后一致。参考图按像素收费，上传前缩到 1024 像素。
+1. **画分镜图**（`--frames shot`，默认）：先用文字模型（默认 `deepseek-v4-pro`）按当前镜头和前文整理实际可见的场景、必要道具、画面与主体朝向，全局场景只作参考，结果保存复用。提示词标注整片分镜号以匹配总表中的关键场景，背向镜头时明确写出背面；再用图片模型（默认 `gpt-image-2.6-sunburst`）画出镜头开始的一瞬间。各图仅使用场景／道具总表和对应角色图作为参考，不引用首张分镜。参考图按像素收费，上传前缩到 1024 像素。
 2. **写提示词**：每段按 Seedance 的写法拼出中文提示词（参考图片1 是总表、2 是谁、之后每张是第几个镜头的首帧），再改写成 H3 官方格式。
 3. **生成**：每段参考图最多 9 张（工作流就 9 个图片口），放不下时先拿掉总表，再拿掉后面镜头的分镜图。分镜图模式下各段互不依赖，默认最多同时生成 3 段，其余等待空位。
 4. **拼片、出报告**，出 `film.mp4` 和 `report.md`（每段费用、GPU 时间）。字幕检查目前暂停，整片和单段重生成均跳过；检查代码与已有记录保留。

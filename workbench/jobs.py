@@ -254,6 +254,7 @@ class Jobs:
             return self.snapshot(identifier)
 
     def edit_frame(self, identifier, key, prompt, env, character_reference_paths=None):
+        from h3ref import frames
         from .inputs import array, invalid, text, verify_image
         from .storyboard import can_edit_frames, frame_records, plan
         with self.lock:
@@ -280,8 +281,8 @@ class Jobs:
                 raise InputError("frame_operation")
             if not description or not (Path(description["path"]).is_file() or previous.get("error") or previous.get("moderation_error")):
                 raise InputError("not_found", value=key)
-            prompt = text(prompt, "prompt")
-            if previous.get("moderation_error") and prompt == (previous.get("failed_prompt") or previous.get("prompt", "")).strip():
+            prompt = text(frames.without_anchor_reference(text(prompt, "prompt")), "prompt")
+            if previous.get("moderation_error") and prompt == frames.without_anchor_reference(previous.get("failed_prompt") or previous.get("prompt", "")).strip():
                 raise InputError("frame_prompt_unchanged")
             current_characters = [r["path"] for r in description["references"] if r["kind"] == "character"]
             characters = current_characters if character_reference_paths is None else array(character_reference_paths, "character_reference_paths")
@@ -292,8 +293,7 @@ class Jobs:
             for path in map(Path, characters):
                 if path not in allowed:
                     invalid("character_reference_paths", str(path), "choice")
-            reference_paths = ([r["path"] for r in description["references"] if r["kind"] == "board"]
-                               + characters + [r["path"] for r in description["references"] if r["kind"] == "anchor"])
+            reference_paths = [r["path"] for r in description["references"] if r["kind"] == "board"] + characters
             for path in map(Path, reference_paths):
                 if not path.is_file():
                     raise InputError("missing_image", path=str(path))

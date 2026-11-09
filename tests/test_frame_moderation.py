@@ -16,6 +16,10 @@ from workbench.server import create_app
 
 class FrameModeration(unittest.TestCase):
     def setUp(self):
+        description = patch.object(frames, "describe_composition", return_value={
+            "scene": "A room.", "frame": "A person starts walking.", "orientation": "The person's back faces the camera."})
+        description.start()
+        self.addCleanup(description.stop)
         key = patch.object(frames.config, "apimart_key", return_value="synthetic-apimart-key")
         key.start()
         self.addCleanup(key.stop)
@@ -24,7 +28,7 @@ class FrameModeration(unittest.TestCase):
         for action, expected in (("死命抓住扶手", "使劲抓住扶手"), ("死盯着门口", "紧盯着门口"),
                                  ("死寂的走廊", "寂静的走廊"), ("死撑着站起来", "勉强支撑着站起来")):
             with self.subTest(action=action):
-                prompt = frames.prompt({"aspect": "9:16"}, {"action": action}, [], False, False)
+                prompt = frames.prompt({"aspect": "9:16"}, {"action": action}, [], False)
                 self.assertNotIn("死", prompt)
                 self.assertIn(expected, prompt)
 
@@ -33,11 +37,12 @@ class FrameModeration(unittest.TestCase):
         shot = {"camera": "特写", "action": "角色死死盯着对方，拼死挣扎后倒地死亡"}
         who = [{"name": "主角", "look": "浑身鲜血，伤口明显"}]
         original = json.dumps([script, shot, who], ensure_ascii=False)
-        prompt = frames.prompt(script, shot, who, True, True)
+        prompt = frames.prompt(script, shot, who, True)
         for word in ("死", "尸体", "血腥", "血迹", "鲜血", "伤口"):
             self.assertNotIn(word, prompt)
         self.assertIn("紧紧盯着", prompt)
-        self.assertIn("参考图片3", prompt)
+        self.assertIn("参考图片2", prompt)
+        self.assertNotIn("参考图片3", prompt)
         self.assertEqual(json.dumps([script, shot, who], ensure_ascii=False), original)
 
     def test_submission_and_polling_rejections_preserve_classification(self):

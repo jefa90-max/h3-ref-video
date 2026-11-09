@@ -8,7 +8,7 @@
 | one 改写 | 已有六段式原样使用；否则 rewrite 模块读取官方指南、RULES、示例并调用改写器 | 完全复用；不拼另一套系统提示词；界面根据缓存和最终提示词判断配置需求 |
 | film 解析 | `film.load` 过滤空 action、默认 2 秒、至少 0.5 秒、时间归一化 | 删除 UI 重复时间算法，直接使用原 load；页面从角色/总表清单绑定上传文件，启动时保存绝对路径 |
 | 切段与参考图 | `film.plan / refs / compile_prompt`，总数不超过 9 张，shot/first/none | 直接使用相同函数；显示实际参与生成的分镜，不承诺超出参考图预算的镜头都有图 |
-| 画图 | `film.stage_frames` → `frames.prompt / draw` | 完整出片和“先生成分镜”使用同一阶段；图像模型、参数、总表→角色→首图锚点顺序一致 |
+| 画图 | `film.stage_frames` → `frames.describe_composition / prompt / draw` | 完整出片和“先生成分镜”使用同一阶段；先按当前镜头整理场景、画面及朝向并缓存，再组装带整片分镜号的提示词；总表→角色顺序一致，不引用首张分镜 |
 | 视频提示词 | `stage_rewrite` → 原 rewrite，官方六段式 | 真实流水线完全沿用；单镜编辑框只修改图像生成提示词，不冒充视频提示词编辑 |
 | 出片与检查 | 原 RunningHub 工作流、轮询、拼接、report；字幕检查目前暂停 | one 直接调用 CLI；film 先调用 stage_frames，全部确认后才调用原 CLI / film.run；整片及单段重生成均跳过字幕检查 |
 | 单镜重出 | `frames.draw` 是原图像 API；CLI 的 `--redo` 只重做视频 | 单镜用原 draw；成功后替换，失败保留旧图。已有 task 但结果未知时只查询原任务，不能用新编辑覆盖；明确终止失败后才允许卡片新生成，审核拒绝须先改词 |

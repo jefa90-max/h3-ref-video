@@ -155,7 +155,7 @@ class ReviewState(unittest.TestCase):
                 with patch.object(frames, "poll", side_effect=[{"state": "running"}, {"state": "done", "url": "fake://image", "cny": 0.3}]), patch.object(frames.http, "download", side_effect=download):
                     storyboard.regenerate(request)
                 storyboard.regenerate(request)  # Already applied: no second payment or cost addition.
-                submit.assert_called_once_with("new image prompt", [anchor], "9:16")
+                submit.assert_called_once_with("new image prompt", [], "9:16")
             self.assertEqual(anchor.read_bytes(), original_anchor)
             self.assertNotEqual(target.read_bytes(), original_target)
             rec = film.Job(out).state["frames"]["s1-2"]

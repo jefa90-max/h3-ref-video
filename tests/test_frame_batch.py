@@ -17,6 +17,12 @@ from workbench.server import create_app
 
 
 class FrameBatch(unittest.TestCase):
+    def setUp(self):
+        description = patch.object(frames, "describe_composition", return_value={
+            "scene": "A room.", "frame": "An object starts moving.", "orientation": "The object's side faces the camera."})
+        description.start()
+        self.addCleanup(description.stop)
+
     def script(self):
         return {"aspect": "9:16", "shots": [
             {"start": index * 2, "end": (index + 1) * 2, "action": f"Object {index} moves"}
@@ -38,7 +44,7 @@ class FrameBatch(unittest.TestCase):
                     attempts.append(index)
                     record(task=f"task-{index}")
                     self.assertTrue(all(Path(reference).is_file() for reference in references))
-                    self.assertEqual(bool(references), index > 0 and 0 not in failed)
+                    self.assertEqual(references, [])
                     if index in failed:
                         raise failed[index]
                     Image.new("RGB", (8, 8), "red").save(output)
@@ -123,7 +129,7 @@ class FrameBatch(unittest.TestCase):
             finally:
                 jobs.close()
 
-    def test_partial_batch_exposes_editable_failure_and_preserves_actual_anchor_references(self):
+    def test_partial_batch_exposes_editable_failure_without_first_frame_reference(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app = create_app(root / "storage", root / ".env")
@@ -175,6 +181,10 @@ class FrameBatch(unittest.TestCase):
 
 class BatchTaskRecovery(unittest.TestCase):
     def setUp(self):
+        description = patch.object(frames, "describe_composition", return_value={
+            "scene": "A room.", "frame": "A ball starts rolling.", "orientation": "The ball's side faces the camera."})
+        description.start()
+        self.addCleanup(description.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)

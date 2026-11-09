@@ -6,8 +6,7 @@ function frameCharacterReferences(frame) {
 
 function frameGenerationReferences(frame) {
   const references = frame.references || [];
-  return [...references.filter((reference) => reference.kind === "board"), ...frameCharacterReferences(frame),
-    ...references.filter((reference) => reference.kind === "anchor")];
+  return [...references.filter((reference) => reference.kind === "board"), ...frameCharacterReferences(frame)];
 }
 
 function frameReferencesChanged(frame) {

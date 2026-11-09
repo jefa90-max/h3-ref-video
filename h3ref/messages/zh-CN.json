@@ -14,5 +14,6 @@
   "subtitle_check_failed": "第 {number} 段字幕检查未完成，继续处理：{error}",
   "frame_moderation_failed": "分镜图内容审核未通过，已记为失败且不会自动重试。请手工修改提示词后，从该分镜卡片重新生成。原始错误：{reason}",
   "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。",
-  "frame_output_missing": "分镜图输出文件缺失：{path}"
+  "frame_output_missing": "分镜图输出文件缺失：{path}",
+  "frame_composition_invalid": "当前分镜的文字描述无效，需要包含非空的 scene、frame 和 orientation：{detail}"
 }

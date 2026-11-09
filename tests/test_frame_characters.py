@@ -101,7 +101,7 @@ class FrameCharacters(unittest.TestCase):
         original = self.snapshot()["storyboard"][0]
         original_bytes = Path(original["path"]).read_bytes()
         self.assertEqual(self.edit([self.bob["path"]]).status_code, 200)
-        expected = [self.board["path"], self.bob["path"], original["path"]]
+        expected = [self.board["path"], self.bob["path"]]
         self.assertEqual(self.regenerate(), expected)
         current = self.snapshot()
         self.assertEqual(current["storyboard"][1]["reference_paths"], expected)
@@ -113,14 +113,14 @@ class FrameCharacters(unittest.TestCase):
         finally:
             restored.extensions["jobs"].close()
 
-    def test_empty_selection_keeps_board_and_anchor_and_allows_resume_without_removed_character(self):
+    def test_empty_selection_keeps_only_board_and_allows_resume_without_removed_character(self):
         Path(self.alice["path"]).unlink()
         self.assertEqual(self.edit([]).status_code, 200)
         self.jobs.find(self.identifier)["status"] = "failed"
         with patch.object(self.jobs, "launch"):
             response = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
         self.assertEqual(response.status_code, 200, response.json)
-        self.assertEqual(self.regenerate(), [self.board["path"], str(self.out / "frames/s1-1.png")])
+        self.assertEqual(self.regenerate(), [self.board["path"]])
 
     def test_non_character_references_and_duplicate_characters_are_rejected(self):
         for paths in ([self.board["path"]], [str(self.out / "frames/s1-1.png")], [self.alice["path"], self.alice["path"]]):

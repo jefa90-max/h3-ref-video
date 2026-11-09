@@ -1,8 +1,8 @@
 """Storyboard frames: one GPT Image picture for the first instant of a shot, drawn on APIMart.
 
 H3 follows a picture far more closely than words. A frame per shot keeps what the model otherwise "normalizes" — a
-miniature prop stays miniature, a prop stays where the script put it — and the first frame of the film goes into every
-later frame as a reference, so the actor and the set stay the same from shot to shot.
+miniature prop stays miniature, a prop stays where the script put it. Each frame uses the scene board and character
+references without using other generated frames.
 """
 import json
 import re
@@ -51,25 +51,62 @@ def task_pending(record) -> bool:
                 and not record.get("task_failed") and not record.get("moderation_error"))
 
 
-def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, with_anchor: bool) -> str:
-    """Chinese prompt for one frame. Pictures in order: board (optional), each character in it, the anchor frame."""
+def without_anchor_reference(text: str) -> str:
+    """Remove the automatic first-frame instruction saved by older versions."""
+    return re.sub(r"参考图片\d+是同一部片子另一个镜头的画面：人物的长相、妆容、服装和场景的样子与它保持一致，构图按上面的画面描述来。(?:\r?\n)?", "", text)
+
+
+def describe_composition(film: dict, shot: dict) -> dict:
+    """Describe only this shot's opening image, using earlier shots for continuity."""
+    shots = film.get("shots") or [shot]
+    number = shots.index(shot) + 1
+    visible = lambda item: {key: item.get(key, "") for key in ("camera", "action", "line")}
+    context = {"shot_number": number, "current_shot": visible(shot),
+               "previous_shots": [visible(item) for item in shots[:number - 1]], "key_scenes": film.get("setting") or ""}
+    rules = ("你是分镜美术指导，为当前分镜刚开始的一瞬间编写图片生成描述。只输出JSON对象，三个非空中文字符串字段："
+             "scene（当前可见的场景和必要道具）、frame（符合当前机位的具体画面和动作起始状态）、"
+             "orientation（逐一明确当前人物或物体相对镜头的朝向）。"
+             "当前镜头的机位和动作优先，前文仅用于理解场景和道具状态的连续性。关键场景参考只提供外观线索，"
+             "按当前镜头需要选择，不能整段照抄或把不同地点的道具都放进画面；没有换场依据时沿用当前场景。"
+             "不提前展示尚未发生的动作结果、未打开容器内的物品或此刻不可见的道具，不添加剧情。"
+             "按机位与动作推断朝向，不默认人物或物体正对镜头。背后跟拍、从身后看或背影要明确写主体背对镜头，"
+             "展示后背、后脑勺；物体背向镜头时写明其背面朝向镜头。不能把背对其他人物或窗户等同于背对镜头。"
+             "角色参考图只用于外观，不能覆盖镜头朝向。分镜号仅用于查找参考图对应的关键场景，不画进图片。"
+             "不要引用首镜参考图，不输出参考图片编号，不输出说明或Markdown。")
+    out = http.request(config.LLM_BASE + "/chat/completions", config.llm_key(),
+                       {"model": config.LLM_MODEL, "messages": [{"role": "system", "content": rules},
+                        {"role": "user", "content": json.dumps(context, ensure_ascii=False)}], "max_tokens": 8000, "stream": False},
+                       timeout=600, tries=1)
+    try:
+        composition = json.loads(out["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])) from exc
+    if not isinstance(composition, dict) or any(not isinstance(composition.get(key), str) or not composition[key].strip()
+                                              for key in ("scene", "frame", "orientation")):
+        raise RuntimeError(message("frame_composition_invalid", detail=json.dumps(composition, ensure_ascii=False)[:300]))
+    return {key: value.strip() for key, value in composition.items() if key in ("scene", "frame", "orientation")}
+
+
+def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None) -> str:
+    """Chinese prompt for one frame. Pictures in order: board (optional), each character in it."""
     aspect = film["aspect"]
     lines = [f"一张{ORIENT.get(aspect, '竖屏')}电影剧照，画幅 {aspect}，它是一段视频里一个镜头的第一帧。画风：{(film.get('look') or '').strip()}"]
+    number = (film.get("shots") or [shot]).index(shot) + 1
+    lines.append(f"当前分镜号：第{number}镜（仅用于查找参考图对应的关键场景，不在画面中显示编号）。")
     k = 1
     if with_board:
-        lines.append("参考图片1是本片的角色、道具和场景参考总表，只用来统一外观，不要把总表、白底和文字标注画进画面。")
+        lines.append(f"参考图片1是本片的角色、道具和场景参考总表，优先查找第{number}镜对应的关键场景，只采用当前镜头需要的外观线索。不要把其他场景、总表、白底和文字标注画进画面。")
         k = 2
-    if (film.get("setting") or "").strip():
-        lines.append("场景与关键道具：" + film["setting"].strip())
     cam = (shot.get("camera") or "").strip().strip("【】")
-    lines.append("画面：" + (f"【{cam}】" if cam else "") + (shot.get("action") or "").strip().rstrip("。")
+    if composition:
+        lines.append("场景与关键道具：" + composition["scene"])
+        lines.append("主体朝向（相对镜头）：" + composition["orientation"])
+    lines.append("画面：" + (f"【{cam}】" if cam else "") + (composition["frame"] if composition else (shot.get("action") or "").strip()).rstrip("。")
                  + "。画的是这个镜头刚开始的一瞬间，动作还没做完。")
     for c in who:
         look = (c.get("look") or "").strip().rstrip("。")
-        lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图。")
+        lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
         k += 1
-    if with_anchor:
-        lines.append(f"参考图片{k}是同一部片子另一个镜头的画面：人物的长相、妆容、服装和场景的样子与它保持一致，构图按上面的画面描述来。")
     lines.append(TAIL)
     return NEUTRAL_PATTERN.sub(lambda match: NEUTRAL_WORDS[match.group()], "\n".join(lines))
 

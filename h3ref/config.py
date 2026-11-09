@@ -46,7 +46,7 @@ MIN_SECONDS, MAX_SECONDS = 5, 15
 
 # APIMart: GPT Image for storyboard frames, and by default the vision check and the prompt rewriter too
 APIMART_BASE = env("APIMART_BASE_URL", "https://api.apimart.ai/v1").rstrip("/")
-IMAGE_MODEL = env("IMAGE_MODEL", "gpt-image-2.5-sunburst")
+IMAGE_MODEL = env("IMAGE_MODEL", "gpt-image-2.6-sunburst")
 IMAGE_RESOLUTION = env("IMAGE_RESOLUTION", "1k")                  # 1K looked as good as 2K once H3 redraws it at 544p
 IMAGE_QUALITY = env("IMAGE_QUALITY", "medium")
 USD_CNY = float(env("USD_CNY", "7.2"))

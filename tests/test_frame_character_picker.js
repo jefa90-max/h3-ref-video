@@ -76,7 +76,7 @@ for (const language of ["zh-CN", "en"]) {
     choices[0].click();
     choices[0].click();
     assert.deepEqual(Array.from(ui.context.frameGenerationReferences(ui.frame), (reference) => reference.path), [
-      "/initial/board.png", "/initial/alice.png", "/initial/bob.png", "/frames/s1-1.png",
+      "/initial/board.png", "/initial/alice.png", "/initial/bob.png",
     ]);
     assert.equal(ui.changes(), 1);
     assert.equal(ui.frame.references.length, 3, "Selection must remain a draft for this frame");
@@ -88,7 +88,7 @@ test("removed imported roles can be selected again and fixed references stay rea
   let remove = ui.nodes().find((node) => node.tag === "button" && node.textContent === ui.messages.removeImage);
   assert.ok(remove);
   remove.click();
-  assert.deepEqual(Array.from(ui.context.frameGenerationReferences(ui.frame), (reference) => reference.kind), ["board", "anchor"]);
+  assert.deepEqual(Array.from(ui.context.frameGenerationReferences(ui.frame), (reference) => reference.kind), ["board"]);
   assert.equal(ui.nodes().filter((node) => node.textContent === ui.messages.removeImage).length, 0);
   ui.render();
   const toggle = ui.nodes().find((node) => node.className.includes("frame-character-toggle"));
