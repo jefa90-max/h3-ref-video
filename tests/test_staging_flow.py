@@ -138,3 +138,83 @@ class StagingFlow(unittest.TestCase):
         self.job.state['frame_failures']=['s1-1']; self.job.save()
         with patch.object(film,'run',return_value=self.out),patch.object(sys,'argv',['h3ref','film',str(self.out)]),self.assertRaisesRegex(SystemExit,'FRAME_BATCH_INCOMPLETE'):
             cli.main()
+
+    def test_video_uses_matching_shot_states_without_global_pose(self):
+        self.script['shots'][0]['end']=4
+        self.script['shots'][1].update(start=4,end=8)
+        self.configure()
+        compositions={'s1-1':self.fixture['transfer_start'],'s1-2':self.fixture['transfer_end']}
+        text=film.compile_prompt(self.script,self.segments[0],self.pictures[0],1,compositions=compositions)
+        self.assertNotIn('正面站立',text)
+        self.assertNotIn('毛巾挂脖',text)
+        self.assertNotIn('场景与关键道具（全片统一）',text)
+        self.assertIn('接好了',text)
+        self.assertIn('递出者已经松手',text)
+        first,second=text.split('分镜：\n')[1].split('4–8秒：')
+        self.assertIn(self.fixture['transfer_start']['characters'][0]['pose'],first)
+        self.assertIn(self.fixture['transfer_end']['characters'][0]['pose'],second)
+        self.assertIn('双手托住红袋，阿青随后松手',first)
+
+    def test_manual_prompt_change_excludes_stale_composition(self):
+        self.run_frames()
+        records=self.job.state['frames']
+        versions=film.frame_reference_versions(self.script,self.segments,records)
+        self.assertEqual(len(film.saved_compositions(records,reference_versions=versions)),2)
+        records['s1-1']['prompt']='手工改词'
+        self.assertEqual(set(film.saved_compositions(records,reference_versions=versions)),{'s2-1'})
+        records['s2-1'].pop('composition_prompt')
+        self.assertEqual(film.saved_compositions(records,reference_versions=versions),{})
+
+    def test_reference_edit_preserves_uploaded_order(self):
+        self.run_frames()
+        records=self.job.state['frames']
+        records['s1-1']['character_reference_paths']=[c['picture'] for c in reversed(self.script['cast'])]
+        versions=film.frame_reference_versions(self.script,self.segments,records)
+        self.assertNotIn('s1-1',film.saved_compositions(records,reference_versions=versions))
+        Path(self.script['cast'][1]['picture']).write_bytes(b'changed reference version')
+        versions=film.frame_reference_versions(self.script,self.segments,records)
+        self.assertEqual(film.saved_compositions(records,reference_versions=versions),{})
+
+    def test_mixed_legacy_and_v2_do_not_force_migration(self):
+        self.script['shots'][0]['end']=4;self.script['shots'][1].update(start=4,end=8);self.configure()
+        original=film.compile_prompt(self.script,self.segments[0],self.pictures[0],1)
+        self.assertEqual(original,film.compile_prompt(self.script,self.segments[0],self.pictures[0],1,compositions={}))
+        mixed=film.compile_prompt(self.script,self.segments[0],self.pictures[0],1,compositions={'s1-1':self.fixture['transfer_start']})
+        self.assertIn(self.script['shots'][1]['action'],mixed)
+        self.assertNotIn('场景与关键道具（全片统一）',mixed)
+        self.assertEqual(mixed.count(self.script['setting']),1)
+
+    def test_preview_and_preflight_do_not_replan(self):
+        from workbench import inputs,storyboard
+        self.run_frames()
+        (self.out/'inputs').mkdir(exist_ok=True)
+        (self.out/'inputs/film.json').write_text(json.dumps(self.script))
+        request=dict(kind='film',film=self.script,output_dir=str(self.out),demo=False,frames='shot',operation='pipeline',lang='zh-CN')
+        with patch.object(film.rewrite,'rewrite',return_value='cached h3'):
+            film.stage_prompts(self.job,self.script,self.segments,self.pictures)
+        for forbidden in (frames.http,'request'),(frames,'describe_composition'),(frames,'draw'),(film.rewrite,'rewrite'):
+            context=patch.object(*forbidden,side_effect=AssertionError('network on preview'))
+            context.start();self.addCleanup(context.stop)
+        inputs.preflight(request,{'RUNNINGHUB_API_KEY':'offline'})
+        view=storyboard.view(request,[],True)
+        self.assertEqual(view[0]['prompt'],self.job.state['frames']['s1-1']['prompt'])
+        film.stage_prompts(self.job,self.script,self.segments,self.pictures)
+
+    def test_existing_task_unknown_and_completed_prompts_are_frozen(self):
+        for flags in ({'task':'accepted'},{'submission_unknown':True},{'file':str(self.out/'clips/seg1.mp4'),'cny':1}):
+            with self.subTest(flags=flags):
+                self.job.state['segs']={'0':dict(zh='original zh',h3='original h3',**flags),'1':dict(zh='other',h3='other',task='other-task')}
+                self.job.save()
+                with patch.object(film.rewrite,'rewrite',side_effect=AssertionError('repaid rewrite')):
+                    film.stage_prompts(self.job,self.script,self.segments,self.pictures)
+                self.assertEqual(self.job.state['segs']['0']['zh'],'original zh')
+                self.assertFalse((self.out/'prompts/seg1.zh.txt').exists())
+
+    def test_rewrite_request_retains_staging_rules_with_mock_backend(self):
+        from h3ref import rewrite
+        text=film.compile_prompt(self.script,self.segments[0],self.pictures[0],2,compositions={'s1-1':self.fixture['transfer_start']})
+        with patch.object(rewrite,'guide',return_value='local offline guide'):
+            request=rewrite.request(text,len(self.pictures[0]),8,'9:16')
+        self.assertIn('body facing',request)
+        self.assertIn('opening direction',request)
+        self.assertIn(self.fixture['transfer_start']['action'],request)

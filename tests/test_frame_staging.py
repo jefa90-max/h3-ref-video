@@ -66,3 +66,33 @@ class FrameStaging(unittest.TestCase):
             text = frames.prompt(self.script,self.script['shots'][0],self.script['cast'],False,dict(scene='旧场景',frame='旧首帧',orientation='背对镜头'))
         for phrase in ('旧场景','旧首帧','背对镜头'):
             self.assertIn(phrase,text)
+
+    def test_manual_regeneration_keeps_real_prompt_and_invalidates_review(self):
+        import tempfile
+        from h3ref import film
+        from workbench import storyboard
+        from workbench.jobs import write_json
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp);(out/'inputs').mkdir();(out/'frames').mkdir()
+            script=copy.deepcopy(self.script)
+            for c in script['cast']:
+                c['picture']=str(out/(c['name']+'.png'));Path(c['picture']).write_bytes(b'reference')
+            (out/'inputs/film.json').write_text(json.dumps(script))
+            request=dict(output_dir=str(out),demo=False,film=script,frames='shot',lang='en')
+            previous=dict(prompt='automatic',composition=self.fixture['transfer_start'],composition_prompt='automatic',composition_reference_version='old',cny=0)
+            film.Job(out).put('frames','s1-1',**previous)
+            write_json(out/'inputs/review.json',{'dirty_segments':[],'confirmed_version':'old'})
+            characters=[c['picture'] for c in reversed(script['cast'])]
+            write_json(out/'inputs/frame-edit.json',dict(key='s1-1',prompt='User actual words',revision='manual',previous=previous,character_reference_paths=characters))
+            def draw(text,refs,aspect,output,**kwargs):
+                self.assertEqual(text,'User actual words')
+                self.assertEqual(list(map(str,refs)),characters)
+                output.write_bytes(b'new frame');return 0.1
+            with patch.object(frames,'describe_composition',side_effect=AssertionError('replanned manual text')),patch.object(frames,'draw',side_effect=draw):
+                storyboard.regenerate(request)
+            record=film.Job(out).state['frames']['s1-1']
+            self.assertEqual(record['prompt'],'User actual words')
+            self.assertEqual(record['composition_prompt'],'automatic')
+            self.assertEqual(storyboard.review_state(out)['dirty_segments'],[1])
+            self.assertNotIn('confirmed_version',storyboard.review_state(out))
+            self.assertEqual(storyboard.view(request,[],True)[0]['prompt'],'User actual words')
