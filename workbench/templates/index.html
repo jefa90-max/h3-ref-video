@@ -19,7 +19,7 @@
               <label><span data-i18n="secondsLabel"></span><input id="seconds" type="number" min="5" max="15" step="1" value="12"></label>
               <label><span data-i18n="aspectLabel"></span><select id="aspect"><option value="9:16" data-i18n="aspectPortrait"></option><option value="16:9" data-i18n="aspectLandscape"></option><option value="1:1" data-i18n="aspectSquare"></option></select></label>
             </div>
-            <div class="field-grid one-options"><label><span data-i18n="seedLabel"></span><input id="seed" type="number" step="1" data-i18n-placeholder="seedPlaceholder"></label><label class="checkbox-field"><input id="check-subtitles" type="checkbox"><span data-i18n="checkSubtitles"></span></label></div>
+            <div class="field-grid one-options"><label><span data-i18n="seedLabel"></span><input id="seed" type="number" step="1" data-i18n-placeholder="seedPlaceholder"></label><label class="checkbox-field"><input id="check-subtitles" type="checkbox"{% if not subtitle_checks_enabled %} disabled{% endif %}><span data-i18n="{{ 'checkSubtitles' if subtitle_checks_enabled else 'checkSubtitlesPaused' }}"></span></label></div>
             <div class="field-block"><div class="label-heading"><span data-i18n="referencesLabel"></span><span id="image-count" class="subtle"></span></div><label class="upload-zone"><input id="one-upload" type="file" accept="image/png,image/jpeg,image/webp" multiple><span class="upload-symbol" aria-hidden="true">+</span><strong data-i18n="uploadReferences"></strong><span class="hint" data-i18n="uploadReferencesHint"></span></label><p class="hint" data-i18n="referenceOrder"></p><div id="reference-list" class="reference-list"></div></div>
           </div>
 

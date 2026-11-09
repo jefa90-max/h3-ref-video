@@ -3,6 +3,7 @@
 Object.assign(state, {
   jobId: $("results-page").dataset.jobId, selectedJob: null, submitting: false,
   page: 1, pageSize: 12, frameDrafts: new Map(), expandedFrames: new Set(),
+  storyboardView: "list", frameIndex: 0,
   frameReferenceDrafts: new Map(), frameSubmissions: new Map(),
   storyboardSignature: "", planSignature: "", linksSignature: "", videoSignature: "",
   player: null, pollTimer: null, jobRevision: 0,
@@ -47,82 +48,111 @@ function renderStoryboard(job) {
   }
   $("storyboard-section").hidden = job.review?.kind !== "frames";
   const pages = Math.max(1, Math.ceil(frames.length / state.pageSize));
-  state.page = Math.min(state.page, pages);
-  const visible = frames.slice((state.page - 1) * state.pageSize, state.page * state.pageSize);
+  state.page = Math.max(1, Math.min(state.page, pages));
+  state.frameIndex = Math.max(0, Math.min(state.frameIndex, frames.length - 1));
+  const carousel = state.storyboardView === "carousel";
+  const visible = carousel ? frames.slice(state.frameIndex, state.frameIndex + 1)
+    : frames.slice((state.page - 1) * state.pageSize, state.page * state.pageSize);
+  for (const view of ["list", "carousel"]) {
+    $(`storyboard-view-${view}`).setAttribute("aria-pressed", String(state.storyboardView === view));
+  }
+  $("review-page-hint").textContent = t(carousel ? "reviewCarouselHint" : "reviewPageHint");
+  $("storyboard-cards").className = carousel ? "storyboard-carousel" : "storyboard-grid";
+  $("page-pagination").hidden = carousel;
   $("page-label").textContent = t("reviewPageLabel", { page: state.page, pages, count: frames.length });
-  $("page-previous").disabled = state.page <= 1;
-  $("page-next").disabled = state.page >= pages;
+  renderPagination("page", state.page, pages);
+  $("frame-navigation").hidden = !carousel || !frames.length;
+  $("frame-position").textContent = t("framePosition", { index: frames.length ? state.frameIndex + 1 : 0, count: frames.length });
+  $("frame-previous").disabled = state.frameIndex <= 0;
+  $("frame-next").disabled = state.frameIndex >= frames.length - 1;
   $("review-empty").hidden = visible.length > 0;
   $("review-empty").textContent = t("framesNotReady");
-  const signature = JSON.stringify([visible, job.character_references, job.status, state.language, state.page ]);
+  const signature = JSON.stringify([visible, job.character_references, job.status, state.language, state.page, state.storyboardView, state.frameIndex]);
   if (state.storyboardSignature === signature) return;
   state.storyboardSignature = signature;
   $("storyboard-cards").replaceChildren();
-  for (const frame of visible) {
-    const card = element("article", "storyboard-card");
-    const heading = element("div", "label-heading");
-    const name = t("frameTitle", { segment: frame.segment, shot: frame.shot });
-    heading.append(element("h3", "", name));
-    card.append(heading);
-    if (frame.url) {
-      const link = element("a", "storyboard-preview");
-      link.href = frame.url;
-      link.target = "_blank";
-      link.rel = "noopener";
-      const image = element("img");
-      image.src = frame.url;
-      image.loading = "lazy";
-      image.alt = name;
-      link.append(image);
-      card.append(link);
-    } else card.append(element("p", "frame-placeholder hint", t("frameWaiting")));
-    const draftNote = element("p", "hint frame-draft-note", t("frameDraftUnapplied"));
-    function updateDraftNote() {
-      draftNote.hidden = (!state.frameDrafts.has(frame.key) || state.frameDrafts.get(frame.key).trim() === (frame.prompt || "").trim()) && !frameReferencesChanged(frame);
-    }
-    updateDraftNote();
-    const details = element("details", "frame-editor");
-    details.append(element("summary", "", t("editFramePrompt")));
-    let editor;
-    function expandEditor() {
-      if (editor) return;
-      const label = element("label");
-      label.append(element("span", "", t("framePromptLabel")));
-      editor = element("textarea", "frame-prompt");
-      editor.rows = 6;
-      editor.value = state.frameDrafts.get(frame.key) ?? frame.prompt;
-      editor.addEventListener("input", () => {
-        state.frameDrafts.set(frame.key, editor.value);
-        updateDraftNote();
-      });
-      label.append(editor);
-      details.append(label);
-      const regenerate = element("button", "button secondary regenerate-frame", t(job.demo ? "regenerateDemo" : "regenerateLive"));
-      regenerate.type = "button";
-      function updateReferences() {
-        regenerate.dataset.enabled = String(frame.references_editable && job.status === "succeeded" && frameGenerationReferences(frame).every((reference) => reference.url));
-        updateDraftNote();
-      }
-      details.append(createFrameReferenceEditor(frame, updateReferences));
+  for (const frame of visible) $("storyboard-cards").append(createStoryboardCard(frame, job, carousel));
+}
+
+function createStoryboardCard(frame, job, carousel) {
+  const card = element("article", "storyboard-card");
+  const heading = element("div", "label-heading");
+  const name = t("frameTitle", { segment: frame.segment, shot: frame.shot });
+  heading.append(element("h3", "", name));
+  const body = element("div", "storyboard-card-body");
+  const media = element("div", "storyboard-media");
+  const information = element("div", "storyboard-info");
+  body.append(media, information);
+  card.append(heading, body);
+  if (frame.url) {
+    const link = element("a", "storyboard-preview");
+    link.href = frame.url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    const image = element("img");
+    image.src = frame.url;
+    image.loading = carousel ? "eager" : "lazy";
+    image.alt = name;
+    link.append(image);
+    media.append(link);
+  } else media.append(element("p", "frame-placeholder hint", t("frameWaiting")));
+  if (frame.error) {
+    const failureMessage = t(frame.moderation_failed ? "frameModerationFailed" : "frameGenerationFailed");
+    if (!frame.url) media.replaceChildren(element("p", "frame-placeholder hint", failureMessage));
+    information.append(element("p", "hint", failureMessage),
+      element("p", "hint", t("frameGenerationReason", { reason: frame.error })));
+  }
+  const draftNote = element("p", "hint frame-draft-note", t("frameDraftUnapplied"));
+  function updateDraftNote() {
+    draftNote.hidden = (!state.frameDrafts.has(frame.key) || state.frameDrafts.get(frame.key).trim() === (frame.prompt || "").trim()) && !frameReferencesChanged(frame);
+  }
+  updateDraftNote();
+  const details = element(carousel ? "section" : "details", "frame-editor");
+  if (!carousel) details.append(element("summary", "", t("editFramePrompt")));
+  let editor;
+  function expandEditor() {
+    if (editor) return;
+    const label = element("label");
+    label.append(element("span", "", t("framePromptLabel")));
+    editor = element("textarea", "frame-prompt");
+    editor.rows = carousel ? 10 : 6;
+    editor.value = state.frameDrafts.get(frame.key) ?? frame.prompt;
+    editor.addEventListener("input", () => {
+      state.frameDrafts.set(frame.key, editor.value);
       updateReferences();
-      regenerate.addEventListener("click", async () => {
-        if (regenerate.disabled) return;
-        if (!editor.value.trim()) { showError(t("framePromptRequired")); return; }
-        const payload = { prompt: editor.value.trim(), character_reference_paths: frameCharacterReferences(frame).map((reference) => reference.path) };
-        state.frameSubmissions.set(frame.key, { ...payload, version: frame.version });
-        await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/frames/${encodeURIComponent(frame.key)}`, payload);
-      });
-      details.append(regenerate, element("p", "hint", t(job.demo ? "regenerateDemoHint" : "regenerateLiveHint")));
       renderResultActions();
+    });
+    label.append(editor);
+    details.append(label);
+    const regenerate = element("button", "button secondary regenerate-frame", t(job.demo ? "regenerateDemo" : "regenerateLive"));
+    regenerate.type = "button";
+    function updateReferences() {
+      regenerate.dataset.enabled = String(frame.references_editable && !running(job) && frameGenerationReferences(frame).every((reference) => reference.url)
+        && (!frame.moderation_failed || editor.value.trim() !== (frame.prompt || "").trim()));
+      updateDraftNote();
     }
+    details.append(createFrameReferenceEditor(frame, updateReferences));
+    updateReferences();
+    regenerate.addEventListener("click", async () => {
+      if (regenerate.disabled) return;
+      if (!editor.value.trim()) { showError(t("framePromptRequired")); return; }
+      const payload = { prompt: editor.value.trim(), character_reference_paths: frameCharacterReferences(frame).map((reference) => reference.path) };
+      state.frameSubmissions.set(frame.key, { ...payload, version: frame.version });
+      await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/frames/${encodeURIComponent(frame.key)}`, payload);
+    });
+    details.append(regenerate, element("p", "hint", t(job.demo ? "regenerateDemoHint" : "regenerateLiveHint")));
+    renderResultActions();
+  }
+  if (carousel) expandEditor();
+  else {
     details.addEventListener("toggle", () => {
       if (details.open) { state.expandedFrames.add(frame.key); expandEditor(); }
       else state.expandedFrames.delete(frame.key);
     });
     if (state.expandedFrames.has(frame.key)) { details.open = true; expandEditor(); }
-    card.append(details, draftNote);
-    $("storyboard-cards").append(card);
   }
+  information.append(details, draftNote);
+  return card;
 }
 
 function renderScriptPlan(job) {
@@ -137,7 +167,7 @@ function renderScriptPlan(job) {
   $("script-plan").append(element("h3", "", plan.title), element("p", "hint", t("scriptPlanSummary", { seconds: plan.seconds, count: plan.segments.length })));
   for (const segment of plan.segments) {
     const details = element("details", "script-segment");
-    details.append(element("summary", "", t("scriptSegment", { index: segment.idx, start: segment.start, end: segment.end, seconds: segment.seconds, count: segment.shots.length })));
+    details.append(element("summary", "", t("scriptSegment", { index: segment.idx + 1, start: segment.start, end: segment.end, seconds: segment.seconds, count: segment.shots.length })));
     let expanded = false;
     details.addEventListener("toggle", () => {
       if (!details.open || expanded) return;
@@ -219,7 +249,7 @@ function renderJob(job) {
   $("job-created").textContent = dateLabel(job.created_at);
   const failed = ["failed", "interrupted"].includes(job.status);
   const activeStage = { pipeline: "stageGeneratingVideo", segment: "stageRegeneratingSegment", assemble: "stageAssembling" }[job.operation] || "stageGeneratingFrames";
-  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.review_needed ? "stageReview" : job.pending_assembly ? "stageAwaitingAssembly" : "stageFinished";
+  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.frame_failures ? "stageFramesIncomplete" : job.review_needed ? "stageReview" : job.pending_assembly ? "stageAwaitingAssembly" : "stageFinished";
   $("stage-title").textContent = t(stage);
   $("stage-hint").textContent = t(stage === "stageReview" && review.kind === "script" ? "stageScriptReviewHint" : `${stage}Hint`);
   $("job-error").hidden = !job.error;
@@ -227,8 +257,9 @@ function renderJob(job) {
   $("frames-count").textContent = job.progress?.frames ?? 0;
   $("clips-count").textContent = job.progress?.clips ?? 0;
   $("files-count").textContent = job.artifacts?.length ?? 0;
-  $("resume-job").hidden = !failed;
-  $("resume-hint").hidden = !failed;
+  $("resume-job").hidden = !failed && !job.can_resume_frames;
+  $("resume-job").textContent = t(job.can_resume_frames ? "resumeFrames" : "resumeJob");
+  $("resume-hint").hidden = !failed && !job.can_resume_frames;
   $("review-section").hidden = job.kind !== "film";
   $("review-progress").textContent = t(review.kind === "script" ? "scriptPlanForReview" : "reviewSummary", { total: review.total || 0 });
   $("review-badge").textContent = t(review.complete ? "reviewComplete" : "reviewPending");
@@ -295,14 +326,42 @@ async function runJobAction(url, payload) {
   if (failed) await refreshJob();
 }
 
-for (const [id, direction] of [["page-previous", -1], ["page-next", 1]]) {
-  $(id).addEventListener("click", () => {
-    state.page += direction;
+initializePagination("page", (page) => {
+  state.page = page;
+  renderStoryboard(state.selectedJob);
+  renderResultActions();
+  $("storyboard-section").scrollIntoView({ block: "start" });
+});
+for (const view of ["list", "carousel"]) {
+  $(`storyboard-view-${view}`).addEventListener("click", () => {
+    if (!state.selectedJob || state.storyboardView === view) return;
+    if (view === "list") state.page = Math.floor(state.frameIndex / state.pageSize) + 1;
+    else if (Math.floor(state.frameIndex / state.pageSize) + 1 !== state.page) {
+      state.frameIndex = (state.page - 1) * state.pageSize;
+    }
+    state.storyboardView = view;
     renderStoryboard(state.selectedJob);
     renderResultActions();
-    $("storyboard-section").scrollIntoView({ block: "start" });
   });
 }
+for (const [id, direction] of [["frame-previous", -1], ["frame-next", 1]]) {
+  $(id).addEventListener("click", () => {
+    if ($(id).disabled || !state.selectedJob) return;
+    state.frameIndex += direction;
+    renderStoryboard(state.selectedJob);
+    renderResultActions();
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight"].includes(event.key) || event.defaultPrevented || event.isComposing
+    || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if (state.storyboardView !== "carousel" || $("storyboard-panel").hidden || $("storyboard-section").hidden) return;
+  if (event.target.isContentEditable || event.target.closest("input, textarea, select")) return;
+  const button = $(event.key === "ArrowLeft" ? "frame-previous" : "frame-next");
+  if (button.disabled) return;
+  event.preventDefault();
+  button.click();
+});
 $("continue-job").addEventListener("click", async () => {
   const job = state.selectedJob;
   if (canGenerateVideo(job)) await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/continue`, { review_version: job.review.version, approved: true });

@@ -56,11 +56,10 @@ function renderVideoSegments(job) {
   if (job.kind !== "film") return;
   const segments = job.segments || [];
   const pages = Math.max(1, Math.ceil(segments.length / state.segmentPageSize));
-  state.segmentPage = Math.min(state.segmentPage, pages);
+  state.segmentPage = Math.max(1, Math.min(state.segmentPage, pages));
   $("segments-summary").textContent = t("segmentsSummary", { ready: segments.filter((segment) => segment.url).length, total: segments.length });
   $("segments-page-label").textContent = t("segmentPageLabel", { page: state.segmentPage, pages, count: segments.length });
-  $("segments-previous").disabled = state.segmentPage <= 1;
-  $("segments-next").disabled = state.segmentPage >= pages;
+  renderPagination("segments", state.segmentPage, pages);
   $("assembly-notice").hidden = !job.pending_video && !job.pending_assembly;
   $("assembly-notice").textContent = t(job.pending_video ? "segmentsNeedFrames" : "assemblyPending");
   $("assembly-hint").textContent = t(job.pending_video ? "segmentsNeedFrames" : job.assembly?.ready ? "assemblyHint" : "assemblyMissing");
@@ -145,13 +144,11 @@ function initializeVideoSegments() {
       renderVideoSegments(state.selectedJob);
     });
   }
-  for (const [id, direction] of [["segments-previous", -1], ["segments-next", 1]]) {
-    $(id).addEventListener("click", () => {
-      state.segmentPage += direction;
-      renderVideoSegments(state.selectedJob);
-      $("segments-section").scrollIntoView({ block: "start" });
-    });
-  }
+  initializePagination("segments", (page) => {
+    state.segmentPage = page;
+    renderVideoSegments(state.selectedJob);
+    $("segments-section").scrollIntoView({ block: "start" });
+  });
   $("assemble-job").addEventListener("click", async () => {
     const job = state.selectedJob;
     if (job?.can_assemble) await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/assemble`, { version: job.assembly.version });

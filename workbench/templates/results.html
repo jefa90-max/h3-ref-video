@@ -1,6 +1,7 @@
 {% extends "base.html" %}
+{% from "_pagination.html" import pagination %}
 {% block head %}<link rel="stylesheet" href="/static/vendor/plyr/plyr.css">{% endblock %}
-{% block scripts %}<script src="/static/vendor/plyr/plyr.min.js" defer></script><script src="/static/video-segments.js" defer></script><script src="/static/frame-references.js" defer></script><script src="/static/results.js" defer></script>{% endblock %}
+{% block scripts %}<script src="/static/vendor/plyr/plyr.min.js" defer></script><script src="/static/pagination.js" defer></script><script src="/static/video-segments.js" defer></script><script src="/static/frame-references.js" defer></script><script src="/static/results.js" defer></script>{% endblock %}
 {% block intro %}
 <section class="intro results-intro"><div><a class="back-link" href="/" data-i18n="backToCreate"></a><p class="eyebrow" data-i18n="resultEyebrow"></p><h1 data-i18n="resultTitle"></h1><p class="intro-copy" data-i18n="resultIntro"></p></div><span id="job-status" class="status-badge"></span></section>
 {% endblock %}
@@ -24,11 +25,22 @@
     <section id="review-section" class="review-section panel" hidden>
       <div class="section-heading"><div><h2 data-i18n="reviewTitle"></h2><p id="review-progress" class="hint" aria-live="polite"></p></div><span id="review-badge" class="status-badge"></span></div>
       <div id="storyboard-section" hidden>
-        <p class="hint" data-i18n="reviewPageHint"></p>
+        <div class="storyboard-toolbar">
+          <p id="review-page-hint" class="hint"></p>
+          <div class="mode-toggle storyboard-view-toggle" role="group" data-i18n-aria="storyboardView">
+            <button id="storyboard-view-list" type="button" aria-pressed="true" data-i18n="storyboardListView"></button>
+            <button id="storyboard-view-carousel" type="button" aria-pressed="false" data-i18n="storyboardCarouselView"></button>
+          </div>
+        </div>
         <p class="hint" data-i18n="storyboardHint"></p><p class="hint" data-i18n="anchorHint"></p>
         <p id="review-empty" class="empty-review hint" hidden></p>
+        <nav id="frame-navigation" class="frame-navigation" data-i18n-aria="frameNavigation" hidden>
+          <button id="frame-previous" type="button" class="button secondary" data-i18n="previousFrame"></button>
+          <span id="frame-position" class="hint" aria-live="polite"></span>
+          <button id="frame-next" type="button" class="button secondary" data-i18n="nextFrame"></button>
+        </nav>
         <div id="storyboard-cards" class="storyboard-grid"></div>
-        <nav class="review-pagination" data-i18n-aria="reviewPagination"><button id="page-previous" type="button" class="button secondary" data-i18n="previousPage"></button><span id="page-label" class="hint" aria-live="polite"></span><button id="page-next" type="button" class="button secondary" data-i18n="nextPage"></button></nav>
+        {{ pagination("page", "reviewPagination", "page-label") }}
       </div>
       <div id="script-section" hidden><p class="hint" data-i18n="scriptReviewHint"></p><div id="script-plan"></div></div>
       <p id="video-stale" class="notice warning" data-i18n="videoStale" hidden></p>
@@ -41,7 +53,7 @@
       <div class="section-heading"><div><h2 data-i18n="segmentsTitle"></h2><p class="hint" data-i18n="segmentsHint"></p></div><span id="segments-summary" class="hint" aria-live="polite"></span></div>
       <p id="assembly-notice" class="notice warning" hidden></p>
       <div id="segment-cards" class="segment-grid"></div>
-      <nav class="review-pagination" data-i18n-aria="segmentPagination"><button id="segments-previous" type="button" class="button secondary" data-i18n="previousPage"></button><span id="segments-page-label" class="hint" aria-live="polite"></span><button id="segments-next" type="button" class="button secondary" data-i18n="nextPage"></button></nav>
+      {{ pagination("segments", "segmentPagination", "segments-page-label") }}
       <div class="continue-section"><button id="assemble-job" type="button" class="button primary" data-i18n="assembleVideo" disabled></button><p id="assembly-hint" class="hint"></p></div>
     </section>
     <section id="final-video-section" class="result-video panel" hidden><div class="section-heading"><h2 data-i18n="finalVideoTitle"></h2><span id="final-video-version" class="hint"></span></div><div id="final-video" class="artifact video"></div><div class="segment-actions"><a id="download-final-video" class="button secondary" hidden></a></div></section>
