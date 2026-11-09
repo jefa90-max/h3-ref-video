@@ -47,23 +47,23 @@ class SubmissionRetry(unittest.TestCase):
     def reject_after_limit(self, path, body):
         self.attempts += 1
         self.assertLessEqual(self.attempts, 5, "submission kept retrying beyond its limit")
-        return {"code": 421, "msg": "TASK_QUEUE_MAXED", "data": None}
+        return {"code": 415, "msg": "TASK_INSTANCE_MAXED", "data": None}
 
-    def test_film_stops_after_five_rejections_and_records_each_reason(self):
+    def test_film_stops_after_five_machine_rejections_and_records_each_reason(self):
         self.attempts = 0
         with patch.object(rh, "_post", side_effect=self.reject_after_limit):
-            with self.assertRaisesRegex(RuntimeError, "5.*421.*TASK_QUEUE_MAXED"):
+            with self.assertRaisesRegex(RuntimeError, "5.*415.*TASK_INSTANCE_MAXED"):
                 self.generate()
         log = (self.job.dir / "run.log").read_text()
         for attempt in range(1, 6):
             self.assertIn(f"{attempt}/5", log)
-        self.assertEqual(log.count("TASK_QUEUE_MAXED"), 5)
+        self.assertEqual(log.count("TASK_INSTANCE_MAXED"), 5)
         self.assertIn("seg1", log)
         self.assertEqual([call.args for call in self.sleep.call_args_list], [(60,)] * 4)
         self.assertNotIn("task", self.job.state["segs"]["0"])
         self.assertEqual(self.frame.read_bytes(), b"existing approved frame")
 
-    def test_single_clip_uses_the_same_retry_limit(self):
+    def test_single_clip_uses_the_same_machine_retry_limit(self):
         self.attempts = 0
         (self.job.dir / "state.json").write_text(json.dumps({"h3": "saved H3 prompt"}))
         prompt = self.job.dir / "input.txt"
@@ -71,7 +71,7 @@ class SubmissionRetry(unittest.TestCase):
         args = SimpleNamespace(out=str(self.job.dir), image=[str(self.frame)], prompt=str(prompt),
                                seed=7, seconds=5, aspect="9:16", check=False)
         with patch.object(rh, "_post", side_effect=self.reject_after_limit):
-            with self.assertRaisesRegex(RuntimeError, "5.*421.*TASK_QUEUE_MAXED"):
+            with self.assertRaisesRegex(RuntimeError, "5.*415.*TASK_INSTANCE_MAXED"):
                 CLI.cmd_one(args)
         self.assertIn("1/5", self.output.getvalue())
         self.assertEqual(self.sleep.call_count, 4)
