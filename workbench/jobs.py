@@ -138,20 +138,24 @@ class Jobs:
             raise InputError("not_found", value=identifier)
         return self.records[identifier]
 
-    def artifacts(self, record):
+    def artifacts(self, record, context=None):
         out = Path(record["output_dir"])
         result = []
+        from . import segments
+        context = context or segments.read_context({"output_dir": str(out)})
         # Deliberately exclude internal state / input copies and arbitrary files in the output folder.
         files = [out / name for name in ("film.mp4", "clip.mp4", "report.md", "plan.json", "prompt.h3.txt")]
         for folder in ("frames", "clips", "prompts"):
             files.extend(sorted((out / folder).glob("*")))
+        files.extend(out / name for name in context["pending"].get("files", {}) if out / name not in files)
         for path in files:
-            if not path.is_file() or not path.resolve().is_relative_to(out) or path.suffix.lower() not in ARTIFACT_TYPES:
+            source = segments.visible_file(out, path.relative_to(out).as_posix(), context)
+            if not source or path.suffix.lower() not in ARTIFACT_TYPES:
                 continue
             name = path.relative_to(out).as_posix()
             result.append({"name": name, "path": str(path), "kind": ARTIFACT_TYPES[path.suffix.lower()],
                            "role": "final" if name in ("film.mp4", "clip.mp4") else None,
-                           "url": f"/api/jobs/{record['id']}/files/{quote(name)}?v={path.stat().st_mtime_ns}"})
+                           "url": f"/api/jobs/{record['id']}/files/{quote(name)}?v={source.stat().st_mtime_ns}"})
         return result
 
     def snapshot(self, identifier, full=True):
@@ -160,7 +164,9 @@ class Jobs:
             result = {k: v for k, v in record.items() if k not in ("pid", "lang")}
             if not full:
                 return result
-            artifacts = self.artifacts(record)
+            from . import segments
+            context = segments.read_context({"output_dir": record["output_dir"]})
+            artifacts = self.artifacts(record, context)
             log = self.storage / "jobs" / f"{identifier}.log"
             if log.exists():
                 with log.open("rb") as stream:
@@ -194,8 +200,8 @@ class Jobs:
                 result["review_needed"] = result["can_continue"]
                 from . import segments
                 editable = record["status"] == "succeeded" and result["review"]["complete"] and not result["pending_video"]
-                result["segments"] = segments.view(saved, artifacts, editable)
-                result["assembly"] = segments.assembly_status(saved)
+                result["segments"] = segments.view(saved, artifacts, editable, context=context)
+                result["assembly"] = segments.assembly_status(saved, context=context)
                 result["pending_assembly"] = result["assembly"]["pending"]
                 result["can_assemble"] = editable and result["assembly"]["ready"]
             return result

@@ -71,5 +71,6 @@
   "assembly_changed": "视频片段版本已变化，请刷新后重新发起拼接。",
   "assembly_done": "完整视频已重新拼接：{path}",
   "frame_prompt_unchanged": "这张分镜图内容审核未通过。请先手工修改提示词，再点击重新生成。",
-  "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。"
+  "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。",
+  "segment_publishing": "第 {number} 段发布未提交，请先续跑完成发布；此步骤不会再次生成。"
 }

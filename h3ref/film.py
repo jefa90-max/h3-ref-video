@@ -475,6 +475,10 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     if not job.state.get("film_path"):
         raise SystemExit("新任务要给 --film")
     mode = job.state.get("mode", mode)
+    pending_path = job.dir / "inputs" / "segment-edit.json"
+    pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
+    if pending.get("publishing") and not pending.get("applied"):
+        raise RuntimeError(message("segment_publication_pending", path=pending_path))
     film = load(Path(job.state["film_path"]))
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}

@@ -266,13 +266,17 @@ def create_app(storage=None, env_path=None):
 
     @app.get("/api/jobs/<identifier>/files/<path:name>")
     def artifact(identifier, name):
+        from . import segments
         with jobs.lock:
-            matches = [a for a in jobs.artifacts(jobs.find(identifier)) if a["name"] == name]
-        if not matches:
-            raise InputError("not_found", value=name)
-        artifact = matches[0]
-        if artifact["kind"] in ("report", "file"):
-            return app.response_class(jobs.redact(Path(artifact["path"]).read_text(encoding="utf-8")), mimetype="text/plain")
-        return send_file(artifact["path"], conditional=True, as_attachment=request.args.get("download") == "1")
+            record = jobs.find(identifier)
+            out = Path(record['output_dir'])
+            context = segments.read_context({'output_dir': str(out)})
+            matches = [a for a in jobs.artifacts(record, context) if a['name'] == name]
+            source = segments.visible_file(out, name, context, request.args.get('v')) if matches else None
+        if not source:
+            raise InputError('not_found', value=name)
+        if matches[0]['kind'] in ('report', 'file'):
+            return app.response_class(jobs.redact(source.read_text(encoding='utf-8')), mimetype='text/plain')
+        return send_file(source, conditional=True, as_attachment=request.args.get('download') == '1')
 
     return app

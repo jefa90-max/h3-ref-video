@@ -71,5 +71,6 @@
   "assembly_changed": "Video segment versions changed. Refresh before starting a new assembly.",
   "assembly_done": "Full video reassembled: {path}",
   "frame_prompt_unchanged": "This frame failed content review. Edit its prompt before manually regenerating it.",
-  "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video."
+  "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video.",
+  "segment_publishing": "Segment {number} publication is uncommitted. Resume publication first; this does not generate again."
 }

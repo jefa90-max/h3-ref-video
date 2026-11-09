@@ -19,25 +19,57 @@ def clip_version(path, out):
     return f"{stat.st_mtime_ns}:{stat.st_size}" if stat.st_size else None
 
 
-def clip_paths(request):
-    out = Path(request["output_dir"])
-    return [out / "clips" / f"seg{s['idx'] + 1}.mp4" for s in film.plan(request["film"]["shots"])]
+def read_context(request):
+    """One immutable read context per snapshot, including an interrupted publication."""
+    out = Path(request['output_dir'])
+    state = read_json(out / 'state.json', {'frames': {}, 'segs': {}})
+    pending = read_json(out / 'inputs' / 'segment-edit.json', {})
+    records = dict(state.get('segs', {}))
+    if pending.get('publishing') and not pending.get('applied'):
+        records[str(pending['number'] - 1)] = pending['previous']
+    return {'state': state, 'records': records, 'pending': pending, 'automatic': {}, 'path_versions': {}}
 
 
-def assembly_status(request):
-    out = Path(request["output_dir"])
-    paths = clip_paths(request)
+def visible_file(out, name, context, version=None):
+    target = out / name
+    entry = context['pending'].get('files', {}).get(name)
+    pending = context['pending']
+    source = Path(entry['previous']) if entry and entry.get('previous') and pending.get('publishing') and not pending.get('applied') else target
+    if entry and pending.get('publishing') and not pending.get('applied') and not entry.get('previous'):
+        return None
+    def matches(path):
+        token = clip_version(path, out)
+        return token and (version is None or str(version) in (token, token.split(':')[0]))
+    if matches(source):
+        return source
+    if version is not None and entry and entry.get('previous'):
+        backup = Path(entry['previous'])
+        if matches(backup):
+            return backup
+    return None
+
+
+def clip_paths(request, context=None):
+    out = Path(request['output_dir'])
+    context = context or read_context(request)
+    return [visible_file(out, f"clips/seg{s['idx'] + 1}.mp4", context) or out / f"clips/seg{s['idx'] + 1}.mp4"
+            for s in film.plan(request['film']['shots'])]
+
+
+def assembly_status(request, context=None):
+    out = Path(request['output_dir'])
+    paths = clip_paths(request, context)
     versions = [clip_version(path, out) for path in paths]
     version = hashlib.sha256(json.dumps(versions).encode()).hexdigest()
     ready = bool(paths) and all(versions)
-    saved = read_json(out / "inputs" / "assembly.json", {})
-    final = out / "film.mp4"
+    saved = read_json(out / 'inputs' / 'assembly.json', {})
+    final = out / 'film.mp4'
     if saved:
-        pending = saved.get("version") != version or not clip_version(final, out)
+        pending = saved.get('version') != version or not clip_version(final, out)
     else:
         pending = any(versions) and (not clip_version(final, out) or any(
             path.stat().st_mtime_ns > final.stat().st_mtime_ns for path in paths if clip_version(path, out)))
-    return {"version": version, "ready": bool(ready), "pending": bool(pending)}
+    return {'version': version, 'ready': bool(ready), 'pending': bool(pending)}
 
 
 def record_assembly(request):
@@ -47,16 +79,17 @@ def record_assembly(request):
         write_json(out / "inputs" / "assembly.json", {"version": summary["version"]})
 
 
-def view(request, artifacts, editable):
+def view(request, artifacts, editable, *, context=None):
     out = Path(request["output_dir"])
     urls = {a["path"]: a["url"] for a in artifacts if a["kind"] == "video"}
     planned = film.plan(request["film"]["shots"])
-    records = read_json(out / "state.json", {}).get("segs", {})
+    context = context or read_context(request)
+    records = context["records"]
     cards = []
     for segment in planned:
         number = segment["idx"] + 1
         path = out / "clips" / f"seg{number}.mp4"
-        version = clip_version(path, out)
+        version = clip_version(visible_file(out, f"clips/seg{number}.mp4", context) or path, out)
         cards.append({"number": number, "start": segment["start"], "end": segment["end"],
                       "seconds": segment["seconds"], "shots": len(segment["shots"]),
                       "url": urls.get(str(path)) if version else None, "version": version,
@@ -159,15 +192,26 @@ def regenerate(request):
             raise InputError("segment_media", path=str(candidate))
         pending["generated"] = True
         write_json(pending_path, pending)
-    for path in (target, tail):
-        backup = staged.dir / f"previous-{path.name}"
-        if path.is_file() and not backup.exists():
-            publish_file(path, backup)
-    write_json(staged.dir / "previous.json", pending["previous"])
-    pending["publishing"] = True
-    write_json(pending_path, pending)
-    publish_file(candidate, target)
-    publish_file(candidate_tail, tail)
+    group = [(candidate, target), (candidate_tail, tail)]
+    for suffix in ('zh', 'h3'):
+        prompt = staged.dir / 'prompts' / f'seg{number}.{suffix}.txt'
+        if prompt.is_file():
+            group.append((prompt, out / 'prompts' / prompt.name))
+    if not pending.get('publishing'):
+        files = {}
+        for source, path in group:
+            backup = staged.dir / f'previous-{path.name}'
+            if path.is_file():
+                publish_file(path, backup)
+            files[path.relative_to(out).as_posix()] = {'previous': str(backup) if path.is_file() else None,
+                                                       'previous_version': clip_version(backup, out),
+                                                       'next': str(source), 'next_version': clip_version(source, out)}
+        write_json(staged.dir / 'previous.json', pending['previous'])
+        pending.update(publishing=True, files=files)
+        write_json(pending_path, pending)
+    for source, path in group:
+        path.parent.mkdir(exist_ok=True)
+        publish_file(source, path)
     active = film.Job(out)
     active.state["segs"][index] = {**staged.state["segs"][index], "file": str(target), "revision": pending["revision"]}
     active.save()
@@ -176,7 +220,14 @@ def regenerate(request):
     print(message("segment_done", request["lang"], number=number), flush=True)
 
 
+def require_committed_publication(request):
+    pending = read_context(request)['pending']
+    if pending.get('publishing') and not pending.get('applied'):
+        raise InputError('segment_publishing', number=pending['number'])
+
+
 def prepare_assembly(request, version):
+    require_committed_publication(request)
     summary = assembly_status(request)
     if not summary["ready"]:
         raise InputError("assembly_missing")
@@ -187,6 +238,7 @@ def prepare_assembly(request, version):
 
 
 def assemble(request):
+    require_committed_publication(request)
     out = Path(request["output_dir"])
     pending_path = out / "inputs" / "assembly-edit.json"
     pending = read_json(pending_path, {})
