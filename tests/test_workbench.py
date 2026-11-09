@@ -29,6 +29,11 @@ N/A"""
 
 
 class CliParity(unittest.TestCase):
+    def test_paused_forced_check_does_not_require_a_vision_key(self):
+        request = {"kind": "one", "demo": False, "prompt": ENGLISH_H3, "check": True}
+        with patch("shutil.which", return_value="/fake/ffmpeg"):
+            preflight(request, {"RUNNINGHUB_API_KEY": "fake-rh"})
+
     def test_english_six_sections_need_no_vision_or_rewrite_key(self):
         request = {"kind": "one", "demo": False, "prompt": ENGLISH_H3}
         with patch("shutil.which", return_value="/fake/ffmpeg"):
@@ -73,6 +78,38 @@ class CliParity(unittest.TestCase):
 
 
 class ReviewState(unittest.TestCase):
+    def test_interrupted_frame_backup_retains_complete_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            (out / "inputs").mkdir()
+            (out / "frames").mkdir()
+            script = {"aspect": "9:16", "shots": [{"start": 0, "end": 5, "action": "A ball rolls."}]}
+            (out / "inputs" / "demo-film.json").write_text(json.dumps(script))
+            target = out / "frames" / "s1-1.png"
+            Image.new("RGB", (8, 8), "red").save(target)
+            original = target.read_bytes()
+            request = {"kind": "film", "demo": True, "frames": "shot", "operation": "frame",
+                       "output_dir": str(out), "lang": "en"}
+            pending = {"key": "s1-1", "prompt": "new light", "revision": "review",
+                       "previous": {"cny": 0.2}, "task": None}
+            (out / "inputs" / "frame-edit.json").write_text(json.dumps(pending))
+
+            def interrupted_copy(source, destination):
+                Path(destination).write_bytes(original[:10])
+                raise OSError("backup interrupted")
+
+            with patch.object(storyboard.shutil, "copy2", side_effect=interrupted_copy):
+                with self.assertRaisesRegex(OSError, "backup interrupted"):
+                    storyboard.regenerate(request)
+            self.assertEqual(target.read_bytes(), original)
+            # A previous version may have left its partial copy at the final backup path.
+            (out / "inputs" / "previous-frame-review.png").write_bytes(original[:10])
+            storyboard.regenerate(request)
+            self.assertEqual((out / "inputs" / "previous-frame-review.png").read_bytes(), original)
+            self.assertNotEqual(target.read_bytes(), original)
+            storyboard.regenerate(request)
+            self.assertAlmostEqual(storyboard.frame_records(request)["s1-1"]["cny"], 0.2)
+
     def test_finished_outputs_remain_viewable_when_source_image_is_missing(self):
         with tempfile.TemporaryDirectory() as temp:
             out = Path(temp).resolve()

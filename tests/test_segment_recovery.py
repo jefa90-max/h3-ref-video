@@ -91,6 +91,31 @@ class SegmentRecovery(unittest.TestCase):
         attempt = next((self.out / 'inputs').glob('segment-*/state.json'))
         self.assertEqual(json.loads(attempt.read_text())['segs']['0']['task'], 'accepted-task')
 
+    def test_interrupted_queue_backoff_allows_submission_on_resume(self):
+        self.prepare_clip(live=True)
+        responses = [{'code': 421, 'msg': 'QUEUE_MAXED'}, {'code': 0, 'data': {'taskId': 'accepted-after-resume'}}]
+        with patch.object(rh, '_post', side_effect=responses) as submitted, patch.object(rh, 'poll', side_effect=RuntimeError('poll reached')):
+            with patch.object(rh.time, 'sleep', side_effect=InterruptedError('backoff interrupted')):
+                with self.assertRaisesRegex(InterruptedError, 'backoff interrupted'):
+                    segments.regenerate(self.request)
+            self.assertEqual(self.clip.read_bytes(), b'ORIGINAL COMPLETE CLIP')
+            with self.assertRaisesRegex(RuntimeError, 'poll reached'):
+                segments.regenerate(self.request)
+        self.assertEqual(submitted.call_count, 2)
+        attempt = next((self.out / 'inputs').glob('segment-*/state.json'))
+        self.assertEqual(json.loads(attempt.read_text())['segs']['0']['task'], 'accepted-after-resume')
+
+    def test_queue_retry_rearms_unknown_marker_before_ambiguous_submission(self):
+        self.prepare_clip(live=True)
+        responses = [{'code': 421, 'msg': 'QUEUE_MAXED'}, RuntimeError('response lost')]
+        with patch.object(rh, '_post', side_effect=responses) as submitted, patch.object(rh.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'response lost'):
+                segments.regenerate(self.request)
+            with self.assertRaises(RuntimeError):
+                segments.regenerate(self.request)
+        self.assertEqual(submitted.call_count, 2, 'Resume must not repeat the ambiguous second submission')
+        self.assertEqual(self.clip.read_bytes(), b'ORIGINAL COMPLETE CLIP')
+
     def test_preparing_a_retry_does_not_mark_a_stale_legacy_film_current(self):
         os.utime(self.final, ns=(1_000_000_000, 1_000_000_000))
         os.utime(self.clip, ns=(2_000_000_000, 2_000_000_000))

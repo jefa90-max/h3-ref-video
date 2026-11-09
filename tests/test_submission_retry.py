@@ -76,6 +76,23 @@ class SubmissionRetry(unittest.TestCase):
         self.assertIn("1/5", self.output.getvalue())
         self.assertEqual(self.sleep.call_count, 4)
 
+    def test_single_clip_skips_vision_while_paused_even_with_force_check(self):
+        prompt = self.job.dir / "input.txt"
+        prompt.write_text("original prompt")
+        for forced in (False, True):
+            with self.subTest(check=forced):
+                self.job.file.write_text(json.dumps({"h3": "cached prompt with 中文对白", "task": "saved-task"}))
+                args = SimpleNamespace(out=str(self.job.dir), image=[str(self.frame)], prompt=str(prompt),
+                                       seed=7, seconds=5, aspect="9:16", check=forced)
+                with patch.object(rh, "poll", return_value={"state": "done", "url": "fake://clip", "cny": 0.1}), \
+                     patch.object(CLI.http, "download", side_effect=lambda url, path: path.write_bytes(b"video")), \
+                     patch.object(CLI.media, "duration", return_value=5), \
+                     patch.object(CLI.check, "subtitles", return_value={"checked": True}) as inspect:
+                    CLI.cmd_one(args)
+                inspect.assert_not_called()
+                self.assertEqual((self.job.dir / "clip.mp4").read_bytes(), b"video")
+                self.assertNotIn("subtitles", json.loads(self.job.file.read_text()))
+
     def test_temporary_rejection_resumes_saved_assets_and_saves_task_before_poll(self):
         responses = iter([{"code": 415, "msg": "TASK_INSTANCE_MAXED", "data": None},
                           {"code": 0, "msg": "success", "data": {"taskId": "accepted-task"}}])
@@ -136,6 +153,8 @@ class SubmissionRetry(unittest.TestCase):
 
     def test_submission_error_uses_the_task_language(self):
         for lang, phrase in [("en", "RunningHub submission failed"), ("zh-CN", "RunningHub 提交失败")]:
+            # Each language exercises a fresh submission, not an ambiguous retry.
+            self.job.put("segs", "0", submission_unknown=False)
             with self.subTest(lang=lang), patch.dict(os.environ, {"H3_LANG": lang}), \
                     patch.object(rh, "_post", side_effect=RuntimeError("connection timed out")):
                 self.output.seek(0)
