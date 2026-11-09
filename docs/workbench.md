@@ -95,3 +95,60 @@ RunningHub 视频生成或单段重生成已保存云端任务号时，续跑继
 规划顺序执行，每镜落盘后立即并行画图；规划总等待为未命中请求之和，600 秒为单次超时，不保证大型剧本首张立即完成。单镜失败不妨碍其它镜头，CLI 以 FRAME_BATCH_INCOMPLETE 非零退出并指明 state.json；在工作台手改失败图再生成即可，文字请求可能已收费。
 
 旧图片、三字段缓存、已接单及提交未知任务沿用原记录，不自动迁移或重新付费。手改图片文字或参考顺序／文件版本后保留原 composition 追溯，但失配状态不再进入视频或后续规划；人工同时核对后续镜头。九图上限内仍使用现有裁减策略，超出容量的镜头沿用原视频文字，不额外画图。没有自动视觉验收；离线测试不能证明真实图像连续性。
+
+## 视频片段提示词
+
+在「视频片段」卡片展开「查看或编辑此段提示词」。默认编辑源词；可明确切到实际 H3 六段式。切换不会自动翻译或转换，两种格式各保留一份草稿。H3-only 旧任务默认 H3，切回源词使用当前自动编译结果作为新草稿，旧源词不会与手改 H3 冒充配对。
+
+编辑、展开、查看当前视频提示词、切页、切 Tab、语言切换和轮询均不调用模型。按「仅重新生成这一段」才提交所选格式；源词变化或参考来源变化可能先产生文字改写费用，再产生视频费用；原词且配对缓存有效或直接 H3 只需目标段视频费用。离线演示不请求模型、不伪造实际 H3 输出。新片成功前旧片和旧成片仍可播放，成功后仍须手动拼接。
+
+编辑框优先保留上次失败尝试的文字；「当前视频使用的提示词」另行显示生效的源词/H3，失败文字不代表旧视频所用文字。每段、每种格式的草稿跨轮询、分页、Tab 与语言切换保留；刷新页面会丢弃未提交的内存草稿，请自行复制重要草稿。后台或另一标签页更新版本后，保留草稿并禁止覆盖；复核当前生效词，再明确点击「以当前版本使用此草稿」。提交成功只清理匹配 revision、文字和格式且未继续修改的那一份。
+
+参考清单只读，按**本次重生成**的真实上传顺序编号。九图裁减会明确提示省略总表或后部镜头；旧视频若没保存历史顺序，不将此清单声称为历史输入。分镜或参考素材变化后，手改视频词仍保留并提示复核；原审图门禁、dirty_segments 和任务互斥继续生效。
+
+<a id="video-prompt-errors"></a>
+## 视频提示词错误与恢复
+
+| 当前尝试 | 可用动作 | 费用与已有成果 |
+| --- | --- | --- |
+| 未改写的 source | 核对配置后继续，或修词新建尝试 | 需要文字 key；已经完成的文字请求可能收费 |
+| 已保存 H3、视频尚未接单 | 恢复相同尝试 | 复用改写缓存；明确拒单仍沿原有限重试策略 |
+| 已有未决 task | 全局「续跑」恢复原 task | 不重新上传、改写或提交；禁止用新词覆盖 |
+| submission_unknown 且无 task | 在供应商后台核对，恢复原任务号 | 禁止重复生成；响应丢失可能已收费 |
+| 明确终态失败 | 修词后点击卡片「用当前提示词再次生成此段」 | 创建新 revision，产生新费用；全局续跑不会自动再付费 |
+| 发布中断 | 续跑完成发布 | 只发布本次已生成文件，不再改写／上传／提交 |
+| 发布成功、成片待更新 | 手动重新拼接 | 不调用生成模型；旧成片在拼接成功前保留 |
+
+视频、尾帧、本段 `.zh.txt`/`.h3.txt` 和 active 记录以 `segment-edit.json` 的 `applied` 为共同可见提交点。发布前读取旧组，提交后读取新组；旧媒体 URL 带 `v` 时只返回对应字节，无法匹配则 404，不默默换成新版。未提交发布期间禁止拼接或 CLI pipeline 消费混版根文件，先在工作台续跑发布。
+
+扩展接口仍是 `POST /api/jobs/<id>/segments/<number>/regenerate`。新客户端提交 `version`、`prompt_version`、`prompt`、`prompt_format`；前两项来自开始编辑时的 GET 快照。旧 `{version}` 请求仍可在有视频、有有效提示词且没有未决尝试时沿用换种子行为。无视频的终态失败项使用新版本契约修复。
+
+以下仅示范协议，**真实 POST 会生成并计费**；本次开发未执行这些付费请求。将示例版本替换为 GET 中相应段的版本，不要覆盖已编辑草稿的基线。
+
+源词示例：
+
+```bash
+curl -H 'X-Workbench: 1' -H 'Accept-Language: zh-CN' \
+  'http://127.0.0.1:8765/api/jobs/JOB_ID'
+# 读取 segments[1].version 和 segments[1].prompt_version，然后使用源词：
+curl -X POST -H 'X-Workbench: 1' -H 'Accept-Language: zh-CN' \
+  -H 'Content-Type: application/json' \
+  'http://127.0.0.1:8765/api/jobs/JOB_ID/segments/2/regenerate' \
+  --data '{"version":"GET中的视频版本","prompt_version":"开始编辑时的提示词版本","prompt":"按当前机位，接收者跪地侧身托袋。","prompt_format":"source"}'
+```
+
+直接 H3 示例（不需要文字改写 key，仍需视频 key；每个 Picture 引用必须匹配本次实际参考数）：
+
+```bash
+curl -H 'X-Workbench: 1' -H 'Accept-Language: en' \
+  'http://127.0.0.1:8765/api/jobs/JOB_ID'
+# 重新读取相应段版本；此示例没有 Picture 引用，实际脚本应保留自己的全部镜头和台词：
+curl -X POST -H 'X-Workbench: 1' -H 'Accept-Language: en' \
+  -H 'Content-Type: application/json' \
+  'http://127.0.0.1:8765/api/jobs/JOB_ID/segments/2/regenerate' \
+  --data '{"version":"CLIP_VERSION_FROM_GET","prompt_version":"PROMPT_VERSION_AT_EDIT_START","prompt":"subject_definitions:\n<Subject 1> The recipient.\n\nsummary:\nA careful handover.\n\nretention_analysis:\nThe recipient keeps the same clothing.\n\ndetailed_description:\n[Shot 1] The recipient kneels beside the counter and supports the upright bag.\n\noverall_soundscape:\nFabric rustles.\n\nnon_diegetic_music:\nN/A","prompt_format":"h3"}'
+```
+
+校验与冲突沿用 HTTP 400，任务不存在 404，意外本地异常 500。此 POST 返回 `application/problem+json`：`type=urn:workbench:error:<code>`、`title/status/detail/code/doc_anchor`，字段问题带 `field`，意外异常带 `instance` 关联本地脱敏日志；兼容保留 `error=detail`。异步改写／生成失败保存在对应片段 `error/attempt_error`，包含阶段、revision、恢复动作和费用副作用，不将 POST 接收成功当作视频已成功。
+
+升级前先停下正在运行的任务并备份任务输出目录（尤其 `state.json`、`inputs/`、`clips/`、`prompts/`）。旧任务不会自动迁移或重新规划。Python 和语言 JSON 已修改，**请自行重启工作台**后体验；本次没有启动或重启服务。

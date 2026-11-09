@@ -202,6 +202,9 @@ class Jobs:
                 from . import segments
                 editable = segments.can_edit_segments(saved, record["status"], context) and result["review"]["complete"] and not result["pending_video"]
                 result["segments"] = segments.view(saved, artifacts, editable, context=context)
+                result["segment_number"] = saved.get("segment") if saved.get("operation") == "segment" else None
+                targets = [card for card in result["segments"] if result["segment_number"] is None or card["number"] == result["segment_number"]]
+                result["can_resume_video"] = not any(card["submission_unknown"] or card["terminal_failed"] for card in targets)
                 result["assembly"] = segments.assembly_status(saved, context=context)
                 result["pending_assembly"] = result["assembly"]["pending"]
                 result["can_assemble"] = record["status"] == "succeeded" and editable and result["assembly"]["ready"]

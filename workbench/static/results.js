@@ -8,6 +8,7 @@ Object.assign(state, {
   storyboardSignature: "", planSignature: "", linksSignature: "", videoSignature: "",
   player: null, pollTimer: null, jobRevision: 0,
   resultTab: null, lastVideoOperation: null, segmentPage: 1, segmentPageSize: 6, segmentCards: new Map(),
+  segmentDrafts: new Map(), expandedSegments: new Set(), segmentSubmissions: new Map(), segmentJobId: null,
 });
 
 function canGenerateVideo(job) {
@@ -20,12 +21,13 @@ function renderResultActions() {
   const job = state.selectedJob;
   if (!job) return;
   const locked = state.submitting || running(job);
-  $("resume-job").disabled = locked;
+  $("resume-job").disabled = locked || job.can_resume_video === false;
   $("continue-job").disabled = locked || !canGenerateVideo(job);
   $("assemble-job").disabled = locked || !job.can_assemble;
   document.querySelectorAll(".regenerate-segment").forEach((button) => {
     button.disabled = locked || button.dataset.enabled !== "true";
   });
+  document.querySelectorAll(".segment-control").forEach((control) => { if (control.dataset.composing !== "true") control.disabled = locked || control.dataset.enabled !== "true"; });
   document.querySelectorAll(".regenerate-frame").forEach((button) => {
     button.disabled = locked || button.dataset.enabled !== "true";
   });
@@ -260,6 +262,8 @@ function renderJob(job) {
   $("resume-job").hidden = !failed && !job.can_resume_frames;
   $("resume-job").textContent = t(job.can_resume_frames ? "resumeFrames" : "resumeJob");
   $("resume-hint").hidden = !failed && !job.can_resume_frames;
+  const blockedSegment = (job.segments || []).find(segment => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || segment.terminal_failed));
+  $("resume-hint").textContent = t(job.can_resume_video === false && blockedSegment ? (blockedSegment.submission_unknown ? "segmentSubmissionUnknown" : "segmentTerminalFailed") : "resumeHint");
   $("review-section").hidden = job.kind !== "film";
   $("review-progress").textContent = t(review.kind === "script" ? "scriptPlanForReview" : "reviewSummary", { total: review.total || 0 });
   $("review-badge").textContent = t(review.complete ? "reviewComplete" : "reviewPending");
@@ -316,14 +320,16 @@ async function runJobAction(url, payload) {
   state.submitting = true;
   clearNotices();
   renderResultActions();
-  let failed = false;
+  let failed = false, accepted = null;
   try {
     state.selectedJob = await post(url, payload);
+    accepted = state.selectedJob;
     renderJob(state.selectedJob);
     if (running(state.selectedJob)) schedulePoll();
   } catch (error) { failed = true; showError(error); }
   finally { state.submitting = false; renderResultActions(); }
   if (failed) await refreshJob();
+  return accepted;
 }
 
 initializePagination("page", (page) => {
