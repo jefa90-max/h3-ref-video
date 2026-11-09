@@ -168,3 +168,16 @@ for (const language of ['zh-CN','en']) {
     h.job.id='job-2';h.render();assert.equal(h.state.segmentDrafts.size,0);assert.equal(h.state.expandedSegments.size,0);assert.equal(h.state.segmentSubmissions.size,0);
   });
 }
+
+for (const language of ['zh-CN','en']) {
+  test(`reference-driven rewrite cost and pipeline resume use server contract (${language})`, async () => {
+    const h=harness(language),c=await h.expand();
+    h.job.segments[1].source_rewrite_required=true;
+    h.job.can_resume_pipeline=true;h.job.can_resume_video=true;
+    h.context.renderJob(h.job);
+    assert.equal(c.cost.textContent,h.state.messages.segmentSourceCost);
+    assert.equal(h.select('resume-job').hidden,false);
+    h.job.segments[1].source_rewrite_required=false;h.job.segments[1].source_changed=true;h.context.renderJob(h.job);
+    assert.equal(c.cost.textContent,h.state.messages.segmentVideoCost);
+  });
+}

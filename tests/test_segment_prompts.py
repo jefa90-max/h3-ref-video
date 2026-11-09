@@ -416,3 +416,144 @@ class SegmentPrompts(unittest.TestCase):
         self.jobs.find(self.identifier)['status']='succeeded'
         self.assertFalse(self.client.get('/api/jobs/job-1').json['pending_assembly'])
         for n in (1,3):self.assertEqual((self.out/f'clips/seg{n}.mp4').read_bytes(),others[n])
+
+    def test_final_review_repaired_segment_keeps_original_pipeline_recoverable(self):
+        for mode in ('shot','first','none'):
+            with self.subTest(mode=mode):
+                case=SegmentPrompts();case.setUp();self.addCleanup(case.doCleanups)
+                case.request['frames']=mode
+                from PIL import Image
+                Image.new('RGB',(8,8),'blue').save(case.script['cast'][0]['picture'])
+                (case.out/'frames').mkdir()
+                for i in range(3):(case.out/f'frames/s{i+1}-1.png').write_bytes(b'approved opening')
+                planned=film.plan(case.script['shots']);pics={s['idx']:film.refs(case.script,s,mode) for s in planned}
+                state=film.Job(case.out)
+                for i,seg in enumerate(planned):
+                    (case.out/f'clips/seg{i+1}.mp4').unlink();(case.out/f'clips/seg{i+1}-last.jpg').unlink()
+                    source=film.compile_prompt(case.script,seg,pics[i],3)
+                    state.state['segs'][str(i)]=dict(zh=source,h3=h3(),h3_source=source)
+                state.state['segs']['0'].update(terminal_failed=True,error='terminal',task='failed-first')
+                state.state['segs']['1'].update(task='accepted-second',error='poll lost')
+                state.save()
+                write_json(case.out/'inputs/request.json',case.request)
+                descriptions=storyboard.view(case.request,case.jobs.artifacts(case.jobs.find(case.identifier)),False)
+                review=storyboard.review_status(case.request,descriptions)
+                write_json(case.out/'inputs/review.json',dict(dirty_segments=[],confirmed_version=review['version']))
+                case.prepare(state.state['segs']['0']['zh'],number=1);case.generate()
+                write_json(case.out/'inputs/request.json',case.request)
+                case.jobs.find(case.identifier).update(status='succeeded',operation='segment')
+                snapshot=case.client.get('/api/jobs/job-1').json
+                self.assertTrue(snapshot.get('can_resume_pipeline'),'single repair must not strand accepted or unstarted segments')
+                with patch.object(case.jobs,'launch'),patch('workbench.jobs.preflight'):
+                    response=case.client.post('/api/jobs/job-1/resume',json={},headers=case.headers)
+                self.assertEqual(response.status_code,200,response.json)
+                request=json.loads((case.out/'inputs/request.json').read_text());self.assertEqual(request['operation'],'pipeline')
+                submitted=[];polled=[]
+                with patch.object(rh,'upload',return_value='ref'),patch.object(rh,'submit_with_retry',side_effect=lambda graph,**kw:submitted.append(graph) or 'new-third'),patch.object(rh,'poll',side_effect=lambda task:polled.append(task) or dict(state='done',url='offline://clip',cny=1)),patch.object(film.http,'download',side_effect=lambda url,path:path.write_bytes(b'recovered video')),patch.object(media,'last_frame',side_effect=lambda clip,path:path.write_bytes(b'recovered tail')),patch.object(media,'join',side_effect=lambda paths,path:path.write_bytes(b'film')),patch.object(media,'duration',return_value=24),patch.object(rewrite,'rewrite',side_effect=AssertionError('rewrote saved pipeline')):
+                    storyboard.run(request)
+                self.assertEqual(len(submitted),1)
+                self.assertEqual(sorted(polled),['accepted-second','new-third'])
+                case.jobs.find(case.identifier)['status']='succeeded'
+                self.assertTrue(all(card['url'] for card in case.client.get('/api/jobs/job-1').json['segments']))
+
+    def test_final_review_version_checked_path_cannot_change_bytes_before_open(self):
+        old=self.card();self.prepare();original=segments.visible_file;published=False
+        def race(out,name,context,version=None):
+            nonlocal published
+            source=original(out,name,context,version)
+            if name=='clips/seg2.mp4' and version is not None and not published:
+                published=True;self.generate()
+            return source
+        with patch.object(segments,'visible_file',side_effect=race),self.client.get(old['url'],headers={'Range':'bytes=0-2'}) as response:
+            self.assertEqual(response.status_code,206)
+            self.assertEqual(response.data,b'OLD')
+
+    def test_final_review_snapshot_retries_publication_that_started_after_context(self):
+        self.prepare();original=self.jobs.artifacts;published=False
+        def race(record,context=None):
+            nonlocal published
+            if not published:
+                published=True;self.generate()
+            return original(record,context)
+        with patch.object(self.jobs,'artifacts',side_effect=race):card=self.card()
+        with self.client.get(card['url']) as response:payload=response.data
+        self.assertIn((card['source_prompt'],payload),[('recipient stands',b'OLD CLIP 2'),('recipient kneels',b'NEW CLIP')])
+
+    def test_final_review_initial_upload_and_explicit_rejection_remain_editable(self):
+        for phase in ('upload','submit'):
+            with self.subTest(phase=phase):
+                case=SegmentPrompts();case.setUp();self.addCleanup(case.doCleanups)
+                (case.out/'clips/seg2.mp4').unlink()
+                job=film.Job(case.out);job.state['segs']['1']={key:value for key,value in job.state['segs']['1'].items() if key in ('zh','h3')};job.save()
+                seg=film.plan(case.script['shots'])[1];pics=film.refs(case.script,seg,'none')
+                with patch.object(rh,'upload',**({'side_effect':RuntimeError('upload failed')} if phase=='upload' else {'return_value':'uploaded'})),patch.object(rh,'submit_with_retry',side_effect=rh.SubmissionRejected('explicit rejection')):
+                    with self.assertRaises(RuntimeError):film.gen_segment(job,case.script,seg,pics)
+                record=film.Job(case.out).state['segs']['1']
+                self.assertTrue(record.get('error'),'initial attempted failures must be saved on the card')
+                case.jobs.find(case.identifier)['status']='failed'
+                self.assertTrue(case.card()['editable'])
+                case.prepare('corrected source')
+
+    def test_final_review_chain_first_completion_binds_actual_uploaded_sources(self):
+        for mode in ('first','none'):
+            with self.subTest(mode=mode):
+                case=SegmentPrompts();case.setUp();self.addCleanup(case.doCleanups)
+                case.request['frames']=mode;(case.out/'frames').mkdir()
+                for i in range(3):
+                    (case.out/f'frames/s{i+1}-1.png').write_bytes(b'opening')
+                    (case.out/f'clips/seg{i+1}.mp4').unlink();(case.out/f'clips/seg{i+1}-last.jpg').unlink()
+                job=film.Job(case.out);job.state['segs']={};job.save()
+                planned=film.plan(case.script['shots']);pics={s['idx']:film.refs(case.script,s,mode) for s in planned}
+                with patch.object(rewrite,'rewrite',return_value=h3()):film.stage_prompts(job,case.script,planned,pics)
+                with patch.object(rh,'upload',return_value='ref'),patch.object(rh,'submit_with_retry',return_value='accepted'),patch.object(rh,'poll',return_value=dict(state='done',url='offline://clip',cny=1)),patch.object(film.http,'download',side_effect=lambda url,path:path.write_bytes(b'clip')),patch.object(media,'last_frame',side_effect=lambda clip,path:path.write_bytes(b'tail')):
+                    film.stage_generate(job,case.script,planned,pics,mode)
+                write_json(case.out/'inputs/request.json',case.request)
+                card=case.card();source=film.Job(case.out).state['segs']['1']['zh']
+                preparation=segments.regeneration_plan(case.request,2,card['version'],prompt=source,prompt_format='source',prompt_version=card['prompt_version'])
+                self.assertTrue(preparation['reuse_h3'],'unchanged completed chain must not charge a new text rewrite')
+
+    def test_final_review_reference_changes_invalidate_prompt_version_and_cost_contract(self):
+        for mode in ('first','none'):
+            with self.subTest(mode=mode):
+                case=SegmentPrompts();case.setUp();self.addCleanup(case.doCleanups)
+                case.request['frames']=mode;write_json(case.out/'inputs/request.json',case.request)
+                (case.out/'frames').mkdir()
+                for i in range(3):(case.out/f'frames/s{i+1}-1.png').write_bytes(b'opening')
+                context=segments.read_context(case.request)
+                reference=segments.automatic_inputs(case.request,2,context)['reference_version']
+                film.Job(case.out).put('segs','1',h3_reference_version=reference,h3_source='recipient stands')
+                before=case.card()
+                self.assertFalse(before.get('source_rewrite_required',True))
+                (case.out/'clips/seg1-last.jpg').write_bytes(b'NEW PREVIOUS TAIL')
+                after=case.card()
+                self.assertNotEqual(before['prompt_version'],after['prompt_version'])
+                self.assertTrue(after['source_rewrite_required'])
+                with self.assertRaises(ValueError):
+                    segments.regeneration_plan(case.request,2,before['version'],prompt='recipient stands',prompt_format='source',prompt_version=before['prompt_version'])
+
+    def test_final_review_malformed_picture_tokens_rejected_before_pending(self):
+        for token in ('-1','1.5','abc','+1',''):
+            with self.subTest(token=token):
+                text=h3().replace('<Picture 1>',f'<Picture {token}>')
+                self.assertTrue(rewrite.problems(text,2))
+                with self.assertRaises(ValueError):self.prepare(text,'h3')
+                self.assertFalse((self.out/'inputs/segment-edit.json').exists())
+
+    def test_final_review_legacy_seed_change_does_not_create_or_rebind_override(self):
+        for override in (None,dict(format='source',text='recipient stands',source_version='original-reviewed-source')):
+            with self.subTest(override=override):
+                case=SegmentPrompts();case.setUp();self.addCleanup(case.doCleanups)
+                reference=segments.automatic_inputs(case.request,2,segments.read_context(case.request))['reference_version']
+                record=dict(h3_reference_version=reference,h3_source='recipient stands')
+                if override:record['prompt_override']=override
+                film.Job(case.out).put('segs','1',**record)
+                (case.out/'clips/seg1-last.jpg').write_bytes(b'changed tail after old page loaded')
+                card=case.card();case.request.update(operation='segment',segment=2)
+                case.request['segment_revision']=segments.prepare_regeneration(case.request,2,card['version'])
+                segments.preflight(case.request,{'RUNNINGHUB_API_KEY':'offline'})
+                mocks=case.generate();mocks[2].assert_not_called()
+                self.assertEqual(film.Job(case.out).state['segs']['1'].get('prompt_override'),override)
+
+    def test_final_review_unchanged_automatic_source_stays_automatic(self):
+        self.prepare('recipient stands');self.generate()
+        self.assertNotIn('prompt_override',film.Job(self.out).state['segs']['1'])
