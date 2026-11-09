@@ -380,3 +380,39 @@ class SegmentPrompts(unittest.TestCase):
         expected=[c['picture'] for c in self.script['cast']]+[str(self.out/f'frames/s1-{i+1}.png') for i in range(7)]
         self.assertEqual(actual,expected)
         self.assertTrue(self.card(1)['reference_history_known'])
+
+    def test_http_edit_fail_resume_publish_and_manual_assembly(self):
+        self.client.post('/api/config',json={'RUNNINGHUB_API_KEY':'offline-rh','LLM_API_KEY':'offline-text','persist':False},headers=self.headers)
+        before=self.card();others={n:(self.out/f'clips/seg{n}.mp4').read_bytes() for n in (1,3)}
+        with patch.object(self.jobs,'launch'):
+            response=self.client.post(self.url,json=dict(version=before['version'],prompt_version=before['prompt_version'],prompt='recipient kneels',prompt_format='source'),headers=self.headers)
+        self.assertEqual(response.status_code,200,response.json)
+        self.request=json.loads((self.out/'inputs/request.json').read_text())
+        with self.assertRaises(RuntimeError):self.generate(poll={'side_effect':RuntimeError('poll connection lost')})
+        self.jobs.find(self.identifier)['status']='failed'
+        failed=self.card()
+        self.assertEqual(failed['source_prompt'],'recipient stands')
+        self.assertEqual(failed['prompt'],'recipient kneels')
+        self.assertTrue(failed['task_pending'])
+        with self.client.get(before['url']) as response:self.assertEqual(response.data,b'OLD CLIP 2')
+        with patch.object(self.jobs,'launch'):
+            response=self.client.post('/api/jobs/job-1/resume',json={},headers=self.headers)
+        self.assertEqual(response.status_code,200,response.json)
+        self.request=json.loads((self.out/'inputs/request.json').read_text());mocks=self.generate()
+        for i in (2,3,4):mocks[i].assert_not_called()
+        self.jobs.find(self.identifier)['status']='succeeded'
+        snapshot=self.client.get('/api/jobs/job-1').json
+        self.assertTrue(snapshot['pending_assembly'])
+        self.assertEqual((self.out/'film.mp4').read_bytes(),b'OLD FILM')
+        with patch.object(self.jobs,'launch'):
+            response=self.client.post('/api/jobs/job-1/assemble',json={'version':snapshot['assembly']['version']},headers=self.headers)
+        self.assertEqual(response.status_code,200,response.json)
+        request=json.loads((self.out/'inputs/request.json').read_text())
+        def join(paths,out):
+            self.assertEqual([p.read_bytes() for p in paths],[others[1],b'NEW CLIP',others[3]])
+            out.write_bytes(b'ASSEMBLED NEW FILM')
+        with patch.object(media,'join',side_effect=join),patch.object(media,'duration',return_value=24),patch.object(rh,'submit_with_retry',side_effect=AssertionError('assemble paid')),patch.object(rewrite,'rewrite',side_effect=AssertionError('assemble rewrote')):
+            segments.assemble(request)
+        self.jobs.find(self.identifier)['status']='succeeded'
+        self.assertFalse(self.client.get('/api/jobs/job-1').json['pending_assembly'])
+        for n in (1,3):self.assertEqual((self.out/f'clips/seg{n}.mp4').read_bytes(),others[n])
