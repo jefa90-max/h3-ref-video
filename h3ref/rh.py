@@ -30,6 +30,10 @@ class SubmissionRejected(RuntimeError):
 class QueueFull(SubmissionRejected):
     """Submission was rejected because queue (421) or machine (415) capacity is full; safe to retry."""
 
+    def __init__(self, reason: str, *, code: int = 421):
+        super().__init__(reason)
+        self.code = code
+
 
 def _post(path: str, body: dict, timeout: float = 60) -> dict:
     key = config.rh_key()
@@ -88,7 +92,8 @@ def submit(g: dict) -> str:
     out = _post("/task/openapi/create", {"workflowId": config.RH_WORKFLOW_ID, "workflow": json.dumps(g, ensure_ascii=False), "addMetadata": False})
     task = (out.get("data") or {}).get("taskId")
     if out.get("code") in (421, 415) or "QUEUE_MAXED" in str(out.get("msg") or ""):
-        raise QueueFull(json.dumps(out, ensure_ascii=False)[:200])
+        code = 421 if out.get("code") == 421 or "QUEUE_MAXED" in str(out.get("msg") or "") else 415
+        raise QueueFull(json.dumps(out, ensure_ascii=False)[:200], code=code)
     if out.get("code") != 0 or not task:
         error = SubmissionRejected if isinstance(out.get("code"), int) and out["code"] != 0 else RuntimeError
         raise error(message("submission_rejected", reason=json.dumps(out, ensure_ascii=False)[:300]))
@@ -97,7 +102,8 @@ def submit(g: dict) -> str:
 
 def submit_with_retry(g: dict, log, *, record_submission=None) -> str:
     """Retry only explicit capacity rejections; never retry an ambiguous network failure."""
-    for attempt in range(1, 6):
+    rejections = {421: 0, 415: 0}
+    while True:
         if record_submission:
             record_submission(True)
         try:
@@ -105,11 +111,14 @@ def submit_with_retry(g: dict, log, *, record_submission=None) -> str:
         except QueueFull as exc:
             if record_submission:
                 record_submission(False)
-            if attempt == 5:
-                detail = message("submission_exhausted", attempt=attempt, limit=5, reason=exc)
+            rejections[exc.code] += 1
+            attempt = rejections[exc.code]
+            limit = 31 if exc.code == 421 else 5
+            if attempt == limit:
+                detail = message("submission_exhausted", attempt=attempt, limit=limit, reason=exc)
                 log(detail)
                 raise SubmissionRejected(detail) from exc
-            log(message("submission_retry", attempt=attempt, limit=5, seconds=60, reason=exc))
+            log(message("submission_retry", attempt=attempt, limit=limit, seconds=60, reason=exc))
             time.sleep(60)
         except RuntimeError as exc:
             if isinstance(exc, SubmissionRejected) and record_submission:

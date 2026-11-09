@@ -44,7 +44,7 @@ H3 这条用的 7 张分镜图，第一张画好以后，后面每张都带着�
 
 1. **Python 3.10+、ffmpeg**，`pip install -r requirements.txt`。
 2. **两个 key**，复制 `.env.example` 成 `.env` 填上：
-   - `RUNNINGHUB_API_KEY`：[RunningHub](https://www.runninghub.cn) 控制台「API 调用」。会员 key 一次跑 5 个、扣 RH 币；企业 key 扣钱包，能同时跑很多个。
+   - `RUNNINGHUB_API_KEY`：[RunningHub](https://www.runninghub.cn) 控制台「API 调用」。本项目使用工作流 API；消费级会员 key 扣积分，企业共享 key 扣钱包。默认同时跑 3 段，可通过 `RUNNINGHUB_CONCURRENCY` 按实际 API 额度调整。
    - `APIMART_API_KEY`：[APIMart](https://apimart.ai)，画分镜图（GPT Image 2.5）和查烧字幕（Gemini 3.8 Flash）。
 3. **改写提示词的模型**：装了 [Claude Code](https://claude.com/claude-code) 并登录过，默认就用它（我们一直用的是这个）；没装就走 APIMart 上的模型（`H3_REWRITER=llm`，默认 `deepseek-v4-pro`，也可以换成任何 OpenAI 兼容接口）。DeepSeek 改写我们试过，格式检查能过；上 H3 出片对比过的只有 Claude 改写的版本。
 4. **MiniMax 官方提示词指南**：工具运行时从 [MiniMax-AI/MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing) 现取 `ref-en.txt` 并缓存，没有随仓库分发（它属于 MiniMax H3 Community License 下的文档）。网络不通就自己下载，用 `H3_GUIDE_FILE` 指过去。
@@ -85,10 +85,10 @@ key 仅按选择写入被 git 忽略的本机 `.env`（权限 0600），不会�
 
 1. **画分镜图**（`--frames shot`，默认）：每个镜头画一张「这个镜头刚开始那一瞬」的图。全片第一张先画，后面每张都把它当参考，演员和场景就前后一致。参考图按像素收费，上传前缩到 1024 像素。
 2. **写提示词**：每段按 Seedance 的写法拼出中文提示词（参考图片1 是总表、2 是谁、之后每张是第几个镜头的首帧），再改写成 H3 官方格式。
-3. **生成**：每段参考图最多 9 张（工作流就 9 个图片口），放不下时先拿掉总表，再拿掉后面镜头的分镜图。分镜图模式下各段互不依赖，一起提交。
+3. **生成**：每段参考图最多 9 张（工作流就 9 个图片口），放不下时先拿掉总表，再拿掉后面镜头的分镜图。分镜图模式下各段互不依赖，默认最多同时生成 3 段，其余等待空位。
 4. **拼片、出报告**，出 `film.mp4` 和 `report.md`（每段费用、GPU 时间）。字幕检查目前暂停，整片和单段重生成均跳过；检查代码与已有记录保留。
 
-断了就原样再跑 `film jobs/<任务名>`：每张图、每个 RunningHub 任务提交后先记下任务号再等结果，续跑只接着查，不重复花钱。某段不满意，`--redo 2` 给第 2 段换种子重跑。
+断了就原样再跑 `film jobs/<任务名>`：每张图、每个 RunningHub 任务提交后先记下任务号再等结果，续跑只接着查，不重复花钱。并发已满（421）时每 60 秒尝试一次，最多 31 次，累计等待最多 30 分钟；机器资源不足（415）仍最多尝试 5 次。网络结果未知时不自动重提。某段不满意，`--redo 2` 给第 2 段换种子重跑。
 
 三种分镜图模式：
 
@@ -113,7 +113,7 @@ key 仅按选择写入被 git 忽略的本机 `.env`（权限 0600），不会�
 - 垫了分镜图的镜头，开头一两秒会比较静，像从照片里动起来。
 - 大的情绪反应（惊吓、疼）H3 还是演得偏小，提示词里要写具体的脸和身体动作。
 - 高配（Ultra 机型、736×1312、30 步）大约慢 8 倍、贵 17 倍，只换来更锐的细节，不值得开。超分到 720p 每 15 秒多 ¥0.32，手机上看提升一般。
-- 会员 key 同时只能跑 5 个；偶尔会爆显存失败，失败不扣费，再跑一次就好。
+- 会员 API 额度与网站任务共享，按当前套餐核对；默认并发为 3，旧 `.env` 若写了 `RUNNINGHUB_CONCURRENCY=5`，需改成实际允许的值。偶尔会爆显存失败，失败不扣费，再跑一次就好。
 
 ## 文件
 

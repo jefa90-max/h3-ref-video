@@ -37,7 +37,7 @@ def need(name: str, what: str) -> str:
 RH_BASE = env("RUNNINGHUB_BASE", "https://www.runninghub.cn")
 RH_WORKFLOW_ID = "2113525277564424193"
 RH_GRAPH = ROOT / "workflows/h3-ref2va-turbo.json"
-RH_CONCURRENCY = int(env("RUNNINGHUB_CONCURRENCY", "5"))          # a member key runs 5 at once; enterprise keys more
+RH_CONCURRENCY = int(env("RUNNINGHUB_CONCURRENCY", "3"))          # set to the account's API allowance; website tasks share it
 RH_COIN_CNY = float(env("RUNNINGHUB_COIN_CNY", str(399 / 180000)))  # what one RH coin cost you (Max monthly: ¥399 for 180k)
 H3_STEPS = int(env("H3_STEPS", "20"))
 SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
