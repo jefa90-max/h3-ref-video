@@ -65,6 +65,18 @@ class Staging(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'visibility'):
             self.validate(self.composition)
 
+    def test_extra_camera_fields_do_not_break_localized_rendering(self):
+        self.composition['camera'].update(movement='slow push in', focal_length='50 mm')
+        normalized = self.validate(self.composition)
+        for lang in ('zh-CN', 'en'):
+            with self.subTest(lang=lang), patch.dict('os.environ', {'H3_LANG': lang}):
+                for render in (staging.render_opening, staging.render_motion):
+                    text = render(normalized)
+                    for field in ('position', 'view_direction', 'framing', 'axis_side'):
+                        self.assertIn(normalized['camera'][field], text)
+                    self.assertNotIn('slow push in', text)
+                    self.assertNotIn('50 mm', text)
+
     def test_localized_labels_and_placeholders(self):
         from h3ref.i18n import MESSAGES
         for lang in ('zh-CN','en'):

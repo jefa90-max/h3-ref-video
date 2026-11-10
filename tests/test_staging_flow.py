@@ -47,6 +47,19 @@ class StagingFlow(unittest.TestCase):
         self.assertEqual(saved['composition_prompt'],saved['prompt'])
         self.assertTrue(saved['composition_reference_version'])
 
+    def test_extra_camera_metadata_does_not_prevent_frame_drawing(self):
+        self.script['shots'] = self.script['shots'][:1]
+        self.configure()
+        composition = copy.deepcopy(self.fixture['transfer_start'])
+        composition['camera']['movement'] = 'slow push in'
+        failures, _, draw = self.run_frames([composition])
+        self.assertEqual(failures, [])
+        self.assertEqual(draw.call_count, 1)
+        self.assertTrue((self.out / 'frames/s1-1.png').is_file())
+        saved = film.Job(self.out).state['frames']['s1-1']
+        self.assertFalse(saved.get('error'))
+        self.assertIn(composition['camera']['position'], saved['prompt'])
+
     def test_drawing_starts_before_second_planning_finishes(self):
         started = threading.Event()
         def describe(*args,**kwargs):
