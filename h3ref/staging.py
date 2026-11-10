@@ -4,6 +4,7 @@ import json
 
 from .i18n import message
 
+CAMERA_FIELDS = ('position', 'view_direction', 'framing', 'axis_side')
 CHARACTER_FIELDS = ('name', 'appearance', 'position', 'body_facing', 'gaze', 'pose', 'expression', 'screen_position', 'visibility')
 PROP_FIELDS = ('name', 'holder', 'contact', 'position', 'orientation', 'state', 'opening_direction', 'base_direction', 'knot_position', 'screen_position', 'visibility')
 PARTS = ('opening_direction', 'base_direction', 'knot_position')
@@ -58,7 +59,7 @@ def validate_composition(value: object, film: dict, shot: dict, known_scenes: di
 
     states(result.get('fixed_objects'), 'fixed_objects', ('name', 'position'))
     obj(result.get('camera'), 'camera')
-    for field in ('position', 'view_direction', 'framing', 'axis_side'):
+    for field in CAMERA_FIELDS:
         result['camera'][field] = text(result['camera'].get(field), f'camera.{field}')
     states(result.get('characters'), 'characters', CHARACTER_FIELDS)
     states(result.get('props'), 'props', PROP_FIELDS)
@@ -83,7 +84,7 @@ def render_opening(composition: dict) -> str:
     return '\n'.join((f"{message('staging_scene')}: {c['scene']}", f"{message('staging_frame')}: {c['frame']}",
                       f"{message('staging_world')}: {c['world_frame']}",
                       f"{message('staging_fixed')}: " + _states(c['fixed_objects'], ('name', 'position')),
-                      f"{message('staging_camera')}: " + '; '.join(f"{message('staging_' + k)}: {v}" for k, v in c['camera'].items()),
+                      f"{message('staging_camera')}: " + '; '.join(f"{message('staging_' + k)}: {c['camera'][k]}" for k in CAMERA_FIELDS),
                       f"{message('staging_characters')}: " + _states(c['characters'], CHARACTER_FIELDS),
                       f"{message('staging_props')}: " + _states(c['props'], PROP_FIELDS)))
 
