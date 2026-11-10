@@ -202,6 +202,80 @@ class BatchTaskRecovery(unittest.TestCase):
         self.request_path = self.out / "inputs" / "request.json"
         self.request = json.loads(self.request_path.read_text(encoding="utf-8"))
 
+    def add_reference_board(self):
+        board = self.out / "board.png"
+        Image.new("RGB", (8, 8), "blue").save(board)
+        self.request["film"]["board"] = str(board)
+        (self.out / "inputs" / "film.json").write_text(json.dumps(self.request["film"]), encoding="utf-8")
+        self.request_path.write_text(json.dumps(self.request), encoding="utf-8")
+
+    def assert_preparation_failure_allows_manual_edit(self, phase):
+        self.add_reference_board()
+        failure = patch.object(frames.media, "shrink", side_effect=OSError("synthetic shrink failure")) if phase == "shrink" else \
+            patch.object(frames, "_upload", side_effect=RuntimeError("synthetic upload failure"))
+        with failure, patch.object(frames.http, "request", side_effect=AssertionError("create must not run")) as create, \
+                patch.object(frames.http, "upload", side_effect=AssertionError("unexpected upload")):
+            storyboard.run(self.request)
+        create.assert_not_called()
+        saved = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertIn(f"synthetic {phase} failure", saved["error"])
+        self.assertFalse(saved.get("submission_unknown"))
+        self.assertFalse(saved.get("task"))
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        card = self.jobs.snapshot(self.identifier)["storyboard"][0]
+        self.assertTrue(card["editable"])
+        self.assertTrue(card["references_editable"])
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A repaired image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        launch.assert_called_once()
+
+    def test_batch_shrink_failure_before_create_allows_manual_edit(self):
+        self.assert_preparation_failure_allows_manual_edit("shrink")
+
+    def test_batch_upload_failure_before_create_allows_manual_edit(self):
+        self.assert_preparation_failure_allows_manual_edit("upload")
+
+    def test_single_frame_upload_failure_can_resume_without_marking_create_unknown(self):
+        self.add_reference_board()
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        previous = target.read_bytes()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                json={"prompt": "A repaired image."}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        request = json.loads(self.request_path.read_text(encoding="utf-8"))
+        with patch.object(frames, "_upload", side_effect=RuntimeError("synthetic upload failure")), \
+                patch.object(frames.http, "request", side_effect=AssertionError("create must not run")) as create:
+            with self.assertRaisesRegex(RuntimeError, "synthetic upload failure"):
+                storyboard.regenerate(request)
+        create.assert_not_called()
+        pending_path = self.out / "inputs" / "frame-edit.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        self.assertFalse(pending.get("submission_unknown"))
+        self.assertFalse(pending.get("task"))
+        self.assertEqual(target.read_bytes(), previous)
+        self.jobs.find(self.identifier)["status"] = "failed"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            response = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.json)
+        launch.assert_called_once()
+        self.assertEqual(json.loads(pending_path.read_text(encoding="utf-8"))["revision"], pending["revision"])
+
+    def test_missing_create_key_does_not_mark_an_unknown_submission(self):
+        saved = {}
+        with patch.object(frames.config, "apimart_key", side_effect=SystemExit("synthetic missing key")), \
+                patch.object(frames.http, "request") as create:
+            with self.assertRaisesRegex(SystemExit, "synthetic missing key"):
+                frames.draw("A ball rolls.", [], "9:16", self.out / "candidate.png", record=lambda **values: saved.update(values))
+        create.assert_not_called()
+        self.assertFalse(saved.get("submission_unknown"))
+        self.assertFalse(saved.get("task"))
+
     def failed_batch(self, terminal=False):
         polling = {"return_value": {"state": "failed", "error": "remote task failed"}} if terminal else {
             "side_effect": RuntimeError("temporary polling outage")}
@@ -283,7 +357,8 @@ class BatchTaskRecovery(unittest.TestCase):
         self.assertTrue(self.jobs.snapshot(self.identifier)["can_continue"])
 
     def test_batch_create_response_loss_cannot_be_replaced_by_a_new_manual_edit(self):
-        with patch.object(frames, "submit", side_effect=RuntimeError("acceptance response lost")) as create:
+        with patch.object(frames.config, "apimart_key", return_value="synthetic"), \
+                patch.object(frames.http, "request", side_effect=RuntimeError("acceptance response lost")) as create:
             storyboard.run(self.request)
             self.jobs.find(self.identifier)["status"] = "succeeded"
             with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
@@ -308,7 +383,8 @@ class BatchTaskRecovery(unittest.TestCase):
                 json={"prompt": "A new image."}, headers=self.headers)
         self.assertEqual(response.status_code, 200, response.json)
         request = json.loads(self.request_path.read_text(encoding="utf-8"))
-        with patch.object(frames, "submit", side_effect=RuntimeError("acceptance response lost")) as create:
+        with patch.object(frames.config, "apimart_key", return_value="synthetic"), \
+                patch.object(frames.http, "request", side_effect=RuntimeError("acceptance response lost")) as create:
             for _ in range(2):
                 with self.assertRaises(RuntimeError):
                     storyboard.regenerate(request)
