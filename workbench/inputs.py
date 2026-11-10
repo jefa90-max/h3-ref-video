@@ -175,11 +175,14 @@ def preflight(job, env):
     else:
         segments = film.plan(job["film"]["shots"])
         compositions = film.saved_compositions(state.get("frames", {}), reference_versions=film.frame_reference_versions(job["film"], segments, state.get("frames", {})))
+        records = state.get("segs", {})
+        if operation == "pipeline" and not job.get("reset_applied"):
+            records = {**records, **film.invalidated_segment_records(records, job["frames"], job.get("redo"))}
         for segment in segments:
             pics = film.refs(job["film"], segment, job["frames"])
             needs_frames |= any(p["kind"] == "frame" and (not out or not (out / "frames" / f"s{segment['idx'] + 1}-{p['shot'] + 1}.png").exists()) for p in pics)
             if operation == "pipeline":
-                rec = state.get("segs", {}).get(str(segment["idx"]), {})
+                rec = records.get(str(segment["idx"]), {})
                 if not film.frozen_segment(rec) and (rec.get("prompt_override") or {}).get("format") != "h3":
                     zh = film.segment_prompt_text(rec, film.compile_prompt(job["film"], segment, pics, len(segments), compositions=compositions))
                     from types import SimpleNamespace

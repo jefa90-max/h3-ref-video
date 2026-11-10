@@ -481,13 +481,17 @@ def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Pa
     return p
 
 
+def invalidated_segment_records(records: dict, mode: str, redo: list[int] | None) -> dict:
+    return {k: {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override") if key in rec}
+            for k, rec in records.items()
+            if any(int(k) == n - 1 or (mode != "shot" and int(k) > n - 1) for n in redo or [])}
+
+
 def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
     """The --redo invalidation rule, shared with the workbench's reviewed-frame continuation."""
-    for n in redo or []:                                # a new seed for these segments (and, chained, everything after)
-        for k in [k for k in job.state["segs"] if int(k) == n - 1 or (mode != "shot" and int(k) > n - 1)]:
-            rec = job.state["segs"][k]
-            job.state["segs"][k] = {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override") if key in rec}
-            (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
+    for k, rec in invalidated_segment_records(job.state["segs"], mode, redo).items():
+        job.state["segs"][k] = rec
+        (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
     job.save()
 
 
