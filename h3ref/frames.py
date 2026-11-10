@@ -132,16 +132,18 @@ def _upload(path: Path) -> str:
     return url
 
 
-def submit(text: str, refs: list[Path], aspect: str) -> str:
+def submit(text: str, refs: list[Path], aspect: str, *, before_submit=lambda: None) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         urls = [_upload(media.shrink(Path(p), Path(tmp) / f"ref{i}.jpg")) for i, p in enumerate(refs)]
     body = {"model": config.IMAGE_MODEL, "prompt": text, "size": aspect, "resolution": config.IMAGE_RESOLUTION,
             "quality": config.IMAGE_QUALITY, "n": 1}
     if urls:
         body["image_urls"] = urls
+    key = config.apimart_key()
+    before_submit()
     try:
         # A rejected submission must reach the caller before any HTTP-level retry.
-        out = http.request(config.APIMART_BASE + "/images/generations", config.apimart_key(), body, tries=1)
+        out = http.request(config.APIMART_BASE + "/images/generations", key, body, tries=1)
     except RuntimeError as exc:
         if is_moderation_error(exc):
             raise ContentPolicyError(str(exc)) from exc
@@ -185,9 +187,8 @@ def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k:
     """Draw one frame to `out`; `record(task=…)` is called with the task id before waiting, so a rerun resumes it.
     Returns the cost in CNY."""
     if not task:
-        record(submission_unknown=True)
         try:
-            task = submit(text, refs, aspect)
+            task = submit(text, refs, aspect, before_submit=lambda: record(submission_unknown=True))
         except SubmissionRejected:
             record(submission_unknown=False)
             raise
