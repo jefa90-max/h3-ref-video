@@ -9,6 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from h3ref import config, film, frames
+from workbench.i18n import InputError
 from workbench.inputs import preflight, validate
 from workbench.jobs import command
 from workbench.settings import save_env
@@ -75,6 +76,87 @@ class CliParity(unittest.TestCase):
             with patch("shutil.which", return_value="/fake/ffmpeg"):
                 preflight({"kind": "film", "demo": False, "film": script, "frames": "none", "output_dir": str(out)},
                           {"RUNNINGHUB_API_KEY": "fake-rh"})
+
+
+class RedoPreflight(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.out = Path(temporary.name)
+        for name in ("frames", "clips"):
+            (self.out / name).mkdir()
+        self.script = {"aspect": "9:16", "shots": [
+            {"start": i * 8, "end": (i + 1) * 8, "action": f"Object {i} moves"}
+            for i in range(3)]}
+        self.segments = film.plan(self.script["shots"])
+
+    def completed_film(self, mode):
+        job = film.Job(self.out)
+        for segment in self.segments:
+            number = segment["idx"] + 1
+            clip = self.out / "clips" / f"seg{number}.mp4"
+            clip.write_bytes(f"paid clip {number}".encode())
+            (self.out / "clips" / f"seg{number}-last.jpg").write_bytes(b"tail")
+            pictures = film.refs(self.script, segment, mode)
+            for picture in pictures:
+                if picture["kind"] == "frame":
+                    (self.out / "frames" / f"s{number}-{picture['shot'] + 1}.png").write_bytes(b"opening")
+            source = film.compile_prompt(self.script, segment, pictures, len(self.segments))
+            reference = film.reference_version(film._picture_paths(job, segment, pictures))
+            job.put("segs", str(segment["idx"]), zh=source, h3=ENGLISH_H3, h3_source=source,
+                    h3_reference_version=reference, task=f"paid-task-{number}", file=str(clip), cny=1)
+        request = {"kind": "film", "demo": False, "operation": "pipeline", "film": self.script,
+                   "frames": mode, "output_dir": str(self.out), "redo": [2], "reset_applied": False}
+        return job, request
+
+    def test_changed_frame_redo_requires_text_key_without_mutating_paid_outputs(self):
+        job, request = self.completed_film("shot")
+        (self.out / "frames" / "s2-1.png").write_bytes(b"changed reviewed opening")
+        before_state = job.file.read_bytes()
+        before_clips = {path: path.read_bytes() for path in (self.out / "clips").glob("*")}
+        with patch("shutil.which", return_value="/fake/ffmpeg"):
+            with self.assertRaises(InputError) as caught:
+                preflight(request, {"RUNNINGHUB_API_KEY": "offline"})
+        self.assertEqual(caught.exception.key, "keys")
+        self.assertIn("LLM_API_KEY", caught.exception.values["names"])
+        self.assertEqual(job.file.read_bytes(), before_state)
+        self.assertTrue(all(path.read_bytes() == content for path, content in before_clips.items()))
+
+    def test_redo_checks_rewrite_keys_for_chained_successors_only(self):
+        for mode, needs_key in (("shot", False), ("first", True), ("none", True)):
+            with self.subTest(mode=mode):
+                job, request = self.completed_film(mode)
+                job.put("segs", "2", zh="previous source before the reviewed change")
+                before_state = job.file.read_bytes()
+                with patch("shutil.which", return_value="/fake/ffmpeg"):
+                    if needs_key:
+                        with self.assertRaises(InputError) as caught:
+                            preflight(request, {"RUNNINGHUB_API_KEY": "offline"})
+                        self.assertEqual(caught.exception.key, "keys")
+                    else:
+                        preflight(request, {"RUNNINGHUB_API_KEY": "offline"})
+                self.assertEqual(job.file.read_bytes(), before_state)
+                self.assertTrue((self.out / "clips" / "seg3.mp4").is_file())
+
+    def test_applied_reset_keeps_the_accepted_task_frozen_without_a_text_key(self):
+        job, request = self.completed_film("shot")
+        (self.out / "frames" / "s2-1.png").write_bytes(b"changed opening")
+        job.put("segs", "1", zh="accepted source", task="new-paid-task", file=None, cny=None)
+        request["reset_applied"] = True
+        before_state = job.file.read_bytes()
+        with patch("shutil.which", return_value="/fake/ffmpeg"):
+            preflight(request, {"RUNNINGHUB_API_KEY": "offline"})
+        self.assertEqual(job.file.read_bytes(), before_state)
+        self.assertEqual(film.Job(self.out).state["segs"]["1"]["task"], "new-paid-task")
+
+    def test_direct_h3_override_redo_does_not_require_a_text_key(self):
+        job, request = self.completed_film("shot")
+        (self.out / "frames" / "s2-1.png").write_bytes(b"changed reviewed opening")
+        job.put("segs", "1", prompt_override={"format": "h3", "text": ENGLISH_H3})
+        before_state = job.file.read_bytes()
+        with patch("shutil.which", return_value="/fake/ffmpeg"):
+            preflight(request, {"RUNNINGHUB_API_KEY": "offline"})
+        self.assertEqual(job.file.read_bytes(), before_state)
 
 
 class ReviewState(unittest.TestCase):
