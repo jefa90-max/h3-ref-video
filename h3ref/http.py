@@ -9,6 +9,13 @@ from pathlib import Path
 from . import config
 
 
+class HTTPResponseError(RuntimeError):
+    """An HTTP error response whose body could not be decoded as JSON."""
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        super().__init__(detail)
+
+
 def request(url: str, key: str, body: dict | None = None, method: str | None = None, timeout: float = 120, tries: int = 3,
             extra_headers: dict | None = None) -> dict:
     """POST (with body) or GET; network errors and 5xx retry, 4xx answers come back as they are."""
@@ -26,7 +33,7 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
                 try:
                     return json.loads(text)
                 except ValueError:
-                    raise RuntimeError(f"{url} {exc.code}: {text.replace(key, '[key]')[:300]}") from None
+                    raise HTTPResponseError(exc.code, f"{url} {exc.code}: {text.replace(key, '[key]')[:300]}") from None
             last = f"{exc.code}: {text[:200]}"
         except Exception as exc:
             last = f"{type(exc).__name__}: {exc}"

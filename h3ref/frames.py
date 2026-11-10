@@ -147,6 +147,8 @@ def submit(text: str, refs: list[Path], aspect: str, *, before_submit=lambda: No
     except RuntimeError as exc:
         if is_moderation_error(exc):
             raise ContentPolicyError(str(exc)) from exc
+        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 403):
+            raise SubmissionRejected(str(exc)) from exc
         raise
     if is_moderation_error(out.get("error") or out):
         raise ContentPolicyError(json.dumps(out, ensure_ascii=False))
