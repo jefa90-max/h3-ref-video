@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -400,6 +401,33 @@ class BatchTaskRecovery(unittest.TestCase):
         self.assertIs(saved.get("submission_unknown"), False)
         self.assertFalse(saved.get("task"))
         self.assertFalse((self.out / "candidate.png").exists())
+
+    def test_plain_text_auth_rejection_keeps_batch_failure_manually_editable(self):
+        for status, reason in ((401, "Unauthorized"), (403, "Forbidden")):
+            with self.subTest(status=status):
+                job = film.Job(self.out)
+                job.state["frames"] = {}
+                job.save()
+                error = urllib.error.HTTPError("https://api.example/images/generations", status, reason, {},
+                                               io.BytesIO(reason.encode()))
+                self.addCleanup(error.close)
+                with patch.object(frames.config, "apimart_key", return_value="synthetic"), \
+                        patch("urllib.request.urlopen", side_effect=error) as opened:
+                    storyboard.run(self.request)
+                opened.assert_called_once()
+                saved = film.Job(self.out).state["frames"]["s1-1"]
+                self.assertIn(reason, saved["error"])
+                self.assertFalse(saved.get("submission_unknown"))
+                self.assertFalse(saved.get("task"))
+                self.jobs.find(self.identifier)["status"] = "succeeded"
+                card = self.jobs.snapshot(self.identifier)["storyboard"][0]
+                self.assertTrue(card["editable"])
+                self.assertTrue(card["references_editable"])
+                with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+                    response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                        json={"prompt": "A repaired image."}, headers=self.headers)
+                self.assertEqual(response.status_code, 200, response.json)
+                launch.assert_called_once()
 
     def test_single_frame_resume_stops_at_remote_failure_until_a_new_manual_edit(self):
         target = self.out / "frames" / "s1-1.png"
