@@ -190,6 +190,7 @@ h3{font-size:13px;font-weight:650}
 .storyboard-section{border-top:1px solid var(--border);margin-top:22px;padding-top:4px}
 .storyboard-section>.hint{margin-bottom:8px}
 .storyboard-card{margin-top:16px;padding:14px;border:1px solid var(--border);border-radius:9px;background:#f9fbf7;min-width:0}
+.storyboard-card .hint{color:#52655a}
 .storyboard-card h4{font-size:12px;margin:0 0 11px}
 .storyboard-preview{display:block;margin-bottom:12px;text-align:center;background:#e9efea;border-radius:6px;overflow:hidden}
 .storyboard-preview img{max-height:260px;max-width:100%;display:block;margin:auto;object-fit:contain}
