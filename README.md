@@ -103,4 +103,4 @@ H3 这条用的 7 张分镜图，第一张画好以后，后面每张都带着�
 
 代码和 `prompts/` 是 MIT。`workflows/` 里的节点图归原作者；MiniMax 官方提示词指南和 H3 模型遵守 [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)。
 
-想做「照着原片换人」的翻拍（MV、舞蹈），看姊妹仓库 [mv-swap](https://github.com/garycaogan/mv-swap)。
+想做「照着原片换人」的翻拍（MV、舞蹈），看姊妹仓库 [mv-swap](https://github.com/garycaogan/gary-mv-swap)。
