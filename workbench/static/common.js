@@ -7,6 +7,8 @@ const state = {
   messages: {}, config: null, jobs: [], ready: false, pollError: false,
 };
 let renderPage = () => {};
+let llmProvider = null;
+let llmDrafts = {};
 
 function t(key, values = {}) {
   return (state.messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
@@ -44,7 +46,11 @@ async function request(url, options = {}) {
     throw new Error(t("networkError", { error: error.message }));
   }
   const body = await response.json();
-  if (!response.ok) throw new Error(body.error || t("httpError", { status: response.status }));
+  if (!response.ok) {
+    const error = new Error(body.error || t("httpError", { status: response.status }));
+    error.status = response.status;
+    throw error;
+  }
   return body;
 }
 
@@ -101,15 +107,40 @@ async function loadLanguage(language) {
   renderPage(previousSample);
 }
 
+function renderLlmProvider(fillInputs = false) {
+  const provider = $("llm-provider").value;
+  const gemini = provider === "gemini";
+  const prefix = gemini ? "GEMINI" : "LLM";
+  $("llm-key-field").hidden = gemini;
+  $("llm-key").disabled = gemini;
+  $("gemini-key-field").hidden = !gemini;
+  $("gemini-key").disabled = !gemini;
+  $("llm-base").disabled = gemini;
+  $("llm-composition-model").name = `${prefix}_COMPOSITION_MODEL`;
+  $("llm-rewrite-model").name = `${prefix}_REWRITE_MODEL`;
+  if (fillInputs) {
+    const profile = llmDrafts[provider] || state.config.llm_providers[provider];
+    $("llm-composition-model").value = profile.composition_model;
+    $("llm-rewrite-model").value = profile.rewrite_model;
+    $("llm-base").value = profile.base_url;
+  }
+  llmProvider = provider;
+}
+
 function renderConfig(fillInputs = false) {
   const config = state.config;
   if (!config) return;
   const keys = config.keys || {};
-  const complete = keys.RUNNINGHUB_API_KEY && keys.APIMART_API_KEY && config.ffmpeg && config.ffprobe;
+  const activeKeyNames = config.llm_providers?.[config.LLM_PROVIDER]?.key_names
+    || (config.LLM_PROVIDER === "gemini" ? ["GEMINI_API_KEY"] : ["LLM_API_KEY", "APIMART_API_KEY"]);
+  const apimartFallback = (config.llm_providers?.apimart?.key_names || ["LLM_API_KEY", "APIMART_API_KEY"]).includes("APIMART_API_KEY");
+  const textReady = activeKeyNames.some((name) => keys[name]);
+  const complete = keys.RUNNINGHUB_API_KEY && keys.APIMART_API_KEY && textReady && config.ffmpeg && config.ffprobe;
   $("config-summary").textContent = t(complete ? "configReady" : "configIncomplete");
   $("rh-key-status").textContent = t(keys.RUNNINGHUB_API_KEY ? "keyPresent" : "keyMissing");
   $("apimart-key-status").textContent = t(keys.APIMART_API_KEY ? "keyPresent" : "keyMissing");
-  $("llm-key-status").textContent = t(keys.LLM_API_KEY ? "keyPresent" : "llmFallback");
+  $("llm-key-status").textContent = t(keys.LLM_API_KEY ? "keyPresent" : apimartFallback ? "llmFallback" : "keyMissing");
+  $("gemini-key-status").textContent = t(keys.GEMINI_API_KEY ? "keyPresent" : "keyMissing");
   $("config-storage").textContent = t(config.saved_to_env ? "configOnDisk" : "configInMemory");
   const environment = $("environment");
   environment.replaceChildren(element("span", "ok", t("pythonVersion", { version: config.python })));
@@ -117,10 +148,18 @@ function renderConfig(fillInputs = false) {
     environment.append(element("span", config[name] ? "ok" : "missing", t(config[name] ? "environmentPresent" : "environmentMissing", { name })));
   }
   if (fillInputs) {
-    $("llm-model").value = config.LLM_MODEL || "";
-    $("llm-base").value = config.LLM_BASE_URL || "";
+    llmDrafts = {};
+    $("llm-provider").value = config.LLM_PROVIDER;
   }
+  renderLlmProvider(fillInputs);
 }
+
+$("llm-provider").addEventListener("change", () => {
+  if (!state.config) return;
+  llmDrafts[llmProvider] = {composition_model: $("llm-composition-model").value,
+    rewrite_model: $("llm-rewrite-model").value, base_url: $("llm-base").value};
+  renderLlmProvider(true);
+});
 
 $("language").addEventListener("change", async (event) => {
   const language = event.target.value;
@@ -139,7 +178,7 @@ $("config-form").addEventListener("submit", async (event) => {
     const payload = Object.fromEntries([...new FormData(event.target)].filter(([, value]) => value.trim()).map(([key, value]) => [key, value.trim()]));
     payload.persist = $("persist-config").checked;
     state.config = await post("/api/config", payload);
-    for (const id of ["rh-key", "apimart-key", "llm-key"]) $(id).value = "";
+    for (const id of ["rh-key", "apimart-key", "llm-key", "gemini-key"]) $(id).value = "";
     renderConfig(true);
     showMessage(t(payload.persist ? "configSavedDisk" : "configSaved"));
   } catch (error) { showError(error); }

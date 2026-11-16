@@ -2,7 +2,7 @@
 {% block scripts %}<script src="/static/create.js" defer></script>{% endblock %}
 {% block intro %}
     <section class="intro">
-      <div><p class="eyebrow" data-i18n="eyebrow"></p><h1 data-i18n="title"></h1><p class="intro-copy" data-i18n="intro"></p></div>
+      <div><h1 data-i18n="title"></h1><p class="intro-copy" data-i18n="intro"></p></div>
       <div class="flow-line" aria-hidden="true"><span><b>01</b><span data-i18n="stepConfig"></span></span><i>→</i><span><b>02</b><span data-i18n="stepCreate"></span></span><i>→</i><span><b>03</b><span data-i18n="stepResult"></span></span></div>
     </section>
 
@@ -10,7 +10,7 @@
 {% block content %}
 <div class="create-workspace">
       <section class="editor-card panel">
-        <div class="section-heading"><div><p class="eyebrow" data-i18n="createEyebrow"></p><h2 data-i18n="createTitle"></h2></div><span class="section-index">02</span></div>
+        <div class="section-heading"><div><h2 data-i18n="createTitle"></h2></div><span class="section-index">02</span></div>
         <div class="workflow-tabs" role="tablist" data-i18n-aria="workflowLabel"><button id="tab-one" type="button" role="tab" aria-selected="false" aria-controls="one-fields" tabindex="-1"><span data-i18n="oneTitle"></span><small data-i18n="oneTabHint"></small></button><button id="tab-film" type="button" role="tab" aria-selected="true" aria-controls="film-fields" class="active"><span data-i18n="filmTitle"></span><small data-i18n="filmTabHint"></small></button></div>
         <form id="job-form">
           <div id="one-fields" role="tabpanel" aria-labelledby="tab-one" hidden>

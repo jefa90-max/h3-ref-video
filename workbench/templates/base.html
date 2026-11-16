@@ -27,8 +27,12 @@
           <div class="config-grid">
             <label><span><span data-i18n="rhKey"></span> <span id="rh-key-status" class="key-state"></span></span><input id="rh-key" name="RUNNINGHUB_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder"></label>
             <label><span><span data-i18n="apimartKey"></span> <span id="apimart-key-status" class="key-state"></span></span><input id="apimart-key" name="APIMART_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder"></label>
-            <label><span data-i18n="llmKey"></span><input id="llm-key" name="LLM_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="llmKeyPlaceholder"><span id="llm-key-status" class="hint"></span></label>
-            <label><span data-i18n="llmModel"></span><input id="llm-model" name="LLM_MODEL" spellcheck="false" required></label>
+            <label><span data-i18n="llmProvider"></span><select id="llm-provider" name="LLM_PROVIDER"><option value="apimart" data-i18n="llmProviderApimart"></option><option value="gemini" data-i18n="llmProviderGemini"></option></select></label>
+            <label id="llm-key-field"><span data-i18n="llmKey"></span><input id="llm-key" name="LLM_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="llmKeyPlaceholder"><span id="llm-key-status" class="hint"></span></label>
+            <label id="gemini-key-field" hidden><span data-i18n="geminiKey"></span><input id="gemini-key" name="GEMINI_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder" disabled><span id="gemini-key-status" class="hint"></span></label>
+            <label><span data-i18n="llmCompositionModel"></span><input id="llm-composition-model" name="LLM_COMPOSITION_MODEL" spellcheck="false" required></label>
+            <label><span data-i18n="llmRewriteModel"></span><input id="llm-rewrite-model" name="LLM_REWRITE_MODEL" spellcheck="false" required></label>
+            <p class="wide hint" data-i18n="llmModelsHint"></p>
             <label class="wide"><span data-i18n="llmBase"></span><input id="llm-base" name="LLM_BASE_URL" type="url" spellcheck="false" required></label>
           </div>
           <label class="checkbox-field"><input id="persist-config" type="checkbox" checked><span data-i18n="persistConfig"></span></label>

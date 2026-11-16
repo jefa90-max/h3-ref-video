@@ -5,8 +5,8 @@ Object.assign(state, {
   page: 1, pageSize: 12, frameDrafts: new Map(), expandedFrames: new Set(),
   storyboardView: "list", frameIndex: 0,
   frameReferenceDrafts: new Map(), frameSubmissions: new Map(),
-  storyboardSignature: "", planSignature: "", linksSignature: "", videoSignature: "",
-  player: null, pollTimer: null, jobRevision: 0,
+  storyboardSignature: "", storyboardCards: new Map(), planSignature: "", linksSignature: "", videoSignature: "",
+  player: null, pollTimer: null, pollFailures: 0, jobRevision: 0,
   resultTab: null, lastVideoOperation: null, segmentPage: 1, segmentPageSize: 6, segmentCards: new Map(),
   segmentDrafts: new Map(), expandedSegments: new Set(), segmentSubmissions: new Map(), segmentJobId: null,
 });
@@ -72,8 +72,25 @@ function renderStoryboard(job) {
   const signature = JSON.stringify([visible, job.character_references, job.status, state.language, state.page, state.storyboardView, state.frameIndex]);
   if (state.storyboardSignature === signature) return;
   state.storyboardSignature = signature;
-  $("storyboard-cards").replaceChildren();
-  for (const frame of visible) $("storyboard-cards").append(createStoryboardCard(frame, job, carousel));
+  const container = $("storyboard-cards");
+  const nextCards = visible.map((frame) => {
+    const cardSignature = JSON.stringify([job.id, frame, job.character_references, Boolean(running(job)), Boolean(job.demo), state.language, carousel]);
+    const cached = state.storyboardCards.get(frame.key);
+    if (cached && cached.signature === cardSignature) return cached.node;
+    const node = createStoryboardCard(frame, job, carousel);
+    state.storyboardCards.set(frame.key, { node, signature: cardSignature });
+    return node;
+  });
+  for (const key of [...state.storyboardCards.keys()]) {
+    if (!visible.some((frame) => frame.key === key)) state.storyboardCards.delete(key);
+  }
+  if (typeof container.replaceChild === "function" && container.children.length === nextCards.length) {
+    nextCards.forEach((node, idx) => {
+      if (container.children[idx] !== node) container.replaceChild(node, container.children[idx]);
+    });
+  } else {
+    container.replaceChildren(...nextCards);
+  }
 }
 
 function createStoryboardCard(frame, job, carousel) {
@@ -262,8 +279,10 @@ function renderJob(job) {
   $("resume-job").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
   $("resume-job").textContent = t(job.can_resume_frames ? "resumeFrames" : "resumeJob");
   $("resume-hint").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
-  const blockedSegment = (job.segments || []).find(segment => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || segment.terminal_failed));
-  $("resume-hint").textContent = t(job.can_resume_video === false && blockedSegment ? (blockedSegment.submission_unknown ? "segmentSubmissionUnknown" : "segmentTerminalFailed") : "resumeHint");
+  const blockedSegment = ["pipeline", "segment"].includes(job.operation)
+    ? (job.segments || []).find((segment) => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || segment.terminal_failed))
+    : null;
+  $("resume-hint").textContent = t(job.can_resume_video === false ? (blockedSegment ? (blockedSegment.submission_unknown ? "segmentSubmissionUnknown" : "segmentTerminalFailed") : "resumeBlockedHint") : "resumeHint");
   $("review-section").hidden = job.kind !== "film";
   $("review-progress").textContent = t(review.kind === "script" ? "scriptPlanForReview" : "reviewSummary", { total: review.total || 0 });
   $("review-badge").textContent = t(review.complete ? "reviewComplete" : "reviewPending");
@@ -290,9 +309,9 @@ function renderJob(job) {
   renderResultActions();
 }
 
-function schedulePoll() {
+function schedulePoll(delayMs = 1400) {
   clearTimeout(state.pollTimer);
-  state.pollTimer = setTimeout(refreshJob, 1400);
+  state.pollTimer = setTimeout(refreshJob, delayMs);
 }
 
 async function refreshJob() {
@@ -301,6 +320,7 @@ async function refreshJob() {
   try {
     const job = await request(`/api/jobs/${encodeURIComponent(state.jobId)}`);
     if (revision !== state.jobRevision) return;
+    state.pollFailures = 0;
     state.selectedJob = job;
     renderJob(job);
     if (state.pollError) clearNotices();
@@ -309,7 +329,11 @@ async function refreshJob() {
     if (revision !== state.jobRevision) return;
     showError(t("pollError", { error: error.message }));
     state.pollError = true;
-    schedulePoll();
+    if (error?.status !== 404) {
+      const delay = Math.min(1400 * 2 ** state.pollFailures, 30000);
+      state.pollFailures = Math.min(state.pollFailures + 1, 6);
+      schedulePoll(delay);
+    }
   }
 }
 
@@ -379,11 +403,34 @@ renderPage = () => renderJob(state.selectedJob);
 
 async function initializeResults() {
   try {
-    await loadLanguage(state.language);
-    state.config = (await request("/api/bootstrap")).config;
-    renderConfig(true);
-    await refreshJob();
-  } catch (error) { showError(error); }
+    const revision = ++state.jobRevision;
+    const langPromise = loadLanguage(state.language);
+    const bootstrapPromise = typeof request === "function" ? request("/api/bootstrap") : null;
+    const jobPromise = typeof request === "function" && state.jobId ? request(`/api/jobs/${encodeURIComponent(state.jobId)}`) : null;
+    bootstrapPromise?.catch(() => {});
+    jobPromise?.catch(() => {});
+    await langPromise;
+    if (bootstrapPromise) {
+      const bootstrap = await bootstrapPromise;
+      state.config = bootstrap.config;
+      renderConfig(true);
+    }
+    if (!jobPromise) return;
+    try {
+      const job = await jobPromise;
+      if (revision === state.jobRevision) {
+        state.selectedJob = job;
+        renderJob(job);
+        if (running(job)) schedulePoll();
+      }
+    } catch (error) {
+      if (revision === state.jobRevision) {
+        if (typeof showError === "function") showError(t("pollError", { error: error.message }));
+        state.pollError = true;
+        if (error?.status !== 404) schedulePoll();
+      }
+    }
+  } catch (error) { if (typeof showError === "function") showError(error); }
 }
 initializeVideoSegments();
 initializeResults();

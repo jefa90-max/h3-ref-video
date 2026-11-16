@@ -2,7 +2,7 @@
 
 Object.assign(state, {
   kind: "film", demo: false, images: [], submitting: false,
-  uploading: false, pollTimer: null, film: null, filmSlots: [],
+  uploading: false, pollTimer: null, filmDebounceTimer: null, film: null, filmSlots: [],
   filmBindings: new Map(), filmRevision: 0, filmParsing: false,
   filmImporting: false, filmError: null, choosingOutput: false,
 });
@@ -86,10 +86,10 @@ function missingFilmReferences() {
   return state.filmSlots.filter((slot) => slot.required && !state.filmBindings.has(slot.id));
 }
 
-function invalidateFilmReferences(clearBindings = false) {
+function invalidateFilmReferences(clearBindings = false, clearSlots = false) {
   state.filmRevision += 1;
   state.film = null;
-  state.filmSlots = [];
+  if (clearSlots) state.filmSlots = [];
   state.filmError = null;
   if (clearBindings) state.filmBindings.clear();
   renderFilmReferences();
@@ -97,10 +97,12 @@ function invalidateFilmReferences(clearBindings = false) {
 }
 
 async function refreshFilmReferences({ reset = false, format = false } = {}) {
+  clearTimeout(state.filmDebounceTimer);
   state.filmParsing = true;
-  const revision = invalidateFilmReferences(reset);
+  const revision = invalidateFilmReferences(reset, reset);
   try {
     if (!$("film-json").value.trim()) {
+      state.filmSlots = [];
       state.filmBindings.clear();
       return false;
     }
@@ -221,8 +223,7 @@ function renderHistory() {
   });
 }
 
-async function refreshBootstrap(fillInputs = true) {
-  const result = await request("/api/bootstrap");
+function applyBootstrap(result, fillInputs = true) {
   state.config = result.config;
   $("output-dir").value = result.config.output_root;
   state.jobs = result.jobs;
@@ -232,6 +233,10 @@ async function refreshBootstrap(fillInputs = true) {
   renderMode();
   if (busy()) scheduleHistoryPoll();
   return result;
+}
+
+async function refreshBootstrap(fillInputs = true) {
+  return applyBootstrap(await request("/api/bootstrap"), fillInputs);
 }
 
 for (const kind of ["one", "film"]) {
@@ -249,7 +254,15 @@ for (const kind of ["one", "film"]) {
 $("mode-demo").addEventListener("click", () => { state.demo = true; renderMode(); });
 $("mode-live").addEventListener("click", () => { state.demo = false; renderMode(); });
 $("frames").addEventListener("change", updateFrameHint);
-$("film-json").addEventListener("input", () => { refreshFilmReferences(); });
+$("film-json").addEventListener("input", () => {
+  state.filmParsing = true;
+  const revision = invalidateFilmReferences(false, false);
+  clearTimeout(state.filmDebounceTimer);
+  state.filmDebounceTimer = setTimeout(() => {
+    if (revision !== state.filmRevision) return undefined;
+    return refreshFilmReferences();
+  }, 250);
+});
 $("demo-placeholders").addEventListener("change", renderMode);
 
 $("choose-output-folder").addEventListener("click", async () => {
@@ -284,7 +297,7 @@ $("film-import").addEventListener("change", async (event) => {
   if (!file || state.uploading || state.filmImporting) return;
   state.filmImporting = true;
   state.filmParsing = false;
-  const revision = invalidateFilmReferences(true);
+  const revision = invalidateFilmReferences(true, true);
   try {
     if (file.size > 2 * 1024 * 1024) throw new Error(t("jsonTooLarge"));
     const text = await file.text();
@@ -361,9 +374,12 @@ renderPage = (previousSample) => {
 
 async function initializeCreate() {
   try {
-    await loadLanguage(state.language);
+    const langPromise = loadLanguage(state.language);
+    const bootstrapPromise = typeof request === "function" ? request("/api/bootstrap") : null;
+    bootstrapPromise?.catch(() => {});
+    await langPromise;
     switchWorkflow(state.kind);
-    await refreshBootstrap();
-  } catch (error) { showError(error); }
+    if (bootstrapPromise) applyBootstrap(await bootstrapPromise);
+  } catch (error) { if (typeof showError === "function") showError(error); }
 }
 initializeCreate();

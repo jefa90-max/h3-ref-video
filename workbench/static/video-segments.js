@@ -180,7 +180,12 @@ function updateSegmentMedia(card, segment) {
     card.media.children[0].textContent = t("segmentWaiting");
   } else {
     // Update player translations without replacing the prompt editor or its focus.
-    card.player?.destroy(); card.player = createVideoPlayer(card.video);
+    const currentTime = card.video.currentTime || 0;
+    card.video.pause(); card.player?.destroy(); card.media.replaceChildren();
+    card.video = element("video"); card.video.controls = true; card.video.preload = "metadata"; card.video.playsInline = true; card.video.src = segment.url;
+    if (currentTime > 0) card.video.addEventListener("loadedmetadata", () => { card.video.currentTime = currentTime; }, { once: true });
+    card.media.append(card.video); card.player = createVideoPlayer(card.video);
+    card.video.addEventListener("play", () => { state.player?.pause(); for (const other of state.segmentCards.values()) if (other !== card) other.video?.pause(); });
   }
   card.mediaUrl = segment.url; card.mediaLanguage = state.language;
 }
