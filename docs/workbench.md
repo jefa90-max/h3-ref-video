@@ -28,7 +28,12 @@ python workbench.py
 
 打开「环境与密钥」，填写 `RUNNINGHUB_API_KEY` 和 `APIMART_API_KEY`，默认勾选保存到本机 `.env`，点击保存；保存后立即用于后续任务，服务重启也会沿用。不勾选则只存当前服务内存。空白 key 保持已有值，已保存的 key 不回传浏览器。`.env` 已被 git 忽略，支持 POSIX 权限的平台使用 0600；key 不写入浏览器存储或任务 JSON。也可预先按 `.env.example` 手动配置；已 export 的环境变量在启动时优先于 .env。
 
-工作台固定 `H3_REWRITER=llm`，不探测或运行 Claude。默认 `LLM_BASE_URL=https://api.apimart.ai/v1`、`LLM_MODEL=deepseek-v4-pro`，改写使用 APIMart key；自定义 OpenAI 兼容服务可填写 LLM key / URL / model。高级的 `VISION_API_KEY`、`VISION_BASE_URL`、`H3_GUIDE_FILE` 等仍从 .env / 环境读取，手动修改后重启工作台。页面环境检查不联网鉴权或查余额，无效 key 会在实际任务中明确报错。
+工作台固定 `H3_REWRITER=llm`，不探测或运行 Claude。选择「文字模型服务」后，分别填写「构图规划模型」和「提示词改写模型」的模型 ID，两项可不同；保存后用于新启动的任务，已有模型产物继续复用，正在运行的子进程不变。
+
+- **APIMart / 自定义兼容服务**：默认地址 `https://api.apimart.ai/v1`，文字密钥优先使用 `LLM_API_KEY`，否则使用 `APIMART_API_KEY`。两项模型分别保存到 `LLM_COMPOSITION_MODEL` / `LLM_REWRITE_MODEL`；旧 `LLM_MODEL` 继续作为未单独配置时的默认值，缺省为 `deepseek-v4-pro`。自定义兼容服务可修改 URL 和 LLM key。
+- **Gemini 官方**：选择后填写 `GEMINI_API_KEY`，固定调用 `https://generativelanguage.googleapis.com/v1beta/openai/`。两项模型分别保存到 `GEMINI_COMPOSITION_MODEL` / `GEMINI_REWRITE_MODEL`；未单独配置时沿用 `GEMINI_MODEL`，缺省为 `gemini-flash-latest`。不使用遗留的 APIMart / LLM key、地址或模型，也不自动切换至 APIMart。
+
+两个平台已保存的模型设置互不覆盖，切换时也暂存当前表单输入；点击保存只应用当前所选平台的表单设置。分镜图片仍由 APIMart 生成，使用 Gemini 规划后出图也需要 `APIMART_API_KEY`。高级的 `VISION_API_KEY`、`VISION_BASE_URL`、`H3_GUIDE_FILE` 等仍从 .env / 环境读取，手动修改后重启工作台。页面环境检查不联网鉴权或查余额，无效 key 会在实际任务中明确报错。
 
 视频默认最多同时生成 3 段；可在 `.env` 设置 `RUNNINGHUB_CONCURRENCY`，旧文件若显式设置为 5，会继续覆盖默认值。消费级会员的网站任务也占用同一并发额度。遇到 `421 / TASK_QUEUE_MAXED`，只对明确未接单的片段每 60 秒尝试一次，最多 31 次（仅 421 累计等待最多 30 分钟）；`415` 机器资源不足仍最多尝试 5 次。两类拒绝分别计数，不因切换错误类型而重置；混合拒绝累计最多等待 34 分钟，不含接口耗时。等待耗尽后可续跑原任务，已有云端任务号继续查询；提交结果未知仍禁止自动重提。修改并发配置或更新代码不会改变正在执行的子进程，待当前任务停止后由用户重启工作台再续跑。
 
