@@ -5,7 +5,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from h3ref import film, frames
+from h3ref import config, film, frames
+from h3ref.i18n import use_lang
 from .i18n import InputError, message
 from .jobs import write_json
 
@@ -23,17 +24,22 @@ def plan(request, check_images=True, *, records=None):
     wanted = [(s["idx"], p["shot"]) for s in segments for p in pictures[s["idx"]] if p["kind"] == "frame"]
     descriptions = []
     records = frame_records(request) if records is None else records
+    pending = read_json(out / "inputs" / "frame-edit.json", {})
+    active_pending = pending if pending and not pending.get("applied") else {}
     compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records))
     character_names = {c["picture"]: c["name"] for c in script.get("cast") or []}
     for segment, shot in wanted:
         key = f"s{segment + 1}-{shot + 1}"
+        pending_for_key = active_pending if active_pending.get("key") == key else {}
         who = [c for c in script.get("cast") or [] if film.in_shots(c, [segments[segment]["shots"][shot]])]
-        characters = records.get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
+        characters = pending_for_key.get("character_reference_paths",
+                                         records.get(key, {}).get("character_reference_paths", [c["picture"] for c in who]))
         references = ([{"kind": "board", "path": script["board"], "name": ""}] if script.get("board") else [])
         references += [{"kind": "character", "path": p, "name": character_names.get(p, "")} for p in characters]
         cached = records.get(key, {})
         composition = compositions.get(key) or (cached.get("composition") if (cached.get("composition") or {}).get("version") != 2 else None)
-        prompt = cached.get("prompt") or frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition)
+        with use_lang(request.get("lang")):
+            prompt = pending_for_key.get("prompt") or cached.get("prompt") or frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition)
         descriptions.append({"key": key, "segment": segment + 1, "shot": shot + 1, "prompt": prompt,
                              "references": references, "reference_paths": [r["path"] for r in references],
                              "path": str(out / "frames" / f"{key}.png")})
@@ -58,13 +64,36 @@ def character_references(request, identifier):
     return references
 
 
+def unsubmitted_frame_pending(pending: dict) -> bool:
+    return bool(pending and not pending.get("applied") and not pending.get("downloaded")
+                and not pending.get("task") and not pending.get("submission_unknown"))
+
+
+def frame_edit_task_pending(pending: dict) -> bool:
+    return bool(pending and not pending.get("applied") and pending.get("task")
+                and not pending.get("task_failed") and not pending.get("moderation_error"))
+
+
 def can_edit_frames(request, status):
     if status == "succeeded":
         return True
     if status not in ("failed", "interrupted"):
         return False
     pending = read_json(Path(request["output_dir"]) / "inputs" / "frame-edit.json", {})
-    return request.get("operation") != "frame" or bool(pending.get("moderation_error") or pending.get("task_failed"))
+    return request.get("operation") != "frame" or bool(
+        pending.get("moderation_error") or pending.get("task_failed") or unsubmitted_frame_pending(pending)
+    )
+
+
+def _cached_mtime_ns(path_str, cache):
+    if path_str not in cache:
+        path = Path(path_str)
+        try:
+            st = path.stat()
+            cache[path_str] = st.st_mtime_ns if path.is_file() else None
+        except OSError:
+            cache[path_str] = None
+    return cache[path_str]
 
 
 def view(request, artifacts, editable, identifier=None, failed_only=False, *, records=None):
@@ -73,25 +102,33 @@ def view(request, artifacts, editable, identifier=None, failed_only=False, *, re
     if not source.exists():
         return []
     records = frame_records(request) if records is None else records
+    pending = read_json(out / "inputs" / "frame-edit.json", {})
+    active_pending = pending if pending and not pending.get("applied") else {}
     _, _, _, descriptions = plan(request, check_images=False, records=records)
     urls = {a["path"]: a["url"] for a in artifacts if a["kind"] == "image"}
+    stat_cache = {}
     for description in descriptions:
         rec = records.get(description["key"], {})
-        missing = [p for p in description["reference_paths"] if not Path(p).is_file()]
-        error = rec.get("error") or rec.get("moderation_error")
-        available = description["path"] in urls or bool(error)
-        task_pending = frames.task_pending(rec)
-        submission_unknown = bool(rec.get("submission_unknown") and not rec.get("task"))
-        can_edit = editable and available and not task_pending and not submission_unknown and (not failed_only or bool(error))
-        description.update(prompt=frames.without_anchor_reference(rec.get("failed_prompt") or rec.get("prompt", description["prompt"])),
-                           url=urls.get(description["path"]), error=error, moderation_failed=bool(rec.get("moderation_error")),
+        pending_for_key = active_pending if active_pending.get("key") == description["key"] else {}
+        missing = [p for p in description["reference_paths"] if _cached_mtime_ns(p, stat_cache) is None]
+        error = rec.get("error") or rec.get("moderation_error") or pending_for_key.get("error") or pending_for_key.get("moderation_error")
+        unsubmitted = unsubmitted_frame_pending(pending_for_key)
+        available = description["path"] in urls or bool(error) or unsubmitted
+        task_pending = frames.task_pending(rec) or frame_edit_task_pending(pending_for_key)
+        submission_unknown = bool((rec.get("submission_unknown") and not rec.get("task"))
+                                  or (pending_for_key.get("submission_unknown") and not pending_for_key.get("task")))
+        can_edit = editable and available and not task_pending and not submission_unknown and (not failed_only or bool(error) or unsubmitted)
+        raw_prompt = pending_for_key.get("prompt") or rec.get("failed_prompt") or rec.get("prompt", description["prompt"])
+        description.update(prompt=frames.without_anchor_reference(raw_prompt),
+                           url=urls.get(description["path"]), error=error,
+                           moderation_failed=bool(rec.get("moderation_error") or pending_for_key.get("moderation_error")),
                            task_pending=task_pending, submission_unknown=submission_unknown,
                            editable=can_edit and not missing, missing_references=missing,
                            references_editable=can_edit)
         for index, reference in enumerate(description["references"]):
-            path = Path(reference["path"])
-            reference["url"] = (f"/api/jobs/{identifier}/frames/{description['key']}/references/{index}?v={path.stat().st_mtime_ns}"
-                                if identifier and path.is_file() else None)
+            mtime_ns = _cached_mtime_ns(reference["path"], stat_cache)
+            reference["url"] = (f"/api/jobs/{identifier}/frames/{description['key']}/references/{index}?v={mtime_ns}"
+                                if identifier and mtime_ns is not None else None)
     return descriptions
 
 
@@ -107,6 +144,8 @@ def review_state(out):
 def review_status(request, descriptions):
     out = Path(request["output_dir"])
     saved = review_state(out)
+    pending = read_json(out / "inputs" / "frame-edit.json", {})
+    active_pending = bool(pending and not pending.get("applied"))
     versions = []
     for description in descriptions:
         path = Path(description["path"])
@@ -120,7 +159,9 @@ def review_status(request, descriptions):
     segments = film.plan(script["shots"])
     total = sum(p["kind"] == "frame" for segment in segments for p in film.refs(script, segment, request["frames"]))
     has_frames = total > 0
-    ready = len(descriptions) == total and all(d["version"] and d["url"] and not d.get("error") for d in descriptions)
+    ready = (not active_pending and len(descriptions) == total
+             and all(d["version"] and d["url"] and not d.get("error") and not d.get("task_pending") and not d.get("submission_unknown")
+                     for d in descriptions))
     complete = ready and saved.get("confirmed_version") == version
     return {"kind": "frames" if has_frames else "script", "total": total, "ready": ready, "version": version,
             "complete": complete,
@@ -176,6 +217,7 @@ def regenerate(request):
         else:
             # Resume the saved task; a terminal failure waits for a new manual edit.
             try:
+                record(error=None)
                 if pending.get("task"):
                     status = frames.poll(pending["task"])
                     if status["state"] == "failed":
@@ -188,9 +230,11 @@ def regenerate(request):
             except frames.ContentPolicyError as exc:
                 save_frame_failure(request, pending, str(exc), exc.reason)
                 raise
-            except RuntimeError as exc:
+            except (Exception, SystemExit) as exc:
                 if pending.get("task_failed"):
                     save_frame_failure(request, pending, str(exc), None)
+                else:
+                    record(error=str(exc))
                 raise
         record(downloaded=True, cny=cost)
 
@@ -204,10 +248,10 @@ def regenerate(request):
     if target.exists() and temporary.exists():
         backup_temporary = backup.with_suffix(".tmp")
         shutil.copy2(target, backup_temporary)
-        backup_temporary.replace(backup)
+        config.atomic_replace(backup_temporary, backup)
     if temporary.exists():
         target.parent.mkdir(exist_ok=True)
-        temporary.replace(target)
+        config.atomic_replace(temporary, target)
     if not target.exists():
         raise RuntimeError(message("frame_missing", request["lang"], path=target))
     previous = pending["previous"]

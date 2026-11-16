@@ -36,6 +36,10 @@ class SubmissionRejected(RuntimeError):
     """The image API explicitly rejected creation of a new task."""
 
 
+NON_RETRYABLE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
+MAX_POLL_ATTEMPTS = 600
+
+
 class ContentPolicyError(SubmissionRejected):
     def __init__(self, reason):
         self.reason = str(reason)
@@ -83,12 +87,34 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
              "世界位置与 screen_position/visibility 分开；袋口、袋底、结扣各写物体方向，裁切不能清除已知方向。"
              "机位、景别、运镜、台词与原动作不改；背影不要求露脸，转头视线允许与身体不同。"
              "不把参考图的正面姿势当成当前姿势，不引用首镜或其它生成图，不输出参考编号，不画文字。")
-    out = http.request(config.LLM_BASE + "/chat/completions", config.llm_key(),
-                       {"model": config.LLM_MODEL, "messages": [{"role": "system", "content": rules},
+    llm = config.llm_settings()
+    out = http.request(llm["base_url"] + "/chat/completions", config.llm_key(),
+                       {"model": llm["composition_model"], "messages": [{"role": "system", "content": rules},
                         {"role": "user", "content": json.dumps(context, ensure_ascii=False)}], "max_tokens": 8000, "stream": False},
                        timeout=600, tries=1)
+    if not isinstance(out, dict):
+        raise http.HTTPResponseError(400, message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300]))
+    if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+        err_obj = out.get("error")
+        detail = json.dumps(out, ensure_ascii=False)
+        low = detail.lower()
+        http_status = out.get("_http_status")
+        raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
+        if http_status in (401, 403) or raw_code in (401, 403, "invalid_api_key", "api_key_invalid", "unauthorized", "authentication_error") or any(
+            tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid", "incorrect api key", "unauthorized", "forbidden")
+        ):
+            code = 403 if http_status == 403 or raw_code == 403 else 401
+        elif isinstance(raw_code, int):
+            code = raw_code
+        elif isinstance(http_status, int) and http_status >= 400:
+            code = http_status
+        else:
+            code = 400
+        raise http.HTTPResponseError(code, message("frame_composition_invalid", detail=detail[:300]))
     try:
-        composition = json.loads(out["choices"][0]["message"]["content"])
+        raw = str(out["choices"][0]["message"]["content"]).strip()
+        raw = re.sub(r"^```\w*\s*|\s*```$", "", raw).strip()
+        composition = json.loads(raw)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])) from exc
     return staging.validate_composition(composition, film, shot, known_scenes)
@@ -147,14 +173,20 @@ def submit(text: str, refs: list[Path], aspect: str, *, before_submit=lambda: No
     except RuntimeError as exc:
         if is_moderation_error(exc):
             raise ContentPolicyError(str(exc)) from exc
-        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 403):
+        if isinstance(exc, http.HTTPResponseError) and exc.status_code in NON_RETRYABLE_STATUSES:
             raise SubmissionRejected(str(exc)) from exc
         raise
+    if not isinstance(out, dict):
+        raise RuntimeError("APIMart gave non-object response: " + json.dumps(out, ensure_ascii=False)[:200])
     if is_moderation_error(out.get("error") or out):
         raise ContentPolicyError(json.dumps(out, ensure_ascii=False))
-    task = ((out.get("data") or [{}])[0] or {}).get("task_id")
+    data = out.get("data")
+    task = (data[0].get("task_id") if isinstance(data, list) and data and isinstance(data[0], dict)
+            else data.get("task_id") if isinstance(data, dict) else None)
     if not task:
-        error = SubmissionRejected if out.get("error") or (isinstance(out.get("code"), int) and out["code"] != 0) else RuntimeError
+        rejected = bool(out.get("error") or out.get("_http_status") in NON_RETRYABLE_STATUSES
+                        or (isinstance(out.get("code"), int) and out["code"] != 0))
+        error = SubmissionRejected if rejected else RuntimeError
         raise error("APIMart gave no task id: " + json.dumps(out, ensure_ascii=False)[:200])
     return task
 
@@ -163,13 +195,37 @@ def poll(task: str) -> dict:
     """{state: running|done|failed, url, cny, error}; APIMart reports cost in US dollars."""
     try:
         out = http.request(config.APIMART_BASE + f"/tasks/{task}", config.apimart_key())
+    except http.HTTPResponseError as exc:
+        if is_moderation_error(exc):
+            raise ContentPolicyError(str(exc)) from exc
+        if exc.status_code == 404:
+            return {"state": "failed", "error": str(exc), "moderation_failed": False}
+        raise
     except RuntimeError as exc:
         if is_moderation_error(exc):
             raise ContentPolicyError(str(exc)) from exc
         raise
-    st = out.get("data") or out
-    if not st.get("status") and is_moderation_error(st.get("error") or st):
-        raise ContentPolicyError(json.dumps(st, ensure_ascii=False))
+    if not isinstance(out, dict):
+        return {"state": "failed", "error": json.dumps(out, ensure_ascii=False)[:200], "moderation_failed": False}
+    http_status = out.get("_http_status")
+    st = out.get("data") if isinstance(out.get("data"), dict) else out
+    if not st.get("status"):
+        if is_moderation_error(st.get("error") or out):
+            raise ContentPolicyError(json.dumps(st, ensure_ascii=False))
+        if http_status == 404:
+            return {"state": "failed", "error": json.dumps(out, ensure_ascii=False)[:300], "moderation_failed": False}
+        if isinstance(http_status, int) and http_status >= 400:
+            raise RuntimeError(f"APIMart poll HTTP {http_status}: {json.dumps(out, ensure_ascii=False)[:260]}")
+        if st.get("error") or out.get("error") or (isinstance(out.get("code"), int) and out["code"] != 0):
+            err_payload = st.get("error") or out.get("error") or out
+            err_code = err_payload.get("code") if isinstance(err_payload, dict) else out.get("code")
+            detail = json.dumps(err_payload, ensure_ascii=False) if isinstance(err_payload, dict) else str(err_payload)
+            low_detail = detail.lower()
+            if err_code in (404, "not_found", "task_not_found") or any(
+                tok in low_detail for tok in ("not exist", "not found", "cancelled", "canceled", "expired")
+            ):
+                return {"state": "failed", "error": detail[:300], "moderation_failed": False}
+            raise RuntimeError(f"APIMart poll transient/auth error: {detail[:300]}")
     usd = st.get("cost")
     res = {"state": "running", "cny": round(float(usd) * config.USD_CNY, 4) if usd is not None else None}
     if st.get("status") == "completed":
@@ -178,7 +234,7 @@ def poll(task: str) -> dict:
         res.update(state="done", url=urls[0] if isinstance(urls, list) and urls else urls or None)
         if not res["url"]:
             res.update(state="failed", error="completed without an image url")
-    elif st.get("status") in ("failed", "cancelled"):
+    elif st.get("status") in ("failed", "cancelled", "canceled", "expired", "error"):
         err = st.get("error") or {}
         detail = json.dumps(err, ensure_ascii=False) if isinstance(err, dict) else str(err or st.get("status"))
         res.update(state="failed", error=detail, moderation_failed=is_moderation_error(err))
@@ -195,7 +251,7 @@ def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k:
             record(submission_unknown=False)
             raise
     record(task=task, task_failed=False, submission_unknown=False)
-    while True:
+    for _ in range(MAX_POLL_ATTEMPTS):
         st = poll(task)
         if st["state"] == "done":
             http.download(st["url"], out)
@@ -209,3 +265,4 @@ def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k:
             record(task_failed=True, moderation_error=None, error=error)
             raise RuntimeError(error)
         time.sleep(6)
+    raise RuntimeError(f"frame poll timed out for task {task}")

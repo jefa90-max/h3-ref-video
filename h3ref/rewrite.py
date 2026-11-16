@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from .i18n import message
 
 SECTIONS = ["subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music"]
 EXAMPLES = config.ROOT / "prompts/h3_examples.md"
+_GUIDE_LOCK = threading.Lock()
 
 RULES = """Rules learned on this workflow (they override nothing in the guide, they make it concrete):
 1. Output exactly the six sections, in order, each as `name:` on its own line followed by its text. English only, except
@@ -66,17 +68,27 @@ def guide() -> str:
     if config.GUIDE_FILE:
         return Path(config.GUIDE_FILE).expanduser().read_text(encoding="utf-8")
     cache = config.CACHE / "ref-en.txt"
-    if not cache.is_file():
-        req = urllib.request.Request(config.GUIDE_URL, headers={"User-Agent": config.UA})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                text = r.read().decode("utf-8")
-        except Exception as exc:
-            raise RewriteError(f"取不到 MiniMax 官方提示词指南（{config.GUIDE_URL}）：{type(exc).__name__}。"
-                               "下载 ref-en.txt 后用 H3_GUIDE_FILE 指向它") from None
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(text, encoding="utf-8")
-    return cache.read_text(encoding="utf-8")
+    with _GUIDE_LOCK:
+        if not cache.is_file() or not cache.stat().st_size:
+            req = urllib.request.Request(config.GUIDE_URL, headers={"User-Agent": config.UA})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    text = r.read().decode("utf-8")
+            except Exception as exc:
+                raise RewriteError(f"取不到 MiniMax 官方提示词指南（{config.GUIDE_URL}）：{type(exc).__name__}。"
+                                   "下载 ref-en.txt 后用 H3_GUIDE_FILE 指向它") from None
+            if not text.strip():
+                raise RewriteError(f"取不到 MiniMax 官方提示词指南（{config.GUIDE_URL}）：内容为空")
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=".ref-en-", suffix=".tmp", dir=cache.parent)
+            tmp_path = Path(tmp_name)
+            try:
+                with open(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                config.atomic_replace(tmp_path, cache)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        return cache.read_text(encoding="utf-8")
 
 
 def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback: str = "") -> str:
@@ -153,8 +165,9 @@ def _claude(prompt: str) -> str:
         raise RewriteError("没找到 claude 命令行；装上 Claude Code，或者设 H3_REWRITER=llm 用别的模型")
     with tempfile.TemporaryDirectory() as cwd:
         proc = subprocess.run([exe, "-p", "--output-format", "json", "--max-turns", "1", "--model", config.CLAUDE_MODEL,
+                               "--tools", "", "--strict-mcp-config",
                                "--disallowedTools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task,Agent"],
-                              input=prompt, capture_output=True, text=True, timeout=900, cwd=cwd)
+                              input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, cwd=cwd)
     try:
         out = json.loads(proc.stdout)
     except ValueError:
@@ -165,10 +178,19 @@ def _claude(prompt: str) -> str:
 
 
 def _llm(prompt: str) -> str:
-    out = http.request(config.LLM_BASE + "/chat/completions", config.llm_key(),
-                       {"model": config.LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
-                       timeout=600)
-    text = ((out.get("choices") or [{}])[0].get("message") or {}).get("content")
+    llm = config.llm_settings()
+    try:
+        out = http.request(llm["base_url"] + "/chat/completions", config.llm_key(),
+                           {"model": llm["rewrite_model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
+                           timeout=600)
+    except http.HTTPResponseError as exc:
+        raise RewriteError("改写模型请求失败：" + str(exc)[:300]) from None
+    if not isinstance(out, dict):
+        raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+    choices = out.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+    text = msg.get("content")
     if not text:
         raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
     return text

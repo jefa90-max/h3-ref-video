@@ -6,10 +6,11 @@ import sys
 import uuid
 from pathlib import Path
 
-from h3ref import film, media
+from h3ref import config, film, media
+from h3ref.i18n import use_lang
 from .i18n import InputError, message
 from .jobs import write_json
-from .storyboard import read_json, review_state
+from .storyboard import read_json
 
 
 def clip_version(path, out):
@@ -27,13 +28,119 @@ def read_context(request):
     pending = read_json(out / 'inputs' / 'segment-edit.json', {})
     records = dict(state.get('segs', {}))
     current = records.get(str(pending.get('number', 0) - 1), {})
-    publication_current = (not pending.get('applied') or not pending.get('active')
-                           or current.get('revision') == pending.get('revision') or current == pending.get('previous'))
+    if pending.get('applied'):
+        publication_current = bool(pending.get('active') and current.get('revision') == pending.get('revision'))
+    else:
+        publication_current = (not pending.get('active')
+                               or current.get('revision') == pending.get('revision')
+                               or current == pending.get('previous'))
     if pending.get('publishing') and not pending.get('applied'):
         records[str(pending['number'] - 1)] = pending['previous']
     elif pending.get('applied') and pending.get('active') and publication_current:
         records[str(pending['number'] - 1)] = pending['active']
     return {'pending_stamp': pending_stamp, 'state': state, 'records': records, 'pending': pending, 'publication_current': publication_current, 'automatic': {}, 'path_versions': {}, 'file_versions': {}}
+
+
+def artifact_context(out):
+    out = Path(out)
+    pending = read_json(out / 'inputs' / 'segment-edit.json', {})
+    publication_current = True
+    if pending.get('publishing'):
+        state = read_json(out / 'state.json', {'frames': {}, 'segs': {}})
+        current = state.get('segs', {}).get(str(pending.get('number', 0) - 1), {})
+        if pending.get('applied'):
+            publication_current = bool(pending.get('active') and current.get('revision') == pending.get('revision'))
+        else:
+            publication_current = (not pending.get('active')
+                                   or current.get('revision') == pending.get('revision')
+                                   or current == pending.get('previous'))
+    return {'pending': pending, 'publication_current': publication_current, 'file_versions': {}}
+
+
+def preview_reconciled_segments(out, records=None, *, keep_pending=False, supersede=False, drain_siblings=False):
+    out = Path(out)
+    pending_path = out / 'inputs' / 'segment-edit.json'
+    pending = read_json(pending_path, {})
+    base_records = dict(read_json(out / 'state.json', {'segs': {}}).get('segs', {}) if records is None else records)
+    if not pending or pending.get('applied'):
+        return base_records, False, False
+    number = pending.get('number')
+    if not isinstance(number, int) or number < 1:
+        return base_records, False, not keep_pending
+    index = str(number - 1)
+    staged = read_json(out / 'inputs' / f"segment-{pending.get('revision', '')}" / 'state.json', {}).get('segs', {}).get(index, {})
+    has_clip = (out / 'clips' / f'seg{number}.mp4').is_file()
+    rec = dict(base_records.get(index, {}))
+    changed = False
+    should_unlink = not keep_pending
+
+    def apply_prompt_fields():
+        nonlocal changed
+        prior_zh = rec.get('zh')
+        for key in ('zh', 'h3', 'h3_source', 'h3_reference_version', 'prompt_override', 'pics', 'reference_images'):
+            if key in staged:
+                rec[key] = staged[key]
+                changed = True
+        if 'prompt_override' not in staged and pending.get('explicit_prompt') and pending.get('prompt_format') in ('source', 'h3'):
+            fmt = pending['prompt_format']
+            prompt_text = pending.get('prompt', '')
+            if fmt == 'h3':
+                rec.update(zh='', h3=prompt_text, h3_source=None)
+            else:
+                if not pending.get('reuse_h3') and prompt_text != prior_zh:
+                    rec.update(h3=None, h3_source=None)
+                rec['zh'] = prompt_text
+            if fmt == 'h3' or prompt_text != (pending.get('previous') or {}).get('zh') or (pending.get('previous') or {}).get('prompt_override'):
+                rec['prompt_override'] = {'format': fmt, 'text': prompt_text, 'source_version': pending.get('source_version')}
+            changed = True
+
+    if supersede:
+        if rec.pop('unapplied_edit', None) is not None or rec.pop('attempt_blocked', None) is not None:
+            changed = True
+        if staged.get('prompt_override') or (pending.get('explicit_prompt') and pending.get('prompt_format') in ('source', 'h3')):
+            apply_prompt_fields()
+        should_unlink = True
+    elif not has_clip:
+        if rec.pop('unapplied_edit', None) is not None:
+            changed = True
+        apply_prompt_fields()
+        if staged.get('terminal_failed'):
+            rec.pop('attempt_blocked', None)
+            rec.update(terminal_failed=True, task=staged.get('task'),
+                       error=staged.get('error') or pending.get('error'), file=None, cny=None)
+            changed = True
+        elif staged.get('error') or pending.get('error'):
+            rec['error'] = staged.get('error') or pending.get('error')
+            if drain_siblings and not staged.get('task'):
+                rec['attempt_blocked'] = True
+            changed = True
+        should_unlink = (not keep_pending) if staged.get('terminal_failed') else True
+    elif not keep_pending:
+        rec['unapplied_edit'] = {
+            'revision': pending.get('revision'),
+            'prompt': pending.get('prompt'),
+            'prompt_format': pending.get('prompt_format'),
+            'error': pending.get('error') or staged.get('error'),
+            'attempt_error': pending.get('attempt_error'),
+        }
+        changed = True
+        should_unlink = True
+    if changed:
+        base_records[index] = rec
+    return base_records, changed, should_unlink
+
+
+def reconcile_pending_segment(out, *, keep_pending=False, supersede=False, drain_siblings=False):
+    out = Path(out)
+    next_records, changed, should_unlink = preview_reconciled_segments(
+        out, keep_pending=keep_pending, supersede=supersede, drain_siblings=drain_siblings,
+    )
+    if changed:
+        job = film.Job(out)
+        job.state['segs'] = next_records
+        job.save()
+    if should_unlink:
+        (out / 'inputs' / 'segment-edit.json').unlink(missing_ok=True)
 
 
 def file_version(path, out, context):
@@ -55,7 +162,12 @@ def visible_file(out, name, context, version=None):
         return None
     def matches(path):
         token = file_version(path, out, context)
-        return token and (version is None or str(version) in (token, token.split(':')[0]))
+        if not token:
+            return False
+        if version is None:
+            return True
+        ver_str = str(version)
+        return ver_str == token if ':' in ver_str else ver_str == token.split(':')[0]
     if matches(source):
         return source
     if version is not None and entry:
@@ -112,7 +224,7 @@ def prompt_pair(record, out, number, context):
 
 def segment_prompt_version(record: dict, version: str | None, pending: dict | None = None, *, reference_version=None) -> str:
     attempt = {key: (pending or {}).get(key) for key in ('revision', 'prompt', 'prompt_format', 'applied')}
-    payload = [version, record.get('zh'), record.get('h3'), record.get('prompt_override'), record.get('revision'), attempt, reference_version]
+    payload = [version, record.get('zh'), record.get('h3'), record.get('prompt_override'), record.get('unapplied_edit'), record.get('revision'), attempt, reference_version]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -122,7 +234,6 @@ def source_rewrite_required(record, pair, reference_version):
 
 def automatic_inputs(request, number, context):
     if number not in context['automatic']:
-        from types import SimpleNamespace
         if 'planned' not in context:
             context['planned'] = film.plan(request['film']['shots'])
         planned = context['planned']
@@ -134,8 +245,9 @@ def automatic_inputs(request, number, context):
             versions = film.frame_reference_versions(request['film'], planned, records)
             context['compositions'] = film.saved_compositions(records, reference_versions=versions)
         pictures = film.refs(request['film'], segment, request['frames'])
-        paths = film._picture_paths(SimpleNamespace(dir=Path(request['output_dir'])), segment, pictures)
-        source = film.compile_prompt(request['film'], segment, pictures, len(planned), compositions=context['compositions'])
+        paths = film.picture_paths(Path(request['output_dir']), segment, pictures)
+        with use_lang(request.get('lang')):
+            source = film.compile_prompt(request['film'], segment, pictures, len(planned), compositions=context['compositions'])
         reference_version = film.reference_version(paths, metadata=context['path_versions'])
         source_version = hashlib.sha256(json.dumps([source, reference_version], ensure_ascii=False).encode()).hexdigest()
         context['automatic'][number] = {'source': source, 'source_version': source_version,
@@ -143,14 +255,13 @@ def automatic_inputs(request, number, context):
     return context['automatic'][number]
 
 
-def segment_source_version(request: dict, number: int) -> str:
-    selected_segment(request, number)
-    return automatic_inputs(request, number, read_context(request))['source_version']
-
-
 def attempt_record(request, context, number):
     pending = context['pending']
     if pending.get('number') != number or pending.get('applied'):
+        return {}, {}
+    active = context['records'].get(str(number - 1), {})
+    prev = pending.get('previous') or {}
+    if active.get('revision') != prev.get('revision') and not pending.get('publishing'):
         return {}, {}
     if 'staged' not in context:
         path = Path(request['output_dir']) / 'inputs' / f"segment-{pending['revision']}" / 'state.json'
@@ -161,16 +272,6 @@ def attempt_record(request, context, number):
 def task_unresolved(record):
     return bool(record.get('task') and not record.get('terminal_failed')
                 and not (record.get('file') and record.get('cny') is not None))
-
-
-def can_edit_segments(request, status, context=None):
-    if status == 'succeeded':
-        return True
-    if status not in ('failed', 'interrupted'):
-        return False
-    context = context or read_context(request)
-    # Local and terminal failures may be corrected; accepted/unknown attempts are locked per card.
-    return True
 
 
 def view(request, artifacts, editable, *, context=None):
@@ -188,15 +289,17 @@ def view(request, artifacts, editable, *, context=None):
         version = file_version(path, out, context) if path else None
         pair = prompt_pair(record, out, number, context)
         pending, staged = attempt_record(request, context, number)
-        attempted = staged or record
+        unapplied = (record.get('unapplied_edit') or {}) if not pending else {}
+        attempted = staged if pending else record
         unknown = bool(attempted.get('submission_unknown') and not attempted.get('task'))
         task_pending = task_unresolved(attempted)
-        error = pending.get('error') or attempted.get('error')
+        error = pending.get('error') or attempted.get('error') or unapplied.get('error')
         terminal = bool(attempted.get('terminal_failed'))
+        unsubmitted_pending = bool((pending and not pending.get('applied') and not attempted.get('task') and not unknown) or unapplied)
         automatic = automatic_inputs(request, number, context)
-        fmt = pending.get('prompt_format') or ('source' if pair['source'] else 'h3')
-        prompt = pending.get('prompt') if pending else (pair['source'] if fmt == 'source' else pair['h3'])
-        recoverable = bool(prompt and (version or error or terminal))
+        fmt = pending.get('prompt_format') or unapplied.get('prompt_format') or ('source' if pair['source'] else 'h3')
+        prompt = pending.get('prompt') if pending else (unapplied.get('prompt') if unapplied.get('prompt') is not None else (pair['source'] if fmt == 'source' else pair['h3']))
+        recoverable = bool(prompt and (version or error or terminal or record.get('error') or record.get('terminal_failed') or unsubmitted_pending))
         publishing = bool(pending.get('publishing') or pending.get('generated'))
         can_generate = bool(editable and recoverable and not task_pending and not unknown and not publishing)
         references = []
@@ -216,8 +319,8 @@ def view(request, artifacts, editable, *, context=None):
                       'source_prompt': pair['source'] if version else '', 'h3_prompt': pair['h3'] if version else '',
                       'source_rewrite_required': source_rewrite_required(record, pair, automatic['reference_version']),
                       'automatic_source_prompt': automatic['source'], 'source_changed': bool(override.get('source_version') and override['source_version'] != automatic['source_version']),
-                      'error': error, 'attempt_error': pending.get('attempt_error'), 'task_pending': task_pending,
-                      'submission_unknown': unknown, 'terminal_failed': terminal, 'attempt_revision': pending.get('revision') or record.get('revision'),
+                      'error': error, 'attempt_error': pending.get('attempt_error') or unapplied.get('attempt_error'), 'task_pending': task_pending,
+                      'submission_unknown': unknown, 'terminal_failed': terminal, 'attempt_revision': pending.get('revision') or unapplied.get('revision') or record.get('revision'),
                       'applied_revision': record.get('revision'), 'publishing': publishing, 'reference_images': references,
                       'reference_history_known': 'reference_images' in record, 'references_for_regeneration': True,
                       'board_omitted': bool(request['film'].get('board') and not any(p['kind'] == 'board' for p in automatic['pictures'])),
@@ -242,9 +345,10 @@ def preflight(request, env):
     if request['demo']:
         return
     out = Path(request['output_dir'])
-    pending = read_json(out / 'inputs' / 'segment-edit.json', {})
-    if pending.get('revision') != request.get('segment_revision'):
-        pending = request.get('_segment_preparation') or {}
+    if '_segment_preparation' in request:
+        pending = request['_segment_preparation'] or {}
+    else:
+        pending = read_json(out / 'inputs' / 'segment-edit.json', {})
     if pending.get('applied') or pending.get('generated'):
         return
     staged = read_json(out / 'inputs' / f"segment-{pending.get('revision', '')}" / 'state.json', {}).get('segs', {}).get(str(segment['idx']), {})
@@ -257,11 +361,11 @@ def preflight(request, env):
     if staged.get('task'):
         return
     if pending.get('prompt_format') == 'source' and not pending.get('reuse_h3') and not staged.get('h3'):
-        if not (env.get('LLM_API_KEY', '').strip() or env.get('APIMART_API_KEY', '').strip()):
-            raise InputError('keys', names='LLM_API_KEY / APIMART_API_KEY')
-    from types import SimpleNamespace
+        names = config.llm_settings(env)['key_names']
+        if not any(env.get(name, '').strip() for name in names):
+            raise InputError('keys', names=' / '.join(names))
     pics = film.refs(request['film'], segment, request['frames'])
-    for path in film._picture_paths(SimpleNamespace(dir=out), segment, pics):
+    for path in film.picture_paths(out, segment, pics):
         if not path.is_file():
             raise InputError('missing_image', path=str(path))
 
@@ -274,10 +378,10 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
     other = context['pending']
     if other and not other.get('applied') and other.get('number') != number:
         _, other_record = attempt_record(request, context, other['number'])
-        if other.get('publishing') or other.get('generated') or task_unresolved(other_record) or other_record.get('submission_unknown'):
+        if other.get('publishing') or other.get('generated') or task_unresolved(other_record) or (other_record.get('submission_unknown') and not other_record.get('task')):
             raise InputError('segment_locked', number=other['number'])
     pending, staged = attempt_record(request, context, number)
-    attempted = staged or previous
+    attempted = staged if pending else previous
     if (attempted.get('submission_unknown') and not attempted.get('task')) or task_unresolved(attempted):
         raise InputError('segment_locked', number=number)
     if pending.get('generated') or pending.get('publishing'):
@@ -292,15 +396,17 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
     automatic = automatic_inputs(request, number, context)
     edited = any(value is not None for value in (prompt, prompt_format, prompt_version))
     if edited:
-        for field, value, valid, expected in (
-                ('prompt', prompt, isinstance(prompt, str) and bool(prompt.strip()), 'nonempty string'),
-                ('prompt_format', prompt_format, prompt_format in ('source', 'h3'), 'source|h3'),
-                ('prompt_version', prompt_version, isinstance(prompt_version, str) and bool(prompt_version), 'current prompt version')):
+        for field, value, valid in (
+                ('prompt', prompt, isinstance(prompt, str) and bool(prompt.strip())),
+                ('prompt_format', prompt_format, prompt_format in ('source', 'h3')),
+                ('prompt_version', prompt_version, isinstance(prompt_version, str) and bool(prompt_version))):
             if not valid:
                 raise InputError('segment_value', field=field, value=json.dumps(value, ensure_ascii=False)[:100], expected=message("segment_expected_" + field, request["lang"]))
         if prompt_version != segment_prompt_version(previous, current, pending, reference_version=automatic['reference_version']):
             raise InputError('segment_prompt_changed', field='prompt_version', number=number)
-        if not current and not (attempted.get('terminal_failed') or attempted.get('error') or pending.get('error')):
+        unsubmitted_pending = bool(pending and not pending.get('applied') and not attempted.get('task') and not attempted.get('submission_unknown'))
+        if not current and not (attempted.get('terminal_failed') or previous.get('terminal_failed')
+                                or attempted.get('error') or previous.get('error') or pending.get('error') or unsubmitted_pending):
             raise InputError('segment_prompt', number=number)
     else:
         if pending or not current or (not request['demo'] and not pair['h3']):
@@ -311,11 +417,12 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
         issues = film.rewrite.problems(prompt, len(automatic['pictures']))
         if issues:
             raise InputError('segment_h3_invalid', field='prompt', detail='; '.join(issues)[:250])
-    reuse = bool(prompt_format == 'source' and previous.get('h3')
+    clean_previous = {k: v for k, v in previous.items() if k not in ('unapplied_edit', 'attempt_blocked')}
+    reuse = bool(prompt_format == 'source' and clean_previous.get('h3')
                  and (not edited or (prompt == pair['source']
-                 and not source_rewrite_required(previous, pair, automatic['reference_version']))))
+                 and not source_rewrite_required(clean_previous, pair, automatic['reference_version']))))
     return {'number': number, 'revision': uuid.uuid4().hex, 'version': version, 'prompt_version': prompt_version,
-            'prompt': prompt, 'prompt_format': prompt_format, 'previous': previous, 'applied': False,
+            'prompt': prompt, 'prompt_format': prompt_format, 'previous': clean_previous, 'applied': False,
             'source_version': automatic['source_version'], 'reference_version': automatic['reference_version'],
             'reuse_h3': reuse, 'explicit_prompt': edited}
 
@@ -323,6 +430,15 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
 def prepare_regeneration(request, number, version, *, prompt=None, prompt_format=None, prompt_version=None):
     preparation = regeneration_plan(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
     out = Path(request['output_dir'])
+    existing = read_json(out / 'inputs' / 'segment-edit.json', {})
+    if existing and not existing.get('applied') and existing.get('number') != number:
+        reconcile_pending_segment(out, keep_pending=False, supersede=False)
+    elif preparation['previous'] != read_json(out / 'state.json', {'segs': {}}).get('segs', {}).get(str(number - 1), {}):
+        job = film.Job(out)
+        if str(number - 1) in job.state['segs']:
+            job.state['segs'][str(number - 1)].pop('unapplied_edit', None)
+            job.state['segs'][str(number - 1)].pop('attempt_blocked', None)
+            job.save()
     if not (out / 'inputs' / 'assembly.json').exists() and not assembly_status(request)['pending']:
         record_assembly(request)
     write_json(out / 'inputs' / 'segment-edit.json', preparation)
@@ -357,7 +473,8 @@ def prepare_prompt(staged, request, pending, segment):
     if prompt_format and not legacy:
         if prompt_format == 'h3' or pending['prompt'] != previous.get('zh') or previous.get('prompt_override'):
             staged.put('segs', index, prompt_override={'format': prompt_format, 'text': pending['prompt'], 'source_version': pending['source_version']})
-        staged.put('segs', index, h3_reference_version=pending['reference_version'])
+        staged.put('segs', index, h3_reference_version=pending['reference_version'],
+                   pics=[p['kind'] for p in film.refs(request['film'], segment, request['frames'])])
     (staged.dir / 'prompts').mkdir(exist_ok=True)
     current = staged.state['segs'][index]
     for suffix, key in (('zh', 'zh'), ('h3', 'h3')):
@@ -368,7 +485,7 @@ def prepare_prompt(staged, request, pending, segment):
 def publish_file(source, target):
     temporary = target.with_name(f".{target.name}.tmp")
     shutil.copy2(source, temporary)
-    temporary.replace(target)
+    config.atomic_replace(temporary, target)
 
 
 def _regenerate(request):
@@ -402,11 +519,10 @@ def _regenerate(request):
             staged.put("segs", index, file=str(candidate), cny=0, run_s=0)
         else:
             pics = film.refs(request["film"], segment, request["frames"])
-            from types import SimpleNamespace
-            paths = film._picture_paths(SimpleNamespace(dir=out), segment, pics)
+            paths = film.picture_paths(out, segment, pics)
             if not staged.state['segs'][index].get('task'):
                 staged.put('segs', index, reference_images=[{'number': n, 'kind': picture['kind'], 'name': picture.get('cast', {}).get('name')} for n, picture in enumerate(pics, 1)])
-            film.gen_segment(staged, request["film"], segment, pics, reference_paths=paths, guard_submission=True)
+            film.gen_segment(staged, request["film"], segment, pics, reference_paths=paths)
             film.stage_check(staged, request["film"], [segment])
         if not clip_version(candidate, staged.dir) or media.duration(candidate) <= 0 or not candidate_tail.is_file():
             raise InputError("segment_media", path=str(candidate))
@@ -423,9 +539,7 @@ def _regenerate(request):
             backup = staged.dir / f'previous-{path.name}'
             if path.is_file():
                 publish_file(path, backup)
-            files[path.relative_to(out).as_posix()] = {'previous': str(backup) if path.is_file() else None,
-                                                       'previous_version': clip_version(backup, out),
-                                                       'next': str(source), 'next_version': clip_version(source, out)}
+            files[path.relative_to(out).as_posix()] = {'previous': str(backup) if path.is_file() else None, 'next': str(source)}
         write_json(staged.dir / 'previous.json', pending['previous'])
         pending.update(publishing=True, files=files)
         write_json(pending_path, pending)
@@ -435,7 +549,7 @@ def _regenerate(request):
     active = film.Job(out)
     active.state["segs"][index] = {**staged.state["segs"][index], "file": str(target), "revision": pending["revision"]}
     active.save()
-    pending.update(applied=True, active=active.state["segs"][index])
+    pending.update(applied=True, publishing=False, active=active.state["segs"][index])
     write_json(pending_path, pending)
     print(message("segment_done", request["lang"], number=number), flush=True)
 
@@ -443,7 +557,7 @@ def _regenerate(request):
 def regenerate(request):
     try:
         _regenerate(request)
-    except (Exception, SystemExit) as exc:
+    except (Exception, SystemExit):
         out = Path(request['output_dir'])
         path = out / 'inputs' / 'segment-edit.json'
         pending = read_json(path, {})
@@ -463,7 +577,7 @@ def regenerate(request):
 
 def require_committed_publication(request):
     pending = read_context(request)['pending']
-    if pending.get('publishing') and not pending.get('applied'):
+    if (pending.get('publishing') or pending.get('generated')) and not pending.get('applied'):
         raise InputError('segment_publishing', number=pending['number'])
 
 

@@ -2,6 +2,8 @@
 import subprocess
 from pathlib import Path
 
+from . import config
+
 
 def ff(*args):
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args], check=True, timeout=900)
@@ -9,8 +11,11 @@ def ff(*args):
 
 def duration(path: Path) -> float:
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
-                         capture_output=True, text=True).stdout.strip()
-    return float(out or 0)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60).stdout.strip()
+    try:
+        return float(out or 0)
+    except ValueError:
+        return 0.0
 
 
 def shrink(src: Path, out: Path, longest: int = 1024) -> Path:
@@ -25,8 +30,12 @@ def shrink(src: Path, out: Path, longest: int = 1024) -> Path:
 
 
 def last_frame(video: Path, out: Path) -> Path:
-    ff("-sseof", "-0.15", "-i", str(video), "-frames:v", "1", "-update", "1", "-q:v", "2", str(out))
-    return out
+    out.unlink(missing_ok=True)
+    for offset in ("-0.15", "-0.5", "-1.0", "-2.0"):
+        ff("-sseof", offset, "-i", str(video), "-frames:v", "1", "-update", "1", "-q:v", "2", str(out))
+        if out.is_file() and out.stat().st_size > 0:
+            return out
+    raise RuntimeError(f"last_frame failed to extract a frame from {video}")
 
 
 def sample_frames(video: Path, out_dir: Path, n: int = 8, width: int = 480) -> list[Path]:
@@ -43,14 +52,14 @@ def sample_frames(video: Path, out_dir: Path, n: int = 8, width: int = 480) -> l
 
 def has_audio(path: Path) -> bool:
     out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
-                         capture_output=True, text=True).stdout.strip()
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60).stdout.strip()
     return bool(out)
 
 
 def join(paths: list[Path], out: Path):
     """Clips one after another at the first clip's size, 24 fps, stereo 48 kHz (silence for a clip without sound)."""
     wh = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0",
-                         str(paths[0])], capture_output=True, text=True).stdout.strip().split(",")
+                         str(paths[0])], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60).stdout.strip().split(",")
     w, h = int(wh[0]), int(wh[1])
     args, chains = [], []
     for p in paths:
@@ -62,5 +71,10 @@ def join(paths: list[Path], out: Path):
         else:
             chains.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{duration(p):.3f}[a{k}]")
     chains.append("".join(f"[v{k}][a{k}]" for k in range(len(paths))) + f"concat=n={len(paths)}:v=1:a=1[v][a]")
-    ff(*args, "-filter_complex", ";".join(chains), "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-       "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out))
+    tmp = out.with_name(f".{out.name}.tmp.mp4")
+    try:
+        ff(*args, "-filter_complex", ";".join(chains), "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+           "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(tmp))
+        config.atomic_replace(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)

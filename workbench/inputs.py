@@ -56,7 +56,7 @@ def verify_image(path):
             if image.format not in ("PNG", "JPEG", "WEBP"):
                 raise InputError("image", path=str(path))
             image.verify()
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, SyntaxError, IndexError, EOFError, ValueError) as exc:
         raise InputError("image", path=str(path)) from exc
 
 
@@ -127,22 +127,14 @@ def validate(payload, root):
                         invalid(prefix + "." + field, shot[field], "number", low="-∞", high="∞")
                     if not math.isfinite(value):
                         invalid(prefix + "." + field, shot[field], "number", low="-∞", high="∞")
-        # Let the CLI own all filtering, rounding and duration rules. Temporary
-        # demo references only satisfy load()'s file check; they never reach a model.
+        # Let the CLI own all filtering, rounding and duration rules.
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "film.json"
-            candidate = copy.deepcopy(script)
-            for index, person in enumerate(candidate["cast"]):
-                if job["demo"] and not Path(person["picture"]).is_file():
-                    placeholder = Path(temporary) / f"cast-{index}.png"
-                    placeholder.touch()
-                    person["picture"] = str(placeholder)
-            source.write_text(json.dumps(candidate, ensure_ascii=False), encoding="utf-8")
+            source.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
             try:
-                loaded = film.load(source)
+                loaded = film.load(source, check_images=not job["demo"])
             except (SystemExit, ValueError, TypeError, KeyError) as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
-        loaded["cast"] = script["cast"]
         job["film"] = loaded
         for segment in film.plan(loaded["shots"]):
             try:
@@ -166,29 +158,59 @@ def preflight(job, env):
     state_file = out / "state.json" if out else None
     state = json.loads(state_file.read_text(encoding="utf-8")) if state_file and state_file.exists() else {}
     operation = job.get("operation", "pipeline")
-    needs_rh, needs_rewrite, needs_frames, needs_vision = False, False, False, False
+    needs_rh, needs_rewrite, needs_frames, needs_vision, needs_composition = False, False, False, False, False
     if job["kind"] == "one":
         needs_rh = True
         h3 = state.get("h3") or (job["prompt"] if is_rewritten(job["prompt"]) else "")
         needs_rewrite = not h3
         needs_vision = config.SUBTITLE_CHECKS_ENABLED and (job.get("check", False) or any(ord(ch) > 0x2E80 for ch in h3))
     else:
-        segments = film.plan(job["film"]["shots"])
-        compositions = film.saved_compositions(state.get("frames", {}), reference_versions=film.frame_reference_versions(job["film"], segments, state.get("frames", {})))
-        records = state.get("segs", {})
-        if operation == "pipeline" and not job.get("reset_applied"):
-            records = {**records, **film.invalidated_segment_records(records, job["frames"], job.get("redo"))}
-        for segment in segments:
-            pics = film.refs(job["film"], segment, job["frames"])
-            needs_frames |= any(p["kind"] == "frame" and (not out or not (out / "frames" / f"s{segment['idx'] + 1}-{p['shot'] + 1}.png").exists()) for p in pics)
-            if operation == "pipeline":
-                rec = records.get(str(segment["idx"]), {})
-                if not film.frozen_segment(rec) and (rec.get("prompt_override") or {}).get("format") != "h3":
-                    zh = film.segment_prompt_text(rec, film.compile_prompt(job["film"], segment, pics, len(segments), compositions=compositions))
-                    from types import SimpleNamespace
-                    reference = film.reference_version(film._picture_paths(SimpleNamespace(dir=out), segment, pics))
-                    needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference))
-                needs_rh |= not (out and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists() and rec.get("cny") is not None)
+        from h3ref import frames
+        from h3ref.i18n import use_lang
+        with use_lang(job.get("lang")):
+            segments = film.plan(job["film"]["shots"])
+            compositions = film.saved_compositions(state.get("frames", {}), reference_versions=film.frame_reference_versions(job["film"], segments, state.get("frames", {})))
+            records = dict(job["_reconciled_segs"]) if "_reconciled_segs" in job else dict(state.get("segs", {}))
+            invalidated = set()
+            if operation == "pipeline" and not job.get("reset_applied"):
+                invalidated_map = film.invalidated_segment_records(records, job["frames"], job.get("redo"))
+                invalidated = {int(idx) for idx in invalidated_map}
+                records = {**records, **invalidated_map}
+            has_blocker = operation == "pipeline" and any(
+                not (out and s["idx"] not in invalidated and (out / "clips" / f"seg{s['idx'] + 1}.mp4").exists()
+                     and (records.get(str(s["idx"])) or {}).get("cny") is not None)
+                and (
+                    (records.get(str(s["idx"])) or {}).get("terminal_failed")
+                    or ((records.get(str(s["idx"])) or {}).get("submission_unknown") and not (records.get(str(s["idx"])) or {}).get("task"))
+                    or (records.get(str(s["idx"])) or {}).get("attempt_blocked")
+                )
+                for s in segments
+            )
+            for segment in segments:
+                pics = film.refs(job["film"], segment, job["frames"])
+                for p in pics:
+                    if p["kind"] == "frame":
+                        fkey = f"s{segment['idx'] + 1}-{p['shot'] + 1}"
+                        fcached = state.get("frames", {}).get(fkey) or {}
+                        needs_frames |= (not out or not (out / "frames" / f"{fkey}.png").exists() or frames.task_pending(fcached))
+                if operation != "frame":
+                    for picture in pics:
+                        if picture["kind"] != "frame":
+                            continue
+                        key = f"s{segment['idx'] + 1}-{picture['shot'] + 1}"
+                        cached = state.get("frames", {}).get(key) or {}
+                        needs_composition |= (not out or not (out / "frames" / f"{key}.png").exists()) and not any(
+                            cached.get(field) for field in ("prompt", "composition", "task", "error", "moderation_error", "submission_unknown"))
+                if operation == "pipeline":
+                    rec = records.get(str(segment["idx"]), {})
+                    if not has_blocker and not film.frozen_segment(rec) and (rec.get("prompt_override") or {}).get("format") != "h3":
+                        zh = film.segment_prompt_text(rec, film.compile_prompt(job["film"], segment, pics, len(segments), compositions=compositions))
+                        paths = film.picture_paths(out, segment, pics) if out is not None else []
+                        tail_invalidated = any(p["kind"] == "prev" and (segment["idx"] - 1) in invalidated for p in pics)
+                        reference = film.reference_version(paths) if (out is not None and not tail_invalidated and all(p.is_file() for p in paths)) else None
+                        needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh and rec.get("h3_source", rec.get("zh")) == zh
+                                              and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference))
+                    needs_rh |= not (out and segment["idx"] not in invalidated and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists() and rec.get("cny") is not None)
         if operation == "frame":
             needs_frames = True
         if job.get("redo") and not job.get("reset_applied"):
@@ -197,8 +219,10 @@ def preflight(job, env):
         # so the UI must not turn that optional check into a blocking key requirement.
     if needs_rh and not env.get("RUNNINGHUB_API_KEY", "").strip():
         required.append("RUNNINGHUB_API_KEY")
-    if needs_rewrite and not (env.get("LLM_API_KEY", "").strip() or env.get("APIMART_API_KEY", "").strip()):
-        required.append("LLM_API_KEY / APIMART_API_KEY")
+    if needs_rewrite or needs_composition:
+        names = config.llm_settings(env)["key_names"]
+        if not any(env.get(name, "").strip() for name in names):
+            required.append(" / ".join(names))
     if needs_frames and not env.get("APIMART_API_KEY", "").strip():
         required.append("APIMART_API_KEY")
     if needs_vision and not (env.get("VISION_API_KEY", "").strip() or env.get("APIMART_API_KEY", "").strip()):

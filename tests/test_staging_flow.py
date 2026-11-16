@@ -13,6 +13,13 @@ from h3ref import film, frames
 
 class StagingFlow(unittest.TestCase):
     def setUp(self):
+        import os
+        env_patch = patch.dict(os.environ, {'PATH': os.environ.get('PATH', '')}, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        which_patch = patch('shutil.which', return_value='/fake/ffmpeg')
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
         self.fixture = json.loads((Path(__file__).parent / 'fixtures/staging.json').read_text(encoding='utf-8'))
         self.script = self.fixture['film']
         self.temporary = tempfile.TemporaryDirectory()

@@ -35,7 +35,7 @@ def validate_composition(value: object, film: dict, shot: dict, known_scenes: di
         invalid('version', result.get('version'), '2')
     for field in ('scene', 'frame', 'orientation', 'scene_id', 'world_frame', 'action'):
         result[field] = text(result.get(field), field)
-    aliases = {alias: c['name'] for c in film.get('cast', []) for alias in [c['name'], *(c.get('aliases') or [])]}
+    aliases = {alias: c['name'] for c in film.get('cast') or [] for alias in [c['name'], *(c.get('aliases') or [])]}
 
     def states(items, path, fields):
         array(items, path)

@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from h3ref import config
 from .i18n import InputError, message
 from .inputs import text
 
@@ -16,8 +17,13 @@ def saved_output_root(root, storage):
     preferences = storage / "preferences.json"
     if not preferences.exists():
         return root / "jobs"
-    saved = json.loads(preferences.read_text(encoding="utf-8"))
-    return Path(text(saved.get("output_root"), "output_root"))
+    try:
+        saved = json.loads(preferences.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            return root / "jobs"
+        return Path(text(saved.get("output_root"), "output_root"))
+    except (OSError, ValueError, InputError):
+        return root / "jobs"
 
 
 def validate_output_root(value, root, storage):
@@ -43,7 +49,7 @@ def save_output_root(value, root, storage):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({"output_root": str(folder)}, stream, ensure_ascii=False, indent=2)
-        temporary.replace(storage / "preferences.json")
+        config.atomic_replace(temporary, storage / "preferences.json")
     finally:
         temporary.unlink(missing_ok=True)
     return folder

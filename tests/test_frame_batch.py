@@ -19,6 +19,10 @@ from workbench.server import create_app
 
 class FrameBatch(unittest.TestCase):
     def setUp(self):
+        import os
+        env_patch = patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         description = patch.object(frames, "describe_composition", return_value=json.loads((Path(__file__).parent / 'fixtures/staging.json').read_text(encoding='utf-8'))['transfer_start'])
         description.start()
         self.addCleanup(description.stop)
@@ -182,6 +186,10 @@ class FrameBatch(unittest.TestCase):
 
 class BatchTaskRecovery(unittest.TestCase):
     def setUp(self):
+        import os
+        env_patch = patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         description = patch.object(frames, "describe_composition", return_value=json.loads((Path(__file__).parent / 'fixtures/staging.json').read_text(encoding='utf-8'))['transfer_start'])
         description.start()
         self.addCleanup(description.stop)
@@ -525,3 +533,459 @@ class BatchTaskRecovery(unittest.TestCase):
                 storyboard.regenerate(request)
         self.jobs.find(self.identifier)["status"] = "interrupted"
         self.assertTrue(self.jobs.snapshot(self.identifier)["storyboard"][0]["moderation_failed"])
+
+    def test_single_frame_submission_rejected_allows_edit_frame_and_settles(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Invalid prompt"}, headers=self.headers)
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", return_value={"error": {"code": "invalid_request_error", "message": "bad prompt"}}):
+            with self.assertRaises(frames.SubmissionRejected):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        self.assertTrue(self.jobs.snapshot(self.identifier)["storyboard"][0]["editable"])
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Corrected prompt"}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "green").save(a[3]) or 0.1)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.assertEqual(film.Job(self.out).state["frames"]["s1-1"]["prompt"], "Corrected prompt")
+        self.assertTrue(json.loads((self.out / "inputs/frame-edit.json").read_text())["applied"])
+
+    def test_stopped_video_stage_with_no_unresolved_tasks_allows_storyboard_frame_edit(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        film.Job(self.out).put("frames", "s1-1", prompt="initial", file=str(target))
+        film.Job(self.out).put("segs", "0", task="failed-seg", terminal_failed=True, error="bad frame")
+        req = json.loads(self.request_path.read_text(encoding="utf-8"))
+        req["operation"] = "pipeline"
+        self.request_path.write_text(json.dumps(req), encoding="utf-8")
+        self.jobs.find(self.identifier)["status"] = "failed"
+        self.assertTrue(self.jobs.snapshot(self.identifier)["storyboard"][0]["editable"])
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Repaired frame"}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+
+    def test_single_frame_unknown_submission_blocks_replacement_edit(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "New image."}, headers=self.headers)
+        request = json.loads(self.request_path.read_text(encoding="utf-8"))
+        with patch.object(frames.config, "apimart_key", return_value="synthetic"), \
+             patch.object(frames.http, "request", side_effect=RuntimeError("lost")):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(request)
+        self.jobs.find(self.identifier)["status"] = "failed"
+        pending_path = self.out / "inputs" / "frame-edit.json"
+        before = pending_path.read_bytes()
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            response = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Replacement."}, headers=self.headers)
+        self.assertEqual(response.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual(pending_path.read_bytes(), before)
+
+    def test_single_frame_terminal_failure_replacement_settles_row(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "First edit"}, headers=self.headers)
+        with patch.object(frames, "submit", return_value="failed-task"), \
+             patch.object(frames, "poll", return_value={"state": "failed", "error": "boom"}):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Second edit"}, headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        with patch.object(frames, "submit", return_value="ok-task"), \
+             patch.object(frames, "poll", return_value={"state": "done", "url": "https://cdn.example/img.png", "cny": 0.1}), \
+             patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "green").save(p)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        saved = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertEqual(saved["task"], "ok-task")
+        self.assertFalse(saved["task_failed"])
+        self.assertIsNone(saved["error"])
+        self.assertTrue(json.loads((self.out / "inputs/frame-edit.json").read_text())["applied"])
+
+    def test_single_frame_pre_task_failure_resume_settles_same_revision(self):
+        self.add_reference_board()
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Repaired."}, headers=self.headers)
+        pending_path = self.out / "inputs" / "frame-edit.json"
+        rev = json.loads(pending_path.read_text(encoding="utf-8"))["revision"]
+        with patch.object(frames, "_upload", side_effect=RuntimeError("upload error")):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.assertEqual(self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers).status_code, 200)
+        with patch.object(frames, "_upload", return_value="https://img/ref.jpg"), \
+             patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", side_effect=[{"data": [{"task_id": "t-1"}]}, {"data": {"status": "completed", "cost": 0.01, "result": {"images": [{"url": ["https://img/out.png"]}]}}}]), \
+             patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "blue").save(p)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        after = json.loads(pending_path.read_text(encoding="utf-8"))
+        self.assertEqual(after["revision"], rev)
+        self.assertTrue(after["applied"])
+        self.assertEqual(film.Job(self.out).state["frames"]["s1-1"]["prompt"], "Repaired.")
+
+    def test_interrupted_inflight_frame_edit_blocks_video_ops_and_replacement_edit(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "in-flight"}, headers=self.headers)
+        pending_path = self.out / "inputs" / "frame-edit.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        pending["task"] = "inflight-apimart-task"
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        self.jobs.find(self.identifier)["status"] = "interrupted"
+        snap = self.jobs.snapshot(self.identifier)
+        self.assertFalse(snap["review"]["ready"])
+        self.assertTrue(snap["storyboard"][0]["task_pending"])
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "overwrite"}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+
+    def test_interrupted_unsubmitted_frame_edit_remains_editable_and_retains_draft_prompt(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Unsubmitted draft prompt"}, headers=self.headers)
+        self.jobs.find(self.identifier)["status"] = "interrupted"
+        card = self.jobs.snapshot(self.identifier)["storyboard"][0]
+        self.assertTrue(card["editable"])
+        self.assertEqual(card["prompt"], "Unsubmitted draft prompt")
+
+    def _enable_two_shots(self):
+        self.request["film"]["shots"] = [
+            {"start": 0, "end": 2, "action": "Shot one"},
+            {"start": 2, "end": 4, "action": "Shot two"},
+        ]
+        (self.out / "inputs/film.json").write_text(json.dumps(self.request["film"]), encoding="utf-8")
+        self.request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        (self.out / "frames").mkdir(exist_ok=True)
+        for key, color in (("s1-1", "red"), ("s1-2", "green")):
+            img = self.out / "frames" / f"{key}.png"
+            Image.new("RGB", (8, 8), color).save(img)
+            film.Job(self.out).put("frames", key, prompt=f"prompt-{key}", file=str(img), cny=0.1, task=f"init-{key}")
+
+    def test_unsubmitted_frame_edit_replaced_by_other_frame_settles_other_and_keeps_first(self):
+        self._enable_two_shots()
+        first_bytes = (self.out / "frames/s1-1.png").read_bytes()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Draft s1-1"}, headers=self.headers)
+        self.jobs.find(self.identifier)["status"] = "interrupted"
+        # Because job was interrupted on frame s1-1, s1-2 is editable once status is succeeded or if video stage stopped;
+        # test replacing unapplied unsubmitted s1-1 with s1-2 when status is succeeded:
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-2", json={"prompt": "Edited s1-2"}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "blue").save(a[3]) or 0.1)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.assertEqual((self.out / "frames/s1-1.png").read_bytes(), first_bytes)
+        self.assertEqual(film.Job(self.out).state["frames"]["s1-1"]["prompt"], "prompt-s1-1")
+        self.assertEqual(film.Job(self.out).state["frames"]["s1-2"]["prompt"], "Edited s1-2")
+        self.assertTrue(json.loads((self.out / "inputs/frame-edit.json").read_text())["applied"])
+
+    def test_single_frame_unknown_submission_rejects_http_resume(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        orig = target.read_bytes()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Ambiguous"}, headers=self.headers)
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", side_effect=RuntimeError("lost")):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        snap = self.jobs.snapshot(self.identifier)
+        self.assertFalse(snap["can_resume_video"])
+        before = (self.out / "inputs/frame-edit.json").read_bytes()
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            res = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / "inputs/frame-edit.json").read_bytes(), before)
+        self.assertEqual(target.read_bytes(), orig)
+
+    def test_single_frame_unknown_submission_blocks_editing_other_frame(self):
+        self._enable_two_shots()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Ambiguous"}, headers=self.headers)
+        pending_path = self.out / "inputs/frame-edit.json"
+        pending = json.loads(pending_path.read_text())
+        pending["submission_unknown"] = True
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        before = pending_path.read_bytes()
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-2", json={"prompt": "Other"}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual(pending_path.read_bytes(), before)
+
+    def test_interrupted_inflight_frame_edit_resumes_via_http_and_settles(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        film.Job(self.out).put("frames", "s1-1", prompt="initial", file=str(target), cny=0.2, task="init-t")
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Inflight edit"}, headers=self.headers)
+        pending_path = self.out / "inputs/frame-edit.json"
+        pending = json.loads(pending_path.read_text())
+        pending["task"] = "saved-cloud-task"
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        self.jobs.find(self.identifier)["status"] = "interrupted"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(frames, "submit", side_effect=AssertionError("resubmitted paid image")), \
+             patch.object(frames, "poll", return_value={"state": "done", "url": "https://cdn.example/f.png", "cny": 0.3}), \
+             patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "blue").save(p)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        saved = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertAlmostEqual(saved["cny"], 0.5)
+        self.assertIn(1, storyboard.review_state(self.out)["dirty_segments"])
+        self.assertTrue(json.loads(pending_path.read_text())["applied"])
+
+    def test_inflight_frame_edit_blocks_editing_other_frame(self):
+        self._enable_two_shots()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Inflight"}, headers=self.headers)
+        pending_path = self.out / "inputs/frame-edit.json"
+        pending = json.loads(pending_path.read_text())
+        pending["task"] = "inflight-task-1"
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        before = pending_path.read_bytes()
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-2", json={"prompt": "Other"}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual(pending_path.read_bytes(), before)
+
+    def test_single_frame_terminal_failure_rejects_http_resume(self):
+        target = self.out / "frames" / "s1-1.png"
+        target.parent.mkdir()
+        Image.new("RGB", (8, 8), "red").save(target)
+        orig = target.read_bytes()
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Terminal"}, headers=self.headers)
+        with patch.object(frames, "submit", return_value="dead-task"), \
+             patch.object(frames, "poll", return_value={"state": "failed", "error": "boom"}):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        snap = self.jobs.snapshot(self.identifier)
+        self.assertFalse(snap["can_resume_video"])
+        before = (self.out / "inputs/frame-edit.json").read_bytes()
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch") as launch:
+            res = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / "inputs/frame-edit.json").read_bytes(), before)
+        self.assertEqual(target.read_bytes(), orig)
+
+    def test_terminal_frame_edit_reconciles_to_state_before_other_frame_replaces_pending(self):
+        self._enable_two_shots()
+        film.Job(self.out).put("frames", "s1-2", error="s1-2 failed earlier", task_failed=True)
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Crash terminal"}, headers=self.headers)
+        pending_path = self.out / "inputs/frame-edit.json"
+        pending = json.loads(pending_path.read_text())
+        pending.update(task="dead-s1-1", task_failed=True, error="remote GPU crash")
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        self.jobs.find(self.identifier)["status"] = "interrupted"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-2", json={"prompt": "Fix s1-2"}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "yellow").save(a[3]) or 0.1)):
+            storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        saved_s1 = film.Job(self.out).state["frames"]["s1-1"]
+        self.assertTrue(saved_s1.get("task_failed"), "Unreconciled terminal failure on s1-1 was erased when editing s1-2")
+        self.assertEqual(saved_s1.get("task"), "dead-s1-1")
+        self.assertTrue(saved_s1.get("error"))
+        self.assertTrue(json.loads(pending_path.read_text())["applied"])
+
+    def test_settled_failed_single_frame_edit_allows_resuming_inflight_or_unstarted_sibling_frames(self):
+        self.request["film"]["shots"] = [
+            {"start": 0, "end": 2, "action": "Shot one"},
+            {"start": 2, "end": 4, "action": "Shot two"},
+        ]
+        (self.out / "inputs/film.json").write_text(json.dumps(self.request["film"]), encoding="utf-8")
+        self.request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        (self.out / "frames").mkdir(exist_ok=True)
+        film.Job(self.out).put("frames", "s1-1", prompt="bad", error="failed", task_failed=True)
+        film.Job(self.out).put("frames", "s1-2", prompt="good", task="inflight-s1-2", error="poll lost")
+        self.jobs.find(self.identifier)["status"] = "failed"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Retry s1-1"}, headers=self.headers)
+        with patch.object(frames, "submit", return_value="dead-retry"), \
+             patch.object(frames, "poll", return_value={"state": "failed", "error": "still failing"}):
+            with self.assertRaises(RuntimeError):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        snap = self.jobs.snapshot(self.identifier)
+        self.assertTrue(snap["can_resume_frames"], "Sibling in-flight frame task must remain resumable after failed single-frame edit")
+        self.assertTrue(snap["can_resume_video"])
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        resumed_req = json.loads(self.request_path.read_text(encoding="utf-8"))
+        self.assertEqual(resumed_req["operation"], "frames")
+        self.assertTrue(resumed_req.get("resume_frame_tasks"))
+        with patch.object(frames, "submit", side_effect=AssertionError("resubmitted dead s1-1")), \
+             patch.object(frames, "poll", return_value={"state": "done", "url": "https://cdn.example/s2.png", "cny": 0.1}) as poll_mock, \
+             patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "green").save(p)):
+            storyboard.run(resumed_req)
+        poll_mock.assert_called_once_with("inflight-s1-2")
+        self.assertTrue((self.out / "frames/s1-2.png").is_file())
+        self.assertTrue(film.Job(self.out).state["frames"]["s1-1"].get("task_failed"))
+
+    def test_cli_film_resume_polls_inflight_frame_tasks_and_pre_task_frame_edit_allows_sibling_resume(self):
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location("h3ref_cli_mod", Path(__file__).resolve().parents[1] / "h3ref.py")
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_dir = Path(tmp) / "cli-job"
+            cli_dir.mkdir()
+            film_file = Path(tmp) / "film.json"
+            film_file.write_text(json.dumps({"aspect": "9:16", "shots": [{"start": 0, "end": 5, "action": "walk"}]}), encoding="utf-8")
+            job = film.Job(cli_dir)
+            job.state.update(film_path=str(film_file), mode="shot")
+            job.put("frames", "s1-1", prompt="saved p", task="cli-inflight-frame", error="poll lost", reference_paths=[])
+            job.save()
+            with patch.object(sys, "argv", ["h3ref.py", "film", str(cli_dir)]), \
+                 patch.object(frames, "submit", side_effect=AssertionError("resubmitted")), \
+                 patch.object(frames, "poll", return_value={"state": "done", "url": "https://cdn.example/f.png", "cny": 0.1}) as cli_poll, \
+                 patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "red").save(p)), \
+                 patch.object(film, "stage_prompts"), patch.object(film, "stage_generate"), \
+                 patch.object(film.media, "join", side_effect=lambda ps, p: p.write_bytes(b"mp4")), \
+                 patch.object(film.media, "duration", return_value=5):
+                job.put("segs", "0", file=str(cli_dir / "clips/seg1.mp4"), cny=1)
+                (cli_dir / "clips").mkdir()
+                (cli_dir / "clips/seg1.mp4").write_bytes(b"mp4")
+                cli_mod.main()
+            cli_poll.assert_called_once_with("cli-inflight-frame")
+            self.assertTrue((cli_dir / "frames/s1-1.png").is_file())
+
+        # Pre-task 402 single-frame edit failure on s1-1 while s1-2 has task_pending allows /resume to settle s1-2
+        self.request["film"]["shots"] = [
+            {"start": 0, "end": 2, "action": "Shot one"},
+            {"start": 2, "end": 4, "action": "Shot two"},
+        ]
+        (self.out / "inputs/film.json").write_text(json.dumps(self.request["film"]), encoding="utf-8")
+        self.request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        (self.out / "frames").mkdir(exist_ok=True)
+        film.Job(self.out).put("frames", "s1-1", prompt="bad", error="402 balance")
+        film.Job(self.out).put("frames", "s1-2", prompt="good", task="inflight-s1-2-pre", error="poll lost")
+        self.jobs.find(self.identifier)["status"] = "failed"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1", json={"prompt": "Retry 402"}, headers=self.headers)
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", return_value={"error": {"code": 402, "message": "insufficient balance"}}):
+            with self.assertRaises(frames.SubmissionRejected):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        snap = self.jobs.snapshot(self.identifier)
+        self.assertTrue(snap["can_resume_frames"])
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(frames, "submit", side_effect=AssertionError("resubmitted s1-1")), \
+             patch.object(frames, "poll", return_value={"state": "done", "url": "https://cdn.example/s2.png", "cny": 0.1}) as poll_s2, \
+             patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "green").save(p)):
+            storyboard.run(json.loads(self.request_path.read_text(encoding="utf-8")))
+        poll_s2.assert_called_once_with("inflight-s1-2-pre")
+        self.assertTrue((self.out / "frames/s1-2.png").is_file())
+
+    def test_pre_task_frame_edit_on_completed_frame_does_not_repoll_old_task_during_sibling_resume(self):
+        self.request["film"]["shots"] = [
+            {"start": 0, "end": 2, "action": "Shot one"},
+            {"start": 2, "end": 4, "action": "Shot two"},
+        ]
+        (self.out / "inputs/film.json").write_text(json.dumps(self.request["film"]), encoding="utf-8")
+        self.request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        (self.out / "frames").mkdir(exist_ok=True)
+        s1_img = self.out / "frames/s1-1.png"
+        Image.new("RGB", (8, 8), "red").save(s1_img)
+        original_bytes = s1_img.read_bytes()
+        film.Job(self.out).put("frames", "s1-1", prompt="Original s1-1", file=str(s1_img), cny=0.1,
+                               task="done-old-s1-1", error=None, task_failed=False)
+        film.Job(self.out).put("frames", "s1-2", prompt="Good s1-2", task="inflight-s1-2", error="poll lost")
+        self.jobs.find(self.identifier)["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            res = self.client.post(f"/api/jobs/{self.identifier}/frames/s1-1",
+                                   json={"prompt": "Ungenerated 402 prompt"}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", return_value={"error": {"code": 402, "message": "insufficient balance"}}):
+            with self.assertRaises(frames.SubmissionRejected):
+                storyboard.regenerate(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.jobs.find(self.identifier)["status"] = "failed"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.assertEqual(self.client.post(f"/api/jobs/{self.identifier}/resume", json={}, headers=self.headers).status_code, 200)
+        polled = []
+        with patch.object(frames, "submit", side_effect=AssertionError("resubmitted")), \
+             patch.object(frames, "poll", side_effect=lambda t: polled.append(t) or {"state": "done", "url": "https://cdn.example/s2.png", "cny": 0.1}), \
+             patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "green").save(p)):
+            storyboard.run(json.loads(self.request_path.read_text(encoding="utf-8")))
+        self.assertEqual(polled, ["inflight-s1-2"])
+        self.assertEqual(s1_img.read_bytes(), original_bytes)
+        self.assertEqual(film.Job(self.out).state["frames"]["s1-1"]["prompt"], "Original s1-1")
+
+    def test_cli_film_rerun_with_explicit_film_flag_polls_inflight_frame_tasks(self):
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location("h3ref_cli_flag_mod", Path(__file__).resolve().parents[1] / "h3ref.py")
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_dir = Path(tmp) / "cli-flag-job"
+            cli_dir.mkdir()
+            film_file = Path(tmp) / "film.json"
+            film_file.write_text(json.dumps({"aspect": "9:16", "shots": [{"start": 0, "end": 5, "action": "walk"}]}), encoding="utf-8")
+            job = film.Job(cli_dir)
+            job.state.update(film_path=str(film_file), mode="shot")
+            job.put("frames", "s1-1", prompt="saved p", task="cli-flag-inflight", error="poll lost", reference_paths=[])
+            (cli_dir / "clips").mkdir()
+            (cli_dir / "clips/seg1.mp4").write_bytes(b"mp4")
+            job.put("segs", "0", file=str(cli_dir / "clips/seg1.mp4"), cny=1)
+            job.save()
+            with patch.object(sys, "argv", ["h3ref.py", "film", str(cli_dir), "--film", str(film_file)]), \
+                 patch.object(frames, "submit", side_effect=AssertionError("resubmitted")), \
+                 patch.object(frames, "poll", return_value={"state": "done", "url": "https://cdn.example/f.png", "cny": 0.1}) as cli_poll, \
+                 patch.object(frames.http, "download", side_effect=lambda u, p: Image.new("RGB", (8, 8), "red").save(p)), \
+                 patch.object(film, "stage_prompts"), patch.object(film, "stage_generate"), \
+                 patch.object(film.media, "join", side_effect=lambda ps, p: p.write_bytes(b"mp4")), \
+                 patch.object(film.media, "duration", return_value=5):
+                cli_mod.main()
+            cli_poll.assert_called_once_with("cli-flag-inflight")
+            self.assertTrue((cli_dir / "frames/s1-1.png").is_file())

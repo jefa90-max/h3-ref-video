@@ -29,7 +29,16 @@ def cmd_one(a):
     out.mkdir(parents=True, exist_ok=True)
     state_file = out / "state.json"
     st = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
-    save = lambda: state_file.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def save():
+        tmp = state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+        config.atomic_replace(tmp, state_file)
+    clip = out / "clip.mp4"
+    if clip.exists() and st.get("cny") is not None:
+        return
+    if st.get("terminal_failed"):
+        raise RuntimeError(message("one_terminal_failed", path=state_file))
     images = [Path(p).expanduser().resolve() for p in a.image]
     for p in images:
         if not p.is_file():
@@ -45,7 +54,7 @@ def cmd_one(a):
         if st.get("submission_unknown"):
             raise RuntimeError(message("submission_unknown", number=1, path=state_file))
         names = [rh.upload(p) for p in images]
-        st["seed"] = a.seed or random.randrange(10 ** 14, 10 ** 15)
+        st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
         g = rh.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
         def record_submission(unknown):
             st["submission_unknown"] = unknown
@@ -55,16 +64,17 @@ def cmd_one(a):
         st["submission_unknown"] = False
         save()
         print(f"已提交，预计 ¥{rh.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
-    while True:
+    for _ in range(360):
         res = rh.poll(st["task"])
         if res["state"] != "running":
             break
         time.sleep(20)
+    else:
+        raise RuntimeError(f"RunningHub 轮询超时：{st['task']}")
     if res["state"] == "failed":
-        st.pop("task")
+        st.update(terminal_failed=True, error=res.get("error"))
         save()
-        raise SystemExit(f"生成失败：{res.get('error')}（再跑一次会重新提交）")
-    clip = out / "clip.mp4"
+        raise RuntimeError(message("one_terminal_failed", path=state_file))
     http.download(res["url"], clip)
     st.update(cny=res["cny"], run_s=res.get("run_seconds"), wall_s=round(time.time() - t0))
     if config.SUBTITLE_CHECKS_ENABLED and (any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check):
@@ -105,7 +115,7 @@ def main():
             raise SystemExit("--seconds 只能是 5 到 15")
         cmd_one(a)
     elif a.cmd == "film":
-        film.run(a.job, a.film, a.frames, a.redo)
+        film.run(a.job, a.film, a.frames, a.redo, resume_frame_tasks=True)
         failed = film.Job(a.job).state.get("frame_failures") or []
         if failed:
             raise SystemExit(message("frames_cli_incomplete", keys=", ".join(failed), path=a.job / "state.json"))

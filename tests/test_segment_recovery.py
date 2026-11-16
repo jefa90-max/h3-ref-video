@@ -132,6 +132,144 @@ class SegmentRecovery(unittest.TestCase):
                 segments.assemble(self.request)
         self.assertEqual(self.final.read_bytes(), b'ORIGINAL COMPLETE FILM')
 
+    def test_explicit_rejection_resume_completes_publication_and_marks_applied(self):
+        self.prepare_clip(live=True)
+        with patch.object(rh, '_post', side_effect=[{'code': 605, 'msg': 'NOT_ENOUGH_BALANCE'}, {'code': 0, 'data': {'taskId': 'ok-task'}}]), \
+             patch.object(rh, 'upload', return_value='up.png'), \
+             patch.object(rh, 'poll', return_value={'state': 'done', 'url': 'https://cdn.example/clip.mp4', 'cny': 0.2}), \
+             patch.object(film.http, 'download', side_effect=lambda u, p: p.write_bytes(b'RESUMED CLIP')), \
+             patch.object(media, 'last_frame', side_effect=lambda c, p: p.write_bytes(b'RESUMED TAIL')), \
+             patch.object(media, 'duration', return_value=5):
+            with self.assertRaisesRegex(RuntimeError, '605'):
+                segments.regenerate(self.request)
+            segments.regenerate(self.request)
+        self.assertEqual(self.clip.read_bytes(), b'RESUMED CLIP')
+        self.assertEqual(film.Job(self.out).state['segs']['0']['task'], 'ok-task')
+        self.assertTrue(json.loads((self.out / 'inputs/segment-edit.json').read_text())['applied'])
+
+    def _app_with_job(self, status='failed', operation='assemble'):
+        from workbench import storyboard
+        from workbench.server import create_app
+        root = self.out.parent
+        write_json(self.out / 'inputs/film.json', self.request['film'])
+        req = {**self.request, 'operation': operation}
+        write_json(self.out / 'inputs/request.json', req)
+        review = storyboard.review_status(req, [])
+        write_json(self.out / 'inputs/review.json', {'dirty_segments': [], 'confirmed_version': review['version']})
+        app = create_app(root / f'st-{id(req)}', root / '.env')
+        self.addCleanup(app.extensions['jobs'].close)
+        jobs = app.extensions['jobs']
+        jobs.records['job-a'] = {'id': 'job-a', 'kind': 'film', 'demo': True, 'status': status,
+                                 'operation': operation, 'output_dir': str(self.out), 'lang': 'en', 'created_at': 1, 'error': 'err'}
+        return app.test_client(), jobs, {'X-Workbench': '1', 'Accept-Language': 'en'}
+
+    def test_failed_ungenerated_assembly_resumes_via_http_and_settles(self):
+        client, jobs, headers = self._app_with_job(status='failed', operation='assemble')
+        segments.prepare_assembly(self.request, segments.assembly_status(self.request)['version'])
+        with patch('workbench.jobs.preflight'), patch.object(jobs, 'launch'):
+            res = client.post('/api/jobs/job-a/resume', json={}, headers=headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        req = json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8'))
+        with patch.object(media, 'join', side_effect=lambda paths, out: out.write_bytes(b'JOINED RESUME')), \
+             patch.object(media, 'duration', return_value=5):
+            segments.assemble(req)
+        self.assertEqual(self.final.read_bytes(), b'JOINED RESUME')
+        self.assertTrue((self.out / 'inputs/assembly.json').is_file())
+        self.assertTrue(json.loads((self.out / 'inputs/assembly-edit.json').read_text())['applied'])
+
+    def test_failed_ungenerated_assembly_can_reassemble_fresh_revision(self):
+        client, jobs, headers = self._app_with_job(status='failed', operation='assemble')
+        segments.prepare_assembly(self.request, segments.assembly_status(self.request)['version'])
+        old_rev = json.loads((self.out / 'inputs/assembly-edit.json').read_text())['revision']
+        snap = client.get('/api/jobs/job-a').json
+        self.assertTrue(snap['can_assemble'])
+        with patch('workbench.jobs.preflight'), patch.object(jobs, 'launch'):
+            res = client.post('/api/jobs/job-a/assemble', json={'version': snap['assembly']['version']}, headers=headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        new_pending = json.loads((self.out / 'inputs/assembly-edit.json').read_text())
+        self.assertNotEqual(new_pending['revision'], old_rev)
+        req = json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8'))
+        with patch.object(media, 'join', side_effect=lambda paths, out: out.write_bytes(b'JOINED REASSEMBLE')), \
+             patch.object(media, 'duration', return_value=5):
+            segments.assemble(req)
+        self.assertEqual(self.final.read_bytes(), b'JOINED REASSEMBLE')
+        self.assertTrue(json.loads((self.out / 'inputs/assembly-edit.json').read_text())['applied'])
+
+    def test_interrupted_generated_assembly_resumes_via_http_without_rejoining(self):
+        client, jobs, headers = self._app_with_job(status='interrupted', operation='assemble')
+        segments.prepare_assembly(self.request, segments.assembly_status(self.request)['version'])
+        copy_file = segments.shutil.copy2
+        def interrupt_backup(src, dst, *a, **kw):
+            if Path(src) == self.final:
+                raise OSError('backup interrupted')
+            return copy_file(src, dst, *a, **kw)
+        req = json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8'))
+        with patch.object(media, 'join', side_effect=lambda paths, out: out.write_bytes(b'CANDIDATE FILM')), \
+             patch.object(media, 'duration', return_value=5), \
+             patch.object(segments.shutil, 'copy2', side_effect=interrupt_backup):
+            with self.assertRaises(OSError):
+                segments.assemble(req)
+        self.assertTrue(json.loads((self.out / 'inputs/assembly-edit.json').read_text())['generated'])
+        with patch('workbench.jobs.preflight'), patch.object(jobs, 'launch'):
+            res = client.post('/api/jobs/job-a/resume', json={}, headers=headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(media, 'join', side_effect=AssertionError('rejoined existing candidate')):
+            segments.assemble(json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8')))
+        self.assertEqual(self.final.read_bytes(), b'CANDIDATE FILM')
+        self.assertTrue(json.loads((self.out / 'inputs/assembly-edit.json').read_text())['applied'])
+
+    def test_interrupted_generated_assembly_can_reassemble_fresh_revision(self):
+        client, jobs, headers = self._app_with_job(status='interrupted', operation='assemble')
+        segments.prepare_assembly(self.request, segments.assembly_status(self.request)['version'])
+        pending_path = self.out / 'inputs/assembly-edit.json'
+        pending = json.loads(pending_path.read_text())
+        old_rev = pending['revision']
+        (self.out / 'inputs' / f"assembled-{old_rev}.mp4").write_bytes(b'OLD CANDIDATE')
+        pending['generated'] = True
+        write_json(pending_path, pending)
+        snap = client.get('/api/jobs/job-a').json
+        self.assertTrue(snap['can_assemble'])
+        with patch('workbench.jobs.preflight'), patch.object(jobs, 'launch'):
+            res = client.post('/api/jobs/job-a/assemble', json={'version': snap['assembly']['version']}, headers=headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        new_rev = json.loads(pending_path.read_text())['revision']
+        self.assertNotEqual(new_rev, old_rev)
+        with patch.object(media, 'join', side_effect=lambda paths, out: out.write_bytes(b'FRESH CANDIDATE')), \
+             patch.object(media, 'duration', return_value=5):
+            segments.assemble(json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8')))
+        self.assertEqual(self.final.read_bytes(), b'FRESH CANDIDATE')
+        self.assertTrue(json.loads(pending_path.read_text())['applied'])
+
+    def test_stale_pending_assembly_rejects_resume_without_overwriting_film(self):
+        from workbench.i18n import InputError
+        self.request['operation'] = 'assemble'
+        segments.prepare_assembly(self.request, segments.assembly_status(self.request)['version'])
+        self.clip.write_bytes(b'UPDATED CLIP BYTES AFTER PREPARE')
+        with self.assertRaises(InputError) as caught:
+            segments.assemble(self.request)
+        self.assertEqual(caught.exception.key, 'assembly_changed')
+        self.assertEqual(self.final.read_bytes(), b'ORIGINAL COMPLETE FILM')
+        self.assertFalse(json.loads((self.out / 'inputs/assembly-edit.json').read_text())['applied'])
+
+    def test_stale_failed_assembly_can_reassemble_with_updated_clip_version(self):
+        client, jobs, headers = self._app_with_job(status='failed', operation='assemble')
+        segments.prepare_assembly(self.request, segments.assembly_status(self.request)['version'])
+        self.clip.write_bytes(b'UPDATED CLIP BYTES AFTER FAILED ASSEMBLE')
+        snap = client.get('/api/jobs/job-a').json
+        self.assertTrue(snap['can_assemble'], 'Failed assemble job with ready clips must allow fresh reassemble')
+        with patch('workbench.jobs.preflight'), patch.object(jobs, 'launch'):
+            res = client.post('/api/jobs/job-a/assemble', json={'version': snap['assembly']['version']}, headers=headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(media, 'join', side_effect=lambda paths, out: out.write_bytes(b'REASSEMBLED UPDATED')), \
+             patch.object(media, 'duration', return_value=5):
+            segments.assemble(json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8')))
+        self.assertEqual(self.final.read_bytes(), b'REASSEMBLED UPDATED')
+        self.assertEqual(
+            json.loads((self.out / 'inputs/assembly.json').read_text())['version'],
+            segments.assembly_status(self.request)['version'],
+        )
+        self.assertTrue(json.loads((self.out / 'inputs/assembly-edit.json').read_text())['applied'])
+
 
 if __name__ == '__main__':
     unittest.main()

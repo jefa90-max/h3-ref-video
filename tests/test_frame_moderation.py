@@ -126,6 +126,12 @@ class FrameModeration(unittest.TestCase):
 
 
 class ManualModerationRecovery(unittest.TestCase):
+    def setUp(self):
+        import os
+        env_patch = patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
     def test_uncertain_task_cannot_be_overwritten_by_another_manual_edit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -201,5 +207,121 @@ class ManualModerationRecovery(unittest.TestCase):
                     response = client.post(f"/api/jobs/{identifier}/resume", json={}, headers=headers)
                 self.assertEqual(response.status_code, 200, response.json)
                 self.assertEqual(launch.call_args.args[1]["operation"], "frames")
+            finally:
+                jobs.close()
+
+    def test_single_frame_moderation_failure_rejects_same_prompt_and_settles_changed_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = create_app(root / "storage", root / ".env")
+            jobs = app.extensions["jobs"]
+            client = app.test_client()
+            headers = {"X-Workbench": "1"}
+            script = {"shots": [{"start": 0, "end": 2, "action": "walk"}]}
+            try:
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    response = client.post("/api/jobs", json={"kind": "film", "demo": False, "frames": "shot",
+                        "film": script, "output_dir": str(root / "output")}, headers=headers)
+                identifier = response.json["id"]
+                out = Path(response.json["output_dir"])
+                target = out / "frames" / "s1-1.png"
+                target.parent.mkdir()
+                Image.new("RGB", (8, 8), "red").save(target)
+                jobs.find(identifier)["status"] = "succeeded"
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    client.post(f"/api/jobs/{identifier}/frames/s1-1", json={"prompt": "Rejected edit"}, headers=headers)
+                with patch.object(frames, "submit", side_effect=frames.ContentPolicyError("policy")):
+                    with self.assertRaises(frames.ContentPolicyError):
+                        storyboard.regenerate(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+                jobs.find(identifier)["status"] = "failed"
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    same = client.post(f"/api/jobs/{identifier}/frames/s1-1", json={"prompt": "Rejected edit"}, headers=headers)
+                    self.assertEqual(same.status_code, 400)
+                    changed = client.post(f"/api/jobs/{identifier}/frames/s1-1", json={"prompt": "Safe edit"}, headers=headers)
+                    self.assertEqual(changed.status_code, 200)
+                with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "blue").save(a[3]) or 0.1)):
+                    storyboard.regenerate(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+                saved = film.Job(out).state["frames"]["s1-1"]
+                self.assertIsNone(saved["moderation_error"])
+                self.assertIsNone(saved["failed_prompt"])
+                self.assertTrue(json.loads((out / "inputs/frame-edit.json").read_text())["applied"])
+            finally:
+                jobs.close()
+
+    def test_single_frame_moderation_failure_rejects_http_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = create_app(root / "storage", root / ".env")
+            jobs = app.extensions["jobs"]
+            client = app.test_client()
+            headers = {"X-Workbench": "1"}
+            try:
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    response = client.post("/api/jobs", json={"kind": "film", "demo": False, "frames": "shot",
+                        "film": {"shots": [{"start": 0, "end": 2, "action": "walk"}]}, "output_dir": str(root / "output")}, headers=headers)
+                identifier = response.json["id"]
+                out = Path(response.json["output_dir"])
+                target = out / "frames" / "s1-1.png"
+                target.parent.mkdir()
+                Image.new("RGB", (8, 8), "red").save(target)
+                orig = target.read_bytes()
+                jobs.find(identifier)["status"] = "succeeded"
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    client.post(f"/api/jobs/{identifier}/frames/s1-1", json={"prompt": "Blocked prompt"}, headers=headers)
+                with patch.object(frames, "submit", side_effect=frames.ContentPolicyError("content_policy_violation")):
+                    with self.assertRaises(frames.ContentPolicyError):
+                        storyboard.regenerate(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+                jobs.find(identifier)["status"] = "failed"
+                snap = jobs.snapshot(identifier)
+                self.assertFalse(snap["can_resume_video"])
+                before = (out / "inputs/frame-edit.json").read_bytes()
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch") as launch:
+                    res = client.post(f"/api/jobs/{identifier}/resume", json={}, headers=headers)
+                self.assertEqual(res.status_code, 400)
+                launch.assert_not_called()
+                self.assertEqual((out / "inputs/frame-edit.json").read_bytes(), before)
+                self.assertEqual(target.read_bytes(), orig)
+            finally:
+                jobs.close()
+
+    def test_moderation_frame_edit_reconciles_to_state_before_other_frame_replaces_pending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = create_app(root / "storage", root / ".env")
+            jobs = app.extensions["jobs"]
+            client = app.test_client()
+            headers = {"X-Workbench": "1"}
+            script = {"shots": [{"start": 0, "end": 2, "action": "walk"}, {"start": 2, "end": 4, "action": "turn"}]}
+            try:
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    response = client.post("/api/jobs", json={"kind": "film", "demo": False, "frames": "shot",
+                        "film": script, "output_dir": str(root / "output")}, headers=headers)
+                identifier = response.json["id"]
+                out = Path(response.json["output_dir"])
+                (out / "frames").mkdir()
+                for key in ("s1-1", "s1-2"):
+                    img = out / "frames" / f"{key}.png"
+                    Image.new("RGB", (8, 8), "red").save(img)
+                    film.Job(out).put("frames", key, prompt=f"init-{key}", file=str(img), cny=0.1)
+                film.Job(out).put("frames", "s1-2", error="earlier error", task_failed=True)
+                jobs.find(identifier)["status"] = "succeeded"
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    client.post(f"/api/jobs/{identifier}/frames/s1-1", json={"prompt": "Policy bad prompt"}, headers=headers)
+                pending_path = out / "inputs/frame-edit.json"
+                pending = json.loads(pending_path.read_text())
+                pending.update(task="mod-task-1", task_failed=True, moderation_error="content_policy_violation", error="Policy rejected")
+                pending_path.write_text(json.dumps(pending), encoding="utf-8")
+                jobs.find(identifier)["status"] = "interrupted"
+                with patch("workbench.jobs.preflight"), patch.object(jobs, "launch"):
+                    res = client.post(f"/api/jobs/{identifier}/frames/s1-2", json={"prompt": "Safe s1-2"}, headers=headers)
+                self.assertEqual(res.status_code, 200, res.json)
+                with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "green").save(a[3]) or 0.1)):
+                    storyboard.regenerate(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+                jobs.find(identifier)["status"] = "succeeded"
+                saved_s1 = film.Job(out).state["frames"]["s1-1"]
+                self.assertEqual(saved_s1.get("moderation_error"), "content_policy_violation")
+                self.assertEqual(saved_s1.get("failed_prompt"), "Policy bad prompt")
+                snap = jobs.snapshot(identifier)
+                self.assertFalse(snap["review"]["ready"], "Unreconciled moderation hold on s1-1 must block review confirmation")
             finally:
                 jobs.close()

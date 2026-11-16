@@ -1,5 +1,4 @@
 """Local prompt edits exercise actual state, rewrite and RH graph boundaries without paid calls."""
-import copy
 import json
 import tempfile
 import unittest
@@ -8,6 +7,7 @@ from unittest.mock import patch
 
 from h3ref import film, frames, media, rewrite, rh
 from workbench import segments, storyboard
+from workbench.i18n import InputError
 from workbench.jobs import write_json
 from workbench.server import create_app
 
@@ -21,6 +21,13 @@ def h3(text='The recipient stands in front of the counter.',picture=True):
 
 class SegmentPrompts(unittest.TestCase):
     def setUp(self):
+        import os
+        env_patch = patch.dict(os.environ, {'PATH': os.environ.get('PATH', '')}, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        which_patch = patch('workbench.segments.shutil.which', return_value='/fake/ffmpeg')
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         root=Path(self.tmp.name).resolve();self.out=root/'output';self.out.mkdir()
         for folder in ('inputs','clips','prompts'):(self.out/folder).mkdir()
@@ -202,12 +209,25 @@ class SegmentPrompts(unittest.TestCase):
         self.assertEqual(response.status_code,400)
 
     def test_new_source_requires_text_key_before_writing_pending(self):
-        with patch.dict('os.environ',{},clear=True),patch.object(self.jobs,'launch') as launch:
-            card=self.card()
-            response=self.client.post(self.url,json=dict(version=card['version'],prompt_version=card['prompt_version'],prompt='new source',prompt_format='source'),headers=self.headers)
-        self.assertEqual(response.status_code,400,response.json)
-        self.assertFalse((self.out/'inputs/segment-edit.json').exists())
-        launch.assert_not_called()
+        import os
+        root = self.out.parent
+        for provider, expected in (('apimart', 'LLM_API_KEY / APIMART_API_KEY'), ('gemini', 'GEMINI_API_KEY')):
+            with self.subTest(provider=provider), patch.dict('os.environ', {'PATH': os.environ.get('PATH', ''), 'RUNNINGHUB_API_KEY': 'offline-rh', 'LLM_PROVIDER': provider}, clear=True), patch('workbench.segments.shutil.which', return_value='/fake/ffmpeg'):
+                app = create_app(root / f'storage-{provider}', root / f'.env-{provider}')
+                jobs = app.extensions['jobs']
+                try:
+                    jobs.records[self.identifier] = dict(self.jobs.records[self.identifier])
+                    client = app.test_client()
+                    card = client.get('/api/jobs/job-1').json['segments'][1]
+                    with patch.object(jobs, 'launch') as launch:
+                        response = client.post(self.url, json=dict(version=card['version'], prompt_version=card['prompt_version'], prompt='new source', prompt_format='source'), headers=self.headers)
+                    self.assertEqual(response.status_code, 400, response.json)
+                    self.assertEqual(response.json['code'], 'keys')
+                    self.assertIn(expected, response.json['detail'])
+                    self.assertFalse((self.out / 'inputs/segment-edit.json').exists())
+                    launch.assert_not_called()
+                finally:
+                    jobs.close()
 
     def test_accepted_task_only_resumes_original_and_reuses_rewrite(self):
         self.prepare()
@@ -277,7 +297,7 @@ class SegmentPrompts(unittest.TestCase):
 
     def test_unexpected_prepare_error_has_safe_correlation_and_log(self):
         card=self.card()
-        with patch.object(segments,'prepare_regeneration',side_effect=OSError('disk error key=VERY_SECRET')),patch.object(self.jobs,'launch') as launch:
+        with patch('workbench.jobs.preflight'),patch.object(segments,'prepare_regeneration',side_effect=OSError('disk error key=VERY_SECRET')),patch.object(self.jobs,'launch') as launch:
             self.jobs.secrets.add('VERY_SECRET')
             response=self.client.post(self.url,json=dict(version=card['version'],prompt_version=card['prompt_version'],prompt='recipient stands',prompt_format='source'),headers=self.headers)
         self.assertEqual(response.status_code,500)
@@ -298,7 +318,7 @@ class SegmentPrompts(unittest.TestCase):
         old=film.Job(self.out).state['segs']['1']['h3_reference_version']
         Path(self.script['cast'][0]['picture']).write_bytes(b'new actor reference')
         self.prepare('recipient stands')
-        with self.assertRaises(ValueError):segments.preflight(self.request,{'RUNNINGHUB_API_KEY':'offline'})
+        with self.assertRaises(InputError):segments.preflight(self.request,{'RUNNINGHUB_API_KEY':'offline'})
         self.generate()
         current=film.Job(self.out).state['segs']['1']['h3_reference_version']
         self.assertNotEqual(old,current)
@@ -663,3 +683,792 @@ class SegmentPrompts(unittest.TestCase):
         self.assertEqual(sorted(polled),['accepted-fourth','new-fifth'])
         self.assertEqual((self.out/'clips/seg1.mp4').read_bytes(),original_clip)
         self.assertEqual((self.out/'film.mp4').read_bytes(),b'film')
+
+    def test_pre_task_interrupted_repair_on_clipless_segment_remains_editable_and_settles(self):
+        (self.out / 'clips/seg2.mp4').unlink()
+        self.job.put('segs', '1', terminal_failed=True, error='terminal', file=None)
+        self.prepare('interrupted draft')
+        with patch.object(rewrite, 'backend', return_value='llm'), patch.object(rewrite, 'guide', return_value='g'), patch.object(rewrite, '_llm', side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                segments.regenerate(self.request)
+        self.jobs.find(self.identifier)['status'] = 'interrupted'
+        self.assertTrue(self.card()['editable'])
+        self.assertTrue(self.card()['can_regenerate'])
+        self.prepare('replacement source')
+        self.generate()
+        self.assertEqual((self.out / 'clips/seg2.mp4').read_bytes(), b'NEW CLIP')
+        self.assertTrue(json.loads((self.out / 'inputs/segment-edit.json').read_text())['applied'])
+
+    def test_stage_prompts_failure_persists_zh_and_error_for_workbench_repair(self):
+        (self.out / 'clips/seg2.mp4').unlink()
+        self.job.state['segs'].pop('1', None)
+        self.job.save()
+        planned = film.plan(self.script['shots'])
+        pics = {s['idx']: film.refs(self.script, s, 'shot') for s in planned}
+        with patch.object(rewrite, 'rewrite', side_effect=rewrite.RewriteError('twice failed')):
+            with self.assertRaises(rewrite.RewriteError):
+                film.stage_prompts(self.job, self.script, planned, pics)
+        self.jobs.find(self.identifier)['status'] = 'failed'
+        card = self.card(2)
+        self.assertTrue(card['editable'])
+        self.assertTrue(card['can_regenerate'])
+        self.assertTrue(card['prompt'])
+
+    def test_applied_publication_clears_publishing_flag_and_does_not_resurrect_after_redo(self):
+        (self.out / 'clips/seg2.mp4').unlink()
+        self.job.state['segs']['1'] = {'zh': 'recipient stands', 'h3': h3()}
+        self.job.save()
+        self.job.put('segs', '1', terminal_failed=True, error='boom')
+        self.prepare('edited once')
+        self.generate()
+        pending = json.loads((self.out / 'inputs/segment-edit.json').read_text())
+        self.assertTrue(pending['applied'])
+        self.assertFalse(pending.get('publishing'))
+        film.invalidate_segments(film.Job(self.out), 'shot', [2])
+        self.assertIsNone(self.card(2)['url'])
+
+    def test_edit_frame_and_invalidate_protect_unresolved_paid_sibling_and_allow_sibling_resume(self):
+        from PIL import Image
+        (self.out / 'frames').mkdir(exist_ok=True)
+        for seg in range(1, 4):
+            Image.new('RGB', (8, 8), 'red').save(self.out / f'frames/s{seg}-1.png')
+        self.request['frames'] = 'shot'
+        write_json(self.out / 'inputs/request.json', self.request)
+        descriptions = storyboard.view(self.request, self.jobs.artifacts(self.jobs.find(self.identifier)), False)
+        review = storyboard.review_status(self.request, descriptions)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[], confirmed_version=review['version']))
+        self.job.put('segs', '0', task='paid-inflight-1', file=None, cny=None)
+        self.job.put('segs', '1', task='failed-2', terminal_failed=True, error='boom', file=None, cny=None)
+        (self.out / 'clips/seg1.mp4').unlink()
+        (self.out / 'clips/seg2.mp4').unlink()
+        self.jobs.find(self.identifier)['status'] = 'failed'
+        snap = self.client.get('/api/jobs/job-1').json
+        self.assertTrue(snap['can_resume_video'], 'In-flight paid sibling segment must remain resumable')
+        # Even if job status became succeeded after repairing seg2, editing s1-1 must not wipe paid-inflight-1
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res = self.client.post('/api/jobs/job-1/frames/s1-1', json={'prompt': 'replace while task pending'}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        film.invalidate_segments(film.Job(self.out), 'shot', [1])
+        self.assertEqual(film.Job(self.out).state['segs']['0']['task'], 'paid-inflight-1')
+
+    def test_staged_unknown_submission_blocks_same_and_other_segment_regeneration(self):
+        self.prepare('ambiguous edit')
+        real_submit = rh.submit_with_retry
+        with patch.object(rh, '_post', side_effect=RuntimeError('response lost')):
+            with self.assertRaises(RuntimeError):
+                self.generate(submit=real_submit)
+        before = (self.out / 'inputs/segment-edit.json').read_bytes()
+        for target in (2, 1):
+            with self.assertRaises(InputError):
+                self.prepare('replacement', number=target)
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before)
+
+    def test_uncommitted_publication_blocks_same_and_other_segment_regeneration(self):
+        self.prepare('publishing edit')
+        publish = segments.publish_file
+        with patch.object(segments, 'publish_file', side_effect=lambda s, t: (_ for _ in ()).throw(OSError('interrupted')) if Path(t).name == 'seg2-last.jpg' else publish(s, t)):
+            with self.assertRaises(OSError):
+                self.generate()
+        before = (self.out / 'inputs/segment-edit.json').read_bytes()
+        for target in (2, 1):
+            with self.assertRaises(InputError):
+                self.prepare('replacement', number=target)
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before)
+
+    def test_repair_of_terminally_failed_segment_can_resume_after_poll_or_publish_interruption(self):
+        from PIL import Image
+        (self.out / 'frames').mkdir(exist_ok=True)
+        for seg in range(1, 4):
+            Image.new('RGB', (8, 8), 'red').save(self.out / f'frames/s{seg}-1.png')
+        self.request['frames'] = 'shot'
+        write_json(self.out / 'inputs/request.json', self.request)
+        descriptions = storyboard.view(self.request, self.jobs.artifacts(self.jobs.find(self.identifier)), False)
+        review = storyboard.review_status(self.request, descriptions)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[], confirmed_version=review['version']))
+        self.job.put('segs', '1', terminal_failed=True, error='old terminal', file=None)
+        (self.out / 'clips/seg2.mp4').unlink()
+        self.prepare('repaired source')
+        write_json(self.out / 'inputs/request.json', self.request)
+        with self.assertRaises(RuntimeError):
+            self.generate(poll={'side_effect': RuntimeError('poll lost')})
+        self.jobs.find(self.identifier).update(status='failed', operation='segment')
+        snap = self.client.get('/api/jobs/job-1').json
+        self.assertTrue(snap['can_resume_video'], 'Active repair attempt must not inherit previous terminal_failed')
+        # Editing even an unaffected shot-mode frame (s1-1) must be blocked while segment-edit.json is unresolved
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res_frame = self.client.post('/api/jobs/job-1/frames/s1-1', json={'prompt': 'edit other frame'}, headers=self.headers)
+        self.assertEqual(res_frame.status_code, 400)
+        self.generate()
+        self.assertTrue(json.loads((self.out / 'inputs/segment-edit.json').read_text())['applied'])
+
+    def test_continue_film_clears_stale_segment_edit_blocks_inflight_sibling_and_includes_size_in_url(self):
+        from PIL import Image
+        Image.new('RGB', (8, 8), 'blue').save(self.script['cast'][0]['picture'])
+        (self.out / 'frames').mkdir(exist_ok=True)
+        for seg in range(1, 4):
+            Image.new('RGB', (8, 8), 'red').save(self.out / f'frames/s{seg}-1.png')
+        self.request['frames'] = 'shot'
+        write_json(self.out / 'inputs/request.json', self.request)
+        # Artifact URLs include :st_size alongside st_mtime_ns
+        seg2_url = next(a['url'] for a in self.jobs.artifacts(self.jobs.find(self.identifier)) if a['name'] == 'clips/seg2.mp4')
+        self.assertRegex(seg2_url, r'[?&]v=\d+(?::|%3A)\d+')
+
+        # If a single-segment repair terminally fails while another pipeline segment has an in-flight paid task,
+        # can_resume_pipeline stays available so the paid pipeline task is never stranded
+        descriptions = storyboard.view(self.request, self.jobs.artifacts(self.jobs.find(self.identifier)), False)
+        review = storyboard.review_status(self.request, descriptions)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[], confirmed_version=review['version']))
+        self.job.put('segs', '2', task='inflight-seg3-task', file=None, cny=None)
+        self.prepare('seg2 terminal attempt')
+        self.request.update(operation='segment', segment=2)
+        write_json(self.out / 'inputs/request.json', self.request)
+        with self.assertRaises(RuntimeError):
+            self.generate(poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+        self.jobs.find(self.identifier).update(status='failed', operation='segment')
+        snap_mid = self.client.get('/api/jobs/job-1').json
+        self.assertTrue(snap_mid['can_resume_pipeline'], 'In-flight sibling task must remain resumable after terminal single-segment failure')
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res_resume = self.client.post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+        self.assertEqual(res_resume.status_code, 200, res_resume.json)
+        self.assertEqual(json.loads((self.out / 'inputs/request.json').read_text())['operation'], 'pipeline')
+
+        # Clear seg3 task, create failed unapplied segment-edit.json on seg2, then dirty frame s2-1 and continue_film
+        self.job.put('segs', '2', task=None, file=str(self.out / 'clips/seg3.mp4'), cny=1)
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        self.prepare('failed single-seg draft')
+        pending_path = self.out / 'inputs/segment-edit.json'
+        pending_data = json.loads(pending_path.read_text(encoding='utf-8'))
+        pending_data['error'] = 'old attempt failed'
+        write_json(pending_path, pending_data)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        snap_before = self.client.get('/api/jobs/job-1').json
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            cont = self.client.post('/api/jobs/job-1/continue',
+                                    json={'approved': True, 'review_version': snap_before['review']['version']},
+                                    headers=self.headers)
+        self.assertEqual(cont.status_code, 200, cont.json)
+        self.assertFalse(pending_path.exists(), 'continue_film must clear unapplied non-locked segment-edit.json')
+
+    def _setup_shot_frames_reviewed(self):
+        from PIL import Image
+        Image.new('RGB', (8, 8), 'blue').save(self.script['cast'][0]['picture'])
+        (self.out / 'frames').mkdir(exist_ok=True)
+        for seg in range(1, 4):
+            Image.new('RGB', (8, 8), 'red').save(self.out / f'frames/s{seg}-1.png')
+        self.request['frames'] = 'shot'
+        write_json(self.out / 'inputs/request.json', self.request)
+        descriptions = storyboard.view(self.request, self.jobs.artifacts(self.jobs.find(self.identifier)), False)
+        review = storyboard.review_status(self.request, descriptions)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[], confirmed_version=review['version']))
+
+    def test_pre_task_failed_segment_edit_resumes_via_http_and_settles_same_revision(self):
+        rev = self.prepare('pre-task draft')
+        write_json(self.out / 'inputs/request.json', self.request)
+        with patch.object(rewrite, 'backend', return_value='llm'), \
+             patch.object(rewrite, 'guide', return_value='g'), \
+             patch.object(rewrite, '_llm', side_effect=RuntimeError('llm down')):
+            with self.assertRaises(RuntimeError):
+                segments.regenerate(self.request)
+        self.jobs.find(self.identifier).update(status='failed', operation='segment')
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res = self.client.post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        self.request = json.loads((self.out / 'inputs/request.json').read_text())
+        self.generate()
+        pending = json.loads((self.out / 'inputs/segment-edit.json').read_text())
+        self.assertEqual(pending['revision'], rev)
+        self.assertTrue(pending['applied'])
+        self.assertFalse(pending.get('publishing'))
+        self.assertEqual((self.out / 'clips/seg2.mp4').read_bytes(), b'NEW CLIP')
+
+    def test_unsubmitted_segment_edit_replaced_by_other_segment_keeps_first_clip(self):
+        orig_seg2 = (self.out / 'clips/seg2.mp4').read_bytes()
+        orig_state_2 = dict(film.Job(self.out).state['segs']['1'])
+        self.prepare('draft on seg2', number=2)
+        self.prepare('edit seg1', number=1)
+        self.generate()
+        self.assertEqual((self.out / 'clips/seg2.mp4').read_bytes(), orig_seg2)
+        self.assertEqual(film.Job(self.out).state['segs']['1']['task'], orig_state_2['task'])
+        self.assertEqual((self.out / 'clips/seg1.mp4').read_bytes(), b'NEW CLIP')
+        self.assertTrue(json.loads((self.out / 'inputs/segment-edit.json').read_text())['applied'])
+
+    def test_continue_dirty_frames_clears_affected_unsubmitted_segment_edit_and_keeps_unaffected(self):
+        self._setup_shot_frames_reviewed()
+        # 1. Pending unsubmitted edit on seg1 while frame s2-1 is dirtied (unaffected seg1): keep segment-edit.json intact!
+        rev1 = self.prepare('unaffected seg1 draft', number=1)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        snap = self.client.get('/api/jobs/job-1').json
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res = self.client.post('/api/jobs/job-1/continue',
+                                   json={'approved': True, 'review_version': snap['review']['version']},
+                                   headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        kept = json.loads((self.out / 'inputs/segment-edit.json').read_text())
+        self.assertEqual(kept['revision'], rev1, 'continue_film must preserve unaffected segment-edit.json')
+        self.assertEqual(kept['number'], 1)
+
+        # 2. Pending unsubmitted edit on seg2 while frame s2-1 is dirtied (affected seg2): supersede segment-edit.json!
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        self.prepare('affected seg2 draft', number=2)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        snap2 = self.client.get('/api/jobs/job-1').json
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res2 = self.client.post('/api/jobs/job-1/continue',
+                                    json={'approved': True, 'review_version': snap2['review']['version']},
+                                    headers=self.headers)
+        self.assertEqual(res2.status_code, 200, res2.json)
+        self.assertFalse((self.out / 'inputs/segment-edit.json').exists())
+
+    def test_staged_unknown_submission_rejects_http_resume(self):
+        orig = (self.out / 'clips/seg2.mp4').read_bytes()
+        self.prepare('ambiguous edit')
+        write_json(self.out / 'inputs/request.json', self.request)
+        with patch.object(rh, '_post', side_effect=RuntimeError('response lost')):
+            with self.assertRaises(RuntimeError):
+                self.generate(submit=rh.submit_with_retry)
+        self.jobs.find(self.identifier).update(status='failed', operation='segment')
+        snap = self.client.get('/api/jobs/job-1').json
+        self.assertFalse(snap['can_resume_video'])
+        before = (self.out / 'inputs/segment-edit.json').read_bytes()
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch') as launch:
+            res = self.client.post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before)
+        self.assertEqual((self.out / 'clips/seg2.mp4').read_bytes(), orig)
+
+    def test_staged_unknown_submission_blocks_continue_film(self):
+        self._setup_shot_frames_reviewed()
+        self.prepare('ambiguous edit', number=1)
+        with patch.object(rh, '_post', side_effect=RuntimeError('response lost')):
+            with self.assertRaises(RuntimeError):
+                self.generate(submit=rh.submit_with_retry)
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        snap = self.client.get('/api/jobs/job-1').json
+        before_rev = (self.out / 'inputs/review.json').read_bytes()
+        before_seg = (self.out / 'inputs/segment-edit.json').read_bytes()
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch') as launch:
+            res = self.client.post('/api/jobs/job-1/continue',
+                                   json={'approved': True, 'review_version': snap['review']['version']},
+                                   headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / 'inputs/review.json').read_bytes(), before_rev)
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before_seg)
+
+    def test_staged_inflight_segment_task_blocks_continue_film(self):
+        self._setup_shot_frames_reviewed()
+        self.prepare('inflight edit', number=1)
+        with self.assertRaises(RuntimeError):
+            self.generate(poll={'side_effect': RuntimeError('poll lost')})
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        snap = self.client.get('/api/jobs/job-1').json
+        before_rev = (self.out / 'inputs/review.json').read_bytes()
+        before_seg = (self.out / 'inputs/segment-edit.json').read_bytes()
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch') as launch:
+            res = self.client.post('/api/jobs/job-1/continue',
+                                   json={'approved': True, 'review_version': snap['review']['version']},
+                                   headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / 'inputs/review.json').read_bytes(), before_rev)
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before_seg)
+
+    def test_interrupted_segment_publication_resumes_via_http_without_llm_keys_and_commits(self):
+        self.prepare('publishing source')
+        write_json(self.out / 'inputs/request.json', self.request)
+        publish = segments.publish_file
+        with patch.object(segments, 'publish_file', side_effect=lambda s, t: (_ for _ in ()).throw(OSError('interrupted')) if Path(t).name == 'seg2-last.jpg' else publish(s, t)):
+            with self.assertRaises(OSError):
+                self.generate()
+        self.jobs.find(self.identifier).update(status='interrupted', operation='segment')
+        with patch.object(self.jobs, 'launch'):
+            res = self.client.post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        with patch.object(rewrite, 'rewrite', side_effect=AssertionError('rewrote on publish resume')), \
+             patch.object(rh, 'submit_with_retry', side_effect=AssertionError('resubmitted on publish resume')):
+            segments.regenerate(json.loads((self.out / 'inputs/request.json').read_text()))
+        pending = json.loads((self.out / 'inputs/segment-edit.json').read_text())
+        self.assertTrue(pending['applied'])
+        self.assertFalse(pending['publishing'])
+        self.assertEqual((self.out / 'clips/seg2.mp4').read_bytes(), b'NEW CLIP')
+
+    def test_uncommitted_segment_publication_blocks_continue_film(self):
+        self._setup_shot_frames_reviewed()
+        self.prepare('publishing source', number=1)
+        publish = segments.publish_file
+        with patch.object(segments, 'publish_file', side_effect=lambda s, t: (_ for _ in ()).throw(OSError('interrupted')) if Path(t).name == 'seg1-last.jpg' else publish(s, t)):
+            with self.assertRaises(OSError):
+                self.generate()
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        snap = self.client.get('/api/jobs/job-1').json
+        before_seg = (self.out / 'inputs/segment-edit.json').read_bytes()
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch') as launch:
+            res = self.client.post('/api/jobs/job-1/continue',
+                                   json={'approved': True, 'review_version': snap['review']['version']},
+                                   headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before_seg)
+
+    def test_staged_terminal_segment_failure_rejects_http_resume(self):
+        self.prepare('terminal edit')
+        write_json(self.out / 'inputs/request.json', self.request)
+        with self.assertRaises(RuntimeError):
+            self.generate(poll={'return_value': {'state': 'failed', 'error': 'terminal gpu'}})
+        self.jobs.find(self.identifier).update(status='failed', operation='segment')
+        snap = self.client.get('/api/jobs/job-1').json
+        self.assertFalse(snap['can_resume_video'])
+        before = (self.out / 'inputs/segment-edit.json').read_bytes()
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch') as launch:
+            res = self.client.post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 400)
+        launch.assert_not_called()
+        self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before)
+
+    def test_staged_terminal_failure_preserved_when_other_segment_regenerates(self):
+        self._setup_shot_frames_reviewed()
+        # Clipless seg2 initially failed pre-submission (error in state.json, terminal_failed not yet set)
+        (self.out / 'clips/seg2.mp4').unlink()
+        (self.out / 'clips/seg2-last.jpg').unlink()
+        self.job.state['segs']['1'] = {'zh': 'recipient stands', 'h3': h3(), 'error': 'upload failed'}
+        self.job.save()
+        self.prepare('clipless seg2 repair', number=2)
+        with self.assertRaises(RuntimeError):
+            self.generate(submit=lambda g, **kw: 'dead-seg2-task', poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+        # Now regenerate seg1 (replace_other): seg2 must retain terminal_failed=True and dead-seg2-task!
+        self.prepare('regenerate seg1', number=1)
+        self.generate(submit=lambda g, **kw: 'ok-seg1-task')
+        saved_seg2 = film.Job(self.out).state['segs']['1']
+        self.assertTrue(saved_seg2.get('terminal_failed'), 'Overwriting segment-edit.json lost clipless seg2 terminal_failed')
+        self.assertEqual(saved_seg2.get('task'), 'dead-seg2-task')
+        self.assertTrue(saved_seg2.get('error'))
+        # Pipeline rerun must refuse to auto-resubmit a duplicate paid task on seg2
+        with patch.object(rh, 'submit_with_retry', side_effect=AssertionError('repaid terminal seg2')):
+            with self.assertRaises(RuntimeError):
+                storyboard.run({**self.request, 'operation': 'pipeline', 'reset_applied': True})
+
+    def test_continue_dirty_frames_preserves_unaffected_staged_terminal_segment_failure(self):
+        self._setup_shot_frames_reviewed()
+        (self.out / 'clips/seg1.mp4').unlink()
+        (self.out / 'clips/seg1-last.jpg').unlink()
+        self.job.state['segs']['0'] = {'zh': 'recipient stands', 'h3': h3(), 'error': 'upload failed'}
+        self.job.save()
+        self.prepare('edited seg1 terminal prompt', number=1)
+        with self.assertRaises(RuntimeError):
+            self.generate(submit=lambda g, **kw: 'dead-seg1-task', poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+        # Dirty frame s2-1 (seg1 is unaffected!) and approve continue_film
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[2]))
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        snap = self.client.get('/api/jobs/job-1').json
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res = self.client.post('/api/jobs/job-1/continue',
+                                   json={'approved': True, 'review_version': snap['review']['version']},
+                                   headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        submitted_segs = []
+        def fake_submit(graph, **kw):
+            submitted_segs.append(graph)
+            return 'new-seg2-task'
+        with patch.object(rewrite, 'rewrite', return_value=h3()), \
+             patch.object(rh, 'upload', return_value='ref'), \
+             patch.object(rh, 'submit_with_retry', side_effect=fake_submit), \
+             patch.object(rh, 'poll', return_value={'state': 'done', 'url': 'offline://v', 'cny': 1}), \
+             patch.object(film.http, 'download', side_effect=lambda u, p: p.write_bytes(b'SEG2')), \
+             patch.object(media, 'last_frame', side_effect=lambda c, p: p.write_bytes(b'TAIL2')), \
+             patch.object(media, 'duration', return_value=8):
+            with self.assertRaises(RuntimeError):
+                storyboard.run(json.loads((self.out / 'inputs/request.json').read_text()))
+        self.assertEqual(len(submitted_segs), 0, 'Preexisting terminal failure on seg1 must block submitting new tasks before repair')
+        saved_seg1 = film.Job(self.out).state['segs']['0']
+        self.assertTrue(saved_seg1.get('terminal_failed'))
+        self.assertEqual(saved_seg1.get('task'), 'dead-seg1-task')
+        self.assertEqual(self.card(1)['prompt'], 'edited seg1 terminal prompt')
+
+    def test_terminal_segment_repair_with_inflight_sibling_resumes_sibling_without_repaying_terminal(self):
+        for mode in ('shot', 'none'):
+            with self.subTest(mode=mode):
+                case = SegmentPrompts()
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                if mode == 'shot':
+                    case._setup_shot_frames_reviewed()
+                else:
+                    from PIL import Image
+                    Image.new('RGB', (8, 8), 'blue').save(case.script['cast'][0]['picture'])
+                    case.request['frames'] = 'none'
+                    write_json(case.out / 'inputs/request.json', case.request)
+                (case.out / 'clips/seg2.mp4').unlink()
+                (case.out / 'clips/seg2-last.jpg').unlink()
+                (case.out / 'clips/seg3.mp4').unlink()
+                (case.out / 'clips/seg3-last.jpg').unlink()
+                case.job.state['segs']['1'] = {'zh': 'recipient stands', 'h3': h3(), 'error': 'initial upload err'}
+                case.job.state['segs']['2'] = {'zh': 'recipient stands', 'h3': h3(), 'task': f'inflight-s3-{mode}', 'submitted': 1.0}
+                case.job.save()
+                case.prepare('seg2 custom repair prompt', number=2)
+                write_json(case.out / 'inputs/request.json', case.request)
+                with self.assertRaises(RuntimeError):
+                    case.generate(submit=lambda g, **kw: f'dead-s2-{mode}', poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+                case.jobs.find(case.identifier).update(status='failed', operation='segment')
+                snap = case.client.get('/api/jobs/job-1').json
+                self.assertTrue(snap['can_resume_pipeline'])
+                self.assertTrue(snap['can_resume_video'], 'UI Resume button must be enabled when can_resume_pipeline is True')
+
+                # Failed preflight must NOT delete segment-edit.json!
+                with patch('workbench.jobs.preflight', side_effect=InputError('keys', names='RUNNINGHUB_API_KEY')):
+                    bad_res = case.client.post('/api/jobs/job-1/resume', json={}, headers=case.headers)
+                self.assertEqual(bad_res.status_code, 400)
+                self.assertTrue((case.out / 'inputs/segment-edit.json').exists(), 'Failed preflight unlinked segment-edit.json')
+
+                with patch('workbench.jobs.preflight'), patch.object(case.jobs, 'launch'):
+                    ok_res = case.client.post('/api/jobs/job-1/resume', json={}, headers=case.headers)
+                self.assertEqual(ok_res.status_code, 200, ok_res.json)
+                polled = []
+                with patch.object(rewrite, 'rewrite', side_effect=AssertionError('rewrote during sibling recovery')), \
+                     patch.object(rh, 'submit_with_retry', side_effect=AssertionError('paid duplicate task on seg2')), \
+                     patch.object(rh, 'poll', side_effect=lambda t: polled.append(t) or {'state': 'done', 'url': 'offline://s3', 'cny': 1.5}), \
+                     patch.object(film.http, 'download', side_effect=lambda u, p: p.write_bytes(b'SETTLED SEG3')), \
+                     patch.object(media, 'last_frame', side_effect=lambda c, p: p.write_bytes(b'TAIL3')), \
+                     patch.object(media, 'duration', return_value=8):
+                    with self.assertRaises(RuntimeError):
+                        storyboard.run(json.loads((case.out / 'inputs/request.json').read_text()))
+                self.assertEqual(polled, [f'inflight-s3-{mode}'], 'In-flight sibling task must be polled and settled before raising on seg2')
+                self.assertEqual((case.out / 'clips/seg3.mp4').read_bytes(), b'SETTLED SEG3')
+                saved_s2 = film.Job(case.out).state['segs']['1']
+                self.assertTrue(saved_s2.get('terminal_failed'))
+                self.assertEqual(saved_s2.get('task'), f'dead-s2-{mode}')
+                self.assertEqual(case.card(2)['prompt'], 'seg2 custom repair prompt')
+
+    def test_terminal_segment_repair_replaced_on_same_segment_preserves_inflight_sibling(self):
+        self._setup_shot_frames_reviewed()
+        (self.out / 'clips/seg2.mp4').unlink()
+        (self.out / 'clips/seg3.mp4').unlink()
+        self.job.state['segs']['1'] = {'zh': 'recipient stands', 'h3': h3(), 'error': 'err'}
+        self.job.state['segs']['2'] = {'zh': 'recipient stands', 'h3': h3(), 'task': 'inflight-seg3', 'submitted': 1.0}
+        self.job.save()
+        self.prepare('first dead attempt', number=2)
+        with self.assertRaises(RuntimeError):
+            self.generate(submit=lambda g, **kw: 'dead-2', poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+        self.prepare('second good attempt', number=2)
+        write_json(self.out / 'inputs/request.json', self.request)
+        self.generate(submit=lambda g, **kw: 'good-2')
+        self.jobs.find(self.identifier).update(status='succeeded', operation='segment')
+        snap = self.client.get('/api/jobs/job-1').json
+        self.assertTrue(snap['can_resume_pipeline'])
+        self.assertTrue(snap['can_resume_video'])
+        self.assertEqual(film.Job(self.out).state['segs']['2']['task'], 'inflight-seg3')
+
+    def test_terminal_segment_with_inflight_sibling_locks_inflight_and_preserves_terminal_on_third_edit(self):
+        self._setup_shot_frames_reviewed()
+        (self.out / 'clips/seg2.mp4').unlink()
+        (self.out / 'clips/seg3.mp4').unlink()
+        self.job.state['segs']['1'] = {'zh': 'recipient stands', 'h3': h3(), 'error': 'err'}
+        self.job.state['segs']['2'] = {'zh': 'recipient stands', 'h3': h3(), 'task': 'inflight-seg3', 'submitted': 1.0}
+        self.job.save()
+        self.prepare('dead seg2', number=2)
+        with self.assertRaises(RuntimeError):
+            self.generate(submit=lambda g, **kw: 'dead-seg2-id', poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+        with self.assertRaises(InputError) as locked_ctx:
+            self.prepare('cannot touch inflight seg3', number=3)
+        self.assertEqual(locked_ctx.exception.key, 'segment_locked')
+        self.prepare('regenerate seg1', number=1)
+        self.generate(submit=lambda g, **kw: 'ok-seg1')
+        st = film.Job(self.out).state['segs']
+        self.assertTrue(st['1'].get('terminal_failed'))
+        self.assertEqual(st['1'].get('task'), 'dead-seg2-id')
+        self.assertEqual(st['2'].get('task'), 'inflight-seg3')
+
+    def test_terminal_segment_with_inflight_sibling_guards_continue_dirty_frames(self):
+        self._setup_shot_frames_reviewed()
+        (self.out / 'clips/seg2.mp4').unlink()
+        (self.out / 'clips/seg3.mp4').unlink()
+        self.job.state['segs']['1'] = {'zh': 'recipient stands', 'h3': h3(), 'error': 'err'}
+        self.job.state['segs']['2'] = {'zh': 'recipient stands', 'h3': h3(), 'task': 'inflight-seg3', 'submitted': 1.0}
+        self.job.save()
+        self.prepare('dead seg2', number=2)
+        with self.assertRaises(RuntimeError):
+            self.generate(submit=lambda g, **kw: 'dead-seg2-id', poll={'return_value': {'state': 'failed', 'error': 'oom'}})
+        self.jobs.find(self.identifier)['status'] = 'succeeded'
+        # Dirtying s3-1 (in-flight sibling) rejects continue_film with 400
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[3]))
+        snap_blocked = self.client.get('/api/jobs/job-1').json
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch') as launch:
+            res_blocked = self.client.post('/api/jobs/job-1/continue',
+                                           json={'approved': True, 'review_version': snap_blocked['review']['version']},
+                                           headers=self.headers)
+        self.assertEqual(res_blocked.status_code, 400)
+        launch.assert_not_called()
+        # Dirtying only s1-1 (neither seg2 nor seg3 affected) accepts and preserves both seg2 terminal_failed and seg3 task
+        write_json(self.out / 'inputs/review.json', dict(dirty_segments=[1]))
+        snap_ok = self.client.get('/api/jobs/job-1').json
+        with patch('workbench.jobs.preflight'), patch.object(self.jobs, 'launch'):
+            res_ok = self.client.post('/api/jobs/job-1/continue',
+                                      json={'approved': True, 'review_version': snap_ok['review']['version']},
+                                      headers=self.headers)
+        self.assertEqual(res_ok.status_code, 200, res_ok.json)
+        self.assertTrue((self.out / 'inputs/segment-edit.json').exists())
+        self.assertTrue(film.Job(self.out).state['segs']['1'].get('terminal_failed'))
+        self.assertEqual(film.Job(self.out).state['segs']['2'].get('task'), 'inflight-seg3')
+
+    def test_stage_prompts_and_stage_generate_cancel_unstarted_segments_on_fatal_error(self):
+        from h3ref import http as http_mod
+        shots = [dict(start=i * 8, end=(i + 1) * 8, action=f'recipient action {i}') for i in range(6)]
+        script = {**self.script, 'shots': shots}
+        segs = film.plan(script['shots'])
+        pics = {s['idx']: [] for s in segs}
+        pjob = film.Job(self.out.parent / 'cancel-prompts')
+        prompt_calls = []
+        def fail_rewrite(zh, *_a):
+            prompt_calls.append(zh)
+            raise http_mod.HTTPResponseError(401, '401 invalid key')
+        with patch.object(rewrite, 'rewrite', side_effect=fail_rewrite):
+            with self.assertRaises(http_mod.HTTPResponseError):
+                film.stage_prompts(pjob, script, segs, pics)
+        self.assertLessEqual(len(prompt_calls), 3, f'Queued segments beyond pool size ran after fatal error: {len(prompt_calls)}')
+
+        gjob = film.Job(self.out.parent / 'cancel-gen')
+        for s in segs:
+            gjob.put('segs', str(s['idx']), zh='z', h3=h3())
+        gen_calls = []
+        def fail_submit(graph, **_kw):
+            gen_calls.append(graph)
+            raise rh.SubmissionRejected('605 NOT_ENOUGH_BALANCE')
+        with patch.object(film.config, 'RH_CONCURRENCY', 2), \
+             patch.object(rh, 'submit_with_retry', side_effect=fail_submit):
+            with self.assertRaises(rh.SubmissionRejected):
+                film.stage_generate(gjob, script, segs, pics, 'shot')
+        self.assertLessEqual(len(gen_calls), 2, f'Queued segments beyond RH_CONCURRENCY ran after fatal error: {len(gen_calls)}')
+
+    def test_preexisting_blocker_on_later_segment_does_not_rewrite_or_submit_earlier_unstarted_segment(self):
+        for mode in ('shot', 'none'):
+            with self.subTest(mode=mode):
+                case = SegmentPrompts()
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                if mode == 'shot':
+                    case._setup_shot_frames_reviewed()
+                else:
+                    from PIL import Image
+                    Image.new('RGB', (8, 8), 'blue').save(case.script['cast'][0]['picture'])
+                for n in (1, 2, 3):
+                    (case.out / f'clips/seg{n}.mp4').unlink()
+                    (case.out / f'clips/seg{n}-last.jpg').unlink()
+                case.job.state['segs'] = {
+                    '0': {'zh': 'unstarted seg1 without h3'},
+                    '1': {'zh': 'dead seg2', 'h3': h3(), 'task': 'dead-seg2', 'terminal_failed': True, 'error': 'oom'},
+                    '2': {'zh': 'inflight seg3', 'h3': h3(), 'task': f'inflight-seg3-{mode}', 'submitted': 1.0},
+                }
+                case.job.save()
+                polled = []
+                with patch.object(rewrite, 'rewrite', side_effect=AssertionError('rewrote unstarted seg1 despite blocker on seg2')), \
+                     patch.object(rh, 'submit_with_retry', side_effect=AssertionError('submitted unstarted seg1 despite blocker on seg2')), \
+                     patch.object(rh, 'poll', side_effect=lambda t: polled.append(t) or {'state': 'done', 'url': 'offline://s3', 'cny': 1.0}), \
+                     patch.object(film.http, 'download', side_effect=lambda u, p: p.write_bytes(b'SEG3')), \
+                     patch.object(media, 'last_frame', side_effect=lambda c, p: p.write_bytes(b'TAIL3')), \
+                     patch.object(media, 'duration', return_value=8):
+                    with self.assertRaises(RuntimeError):
+                        film.run(case.out, case.out / 'inputs/film.json', mode)
+                self.assertEqual(polled, [f'inflight-seg3-{mode}'])
+                self.assertEqual((case.out / 'clips/seg3.mp4').read_bytes(), b'SEG3')
+
+    def test_inflight_ambiguous_or_generated_segment_blocks_http_assemble(self):
+        for scenario in ('inflight', 'ambiguous', 'generated'):
+            with self.subTest(scenario=scenario):
+                case = SegmentPrompts()
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                rev = case.prepare(f'{scenario} edit')
+                write_json(case.out / 'inputs/request.json', case.request)
+                if scenario == 'inflight':
+                    with self.assertRaises(RuntimeError):
+                        case.generate(poll={'side_effect': RuntimeError('poll lost')})
+                    expected_code = 'segment_locked'
+                elif scenario == 'ambiguous':
+                    with patch.object(rh, '_post', side_effect=RuntimeError('lost')):
+                        with self.assertRaises(RuntimeError):
+                            case.generate(submit=rh.submit_with_retry)
+                    expected_code = 'segment_locked'
+                else:
+                    pending_path = case.out / 'inputs/segment-edit.json'
+                    pending = json.loads(pending_path.read_text())
+                    pending.update(generated=True, publishing=False, applied=False, phase='publish')
+                    write_json(pending_path, pending)
+                    expected_code = 'segment_publishing'
+                case.jobs.find(case.identifier).update(status='failed', operation='segment')
+                snap = case.client.get('/api/jobs/job-1').json
+                self.assertFalse(snap['can_assemble'])
+                before_req = (case.out / 'inputs/request.json').read_bytes()
+                with patch('workbench.jobs.preflight'), patch.object(case.jobs, 'launch') as launch:
+                    res = case.client.post('/api/jobs/job-1/assemble',
+                                           json={'version': snap['assembly']['version']},
+                                           headers=case.headers)
+                from workbench.i18n import message as wb_message
+                self.assertEqual(res.status_code, 400, res.json)
+                self.assertEqual(res.json['error'], wb_message(expected_code, 'en', number=2))
+                launch.assert_not_called()
+                self.assertEqual((case.out / 'inputs/request.json').read_bytes(), before_req)
+                if scenario == 'generated':
+                    with self.assertRaises(InputError):
+                        segments.prepare_assembly(case.request, snap['assembly']['version'])
+
+    def test_continue_film_preflights_reconciled_source_edit_before_deleting_paid_clip(self):
+        import os
+        self._setup_shot_frames_reviewed()
+        self.job.put('segs', '1', prompt_override={'format': 'h3', 'text': h3('H3'), 'source_version': 'v0'})
+        self.prepare('new source needing text key', 'source', number=2)
+        write_json(self.out / 'inputs/review.json', {'dirty_segments': [2]})
+        before_review = (self.out / 'inputs/review.json').read_bytes()
+        before_seg = (self.out / 'inputs/segment-edit.json').read_bytes()
+        snap = self.client.get('/api/jobs/job-1').json
+        with patch.dict(os.environ, {'PATH': os.environ.get('PATH', ''), 'RUNNINGHUB_API_KEY': 'rh', 'APIMART_API_KEY': 'ap', 'LLM_PROVIDER': 'gemini'}, clear=True), \
+             patch('shutil.which', return_value='/fake/ffmpeg'):
+            app = create_app(self.out.parent / 'st-reconcile', self.out.parent / '.env-reconcile')
+            try:
+                app.extensions['jobs'].records[self.identifier] = dict(self.jobs.records[self.identifier])
+                with patch.object(app.extensions['jobs'], 'launch') as launch:
+                    res = app.test_client().post('/api/jobs/job-1/continue',
+                                                 json={'approved': True, 'review_version': snap['review']['version']},
+                                                 headers=self.headers)
+                self.assertEqual(res.status_code, 400, res.json)
+                launch.assert_not_called()
+                self.assertEqual((self.out / 'inputs/review.json').read_bytes(), before_review)
+                self.assertEqual((self.out / 'inputs/segment-edit.json').read_bytes(), before_seg)
+            finally:
+                app.extensions['jobs'].close()
+
+    def test_pre_task_segment_failure_sibling_drain_freezes_clipless_and_preserves_clipful_draft(self):
+        import os
+        # Part A: Clip-having seg2 with unapplied draft keeps its edited prompt when seg1 replaces segment-edit.json
+        self.prepare('unapplied seg2 draft prompt', 'source', number=2)
+        self.prepare('seg1 replacement prompt', 'source', number=1)
+        self.generate()
+        self.assertEqual(self.card(2)['prompt'], 'unapplied seg2 draft prompt')
+
+        # Part B: Clipless seg1 pre-task failure while seg2 is in-flight drains seg2 without LLM keys or submitting seg1
+        case = SegmentPrompts()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case._setup_shot_frames_reviewed()
+        (case.out / 'clips/seg1.mp4').unlink()
+        (case.out / 'clips/seg1-last.jpg').unlink()
+        (case.out / 'clips/seg2.mp4').unlink()
+        (case.out / 'clips/seg2-last.jpg').unlink()
+        case.job.state['segs']['0'] = {'zh': 'initial s1', 'error': 'initial err'}
+        case.job.state['segs']['1'] = {'zh': 's2', 'h3': h3(), 'task': 'inflight-s2', 'submitted': 1.0}
+        case.job.save()
+        case.prepare('edited s1 failing rewrite', 'source', number=1)
+        write_json(case.out / 'inputs/request.json', case.request)
+        with patch.object(rewrite, 'backend', return_value='llm'), \
+             patch.object(rewrite, 'guide', return_value='g'), \
+             patch.object(rewrite, '_llm', side_effect=RuntimeError('llm quota')):
+            with self.assertRaises(RuntimeError):
+                segments.regenerate(case.request)
+        case.jobs.find(case.identifier).update(status='failed', operation='segment')
+        # Unmocked preflight with ONLY RUNNINGHUB_API_KEY (NO LLM key!) must allow /resume to drain inflight-s2!
+        with patch.dict(os.environ, {'PATH': os.environ.get('PATH', ''), 'RUNNINGHUB_API_KEY': 'rh-only', 'LLM_PROVIDER': 'gemini'}, clear=True), \
+             patch('shutil.which', return_value='/fake/ffmpeg'):
+            app = create_app(case.out.parent / 'st-drain', case.out.parent / '.env-drain')
+            try:
+                app.extensions['jobs'].records[case.identifier] = dict(case.jobs.records[case.identifier])
+                with patch.object(app.extensions['jobs'], 'launch'):
+                    res = app.test_client().post('/api/jobs/job-1/resume', json={}, headers=case.headers)
+                self.assertEqual(res.status_code, 200, res.json)
+            finally:
+                app.extensions['jobs'].close()
+        polled = []
+        with patch.object(rewrite, 'rewrite', side_effect=AssertionError('rewrote failed s1 during drain')), \
+             patch.object(rh, 'submit_with_retry', side_effect=AssertionError('submitted failed s1 during drain')), \
+             patch.object(rh, 'poll', side_effect=lambda t: polled.append(t) or {'state': 'done', 'url': 'offline://s2', 'cny': 1.0}), \
+             patch.object(film.http, 'download', side_effect=lambda u, p: p.write_bytes(b'DRAINED S2')), \
+             patch.object(media, 'last_frame', side_effect=lambda c, p: p.write_bytes(b'TAIL2')), \
+             patch.object(media, 'duration', return_value=8):
+            with self.assertRaises(RuntimeError):
+                storyboard.run(json.loads((case.out / 'inputs/request.json').read_text()))
+        self.assertEqual(polled, ['inflight-s2'])
+        self.assertEqual((case.out / 'clips/seg2.mp4').read_bytes(), b'DRAINED S2')
+        card1 = case.card(1)
+        self.assertTrue(card1['editable'])
+        self.assertTrue(card1['can_regenerate'])
+        self.assertEqual(card1['prompt'], 'edited s1 failing rewrite')
+
+    def test_post_drain_pipeline_resume_clears_attempt_blocked_and_validates_llm_preflight(self):
+        import os
+        self._setup_shot_frames_reviewed()
+        (self.out / 'clips/seg1.mp4').unlink()
+        (self.out / 'clips/seg1-last.jpg').unlink()
+        self.job.state['segs']['0'] = {
+            'zh': 'edited s1 failing rewrite',
+            'h3': None,
+            'h3_source': None,
+            'prompt_override': {'format': 'source', 'text': 'edited s1 failing rewrite', 'source_version': 'sv1'},
+            'error': 'RuntimeError: llm quota',
+            'attempt_blocked': True,
+        }
+        self.job.save()
+        req = json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8'))
+        req['operation'] = 'pipeline'
+        write_json(self.out / 'inputs/request.json', req)
+        self.jobs.find(self.identifier).update(status='failed', operation='pipeline')
+
+        # 1. With no sibling task_pending left, /resume without LLM key must fail preflight instead of looping into attempt_blocked crash
+        with patch.dict(os.environ, {'PATH': os.environ.get('PATH', ''), 'RUNNINGHUB_API_KEY': 'rh-only', 'LLM_PROVIDER': 'gemini'}, clear=True), \
+             patch('shutil.which', return_value='/fake/ffmpeg'):
+            app = create_app(self.out.parent / 'st-postdrain-1', self.out.parent / '.env-postdrain-1')
+            try:
+                app.extensions['jobs'].records[self.identifier] = dict(self.jobs.records[self.identifier])
+                with patch.object(app.extensions['jobs'], 'launch') as launch:
+                    r_no_llm = app.test_client().post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+                self.assertEqual(r_no_llm.status_code, 400, r_no_llm.json)
+                launch.assert_not_called()
+            finally:
+                app.extensions['jobs'].close()
+
+        # 2. With valid LLM + RunningHub keys, /resume clears attempt_blocked so film.run rewrites and generates seg1
+        with patch.dict(os.environ, {'PATH': os.environ.get('PATH', ''), 'RUNNINGHUB_API_KEY': 'rh-ok', 'GEMINI_API_KEY': 'gm-ok', 'LLM_PROVIDER': 'gemini'}, clear=True), \
+             patch('shutil.which', return_value='/fake/ffmpeg'):
+            app = create_app(self.out.parent / 'st-postdrain-2', self.out.parent / '.env-postdrain-2')
+            try:
+                app.extensions['jobs'].records[self.identifier] = dict(self.jobs.records[self.identifier])
+                with patch.object(app.extensions['jobs'], 'launch') as launch:
+                    r_ok = app.test_client().post('/api/jobs/job-1/resume', json={}, headers=self.headers)
+                self.assertEqual(r_ok.status_code, 200, r_ok.json)
+                launch.assert_called_once()
+            finally:
+                app.extensions['jobs'].close()
+        self.assertFalse(film.Job(self.out).state['segs']['0'].get('attempt_blocked'))
+        with patch.object(rewrite, 'rewrite', return_value=h3()) as rw_mock, \
+             patch.object(rh, 'upload', return_value='ref.png'), \
+             patch.object(rh, 'graph', return_value={}), \
+             patch.object(rh, 'submit_with_retry', return_value='new-s1-task'), \
+             patch.object(rh, 'poll', return_value={'state': 'done', 'url': 'offline://s1', 'cny': 1.0}), \
+             patch.object(film.http, 'download', side_effect=lambda u, p: p.write_bytes(b'NEW S1')), \
+             patch.object(media, 'last_frame', side_effect=lambda c, p: p.write_bytes(b'TAIL1')), \
+             patch.object(media, 'join', side_effect=lambda ps, p: p.write_bytes(b'FINAL')), \
+             patch.object(media, 'duration', return_value=16):
+            storyboard.run(json.loads((self.out / 'inputs/request.json').read_text(encoding='utf-8')))
+        rw_mock.assert_called_once()
+        self.assertEqual(rw_mock.call_args.args[0], 'edited s1 failing rewrite')
+        self.assertEqual((self.out / 'clips/seg1.mp4').read_bytes(), b'NEW S1')
+
+    def test_reconciled_records_clears_stale_h3_when_staged_wrote_updated_zh_before_failing(self):
+        (self.out / 'clips/seg1.mp4').unlink()
+        self.job.state['segs']['0'] = {'zh': 'Old zh', 'h3': h3(), 'h3_source': 'Old zh'}
+        self.job.save()
+        rev = 'rev-stale-h3'
+        staged_dir = self.out / 'inputs' / f'segment-{rev}'
+        staged_dir.mkdir(parents=True, exist_ok=True)
+        write_json(staged_dir / 'state.json', {'segs': {'0': {'zh': 'New zh', 'error': 'RewriteError: partial'}}})
+        write_json(self.out / 'inputs/segment-edit.json', {
+            'number': 1, 'revision': rev, 'explicit_prompt': True,
+            'prompt_format': 'source', 'prompt': 'New zh', 'reuse_h3': False,
+            'previous': {'zh': 'Old zh', 'h3': h3(), 'h3_source': 'Old zh'}, 'applied': False,
+        })
+        reconciled, changed, _ = segments.preview_reconciled_segments(self.out, keep_pending=False, supersede=False)
+        self.assertTrue(changed)
+        self.assertIsNone(reconciled['0'].get('h3'))
+        self.assertIsNone(reconciled['0'].get('h3_source'))

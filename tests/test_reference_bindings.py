@@ -94,31 +94,33 @@ class ReferenceBindings(unittest.TestCase):
                 describe_references({"cast": cast})
 
     def test_http_upload_binding_reaches_original_film_input_in_both_modes(self):
-        app = create_app(self.root / "storage", self.root / ".env")
-        client = app.test_client()
-        headers = {"X-Workbench": "1"}
-        jobs = app.extensions["jobs"]
-        try:
-            parsed = client.post("/api/film/references", json={"film": self.script}, headers=headers)
-            self.assertEqual(parsed.status_code, 200)
-            image = io.BytesIO()
-            Image.new("RGB", (8, 8)).save(image, "PNG")
-            image.seek(0)
-            uploaded = client.post("/api/uploads", data={"images": (image, "actor.png")}, headers=headers).json["files"][0]
-            client.post("/api/config", json={"APIMART_API_KEY": "fake-never-called", "persist": False}, headers=headers)
-            for demo in (True, False):
-                with patch.object(jobs, "launch") as launch:
-                    response = client.post("/api/jobs", json={"kind": "film", "demo": demo,
-                        "operation": "frames", "film": parsed.json["film"],
-                        "reference_bindings": {"cast:0": uploaded["id"]},
-                        "output_dir": str(self.root / f"out-{demo}")}, headers=headers)
-                self.assertEqual(response.status_code, 201, response.json)
-                launch.assert_called_once()
-                saved = json.loads((Path(response.json["output_dir"]) / "inputs" / "film.json").read_text())
-                self.assertEqual(saved["cast"][0]["picture"], uploaded["path"])
-                jobs.records[response.json["id"]]["status"] = "succeeded"
-        finally:
-            jobs.close()
+        import os
+        with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True):
+            app = create_app(self.root / "storage", self.root / ".env")
+            client = app.test_client()
+            headers = {"X-Workbench": "1"}
+            jobs = app.extensions["jobs"]
+            try:
+                parsed = client.post("/api/film/references", json={"film": self.script}, headers=headers)
+                self.assertEqual(parsed.status_code, 200)
+                image = io.BytesIO()
+                Image.new("RGB", (8, 8)).save(image, "PNG")
+                image.seek(0)
+                uploaded = client.post("/api/uploads", data={"images": (image, "actor.png")}, headers=headers).json["files"][0]
+                client.post("/api/config", json={"APIMART_API_KEY": "fake-never-called", "persist": False}, headers=headers)
+                for demo in (True, False):
+                    with patch.object(jobs, "launch") as launch:
+                        response = client.post("/api/jobs", json={"kind": "film", "demo": demo,
+                            "operation": "frames", "film": parsed.json["film"],
+                            "reference_bindings": {"cast:0": uploaded["id"]},
+                            "output_dir": str(self.root / f"out-{demo}")}, headers=headers)
+                    self.assertEqual(response.status_code, 201, response.json)
+                    launch.assert_called_once()
+                    saved = json.loads((Path(response.json["output_dir"]) / "inputs" / "film.json").read_text())
+                    self.assertEqual(saved["cast"][0]["picture"], uploaded["path"])
+                    jobs.records[response.json["id"]]["status"] = "succeeded"
+            finally:
+                jobs.close()
 
 
 if __name__ == "__main__":

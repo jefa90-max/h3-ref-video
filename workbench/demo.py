@@ -91,6 +91,7 @@ def run(request):
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-i", str(still),
                             "-t", str(segment["seconds"]), "-r", "24", "-c:v", "libx264", "-preset", "ultrafast",
                             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(clip)], check=True, timeout=120)
+            media.last_frame(clip, clip.with_name(f"{name}-last.jpg"))
             clips.append(clip)
             log("demo_clip", name=name)
         final = out / ("film.mp4" if request["kind"] == "film" else "clip.mp4")

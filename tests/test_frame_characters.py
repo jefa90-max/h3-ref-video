@@ -1,6 +1,7 @@
 """Frame edits select characters imported with the film, never unrelated uploads."""
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,9 @@ from workbench.server import create_app
 
 class FrameCharacters(unittest.TestCase):
     def setUp(self):
+        env_patch = patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.app = create_app(self.root / "storage", self.root / ".env")

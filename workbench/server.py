@@ -2,6 +2,7 @@
 import json
 import os
 import platform
+import re
 import shutil
 import threading
 import uuid
@@ -11,16 +12,17 @@ from urllib.parse import urlsplit
 from flask import Flask, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
 
-from h3ref import config
+from h3ref import config, film
 from .i18n import InputError, message
 from .inputs import array, invalid, text, verify_image
-from .jobs import Jobs
+from .jobs import ARTIFACT_TYPES, Jobs
 from .settings import save_env
 from .references import bind_references, describe_references
 from .directories import choose_output_folder, saved_output_root, save_output_root
 
-KEYS = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY")
-FIELDS = (*KEYS, "LLM_BASE_URL", "LLM_MODEL")
+KEYS = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
+FIELDS = (*KEYS, "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
+          "GEMINI_MODEL", "GEMINI_COMPOSITION_MODEL", "GEMINI_REWRITE_MODEL")
 
 
 def create_app(storage=None, env_path=None):
@@ -32,18 +34,50 @@ def create_app(storage=None, env_path=None):
     folder_picker_lock = threading.Lock()
     env_path = Path(env_path or root / ".env")
     app.extensions["jobs"] = jobs
-    env = dict(os.environ)
+    env = config.load_server_env(env_path)
     env["H3_REWRITER"] = "llm"
-    env.setdefault("LLM_BASE_URL", config.LLM_BASE)
-    env.setdefault("LLM_MODEL", config.LLM_MODEL)
+    env.setdefault("LLM_BASE_URL", config.LLM_DEFAULTS["apimart"]["base_url"])
+    env.setdefault("LLM_MODEL", config.LLM_DEFAULTS["apimart"]["model"])
+    if env.get("LLM_PROVIDER", "").strip().lower() not in ("", *config.LLM_DEFAULTS):
+        env["LLM_PROVIDER"] = "apimart"
+    config.llm_settings(env)
     jobs.remember_secrets(env)
+
+    verified_images = set()
+
+    def send_verified_image(path):
+        resolved = path.resolve()
+        try:
+            st = resolved.stat()
+        except FileNotFoundError:
+            raise InputError("not_found", value=path.name)
+        token = f"{st.st_mtime_ns}:{st.st_size}"
+        stamp = (str(resolved), st.st_mtime_ns, st.st_size)
+        if stamp not in verified_images:
+            verify_image(resolved)
+            if len(verified_images) >= 512:
+                verified_images.clear()
+            verified_images.add(stamp)
+        if request.if_none_match and request.if_none_match.contains(token):
+            response = app.response_class(status=304)
+            response.set_etag(token)
+            return response
+        response = send_file(resolved, conditional=False)
+        response.set_etag(token)
+        response.last_modified = st.st_mtime
+        response.make_conditional(request.environ)
+        return response
 
     def language():
         return "en" if request.headers.get("Accept-Language", "").lower().startswith("en") else "zh-CN"
 
     def settings():
         return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS}, "LLM_BASE_URL": env["LLM_BASE_URL"],
-                "LLM_MODEL": env["LLM_MODEL"], "rewriter": "llm", "python": platform.python_version(),
+                "LLM_MODEL": env["LLM_MODEL"], "LLM_PROVIDER": config.llm_settings(env)["provider"],
+                "llm_providers": {provider: {**config.llm_settings({**env, "LLM_PROVIDER": provider}),
+                                             "key_names": list(config.llm_settings({**env, "LLM_PROVIDER": provider})["key_names"])}
+                                  for provider in config.LLM_DEFAULTS},
+                "rewriter": "llm", "python": platform.python_version(),
                 "ffmpeg": bool(shutil.which("ffmpeg")), "ffprobe": bool(shutil.which("ffprobe")), "saved_to_env": env_path.is_file(),
                 "output_root": str(saved_output_root(root, storage))}
 
@@ -57,7 +91,10 @@ def create_app(storage=None, env_path=None):
 
     @app.after_request
     def headers(response):
-        response.headers["Cache-Control"] = "no-store"
+        if "ETag" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+        else:
+            response.headers.setdefault("Cache-Control", "private, no-cache")
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self'; style-src-attr 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'"
@@ -96,9 +133,11 @@ def create_app(storage=None, env_path=None):
             identifier = (request.view_args or {}).get('identifier', '?')
             trace = '; '.join(f'{Path(frame.filename).name}:{frame.lineno}:{frame.name}' for frame in traceback.extract_tb(exc.__traceback__)[-5:])
             # No exception messages/URLs or user script contents enter this trace.
-            storage_path = storage / 'jobs' / f'{identifier}.log'
-            with storage_path.open('a', encoding='utf-8') as log:
-                log.write(f'correlation={instance} segment={number} error={type(exc).__name__} trace={trace}\n')
+            if isinstance(identifier, str) and identifier in jobs.records:
+                storage_path = (storage / 'jobs' / f'{identifier}.log').resolve()
+                if storage_path.parent == (storage / 'jobs').resolve():
+                    with storage_path.open('a', encoding='utf-8') as log:
+                        log.write(f'correlation={instance} segment={number} error={type(exc).__name__} trace={trace}\n')
             return segment_problem('segment_internal', message('segment_internal', language(), number=number, instance=instance), 500, instance=instance)
         return jsonify(error=message("internal", language(), detail=jobs.redact(f"{type(exc).__name__}: {exc}"))), 500
 
@@ -112,8 +151,7 @@ def create_app(storage=None, env_path=None):
 
     @app.get("/api/bootstrap")
     def bootstrap():
-        return jsonify(config=settings(), example=json.loads((root / "examples" / "film.example.json").read_text(encoding="utf-8")),
-                       example_base_dir="examples", jobs=jobs.summaries())
+        return jsonify(config=settings(), jobs=jobs.summaries())
 
     @app.get("/api/film/example")
     def download_film_example():
@@ -135,19 +173,39 @@ def create_app(storage=None, env_path=None):
             if key not in FIELDS:
                 invalid("config", key, "choice")
             # Never quote a key's value in an error response.
-            if not isinstance(value, str) or "\n" in value or "\r" in value or "\0" in value:
+            if not isinstance(value, str) or "\0" in value or len(f"{key}={value}".splitlines()) != 1:
                 invalid(key, "[REDACTED]" if key in KEYS else value, "text")
             if key in KEYS and not value.strip():
                 continue
+            if key == "LLM_PROVIDER" and value.strip() not in config.LLM_DEFAULTS:
+                invalid(key, value, "choice")
             if key == "LLM_BASE_URL":
-                url = urlsplit(value)
-                if url.scheme not in ("http", "https") or not url.netloc or url.username or url.password or url.query or url.fragment:
+                try:
+                    url = urlsplit(value.strip())
+                    _ = url.port
+                except ValueError:
+                    invalid(key, "[URL]", "choice")
+                if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
                     invalid(key, "[URL]", "choice")
             updates[key] = text(value, key, empty=key in KEYS)
         with jobs.lock:
+            disk_updates = dict(updates)
+            mem_updates = dict(updates)
+            if "LLM_BASE_URL" in updates and "LLM_API_KEY" not in updates:
+                new_origin = config.url_origin(updates["LLM_BASE_URL"])
+                mem_changed = new_origin != config.url_origin(env.get("LLM_BASE_URL", ""))
+                if mem_changed:
+                    mem_updates["LLM_API_KEY"] = None
+                if persist:
+                    disk_file = config.read_env_file(env_path)
+                    disk_base = disk_file.get("LLM_BASE_URL") or config.LLM_DEFAULTS["apimart"]["base_url"]
+                    disk_changed = new_origin != config.url_origin(disk_base)
+                    if disk_changed or mem_changed or (not env.get("LLM_API_KEY", "").strip() and "LLM_API_KEY" in disk_file):
+                        disk_updates["LLM_API_KEY"] = None
             if persist:
-                save_env(env_path, updates)
-            env.update(updates)
+                save_env(env_path, disk_updates)
+            for k, v in mem_updates.items():
+                env[k] = "" if v is None else v
             jobs.remember_secrets(env)
         return jsonify(settings())
 
@@ -242,30 +300,49 @@ def create_app(storage=None, env_path=None):
             record = jobs.find(identifier)
             if record["kind"] != "film":
                 raise InputError("not_found", value=index)
-            saved = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
-            references = character_references(saved, identifier)
-            if index >= len(references) or not references[index]["url"]:
-                raise InputError("not_found", value=index)
-            path = Path(references[index]["path"])
-            verify_image(path)
-            return send_file(path)
+            out = Path(record["output_dir"])
+        saved = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
+        references = character_references(saved, identifier)
+        if index >= len(references) or not references[index]["url"]:
+            raise InputError("not_found", value=index)
+        path = Path(references[index]["path"])
+        return send_verified_image(path)
 
     @app.get("/api/jobs/<identifier>/frames/<key>/references/<int:index>")
     def frame_reference(identifier, key, index):
-        from .storyboard import plan
+        from .storyboard import frame_records, read_json
         with jobs.lock:
             record = jobs.find(identifier)
             if record["kind"] != "film":
                 raise InputError("not_found", value=key)
-            saved = json.loads((Path(record["output_dir"]) / "inputs" / "request.json").read_text(encoding="utf-8"))
-            description = next((item for item in plan(saved, check_images=False)[3] if item["key"] == key), None)
-            if not description or index >= len(description["reference_paths"]):
-                raise InputError("not_found", value=f"{key}/{index}")
-            path = Path(description["reference_paths"][index])
-            if not path.is_file():
-                raise InputError("not_found", value=f"{key}/{index}")
-            verify_image(path)
-            return send_file(path)
+            out = Path(record["output_dir"])
+        match = re.fullmatch(r"s(\d+)-(\d+)", key)
+        if not match:
+            raise InputError("not_found", value=f"{key}/{index}")
+        seg_idx, shot_idx = int(match.group(1)) - 1, int(match.group(2)) - 1
+        saved = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
+        source = out / "inputs" / ("demo-film.json" if saved["demo"] and (out / "inputs" / "demo-film.json").exists() else "film.json")
+        script = film.load(source, check_images=False)
+        planned = film.plan(script["shots"])
+        if not (0 <= seg_idx < len(planned)):
+            raise InputError("not_found", value=f"{key}/{index}")
+        segment = planned[seg_idx]
+        if not any(p["kind"] == "frame" and p["shot"] == shot_idx for p in film.refs(script, segment, saved["frames"])):
+            raise InputError("not_found", value=f"{key}/{index}")
+        allowed = {Path(c["picture"]).resolve() for c in script.get("cast") or [] if c.get("picture")}
+        if script.get("board"):
+            allowed.add(Path(script["board"]).resolve())
+        who = [c for c in script.get("cast") or [] if film.in_shots(c, [segment["shots"][shot_idx]])]
+        pending_frame = read_json(out / "inputs" / "frame-edit.json", {})
+        active_pending = pending_frame if pending_frame and not pending_frame.get("applied") and pending_frame.get("key") == key else {}
+        characters = active_pending.get("character_reference_paths") if "character_reference_paths" in active_pending else frame_records(saved).get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
+        ref_paths = ([script["board"]] if script.get("board") else []) + list(characters)
+        if not (0 <= index < len(ref_paths)):
+            raise InputError("not_found", value=f"{key}/{index}")
+        path = Path(ref_paths[index]).resolve()
+        if path not in allowed or not path.is_file():
+            raise InputError("not_found", value=f"{key}/{index}")
+        return send_verified_image(path)
 
     @app.post("/api/jobs/<identifier>/continue")
     def continue_film(identifier):
@@ -297,16 +374,21 @@ def create_app(storage=None, env_path=None):
     @app.get("/api/jobs/<identifier>/files/<path:name>")
     def artifact(identifier, name):
         from . import segments
+        parts = Path(name).parts
+        kind = ARTIFACT_TYPES.get(Path(name).suffix.lower())
+        whitelisted = bool(kind and (
+            name in ("film.mp4", "clip.mp4", "report.md", "plan.json", "prompt.h3.txt")
+            or (len(parts) == 2 and parts[0] in ("frames", "clips", "prompts") and parts[1] not in ("", ".", ".."))
+        ))
         # The worker is a separate process. Pin an opened file, then validate that
         # descriptor; a path/version check alone races with atomic replacement.
         for _ in range(2):
             with jobs.lock:
                 record = jobs.find(identifier)
                 out = Path(record['output_dir'])
-                context = segments.read_context({'output_dir': str(out)})
-                matches = [a for a in jobs.artifacts(record, context) if a['name'] == name]
-                mapped = name in context['pending'].get('files', {})
-                source = segments.visible_file(out, name, context, request.args.get('v')) if matches or mapped else None
+            context = segments.artifact_context(out)
+            mapped = bool(kind and name in context['pending'].get('files', {}))
+            source = segments.visible_file(out, name, context, request.args.get('v')) if whitelisted or mapped else None
             if not source:
                 break
             try:
@@ -316,13 +398,13 @@ def create_app(storage=None, env_path=None):
             stat = os.fstat(stream.fileno())
             token = f'{stat.st_mtime_ns}:{stat.st_size}'
             expected = request.args.get('v') or segments.file_version(source, out, context)
-            if expected not in (token, token.split(':')[0]):
+            if expected and ((expected != token) if ':' in expected else (expected != token.split(':')[0])):
                 stream.close()
                 continue
             try:
-                if (matches and matches[0]['kind'] in ('report', 'file')) or (not matches and source.suffix == '.txt'):
+                if kind in ('report', 'file') or (not whitelisted and source.suffix == '.txt'):
                     with stream:
-                        content = jobs.redact(stream.read().decode('utf-8'))
+                        content = jobs.redact(stream.read().decode('utf-8', errors='replace'))
                     return app.response_class(content, mimetype='text/plain')
                 response = send_file(stream, download_name=Path(name).name, conditional=False,
                                      as_attachment=request.args.get('download') == '1')

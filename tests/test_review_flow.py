@@ -13,13 +13,17 @@ from workbench import storyboard
 
 class ReviewFlow(unittest.TestCase):
     def setUp(self):
+        import os
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.env_patch = patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         self.app = create_app(self.root / "storage", self.root / ".env")
         self.client = self.app.test_client()
         self.jobs = self.app.extensions["jobs"]
         self.headers = {"X-Workbench": "1"}
-        self.client.post("/api/config", json={"APIMART_API_KEY": "fake-image-only", "persist": False}, headers=self.headers)
+        self.client.post("/api/config", json={"LLM_PROVIDER": "apimart", "APIMART_API_KEY": "fake-image-only", "persist": False}, headers=self.headers)
 
     def tearDown(self):
         self.jobs.close()
@@ -203,6 +207,92 @@ class ReviewFlow(unittest.TestCase):
         self.assertEqual(len(submitted), 2)
         self.assertEqual(submitted[-1][rh.PROMPT]['inputs']['prompt'], h3)
         self.assertEqual(film.Job(out).state['segs']['0']['prompt_override']['text'], h3)
+
+    def test_dirty_first_mode_frame_approval_regenerates_chained_suffix(self):
+        from h3ref import film, frames, media, rewrite, rh
+        script = {"shots": [{"start": i * 8, "end": (i + 1) * 8, "action": f"Shot {i}"} for i in range(3)]}
+        with patch.object(self.jobs, "launch"):
+            job = self.client.post("/api/jobs", json={"kind": "film", "demo": False, "frames": "first",
+                "film": script, "output_dir": str(self.root / "first-out")}, headers=self.headers).json
+        out = Path(job["output_dir"])
+        (out / "clips").mkdir()
+        for frame in job["storyboard"]:
+            Path(frame["path"]).parent.mkdir(exist_ok=True)
+            Image.new("RGB", (8, 8), "red").save(frame["path"])
+        for i in range(3):
+            clip = out / f"clips/seg{i + 1}.mp4"
+            clip.write_bytes(f"old-{i + 1}".encode())
+            (out / f"clips/seg{i + 1}-last.jpg").write_bytes(b"tail")
+            film.Job(out).put("segs", str(i), zh="src", h3="h3", file=str(clip), cny=1, task=f"t-{i}")
+        self.jobs.find(job["id"])["status"] = "succeeded"
+        self.confirm(self.jobs.snapshot(job["id"]))
+        self.jobs.find(job["id"])["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{job['id']}/frames/s2-1", json={"prompt": "updated s2"}, headers=self.headers)
+        with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "blue").save(a[3]) or 0)):
+            storyboard.regenerate(json.loads((out / "inputs/request.json").read_text()))
+        self.jobs.find(job["id"])["status"] = "succeeded"
+        self.confirm(self.jobs.snapshot(job["id"]))
+        with patch.object(rewrite, "rewrite", return_value="h3"), \
+             patch.object(rh, "upload", return_value="u"), \
+             patch.object(rh, "submit_with_retry", return_value="new-t"), \
+             patch.object(rh, "poll", return_value={"state": "done", "url": "https://cdn.example/v.mp4", "cny": 1}), \
+             patch.object(film.http, "download", side_effect=lambda u, p: p.write_bytes(b"new")), \
+             patch.object(media, "last_frame", side_effect=lambda c, p: p.write_bytes(b"new-tail")), \
+             patch.object(media, "join", side_effect=lambda ps, p: p.write_bytes(b"film")), \
+             patch.object(media, "duration", return_value=24):
+            storyboard.run(json.loads((out / "inputs/request.json").read_text()))
+        self.assertEqual((out / "clips/seg1.mp4").read_bytes(), b"old-1")
+        self.assertEqual((out / "clips/seg2.mp4").read_bytes(), b"new")
+        self.assertEqual((out / "clips/seg3.mp4").read_bytes(), b"new")
+
+    def test_dirty_shot_mode_frame_approval_regenerates_only_dirty_segment_and_clears_dirty(self):
+        from h3ref import film, frames, media, rewrite, rh
+        script = {"shots": [{"start": i * 8, "end": (i + 1) * 8, "action": f"Shot {i}"} for i in range(3)]}
+        with patch.object(self.jobs, "launch"):
+            job = self.client.post("/api/jobs", json={"kind": "film", "demo": False, "frames": "shot",
+                "film": script, "output_dir": str(self.root / "shot-out")}, headers=self.headers).json
+        out = Path(job["output_dir"])
+        (out / "clips").mkdir()
+        for frame in job["storyboard"]:
+            Path(frame["path"]).parent.mkdir(exist_ok=True)
+            Image.new("RGB", (8, 8), "red").save(frame["path"])
+        for i in range(3):
+            clip = out / f"clips/seg{i + 1}.mp4"
+            clip.write_bytes(f"old-shot-{i + 1}".encode())
+            (out / f"clips/seg{i + 1}-last.jpg").write_bytes(b"tail")
+            film.Job(out).put("segs", str(i), zh="src", h3="h3", file=str(clip), cny=1, task=f"t-{i}")
+        self.jobs.find(job["id"])["status"] = "succeeded"
+        self.confirm(self.jobs.snapshot(job["id"]))
+        self.jobs.find(job["id"])["status"] = "succeeded"
+        with patch("workbench.jobs.preflight"), patch.object(self.jobs, "launch"):
+            self.client.post(f"/api/jobs/{job['id']}/frames/s2-1", json={"prompt": "updated shot s2"}, headers=self.headers)
+        with patch.object(frames, "draw", side_effect=lambda *a, **k: (Image.new("RGB", (8, 8), "blue").save(a[3]) or 0)):
+            storyboard.regenerate(json.loads((out / "inputs/request.json").read_text()))
+        self.jobs.find(job["id"])["status"] = "succeeded"
+        confirmed = self.confirm(self.jobs.snapshot(job["id"]))
+        self.assertTrue(confirmed["review"]["complete"])
+        req = json.loads((out / "inputs/request.json").read_text())
+        self.assertEqual(req["redo"], [2])
+        with patch("subprocess.Popen") as popen, patch("workbench.jobs.stop_posix_descendants_on_exit"), patch("workbench.jobs.stop_child"):
+            def fake_worker(*_a, **_kw):
+                with patch.object(rewrite, "rewrite", return_value="h3"), \
+                     patch.object(rh, "upload", return_value="u"), \
+                     patch.object(rh, "submit_with_retry", return_value="new-s2"), \
+                     patch.object(rh, "poll", return_value={"state": "done", "url": "https://cdn.example/v.mp4", "cny": 1}), \
+                     patch.object(film.http, "download", side_effect=lambda u, p: p.write_bytes(b"new-shot-2")), \
+                     patch.object(media, "last_frame", side_effect=lambda c, p: p.write_bytes(b"new-tail")), \
+                     patch.object(media, "join", side_effect=lambda ps, p: p.write_bytes(b"film")), \
+                     patch.object(media, "duration", return_value=24):
+                    storyboard.run(json.loads((out / "inputs/request.json").read_text()))
+                from unittest.mock import MagicMock
+                return MagicMock(pid=12345, stdout=iter([]), wait=lambda *_x, **_y: 0)
+            popen.side_effect = fake_worker
+            self.jobs.run(self.jobs.find(job["id"]), json.loads((out / "inputs/request.json").read_text()), {})
+        self.assertEqual((out / "clips/seg1.mp4").read_bytes(), b"old-shot-1")
+        self.assertEqual((out / "clips/seg2.mp4").read_bytes(), b"new-shot-2")
+        self.assertEqual((out / "clips/seg3.mp4").read_bytes(), b"old-shot-3")
+        self.assertEqual(json.loads((out / "inputs/review.json").read_text())["dirty_segments"], [])
 
 
 if __name__ == "__main__":
