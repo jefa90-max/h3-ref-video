@@ -557,3 +557,109 @@ class SegmentPrompts(unittest.TestCase):
     def test_final_review_unchanged_automatic_source_stays_automatic(self):
         self.prepare('recipient stands');self.generate()
         self.assertNotIn('prompt_override',film.Job(self.out).state['segs']['1'])
+
+    def test_applied_frame_redo_allows_failed_segment_retry_after_refresh(self):
+        self.request.update(redo=[2],reset_applied=True)
+        write_json(self.out/'inputs/request.json',self.request)
+        review=storyboard.review_state(self.out)
+        review['dirty_segments']=[2]
+        write_json(self.out/'inputs/review.json',review)
+        self.job.put('segs','1',terminal_failed=True,error='Read timeout',file=None,cny=None)
+        (self.out/'clips/seg2.mp4').unlink()
+        self.jobs.find(self.identifier)['status']='failed'
+        saved_review=(self.out/'inputs/review.json').read_bytes()
+        saved_request=(self.out/'inputs/request.json').read_bytes()
+        for _ in range(2):
+            snapshot=self.client.get('/api/jobs/job-1').json
+            self.assertTrue(snapshot['review']['complete'])
+            self.assertFalse(snapshot['pending_video'])
+            self.assertFalse(snapshot['can_resume_video'],'terminal failure still requires an explicit new attempt')
+            self.assertTrue(snapshot['segments'][1]['can_regenerate'])
+        self.assertEqual((self.out/'inputs/review.json').read_bytes(),saved_review)
+        self.assertEqual((self.out/'inputs/request.json').read_bytes(),saved_request)
+        card=snapshot['segments'][1]
+        with patch.object(self.jobs,'launch'),patch('workbench.jobs.preflight'):
+            response=self.client.post(self.url,json=dict(version=card['version'],prompt_version=card['prompt_version'],
+                prompt=card['prompt'],prompt_format=card['prompt_format']),headers=self.headers)
+        self.assertEqual(response.status_code,200,response.json)
+        self.assertFalse(response.json['pending_video'])
+        self.assertEqual(json.loads((self.out/'inputs/review.json').read_text())['dirty_segments'],[])
+        self.assertTrue(film.Job(self.out).state['segs']['1']['terminal_failed'])
+
+    def test_unapplied_or_new_frame_changes_still_block_segment_retry(self):
+        self.job.put('segs','1',terminal_failed=True,error='Read timeout')
+        self.jobs.find(self.identifier)['status']='failed'
+        for operation,applied,redo in [('pipeline',False,[2]),('pipeline',True,[1]),('segment',True,[2])]:
+            with self.subTest(operation=operation,applied=applied,redo=redo):
+                self.request.update(operation=operation,reset_applied=applied,redo=redo)
+                write_json(self.out/'inputs/request.json',self.request)
+                review=json.loads((self.out/'inputs/review.json').read_text())
+                review['dirty_segments']=[2]
+                write_json(self.out/'inputs/review.json',review)
+                snapshot=self.client.get('/api/jobs/job-1').json
+                self.assertTrue(snapshot['pending_video'])
+                card=snapshot['segments'][1]
+                self.assertFalse(card['can_regenerate'])
+                with patch.object(self.jobs,'launch') as launch:
+                    response=self.client.post(self.url,json=dict(version=card['version'],prompt_version=card['prompt_version'],
+                        prompt=card['prompt'],prompt_format=card['prompt_format']),headers=self.headers)
+                self.assertEqual(response.status_code,400,response.json)
+                self.assertEqual(response.json['code'],'review_required')
+                launch.assert_not_called()
+
+    def test_multiple_failed_segments_can_be_repaired_then_resume_original_pipeline(self):
+        from PIL import Image
+        Image.new('RGB',(8,8),'blue').save(self.script['cast'][0]['picture'])
+        self.script['shots']=[dict(start=i*8,end=(i+1)*8,action='recipient stands') for i in range(5)]
+        self.request.update(frames='shot',redo=[2,3,5],reset_applied=True)
+        write_json(self.out/'inputs/film.json',self.script)
+        write_json(self.out/'inputs/request.json',self.request)
+        (self.out/'frames').mkdir()
+        for i in range(5):(self.out/f'frames/s{i+1}-1.png').write_bytes(b'approved opening')
+        planned=film.plan(self.script['shots'])
+        for seg in planned:
+            i=seg['idx'];source=film.compile_prompt(self.script,seg,film.refs(self.script,seg,'shot'),5)
+            record=dict(zh=source,h3=h3(),h3_source=source)
+            if i==0:record.update(file=str(self.out/'clips/seg1.mp4'),cny=1,task='completed-first')
+            elif i in (1,2):record.update(task=f'failed-{i+1}',terminal_failed=True,error='Read timeout')
+            elif i==3:record.update(task='accepted-fourth')
+            self.job.state['segs'][str(i)]=record
+        self.job.save()
+        for number in (2,3):
+            (self.out/f'clips/seg{number}.mp4').unlink()
+            (self.out/f'clips/seg{number}-last.jpg').unlink()
+        (self.out/'film.mp4').unlink()
+        descriptions=storyboard.view(self.request,self.jobs.artifacts(self.jobs.find(self.identifier)),False)
+        review=storyboard.review_status(self.request,descriptions)
+        write_json(self.out/'inputs/review.json',dict(dirty_segments=[2,3,5],confirmed_version=review['version']))
+        self.jobs.find(self.identifier)['status']='failed'
+        original_clip=(self.out/'clips/seg1.mp4').read_bytes()
+        self.client.post('/api/config',json={'RUNNINGHUB_API_KEY':'offline-rh','persist':False},headers=self.headers)
+        for number in (2,3):
+            card=self.card(number)
+            self.assertTrue(card['can_regenerate'])
+            with patch.object(self.jobs,'launch'),patch('workbench.segments.shutil.which',return_value='/offline/ffmpeg'):
+                response=self.client.post(f'/api/jobs/job-1/segments/{number}/regenerate',json=dict(version=card['version'],
+                    prompt_version=card['prompt_version'],prompt=card['prompt'],prompt_format=card['prompt_format']),headers=self.headers)
+            self.assertEqual(response.status_code,200,response.json)
+            self.request=json.loads((self.out/'inputs/request.json').read_text())
+            self.generate(submit=lambda graph,**kw:f'repaired-{number}')
+            self.jobs.find(self.identifier)['status']='succeeded'
+            snapshot=self.client.get('/api/jobs/job-1').json
+            self.assertFalse(snapshot['pending_video'])
+            self.assertTrue(snapshot['can_resume_pipeline'])
+            self.assertEqual(snapshot['can_resume_video'],number==3)
+            self.assertEqual((self.out/'clips/seg1.mp4').read_bytes(),original_clip)
+            self.assertEqual(film.Job(self.out).state['segs']['3']['task'],'accepted-fourth')
+        with patch.object(self.jobs,'launch'),patch('workbench.segments.shutil.which',return_value='/offline/ffmpeg'):
+            response=self.client.post('/api/jobs/job-1/resume',json={},headers=self.headers)
+        self.assertEqual(response.status_code,200,response.json)
+        request=json.loads((self.out/'inputs/request.json').read_text())
+        self.assertEqual(request['operation'],'pipeline')
+        submitted=[];polled=[]
+        with patch.object(rh,'upload',return_value='ref'),patch.object(rh,'submit_with_retry',side_effect=lambda graph,**kw:submitted.append(graph) or 'new-fifth'),patch.object(rh,'poll',side_effect=lambda task:polled.append(task) or dict(state='done',url='offline://clip',cny=1)),patch.object(film.http,'download',side_effect=lambda url,path:path.write_bytes(b'recovered video')),patch.object(media,'last_frame',side_effect=lambda clip,path:path.write_bytes(b'recovered tail')),patch.object(media,'join',side_effect=lambda paths,path:path.write_bytes(b'film')),patch.object(media,'duration',return_value=40),patch.object(rewrite,'rewrite',side_effect=AssertionError('rewrote saved pipeline')):
+            storyboard.run(request)
+        self.assertEqual(len(submitted),1,'only the never-submitted fifth segment may create a task')
+        self.assertEqual(sorted(polled),['accepted-fourth','new-fifth'])
+        self.assertEqual((self.out/'clips/seg1.mp4').read_bytes(),original_clip)
+        self.assertEqual((self.out/'film.mp4').read_bytes(),b'film')
