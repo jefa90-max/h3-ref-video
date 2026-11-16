@@ -626,6 +626,12 @@ def invalidated_segment_records(records: dict, mode: str, redo: list[int] | None
             if any(int(k) == n - 1 or (mode != "shot" and int(k) > n - 1) for n in redo or [])}
 
 
+def unaffected_segment_blocker(job: Job, mode: str, redo: list[int] | None) -> dict | None:
+    invalidated = set(invalidated_segment_records(job.state["segs"], mode, redo))
+    unaffected = [{"idx": int(k)} for k in sorted(job.state["segs"], key=int) if k not in invalidated]
+    return preexisting_segment_blocker(job, unaffected)
+
+
 def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
     """The --redo invalidation rule, shared with the workbench's reviewed-frame continuation."""
     for k, rec in invalidated_segment_records(job.state["segs"], mode, redo).items():
@@ -686,7 +692,8 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     film = load(Path(job.state["film_path"]))
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}
-    invalidate_segments(job, mode, redo)
+    if redo and unaffected_segment_blocker(job, mode, redo) is None:
+        invalidate_segments(job, mode, redo)
     job.state["t_start"] = time.time()
     job.save()
     job.log("plan", f"{len(segs)} segments", " / ".join(f"{s['seconds']}s·{len(s['shots'])} shots·{len(pics[s['idx']])} pictures" for s in segs))

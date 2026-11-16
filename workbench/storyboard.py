@@ -290,9 +290,11 @@ def run(request):
         # Apply the CLI's --redo rule once, before any new paid generation. Retries
         # use the saved tasks instead of resetting them again with repeated --redo.
         if not request.get("reset_applied"):
-            film.invalidate_segments(film.Job(out), request["frames"], request.get("redo", []))
-            request["reset_applied"] = True
-            write_json(out / "inputs" / "request.json", request)
+            fjob = film.Job(out)
+            if film.unaffected_segment_blocker(fjob, request["frames"], request.get("redo", [])) is None:
+                film.invalidate_segments(fjob, request["frames"], request.get("redo", []))
+                request["reset_applied"] = True
+                write_json(out / "inputs" / "request.json", request)
         film.run(out, out / "inputs" / "film.json", request["frames"])
 
 

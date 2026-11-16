@@ -1229,8 +1229,55 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                 snap = jobs_mgr.snapshot("f-rec")
                 self.assertTrue(snap["can_resume_pipeline"])
                 self.assertTrue(snap["can_resume_video"])
+
+                # 7. D6: Resumable pre-task segment error keeps single-segment Resume instead of flipping to pipeline
+                (job_out / "inputs" / "segment-revdead" / "state.json").write_text(
+                    json.dumps({"segs": {"0": {"error": "upload timeout", "h3": "paid-h3"}}}),
+                    encoding="utf-8",
+                )
+                snap_pretask = jobs_mgr.snapshot("f-rec")
+                self.assertFalse(snap_pretask["can_resume_pipeline"])
+                self.assertEqual(snap_pretask["segment_number"], 1)
+                self.assertTrue(snap_pretask["can_resume_video"])
             finally:
                 jobs_mgr.close()
+
+            # 8. D7: Unaffected preexisting blocker prevents --redo / storyboard.run from deleting paid clips
+            from workbench import storyboard as wb_storyboard
+            redo_dir = root / "redo-preserve"
+            (redo_dir / "inputs").mkdir(parents=True)
+            (redo_dir / "clips").mkdir(parents=True)
+            (redo_dir / "clips" / "seg2.mp4").write_bytes(b"PAID_SEG2")
+            redo_spec = {"aspect": "9:16", "shots": [{"start": 0, "end": 12, "action": "s1"}, {"start": 12, "end": 24, "action": "s2"}]}
+            (redo_dir / "inputs" / "film.json").write_text(json.dumps(redo_spec), encoding="utf-8")
+            redo_req = {"kind": "film", "demo": False, "frames": "none", "operation": "pipeline", "redo": [2], "reset_applied": False, "output_dir": str(redo_dir), "film": redo_spec, "lang": "en"}
+            (redo_dir / "inputs" / "request.json").write_text(json.dumps(redo_req), encoding="utf-8")
+            rjob = film.Job(redo_dir)
+            rjob.put("segs", "0", task="dead-1", terminal_failed=True, error="oom")
+            rjob.put("segs", "1", file=str(redo_dir / "clips" / "seg2.mp4"), cny=0.2, zh="s2", h3="h2")
+            with self.assertRaises(RuntimeError):
+                wb_storyboard.run(dict(redo_req))
+            self.assertEqual((redo_dir / "clips" / "seg2.mp4").read_bytes(), b"PAID_SEG2")
+            self.assertFalse(json.loads((redo_dir / "inputs" / "request.json").read_text(encoding="utf-8"))["reset_applied"])
+
+            # 9. D8: Reconciling a fresh pre-task clipless repair clears stale terminal_failed/task fields
+            rec_dir = root / "reconcile-clipless"
+            (rec_dir / "inputs" / "segment-rev2").mkdir(parents=True)
+            (rec_dir / "inputs" / "film.json").write_text(json.dumps({"aspect": "9:16", "shots": [{"start": 0, "end": 8, "action": "s1"}]}), encoding="utf-8")
+            (rec_dir / "inputs" / "request.json").write_text(json.dumps({"kind": "film", "demo": False, "frames": "none", "output_dir": str(rec_dir), "film": {"aspect": "9:16", "shots": [{"start": 0, "end": 8, "action": "s1"}]}}), encoding="utf-8")
+            cjob = film.Job(rec_dir)
+            cjob.put("segs", "0", revision="r0", task="old-dead", terminal_failed=True, error="old oom", zh="old", h3="old-h3")
+            (rec_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev2", "applied": False, "explicit_prompt": True, "prompt": "new repair", "prompt_format": "source", "previous": {"revision": "r0"}, "error": "transient upload err"}),
+                encoding="utf-8",
+            )
+            (rec_dir / "inputs" / "segment-rev2" / "state.json").write_text(json.dumps({"segs": {"0": {"error": "transient upload err"}}}), encoding="utf-8")
+            segments.reconcile_pending_segment(rec_dir, keep_pending=False, supersede=False, drain_siblings=True)
+            reconciled_seg = film.Job(rec_dir).state["segs"]["0"]
+            self.assertNotIn("terminal_failed", reconciled_seg)
+            self.assertNotIn("task", reconciled_seg)
+            self.assertTrue(reconciled_seg.get("attempt_blocked"))
+            self.assertEqual(reconciled_seg.get("zh"), "new repair")
 
 
 if __name__ == "__main__":

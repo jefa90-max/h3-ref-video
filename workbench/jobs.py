@@ -280,17 +280,21 @@ class Jobs:
             _, pending_staged = segments.attempt_record(saved, context, pending_seg.get('number', 0)) if pending_seg else ({}, {})
             pending_card = next((c for c in result['segments'] if c['number'] == pending_seg.get('number')), None) if pending_seg else None
             pending_has_clip = bool(pending_card and pending_card.get('url'))
+            sibling_cards = [c for c in result['segments'] if c['number'] != pending_seg.get('number')] if pending_seg else []
+            has_inflight_sibling = any(c['task_pending'] for c in sibling_cards)
+            has_runnable_clipless_sibling = any(
+                not c['url'] and not c['terminal_failed'] and not c['submission_unknown']
+                for c in sibling_cards
+            )
             pending_settled_dead = bool(
                 pending_seg and not pending_seg.get('applied')
                 and not pending_seg.get('publishing') and not pending_seg.get('generated')
                 and not segments.task_unresolved(pending_staged)
                 and not (pending_staged.get('submission_unknown') and not pending_staged.get('task'))
-                and (pending_staged.get('terminal_failed')
-                     or (record['status'] in ('failed', 'interrupted') and not pending_staged.get('task')
-                         and (pending_seg.get('error') or pending_staged.get('error'))))
-                and any(
-                    (not c['url'] or c['task_pending']) if pending_has_clip else c['task_pending']
-                    for c in result['segments'] if c['number'] != pending_seg.get('number')
+                and (
+                    (pending_staged.get('terminal_failed') and (has_inflight_sibling or (pending_has_clip and has_runnable_clipless_sibling)))
+                    or (record['status'] in ('failed', 'interrupted') and not pending_staged.get('task')
+                        and (pending_seg.get('error') or pending_staged.get('error')) and has_inflight_sibling)
                 )
             )
             result['can_resume_pipeline'] = bool(saved.get('operation') == 'segment'

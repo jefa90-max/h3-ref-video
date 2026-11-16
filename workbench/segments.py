@@ -109,10 +109,22 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
             rec.update(terminal_failed=True, task=staged.get('task'),
                        error=staged.get('error') or pending.get('error'), file=None, cny=None)
             changed = True
+        elif not staged.get('task') and not staged.get('submission_unknown'):
+            for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
+                              'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
+                              'error_code', 'attempt_blocked'):
+                if rec.pop(stale_key, None) is not None:
+                    changed = True
+            err = staged.get('error') or pending.get('error')
+            if err:
+                rec['error'] = err
+                if drain_siblings:
+                    rec['attempt_blocked'] = True
+                changed = True
+            elif rec.pop('error', None) is not None:
+                changed = True
         elif staged.get('error') or pending.get('error'):
             rec['error'] = staged.get('error') or pending.get('error')
-            if drain_siblings and not staged.get('task'):
-                rec['attempt_blocked'] = True
             changed = True
         should_unlink = (not keep_pending) if staged.get('terminal_failed') else True
     elif not keep_pending:
