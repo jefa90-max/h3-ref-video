@@ -1279,6 +1279,69 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
             self.assertTrue(reconciled_seg.get("attempt_blocked"))
             self.assertEqual(reconciled_seg.get("zh"), "new repair")
 
+            # 10. D9/Step 11: Live CLI task on rec is preserved during pre-task reconciliation
+            live_dir = root / "reconcile-live-cli"
+            (live_dir / "inputs" / "segment-rev3").mkdir(parents=True)
+            (live_dir / "inputs" / "film.json").write_text(json.dumps({"aspect": "9:16", "shots": [{"start": 0, "end": 8, "action": "s1"}]}), encoding="utf-8")
+            (live_dir / "inputs" / "request.json").write_text(json.dumps({"kind": "film", "demo": False, "frames": "none", "output_dir": str(live_dir), "film": {"aspect": "9:16", "shots": [{"start": 0, "end": 8, "action": "s1"}]}}), encoding="utf-8")
+            ljob = film.Job(live_dir)
+            ljob.put("segs", "0", revision="r0", task="accepted-cli-task", submitted=1.0, zh="cli-zh", h3="cli-h3")
+            (live_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev3", "applied": False, "explicit_prompt": True, "prompt": "stale edit", "prompt_format": "source", "previous": {"revision": "r0"}, "error": "pre-task err"}),
+                encoding="utf-8",
+            )
+            (live_dir / "inputs" / "segment-rev3" / "state.json").write_text(json.dumps({"segs": {"0": {"error": "pre-task err"}}}), encoding="utf-8")
+            segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=False)
+            self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("task"), "accepted-cli-task")
+
+            # 11. D9/Step 11: unaffected_segment_blocker ignores orphan trailing segments and blocks submission_unknown inside redo
+            orphan_dir = root / "orphan-redo"
+            orphan_dir.mkdir(parents=True)
+            ojob = film.Job(orphan_dir)
+            ojob.put("segs", "0", file="seg1.mp4", cny=0.1)
+            ojob.put("segs", "1", file="seg2.mp4", cny=0.1)
+            ojob.put("segs", "2", terminal_failed=True, task="orphan-dead")
+            self.assertIsNone(film.unaffected_segment_blocker(ojob, "shot", [1], planned_count=2))
+            ojob.put("segs", "1", file=None, cny=None, task=None, submission_unknown=True)
+            self.assertEqual(film.unaffected_segment_blocker(ojob, "first", [1], planned_count=2), {"idx": 1})
+
+            # 12. D9/Step 11: film.run checks worker.lock unconditionally and blocks unapplied frame-edit.json
+            flock_dir = root / "frame-locked"
+            (flock_dir / "inputs").mkdir(parents=True)
+            (flock_dir / "inputs" / "frame-edit.json").write_text(
+                json.dumps({"key": "s1-1", "applied": False, "downloaded": True}), encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                film.run(flock_dir, film_path, mode="shot")
+
+            # 13. D9/Step 11: Unaffected terminal_failed segment stays regenerable when pending_video=True after deferred redo
+            unlk_out = root / "unlock-deferred"
+            (unlk_out / "inputs").mkdir(parents=True)
+            (unlk_out / "frames").mkdir(parents=True)
+            (unlk_out / "clips").mkdir(parents=True)
+            for fk in ("s1-1.png", "s2-1.png"):
+                Image.new("RGB", (8, 8)).save(unlk_out / "frames" / fk)
+            (unlk_out / "clips" / "seg2.mp4").write_bytes(b"PAID2")
+            unlk_spec = {"aspect": "9:16", "shots": [{"start": 0, "end": 10, "action": "s1"}, {"start": 10, "end": 20, "action": "s2"}]}
+            unlk_req = {"kind": "film", "demo": False, "frames": "shot", "operation": "pipeline", "redo": [2], "reset_applied": False, "output_dir": str(unlk_out), "film": unlk_spec}
+            (unlk_out / "inputs" / "request.json").write_text(json.dumps(unlk_req), encoding="utf-8")
+            (unlk_out / "inputs" / "film.json").write_text(json.dumps(unlk_spec), encoding="utf-8")
+            ujob = film.Job(unlk_out)
+            ujob.put("segs", "0", task="dead-s1", terminal_failed=True, error="oom", zh="s1-zh", h3="s1-h3")
+            ujob.put("segs", "1", file=str(unlk_out / "clips" / "seg2.mp4"), cny=0.2, zh="s2-zh", h3="s2-h3")
+            jm2 = Jobs(root / "st2", root)
+            try:
+                jm2.records["u1"] = {"id": "u1", "kind": "film", "demo": False, "output_dir": str(unlk_out), "created_at": "2026-11-16T00:00:00+0000", "status": "failed", "error": "oom", "lang": "en", "operation": "pipeline"}
+                s_init = jm2.snapshot("u1")
+                (unlk_out / "inputs" / "review.json").write_text(json.dumps({"dirty_segments": [2], "confirmed_version": s_init["review"]["version"]}), encoding="utf-8")
+                s_after = jm2.snapshot("u1")
+                self.assertTrue(s_after["pending_video"])
+                self.assertTrue(s_after["segments"][0]["can_regenerate"])
+                self.assertFalse(s_after["segments"][1]["can_regenerate"])
+                self.assertFalse(s_after["can_assemble"])
+            finally:
+                jm2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -101,15 +101,17 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
             apply_prompt_fields()
         should_unlink = True
     elif not has_clip:
+        rec_locked_live = task_unresolved(rec) or (rec.get('submission_unknown') and not rec.get('task'))
         if rec.pop('unapplied_edit', None) is not None:
             changed = True
-        apply_prompt_fields()
+        if not rec_locked_live or staged.get('task') or staged.get('terminal_failed') or staged.get('submission_unknown'):
+            apply_prompt_fields()
         if staged.get('terminal_failed'):
             rec.pop('attempt_blocked', None)
             rec.update(terminal_failed=True, task=staged.get('task'),
                        error=staged.get('error') or pending.get('error'), file=None, cny=None)
             changed = True
-        elif not staged.get('task') and not staged.get('submission_unknown'):
+        elif not staged.get('task') and not staged.get('submission_unknown') and not rec_locked_live:
             for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
                               'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                               'error_code', 'attempt_blocked'):
@@ -123,7 +125,7 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 changed = True
             elif rec.pop('error', None) is not None:
                 changed = True
-        elif staged.get('error') or pending.get('error'):
+        elif not rec_locked_live and (staged.get('error') or pending.get('error')):
             rec['error'] = staged.get('error') or pending.get('error')
             changed = True
         should_unlink = (not keep_pending) if staged.get('terminal_failed') else True
@@ -286,7 +288,7 @@ def task_unresolved(record):
                 and not (record.get('file') and record.get('cny') is not None))
 
 
-def view(request, artifacts, editable, *, context=None):
+def view(request, artifacts, editable, *, context=None, editable_numbers=None):
     out = Path(request['output_dir'])
     context = context or read_context(request)
     if 'planned' not in context:
@@ -313,7 +315,8 @@ def view(request, artifacts, editable, *, context=None):
         prompt = pending.get('prompt') if pending else (unapplied.get('prompt') if unapplied.get('prompt') is not None else (pair['source'] if fmt == 'source' else pair['h3']))
         recoverable = bool(prompt and (version or error or terminal or record.get('error') or record.get('terminal_failed') or unsubmitted_pending))
         publishing = bool(pending.get('publishing') or pending.get('generated'))
-        can_generate = bool(editable and recoverable and not task_pending and not unknown and not publishing)
+        card_editable = editable if editable_numbers is None else (editable and number in editable_numbers)
+        can_generate = bool(card_editable and recoverable and not task_pending and not unknown and not publishing)
         references = []
         for i, (picture, source) in enumerate(zip(automatic['pictures'], automatic['paths']), 1):
             reference = {'number': i, 'kind': picture['kind'], 'available': source.is_file()}
@@ -325,7 +328,7 @@ def view(request, artifacts, editable, *, context=None):
         override = record.get('prompt_override') or {}
         cards.append({'number': number, 'start': segment['start'], 'end': segment['end'], 'seconds': segment['seconds'],
                       'shots': len(segment['shots']), 'url': urls.get(str(out / f'clips/seg{number}.mp4')) if version else None,
-                      'version': version, 'can_regenerate': can_generate, 'editable': bool(editable and recoverable and not task_pending and not unknown and not publishing),
+                      'version': version, 'can_regenerate': can_generate, 'editable': bool(card_editable and recoverable and not task_pending and not unknown and not publishing),
                       'chained_next': request['frames'] != 'shot' and number < len(planned),
                       'prompt': prompt or '', 'prompt_format': fmt, 'prompt_version': segment_prompt_version({**record, 'zh': pair['source'], 'h3': pair['h3']}, version, pending, reference_version=automatic['reference_version']),
                       'source_prompt': pair['source'] if version else '', 'h3_prompt': pair['h3'] if version else '',

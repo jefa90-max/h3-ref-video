@@ -65,6 +65,16 @@ def process_alive(pid):
     return True
 
 
+def _dirty_affected_segments(saved, out, total_segs):
+    from .storyboard import review_state
+    dirty = review_state(out).get("dirty_segments", [])
+    if not dirty:
+        return set()
+    if saved.get("frames") == "shot":
+        return {int(d) for d in dirty}
+    return {num for num in range(1, total_segs + 1) if any(num >= int(d) for d in dirty)}
+
+
 def worker_locked(output_dir):
     if not output_dir or os.name == "nt":
         return False
@@ -269,8 +279,12 @@ class Jobs:
                 frame["task_pending"] for frame in result["storyboard"]) or (saved.get("operation") == "frame" and any(
                 not frame["url"] and not frame.get("error") for frame in result["storyboard"])))) or settled_dead_frame
             result["review_needed"] = result["can_continue"]
-            editable = record["status"] in ("succeeded", "failed", "interrupted") and result["review"]["complete"] and not result["pending_video"]
-            result["segments"] = segments.view(saved, artifacts, editable, context=context)
+            editable_base = record["status"] in ("succeeded", "failed", "interrupted") and result["review"]["complete"]
+            total_segs = len(result["review"]["plan"]["segments"])
+            affected_dirty = _dirty_affected_segments(saved, out, total_segs) if result["pending_video"] else set()
+            editable_numbers = ({n for n in range(1, total_segs + 1) if n not in affected_dirty} if result["pending_video"] else None)
+            editable = editable_base and not result["pending_video"]
+            result["segments"] = segments.view(saved, artifacts, editable_base, context=context, editable_numbers=editable_numbers)
             for card in result["segments"]:
                 if card.get("error"):
                     card["error"] = self.redact(str(card["error"]))
@@ -282,7 +296,11 @@ class Jobs:
             pending_has_clip = bool(pending_card and pending_card.get('url'))
             sibling_cards = [c for c in result['segments'] if c['number'] != pending_seg.get('number')] if pending_seg else []
             has_inflight_sibling = any(c['task_pending'] for c in sibling_cards)
-            has_runnable_clipless_sibling = any(
+            has_blocking_sibling = any(
+                c['submission_unknown'] or (c['terminal_failed'] and not c['url'])
+                for c in sibling_cards
+            )
+            has_runnable_clipless_sibling = not has_blocking_sibling and any(
                 not c['url'] and not c['terminal_failed'] and not c['submission_unknown']
                 for c in sibling_cards
             )
@@ -582,7 +600,13 @@ class Jobs:
             if record["kind"] != "film" or record["status"] not in ("succeeded", "failed", "interrupted"):
                 raise InputError("segment_operation")
             snapshot = self.snapshot(identifier)
-            if not snapshot["review"]["complete"] or snapshot["pending_video"]:
+            out = Path(record["output_dir"])
+            request = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
+            total_segs = len(snapshot["review"]["plan"]["segments"])
+            affected_dirty = _dirty_affected_segments(request, out, total_segs) if snapshot["pending_video"] else set()
+            if not snapshot["review"]["complete"]:
+                raise InputError("review_required")
+            if snapshot["pending_video"] and (operation != "segment" or number in affected_dirty):
                 raise InputError("review_required")
             if operation == "assemble":
                 publishing_card = next((c for c in snapshot["segments"] if c["publishing"]), None)
@@ -591,8 +615,6 @@ class Jobs:
                 locked_card = next((c for c in snapshot["segments"] if c["task_pending"] or c["submission_unknown"]), None)
                 if locked_card:
                     raise InputError("segment_locked", number=locked_card["number"])
-            out = Path(record["output_dir"])
-            request = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
             request.update(operation=operation)
             for key in ("redo", "reset_applied", "segment_revision"):
                 request.pop(key, None)
@@ -625,7 +647,15 @@ class Jobs:
             elif remaining_frames:
                 request["operation"] = "frames"
             if request.get("operation") in ("segment", "assemble") or remaining_pipeline:
-                if not snapshot["review"]["complete"] or snapshot["pending_video"]:
+                total_segs = len(snapshot["review"]["plan"]["segments"])
+                affected_dirty = _dirty_affected_segments(request, out_dir, total_segs) if snapshot["pending_video"] else set()
+                if not snapshot["review"]["complete"]:
+                    raise InputError("review_required")
+                if snapshot["pending_video"] and (
+                    request.get("operation") != "segment"
+                    or remaining_pipeline
+                    or request.get("segment") in affected_dirty
+                ):
                     raise InputError("review_required")
             elif request.get("operation") != "frame":
                 one_inflight = False

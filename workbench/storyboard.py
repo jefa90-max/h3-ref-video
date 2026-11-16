@@ -291,11 +291,20 @@ def run(request):
         # use the saved tasks instead of resetting them again with repeated --redo.
         if not request.get("reset_applied"):
             fjob = film.Job(out)
-            if film.unaffected_segment_blocker(fjob, request["frames"], request.get("redo", [])) is None:
+            planned_count = None
+            if (request.get("film") or {}).get("shots"):
+                planned_count = len(film.plan(request["film"]["shots"]))
+            elif (out / "inputs" / "film.json").is_file():
+                planned_count = len(film.plan(film.load(out / "inputs" / "film.json", check_images=False)["shots"]))
+            if film.unaffected_segment_blocker(fjob, request["frames"], request.get("redo", []), planned_count=planned_count) is None:
                 film.invalidate_segments(fjob, request["frames"], request.get("redo", []))
                 request["reset_applied"] = True
                 write_json(out / "inputs" / "request.json", request)
-        film.run(out, out / "inputs" / "film.json", request["frames"])
+        film._IN_WORKBENCH_RUNNER.active = True
+        try:
+            film.run(out, out / "inputs" / "film.json", request["frames"])
+        finally:
+            film._IN_WORKBENCH_RUNNER.active = False
 
 
 if __name__ == "__main__":

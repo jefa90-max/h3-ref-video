@@ -9,6 +9,7 @@ Frame modes (--frames):
   none   no frames: characters and setting from words and pictures alone, segments chained on the last frame
 """
 import copy
+import errno
 import hashlib
 import json
 import math
@@ -626,9 +627,18 @@ def invalidated_segment_records(records: dict, mode: str, redo: list[int] | None
             if any(int(k) == n - 1 or (mode != "shot" and int(k) > n - 1) for n in redo or [])}
 
 
-def unaffected_segment_blocker(job: Job, mode: str, redo: list[int] | None) -> dict | None:
-    invalidated = set(invalidated_segment_records(job.state["segs"], mode, redo))
-    unaffected = [{"idx": int(k)} for k in sorted(job.state["segs"], key=int) if k not in invalidated]
+def unaffected_segment_blocker(job: Job, mode: str, redo: list[int] | None, *, planned_count: int | None = None) -> dict | None:
+    raw_inv = invalidated_segment_records(job.state["segs"], mode, redo)
+    actually_invalidated = {
+        k for k in raw_inv
+        if not _segment_task_unresolved(job.state["segs"].get(k, {}))
+    }
+    indices = (
+        range(planned_count)
+        if planned_count is not None
+        else [int(k) for k in sorted(job.state["segs"], key=int)]
+    )
+    unaffected = [{"idx": idx} for idx in indices if str(idx) not in actually_invalidated]
     return preexisting_segment_blocker(job, unaffected)
 
 
@@ -643,37 +653,58 @@ def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
     job.save()
 
 
-def _unapplied_segment_locked(job_dir: Path, pending: dict) -> bool:
-    if not pending or pending.get("applied"):
-        return False
-    if pending.get("publishing") or pending.get("generated"):
-        return True
-    revision = str(pending.get("revision") or "").strip()
-    number = pending.get("number")
-    if revision and isinstance(number, int) and number >= 1:
-        staged_file = job_dir / "inputs" / f"segment-{revision}" / "state.json"
-        if staged_file.is_file():
-            try:
-                staged = json.loads(staged_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                return True
-            staged_rec = (staged.get("segs") or {}).get(str(number - 1)) or {}
-            if _segment_task_unresolved(staged_rec):
-                return True
-    if os.environ.get("H3_WORKBENCH_WORKER") != "1" and os.name != "nt":
+_IN_WORKBENCH_RUNNER = threading.local()
+
+
+def _workbench_activity_locked(job_dir: Path) -> Path | None:
+    in_wb = getattr(_IN_WORKBENCH_RUNNER, "active", False) or os.environ.get("H3_WORKBENCH_WORKER") == "1"
+    if not in_wb and os.name != "nt":
         lock_path = job_dir / "inputs" / "worker.lock"
-        if lock_path.is_file():
+        if lock_path.exists():
             import fcntl
             try:
                 with lock_path.open("a+b") as handle:
                     try:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
-                        return True
+                        return lock_path
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                return False
-    return False
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    return lock_path
+    pending_path = job_dir / "inputs" / "segment-edit.json"
+    if pending_path.exists():
+        try:
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return pending_path
+        if pending and not pending.get("applied"):
+            if pending.get("publishing") or pending.get("generated"):
+                return pending_path
+            revision = str(pending.get("revision") or "").strip()
+            number = pending.get("number")
+            if revision and isinstance(number, int) and number >= 1:
+                staged_file = job_dir / "inputs" / f"segment-{revision}" / "state.json"
+                if staged_file.is_file():
+                    try:
+                        staged = json.loads(staged_file.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        return pending_path
+                    staged_rec = (staged.get("segs") or {}).get(str(number - 1)) or {}
+                    if _segment_task_unresolved(staged_rec):
+                        return pending_path
+    frame_pending_path = job_dir / "inputs" / "frame-edit.json"
+    if frame_pending_path.exists():
+        try:
+            frame_pending = json.loads(frame_pending_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return frame_pending_path
+        if frame_pending and not frame_pending.get("applied"):
+            if (frame_pending.get("downloaded")
+                    or (frame_pending.get("submission_unknown") and not frame_pending.get("task"))
+                    or (frame_pending.get("task") and not frame_pending.get("task_failed") and not frame_pending.get("moderation_error"))):
+                return frame_pending_path
+    return None
 
 
 def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None,
@@ -685,14 +716,13 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     if not job.state.get("film_path"):
         raise SystemExit("新任务要给 --film")
     mode = job.state.get("mode", mode)
-    pending_path = job.dir / "inputs" / "segment-edit.json"
-    pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
-    if _unapplied_segment_locked(job.dir, pending):
-        raise RuntimeError(message("segment_publication_pending", path=pending_path))
+    locked_artifact = _workbench_activity_locked(job.dir)
+    if locked_artifact is not None:
+        raise RuntimeError(message("segment_publication_pending", path=locked_artifact))
     film = load(Path(job.state["film_path"]))
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}
-    if redo and unaffected_segment_blocker(job, mode, redo) is None:
+    if redo and unaffected_segment_blocker(job, mode, redo, planned_count=len(segs)) is None:
         invalidate_segments(job, mode, redo)
     job.state["t_start"] = time.time()
     job.save()
