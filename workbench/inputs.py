@@ -113,6 +113,9 @@ def validate(payload, root):
         if script.get("board"):
             script["board"] = image_path(script["board"], base, job["demo"])
         shots = array(script.get("shots"), "film.shots")
+        limit_shots = config.max_shots()
+        if len(shots) > max(2000, limit_shots * 2):
+            raise InputError("film_invalid", detail=f"shots>{limit_shots}")
         for index, shot in enumerate(shots):
             prefix = f"shots[{index}]"
             if not isinstance(shot, dict):
@@ -121,22 +124,26 @@ def validate(payload, root):
                 text(shot.get(field) or "", prefix + "." + field, empty=True)
             if shot.get("start") is not None and shot.get("end") is not None:
                 for field in ("start", "end"):
+                    raw_val = shot[field]
+                    if isinstance(raw_val, bool):
+                        invalid(prefix + "." + field, raw_val, "number", low=0, high=3600)
                     try:
-                        value = float(shot[field])
-                    except (ValueError, TypeError):
-                        invalid(prefix + "." + field, shot[field], "number", low="-∞", high="∞")
-                    if not math.isfinite(value):
-                        invalid(prefix + "." + field, shot[field], "number", low="-∞", high="∞")
+                        value = float(raw_val)
+                    except (ValueError, TypeError, OverflowError):
+                        invalid(prefix + "." + field, raw_val, "number", low=0, high=3600)
+                    if not math.isfinite(value) or not 0 <= value <= 3600:
+                        invalid(prefix + "." + field, raw_val, "number", low=0, high=3600)
         # Let the CLI own all filtering, rounding and duration rules.
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "film.json"
             source.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
             try:
                 loaded = film.load(source, check_images=not job["demo"])
-            except (SystemExit, ValueError, TypeError, KeyError) as exc:
+                planned = film.plan(loaded["shots"])
+            except (SystemExit, ValueError, TypeError, KeyError, OverflowError) as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
         job["film"] = loaded
-        for segment in film.plan(loaded["shots"]):
+        for segment in planned:
             try:
                 film.refs(loaded, segment, job["frames"])
             except SystemExit as exc:

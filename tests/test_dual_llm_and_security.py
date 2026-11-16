@@ -1124,6 +1124,114 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                 finally:
                     jobs.close()
 
+    def test_ship_review_fixes_shot_caps_402_429_abort_and_segment_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1. D3: MAX_SHOTS and MAX_SEGMENTS cap unbounded paid fan-out in validate() and film.load/plan
+            with patch.dict(os.environ, {"H3_MAX_SHOTS": "4", "H3_MAX_SEGMENTS": "2"}, clear=False):
+                five_shots = [{"action": f"shot {i}", "start": i * 2, "end": (i + 1) * 2} for i in range(5)]
+                with self.assertRaises(InputError):
+                    inputs.validate({"kind": "film", "demo": False, "film": {"shots": five_shots}}, root)
+                three_segs = [{"action": f"shot {i}", "start": i * 12, "end": (i + 1) * 12} for i in range(3)]
+                with self.assertRaises(InputError):
+                    inputs.validate({"kind": "film", "demo": False, "film": {"shots": three_segs}}, root)
+
+            # 2. Auto-fix: boolean, negative, and huge start/end timestamps reject cleanly as 400 InputError
+            for bad_shot in (
+                {"action": "walk", "start": True, "end": 2},
+                {"action": "walk", "start": -1, "end": 2},
+                {"action": "walk", "start": 0, "end": 1e308},
+            ):
+                with self.assertRaises(InputError):
+                    inputs.validate({"kind": "film", "demo": False, "film": {"shots": [bad_shot]}}, root)
+
+            # 3. D4: stage_frames aborts early on pre-task 402 and 429 without poisoning remaining shots
+            for code in (402, 429):
+                fdir = root / f"abort-{code}"
+                job = film.Job(fdir)
+                script = {"aspect": "9:16", "shots": [{"start": 0, "end": 2, "action": "s1"}, {"start": 2, "end": 4, "action": "s2"}]}
+                segs = film.plan(script["shots"])
+                with patch.object(frames, "describe_composition", side_effect=http.HTTPResponseError(code, f"HTTP {code}")) as desc_mock:
+                    with self.assertRaises(http.HTTPResponseError):
+                        film.stage_frames(job, script, segs, {s["idx"]: film.refs(script, s, "shot") for s in segs})
+                self.assertEqual(desc_mock.call_count, 1)
+                self.assertEqual(job.state["frames"], {})
+
+            # 4. Auto-fix: film.run blocks unapplied segment-edit.json with unresolved staged task
+            run_dir = root / "locked-film"
+            (run_dir / "inputs" / "segment-rev1").mkdir(parents=True)
+            film_path = root / "f.json"
+            film_path.write_text(json.dumps({"aspect": "9:16", "shots": [{"start": 0, "end": 5, "action": "walk"}]}), encoding="utf-8")
+            (run_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev1", "applied": False}), encoding="utf-8"
+            )
+            (run_dir / "inputs" / "segment-rev1" / "state.json").write_text(
+                json.dumps({"segs": {"0": {"task": "t-inflight", "submitted": True}}}), encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                film.run(run_dir, film_path, mode="none")
+
+            # 5. Auto-fix: cmd_one and Jobs.resume poll already-submitted single-clip task after source image moved
+            cli_main = _load_cli()
+            one_dir = root / "one-moved"
+            one_dir.mkdir(parents=True)
+            missing_img = root / "moved.png"
+            prompt_file = root / "one.txt"
+            prompt_file.write_text("walk", encoding="utf-8")
+            (one_dir / "state.json").write_text(
+                json.dumps({"h3": "subject_definitions:\nA\n\nsummary:\nB\n\nretention_analysis:\nC\n\ndetailed_description:\n[Shot 1] D\n\noverall_soundscape:\nE\n\nnon_diegetic_music:\nN/A", "task": "t-submitted"}),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(out=str(one_dir), image=[str(missing_img)], prompt=str(prompt_file), seed=1, seconds=5, aspect="9:16", check=False)
+            with patch.object(cli_main.rh, "poll", return_value={"state": "done", "url": "https://v/1.mp4", "cny": 0.1, "coins": 45, "run_s": 10}), \
+                 patch.object(cli_main.http, "download", side_effect=lambda u, p: p.write_bytes(b"MP4")):
+                cli_main.cmd_one(args)
+            self.assertTrue((one_dir / "clip.mp4").is_file())
+
+            # 6. D5: Jobs._snapshot() allows pipeline resume when seg1 has a valid published clip + dead regen attempt and seg2 is unstarted
+            st_dir = root / "wb-storage"
+            job_out = root / "wb-film"
+            (job_out / "inputs" / "segment-revdead").mkdir(parents=True)
+            (job_out / "clips").mkdir(parents=True)
+            (job_out / "clips" / "seg1.mp4").write_bytes(b"VALID_CLIP_1")
+            film_spec = {
+                "aspect": "9:16",
+                "shots": [
+                    {"start": 0, "end": 12, "action": "first segment"},
+                    {"start": 12, "end": 24, "action": "second segment"},
+                ],
+            }
+            req_spec = {"kind": "film", "demo": False, "frames": "none", "operation": "segment", "segment": 1, "output_dir": str(job_out), "film": film_spec}
+            (job_out / "inputs" / "request.json").write_text(json.dumps(req_spec), encoding="utf-8")
+            (job_out / "inputs" / "film.json").write_text(json.dumps(film_spec), encoding="utf-8")
+            fjob = film.Job(job_out)
+            fjob.put("segs", "0", revision="orig1", file=str(job_out / "clips" / "seg1.mp4"), cny=0.1, zh="s1", h3="h3-1")
+            from workbench.storyboard import review_state
+            (job_out / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "revdead", "applied": False, "previous": {"revision": "orig1"}, "prompt": "retry s1", "prompt_format": "source"}),
+                encoding="utf-8",
+            )
+            (job_out / "inputs" / "segment-revdead" / "state.json").write_text(
+                json.dumps({"segs": {"0": {"task": "t-dead", "terminal_failed": True, "error": "failed"}}}),
+                encoding="utf-8",
+            )
+            jobs_mgr = Jobs(st_dir, root)
+            try:
+                jobs_mgr.records["f-rec"] = {
+                    "id": "f-rec", "kind": "film", "demo": False, "output_dir": str(job_out),
+                    "created_at": "2026-11-16T00:00:00+0000", "status": "failed", "error": "seg1 regen failed",
+                    "lang": "en", "operation": "segment",
+                }
+                snap0 = jobs_mgr.snapshot("f-rec")
+                rev = review_state(job_out)
+                rev["confirmed_version"] = snap0["review"]["version"]
+                (job_out / "inputs" / "review.json").write_text(json.dumps(rev), encoding="utf-8")
+                snap = jobs_mgr.snapshot("f-rec")
+                self.assertTrue(snap["can_resume_pipeline"])
+                self.assertTrue(snap["can_resume_video"])
+            finally:
+                jobs_mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

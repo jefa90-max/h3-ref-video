@@ -97,6 +97,17 @@ MAX_IMAGES = 9                                                     # the workflo
 MIN_SECONDS, MAX_SECONDS = 5, 15
 
 
+def max_shots() -> int:
+    return max(1, int(env("H3_MAX_SHOTS", "1000")))
+
+
+def max_segments() -> int:
+    return max(1, int(env("H3_MAX_SEGMENTS", "200")))
+
+
+MAX_SHOTS = max_shots()
+MAX_SEGMENTS = max_segments()
+
 # APIMart: GPT Image for storyboard frames, and by default the vision check and the prompt rewriter too
 APIMART_BASE = env("APIMART_BASE_URL", "https://api.apimart.ai/v1").rstrip("/")
 IMAGE_MODEL = env("IMAGE_MODEL", "gpt-image-2.6-sunburst")

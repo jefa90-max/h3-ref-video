@@ -40,12 +40,13 @@ def cmd_one(a):
     if st.get("terminal_failed"):
         raise RuntimeError(message("one_terminal_failed", path=state_file))
     images = [Path(p).expanduser().resolve() for p in a.image]
-    for p in images:
-        if not p.is_file():
-            raise SystemExit(f"找不到参考图：{p}")
-    text = Path(a.prompt).read_text(encoding="utf-8")
+    if not st.get("task") or not st.get("h3"):
+        for p in images:
+            if not p.is_file():
+                raise SystemExit(f"找不到参考图：{p}")
     t0 = time.time()
     if not st.get("h3"):
+        text = Path(a.prompt).read_text(encoding="utf-8")
         st["h3"] = text if rewrite.is_rewritten(text) else rewrite.rewrite(text, len(images), a.seconds, a.aspect)
         (out / "prompt.h3.txt").write_text(st["h3"], encoding="utf-8")
         save()

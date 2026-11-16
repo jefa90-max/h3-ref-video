@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
 import threading
 import time
@@ -53,6 +54,9 @@ def load(path: Path, check_images: bool = True) -> dict:
     shots = [s for s in film.get("shots") or [] if (s.get("action") or "").strip()]
     if not shots:
         raise SystemExit("film.json 里没有镜头（shots）")
+    limit_shots = config.max_shots()
+    if len(shots) > limit_shots:
+        raise SystemExit(f"镜头数不能超过 {limit_shots}（当前 {len(shots)}）")
     t = 0.0
     for s in shots:                                    # times made continuous; a shot without times lasts 2 s
         length = float(s["end"]) - float(s["start"]) if s.get("start") is not None and s.get("end") is not None else 2.0
@@ -80,6 +84,9 @@ def plan(shots: list[dict], max_len: int = config.MAX_SECONDS) -> list[dict]:
         a, b = float(group[0]["start"]), float(group[-1]["end"])
         out.append({"idx": i, "start": a, "end": b, "shots": group,
                     "seconds": max(config.MIN_SECONDS, min(max_len, int(math.ceil(b - a - 0.25))))})
+    limit_segs = config.max_segments()
+    if len(out) > limit_segs:
+        raise SystemExit(f"分段数不能超过 {limit_segs}（当前 {len(out)}）")
     return out
 
 
@@ -289,7 +296,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                                     composition_reference_version=versions[key], reference_paths=references)
                         futures.append(pool.submit(draw, key, text, references, rec.get('task')))
                     except Exception as exc:
-                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 403) and not rec.get('task') and not rec.get('submission_unknown'):
+                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 402, 403, 429) and not rec.get('task') and not rec.get('submission_unknown'):
                             for future in futures:
                                 future.result()
                             raise
@@ -630,6 +637,39 @@ def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
     job.save()
 
 
+def _unapplied_segment_locked(job_dir: Path, pending: dict) -> bool:
+    if not pending or pending.get("applied"):
+        return False
+    if pending.get("publishing") or pending.get("generated"):
+        return True
+    revision = str(pending.get("revision") or "").strip()
+    number = pending.get("number")
+    if revision and isinstance(number, int) and number >= 1:
+        staged_file = job_dir / "inputs" / f"segment-{revision}" / "state.json"
+        if staged_file.is_file():
+            try:
+                staged = json.loads(staged_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return True
+            staged_rec = (staged.get("segs") or {}).get(str(number - 1)) or {}
+            if _segment_task_unresolved(staged_rec):
+                return True
+    if os.environ.get("H3_WORKBENCH_WORKER") != "1" and os.name != "nt":
+        lock_path = job_dir / "inputs" / "worker.lock"
+        if lock_path.is_file():
+            import fcntl
+            try:
+                with lock_path.open("a+b") as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return True
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                return False
+    return False
+
+
 def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None,
         *, resume_frame_tasks: bool = False) -> Path:
     job = Job(job_dir)
@@ -641,7 +681,7 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     mode = job.state.get("mode", mode)
     pending_path = job.dir / "inputs" / "segment-edit.json"
     pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
-    if (pending.get("publishing") or pending.get("generated")) and not pending.get("applied"):
+    if _unapplied_segment_locked(job.dir, pending):
         raise RuntimeError(message("segment_publication_pending", path=pending_path))
     film = load(Path(job.state["film_path"]))
     segs = plan(film["shots"])

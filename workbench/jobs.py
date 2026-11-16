@@ -278,6 +278,8 @@ class Jobs:
             unfinished = [card for card in result['segments'] if not card['url'] or card['task_pending']]
             pending_seg = context['pending']
             _, pending_staged = segments.attempt_record(saved, context, pending_seg.get('number', 0)) if pending_seg else ({}, {})
+            pending_card = next((c for c in result['segments'] if c['number'] == pending_seg.get('number')), None) if pending_seg else None
+            pending_has_clip = bool(pending_card and pending_card.get('url'))
             pending_settled_dead = bool(
                 pending_seg and not pending_seg.get('applied')
                 and not pending_seg.get('publishing') and not pending_seg.get('generated')
@@ -286,7 +288,10 @@ class Jobs:
                 and (pending_staged.get('terminal_failed')
                      or (record['status'] in ('failed', 'interrupted') and not pending_staged.get('task')
                          and (pending_seg.get('error') or pending_staged.get('error'))))
-                and any(c['task_pending'] for c in result['segments'] if c['number'] != pending_seg.get('number'))
+                and any(
+                    (not c['url'] or c['task_pending']) if pending_has_clip else c['task_pending']
+                    for c in result['segments'] if c['number'] != pending_seg.get('number')
+                )
             )
             result['can_resume_pipeline'] = bool(saved.get('operation') == 'segment'
                     and (pending_seg.get('applied') or pending_settled_dead)
@@ -304,12 +309,13 @@ class Jobs:
             else:
                 targets = [card for card in result["segments"] if result["segment_number"] is None or card["number"] == result["segment_number"]]
                 has_unknown = any(card["submission_unknown"] for card in targets)
-                has_terminal = any(card["terminal_failed"] for card in targets)
+                is_pipeline_target = saved.get("operation") == "pipeline" or result["can_resume_pipeline"]
+                has_terminal = any(card["terminal_failed"] and not (is_pipeline_target and card["url"]) for card in targets)
                 has_inflight = any(card["task_pending"] for card in targets)
                 result["can_resume_video"] = not has_unknown and (
                     not has_terminal or (
                         record["status"] in ("failed", "interrupted")
-                        and (saved.get("operation") == "pipeline" or result["can_resume_pipeline"])
+                        and is_pipeline_target
                         and has_inflight
                     )
                 )
@@ -618,7 +624,15 @@ class Jobs:
                 if not snapshot["review"]["complete"] or snapshot["pending_video"]:
                     raise InputError("review_required")
             elif request.get("operation") != "frame":
-                request = validate(request, self.root)
+                one_inflight = False
+                if request.get("kind") == "one" and (out_dir / "state.json").is_file():
+                    try:
+                        saved_one = json.loads((out_dir / "state.json").read_text(encoding="utf-8"))
+                        one_inflight = bool(saved_one.get("task") and saved_one.get("h3"))
+                    except (OSError, ValueError):
+                        one_inflight = False
+                if not one_inflight:
+                    request = validate(request, self.root)
             if request["kind"] == "film" and request["operation"] == "pipeline" and not snapshot["review"]["complete"]:
                 # Old/interrupted jobs cannot bypass the newly required review via resume.
                 request["operation"] = "frames"
@@ -727,7 +741,8 @@ class Jobs:
                             raise RuntimeError(message("alive", lang, pid=record.get("pid") or identifier)) from exc
                         popen_extra["pass_fds"] = (lock_handle.fileno(),)
                     try:
-                        child = start(command(request, self.root), cwd=self.root, env=env, stdout=subprocess.PIPE,
+                        child_env = {**env, "H3_WORKBENCH_WORKER": "1"}
+                        child = start(command(request, self.root), cwd=self.root, env=child_env, stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                       start_new_session=(os.name != "nt"), **popen_extra)
                     finally:
