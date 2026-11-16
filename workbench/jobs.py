@@ -357,6 +357,10 @@ class Jobs:
             return self.restart(record, request, env)
 
     def restart(self, record, request, env):
+        if record["kind"] == "film":
+            from .storyboard import review_state
+            out = Path(record["output_dir"])
+            write_json(out / "inputs" / "review.json", review_state(out))
         write_json(Path(record["output_dir"]) / "inputs" / "request.json", request)
         record.update(status="queued", error=None, operation=request["operation"], operation_id=uuid.uuid4().hex)
         self.save(record)

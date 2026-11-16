@@ -96,7 +96,12 @@ def view(request, artifacts, editable, identifier=None, failed_only=False, *, re
 
 
 def review_state(out):
-    return read_json(out / "inputs" / "review.json", {"dirty_segments": []})
+    saved = read_json(out / "inputs" / "review.json", {"dirty_segments": []})
+    request = read_json(out / "inputs" / "request.json", {})
+    if request.get("operation") == "pipeline" and request.get("reset_applied"):
+        applied = set(request.get("redo") or [])
+        saved["dirty_segments"] = [number for number in saved.get("dirty_segments", []) if number not in applied]
+    return saved
 
 
 def review_status(request, descriptions):
