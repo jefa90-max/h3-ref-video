@@ -264,7 +264,7 @@ def assembly_status(request, context=None):
     if saved:
         pending = saved.get('version') != version or not clip_version(final, out)
     else:
-        pending = any(versions) and (not clip_version(final, out) or any(
+        pending = any(versions) and (not clip_version(final, out) or not all(versions) or any(
             path.stat().st_mtime_ns > final.stat().st_mtime_ns for path in paths if clip_version(path, out)))
     return {'version': version, 'ready': bool(ready), 'pending': bool(pending)}
 

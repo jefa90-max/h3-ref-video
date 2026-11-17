@@ -208,15 +208,22 @@ def poll(task: str) -> dict:
     if not isinstance(out, dict):
         return {"state": "failed", "error": json.dumps(out, ensure_ascii=False)[:200], "moderation_failed": False}
     http_status = out.get("_http_status")
-    st = out.get("data") if isinstance(out.get("data"), dict) else out
-    if not st.get("status"):
+    has_data = isinstance(out.get("data"), dict)
+    st = out["data"] if has_data else out
+    raw_status = st.get("status")
+    if isinstance(http_status, int) and http_status >= 400:
         if is_moderation_error(st.get("error") or out):
             raise ContentPolicyError(json.dumps(st, ensure_ascii=False))
         if http_status == 404:
             return {"state": "failed", "error": json.dumps(out, ensure_ascii=False)[:300], "moderation_failed": False}
-        if isinstance(http_status, int) and http_status >= 400:
-            raise RuntimeError(f"APIMart poll HTTP {http_status}: {json.dumps(out, ensure_ascii=False)[:260]}")
-        if st.get("error") or out.get("error") or (isinstance(out.get("code"), int) and out["code"] != 0):
+        raise RuntimeError(f"APIMart poll HTTP {http_status}: {json.dumps(out, ensure_ascii=False)[:260]}")
+    bad_code = isinstance(out.get("code"), int) and out["code"] not in (0, 200)
+    gateway_error = not has_data and not st.get("id") and raw_status == "error"
+    non_str_status = raw_status is not None and not isinstance(raw_status, str)
+    if not raw_status or non_str_status or bad_code or gateway_error:
+        if is_moderation_error(st.get("error") or out):
+            raise ContentPolicyError(json.dumps(st, ensure_ascii=False))
+        if st.get("error") or out.get("error") or bad_code or gateway_error or non_str_status:
             err_payload = st.get("error") or out.get("error") or out
             err_code = err_payload.get("code") if isinstance(err_payload, dict) else out.get("code")
             detail = json.dumps(err_payload, ensure_ascii=False) if isinstance(err_payload, dict) else str(err_payload)
