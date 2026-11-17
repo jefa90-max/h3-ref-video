@@ -175,9 +175,27 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
     if not structured:
         lines.append("画面：" + (f"【{cam}】" if cam else "") + (composition["frame"] if composition else (shot.get("action") or "").strip()).rstrip("。")
                  + "。画的是这个镜头刚开始的一瞬间，动作还没做完。")
-    for c in who:
-        look = "" if structured else (c.get("look") or "").strip().rstrip("。")
-        lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
+    comp_looks = {}
+    if structured:
+        for ch in composition.get("characters") or []:
+            if ch.get("name"):
+                comp_looks[ch["name"]] = (ch.get("locked_look") or ch.get("appearance") or "").strip().rstrip("。；; ")
+    groups = staging.group_cast_by_picture(who, film.get("cast") or who)
+    for g in groups:
+        if len(g["all"]) <= 1 and len(g["active"]) == 1 and not g["absent"]:
+            c = g["active"][0]
+            look = "" if structured else (c.get("look") or "").strip().rstrip("。")
+            lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
+        else:
+            parts = []
+            for c in g["active"]:
+                lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
+            absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in g['absent'])}，严禁将未出场角色画进画面。" if g["absent"] else ""
+            lines.append(
+                f"参考图片{k}是多角色合图，本镜出场角色为{'、'.join(parts)}。请按各自外观特征将长相、发型、妆容和服装严格对号入座，切勿角色串脸；朝向与动作按当前镜头描述，不沿用参考图中的正面姿态。"
+                + absent_clause
+            )
         k += 1
     lines.append(TAIL)
     return NEUTRAL_PATTERN.sub(lambda match: NEUTRAL_WORDS[match.group()], "\n".join(lines))
@@ -194,6 +212,8 @@ def _upload(path: Path) -> str:
 
 
 def submit(text: str, refs: list[Path], aspect: str, *, before_submit=lambda: None) -> str:
+    if len(refs) > config.MAX_IMAGES:
+        raise SubmissionRejected(message("frame_too_many_refs", count=len(refs), limit=config.MAX_IMAGES))
     with tempfile.TemporaryDirectory() as tmp:
         urls = [_upload(media.shrink(Path(p), Path(tmp) / f"ref{i}.jpg")) for i, p in enumerate(refs)]
     body = {"model": config.IMAGE_MODEL, "prompt": text, "size": aspect, "resolution": config.IMAGE_RESOLUTION,

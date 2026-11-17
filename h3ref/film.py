@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import check, config, frames, http, media, rewrite, rh, staging
 from .i18n import message
+from .staging import deduplicate_paths, group_cast_by_picture
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
 LANG = {"zh": "中文", "en": "英文", "ja": "日文", "ko": "韩文", "es": "西班牙文", "pt": "葡萄牙文"}
@@ -102,11 +103,15 @@ def in_shots(c: dict, shots: list[dict]) -> bool:
 
 
 def refs(film: dict, seg: dict, mode: str) -> list[dict]:
-    """The segment's pictures in <Picture N> order: board, each character in it, then the frames or the previous last frame.
+    """The segment's pictures in <Picture N> order: board, each character sheet in it, then the frames or the previous last frame.
     Nine at most: when they run short the board goes first, then the later shots' frames."""
-    cast = [c for c in film.get("cast") or [] if in_shots(c, seg["shots"])] or list(film.get("cast") or [])
+    all_cast = list(film.get("cast") or [])
+    active_cast = [c for c in all_cast if in_shots(c, seg["shots"])] or all_cast
+    groups = group_cast_by_picture(active_cast, all_cast)
     board = [{"kind": "board", "path": film["board"]}] if film.get("board") else []
-    people = [{"kind": "cast", "path": c["picture"], "cast": c} for c in cast]
+    people = [{"kind": "cast", "path": g["path"], "cast": {**g["active"][0], "name": g["name"]},
+               "active_cast": g["active"], "absent_cast": g["absent"], "all_cast": g["all"]}
+              for g in groups]
     tail = []
     if mode == "shot":
         room = config.MAX_IMAGES - len(people) - len(board)
@@ -120,7 +125,7 @@ def refs(film: dict, seg: dict, mode: str) -> list[dict]:
             tail.append({"kind": "prev"})
     out = board + people + tail
     if len(out) > config.MAX_IMAGES:
-        raise SystemExit(f"第 {seg['idx'] + 1} 段要 {len(out)} 张参考图，H3 最多 {config.MAX_IMAGES} 张；减少这一段的角色")
+        raise SystemExit(f"第 {seg['idx'] + 1} 段要 {len(out)} 张参考图，H3 最多 {config.MAX_IMAGES} 张；减少这一段的角色或将多个角色合并为一张参考图")
     return out
 
 
@@ -129,6 +134,11 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     compositions = {key: value for key, value in (compositions or {}).items()
                     if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
     covered = {c['name'] for comp in compositions.values() for c in comp['characters']}
+    comp_looks: dict[str, str] = {}
+    for comp in compositions.values():
+        for ch in comp.get('characters') or []:
+            if ch.get('name'):
+                comp_looks.setdefault(ch['name'], (ch.get('locked_look') or ch.get('appearance') or '').strip().rstrip('。；; '))
     aspect = film["aspect"]
     head = (f"根据下面文字分镜生成一段{seg['seconds']}秒{ORIENT[aspect]}视频，{aspect}。"
             + (f"这是一条连续短片的第{seg['idx'] + 1}段。" if count > 1 else "")
@@ -140,8 +150,23 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
         if p["kind"] == "board":
             lines.append(f"参考图片{k}是本片的角色、道具和场景参考总表，只用来统一外观，不要把总表、白底、文字标注画进画面。")
         elif p["kind"] == "cast":
-            look = "" if p["cast"]["name"] in covered else (p["cast"].get("look") or "").strip().rstrip("。")
-            lines.append(f"参考图片{k}只约束{p['cast']['name']}身份" + (f"：{look}。" if look else "。"))
+            active_list = p.get("active_cast") or [p["cast"]]
+            absent_list = p.get("absent_cast") or []
+            all_list = p.get("all_cast") or active_list
+            if len(all_list) <= 1 and len(active_list) == 1 and not absent_list:
+                c = active_list[0]
+                look = "" if c["name"] in covered else (c.get("look") or "").strip().rstrip("。")
+                lines.append(f"参考图片{k}只约束{c['name']}身份" + (f"：{look}。" if look else "。"))
+            else:
+                parts = []
+                for c in active_list:
+                    lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                    parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
+                absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in absent_list)}，严禁将未出场角色画进画面。" if absent_list else ""
+                lines.append(
+                    f"参考图片{k}是多角色合图，本段仅约束出场角色{'、'.join(parts)}的身份与外貌，请按各自外观特征严格对号入座，切勿混淆或串脸。"
+                    + absent_clause
+                )
         elif p["kind"] == "frame":
             s = seg["shots"][p["shot"]]
             span = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒"
@@ -151,7 +176,7 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
             first = any(x["kind"] == "frame" for x in pics)
             lines.append(f"参考图片{k}是上一段的最后一个画面：" + ("只用来保持画风、光线、场景和角色状态一致，这一段的第一个镜头从它的首帧开始。"
                                                        if first else "这一段从这个画面直接接着演，画风、光线、场景和角色状态保持一致。"))
-    n = sum(1 for p in pics if p["kind"] == "cast")
+    n = sum(len(p.get("active_cast") or [p["cast"]]) for p in pics if p["kind"] == "cast")
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
     out = [head, "".join(lines)]
@@ -217,7 +242,11 @@ def _frame_key(i: int, j: int) -> str:
 
 
 def frame_reference_paths(film: dict, shot: dict, record: dict) -> list[str]:
-    characters = record.get("character_reference_paths", [c["picture"] for c in film.get("cast") or [] if in_shots(c, [shot])])
+    if "character_reference_paths" in record:
+        characters = deduplicate_paths(record["character_reference_paths"])
+    else:
+        active = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
+        characters = [g["path"] for g in group_cast_by_picture(active, film.get("cast") or [])]
     return ([film["board"]] if film.get("board") else []) + characters
 
 

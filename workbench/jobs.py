@@ -48,6 +48,8 @@ def command(request, root):
             argv += ["--check"]
     else:
         argv += [str(out), "--film", str(out / "inputs" / "film.json"), "--frames", request["frames"]]
+        if not request.get("optimize_storyboard", True):
+            argv.append("--no-optimize-storyboard")
     return argv
 
 
@@ -506,6 +508,8 @@ class Jobs:
                 if path not in allowed:
                     invalid("character_reference_paths", str(path), "choice")
             reference_paths = [r["path"] for r in description["references"] if r["kind"] == "board"] + characters
+            if len(reference_paths) > config.MAX_IMAGES:
+                raise InputError("too_many_references", count=len(reference_paths), limit=config.MAX_IMAGES)
             for path in map(Path, reference_paths):
                 if not path.is_file():
                     raise InputError("missing_image", path=str(path))

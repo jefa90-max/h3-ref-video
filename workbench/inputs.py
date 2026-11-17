@@ -90,6 +90,9 @@ def validate(payload, root):
             invalid("check", job["check"], "choice")
     else:
         job["frames"] = choice(job.get("frames", "shot"), "frames", ("shot", "first", "none"))
+        if not isinstance(job.get("optimize_storyboard", True), bool):
+            invalid("optimize_storyboard", job.get("optimize_storyboard"), "choice")
+        job["optimize_storyboard"] = job.get("optimize_storyboard", True)
         base = Path(text(job.get("film_base_dir", "."), "film_base_dir")).expanduser()
         base = (base if base.is_absolute() else root / base).resolve()
         job["film_base_dir"] = str(base)
@@ -148,6 +151,12 @@ def validate(payload, root):
                 film.refs(loaded, segment, job["frames"])
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
+        if job["frames"] != "none":
+            checked_shots = loaded["shots"] if job["frames"] == "shot" else [seg["shots"][0] for seg in planned]
+            for shot in checked_shots:
+                frame_refs = film.frame_reference_paths(loaded, shot, {})
+                if len(frame_refs) > config.MAX_IMAGES:
+                    raise InputError("too_many_references", count=len(frame_refs), limit=config.MAX_IMAGES)
     return job
 
 
@@ -200,7 +209,7 @@ def preflight(job, env):
                         fkey = f"s{segment['idx'] + 1}-{p['shot'] + 1}"
                         fcached = state.get("frames", {}).get(fkey) or {}
                         needs_frames |= (not out or not (out / "frames" / f"{fkey}.png").exists() or frames.task_pending(fcached))
-                if operation != "frame":
+                if operation != "frame" and job.get("optimize_storyboard", True):
                     for picture in pics:
                         if picture["kind"] != "frame":
                             continue

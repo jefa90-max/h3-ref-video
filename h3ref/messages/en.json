@@ -15,6 +15,7 @@
   "frame_moderation_failed": "Frame content review failed. Automatic retries are blocked. Edit the prompt and manually regenerate this frame. Original error: {reason}",
   "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video.",
   "frame_output_missing": "Frame output is missing: {path}",
+  "frame_too_many_refs": "Frame has {count} reference images, exceeding the {limit}-image model limit; merge characters into a group sheet or remove extra references.",
   "frame_composition_invalid": "Composition model returned missing or invalid JSON output: {detail}",
   "staging_scene": "Current scene",
   "staging_frame": "Opening instant",

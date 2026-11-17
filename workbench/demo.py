@@ -41,9 +41,13 @@ def run(request):
     frames_count = 0
     if request["kind"] == "film":
         script = request["film"]
+        demo_cast_map: dict[str, str] = {}
         for index, person in enumerate(script.get("cast", [])):
-            if not Path(person["picture"]).is_file():
-                person["picture"] = str(placeholder(out / "inputs" / f"demo-cast-{index}.png", f"CAST {index + 1}", script["aspect"]))
+            orig_pic = str(person.get("picture") or "")
+            if not Path(orig_pic).is_file():
+                if orig_pic not in demo_cast_map:
+                    demo_cast_map[orig_pic] = str(placeholder(out / "inputs" / f"demo-cast-{index}.png", f"CAST {index + 1}", script["aspect"]))
+                person["picture"] = demo_cast_map[orig_pic]
         if script.get("board") and not Path(script["board"]).is_file():
             script["board"] = str(placeholder(out / "inputs" / "demo-board.png", "BOARD", script["aspect"]))
         source = out / "inputs" / "demo-film.json"

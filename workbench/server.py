@@ -333,9 +333,11 @@ def create_app(storage=None, env_path=None):
         if script.get("board"):
             allowed.add(Path(script["board"]).resolve())
         who = [c for c in script.get("cast") or [] if film.in_shots(c, [segment["shots"][shot_idx]])]
+        default_char_paths = [g["path"] for g in film.group_cast_by_picture(who, script.get("cast") or [])]
         pending_frame = read_json(out / "inputs" / "frame-edit.json", {})
         active_pending = pending_frame if pending_frame and not pending_frame.get("applied") and pending_frame.get("key") == key else {}
-        characters = active_pending.get("character_reference_paths") if "character_reference_paths" in active_pending else frame_records(saved).get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
+        raw_characters = active_pending.get("character_reference_paths") if "character_reference_paths" in active_pending else frame_records(saved).get(key, {}).get("character_reference_paths", default_char_paths)
+        characters = film.deduplicate_paths(raw_characters)
         ref_paths = ([script["board"]] if script.get("board") else []) + list(characters)
         if not (0 <= index < len(ref_paths)):
             raise InputError("not_found", value=f"{key}/{index}")

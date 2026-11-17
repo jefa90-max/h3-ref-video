@@ -15,6 +15,7 @@
   "frame_moderation_failed": "分镜图内容审核未通过，已记为失败且不会自动重试。请手工修改提示词后，从该分镜卡片重新生成。原始错误：{reason}",
   "frames_partial": "其余分镜已处理，{count} 张生成失败并已保留。请从分镜卡片手动处理；分镜完整后再生成视频。",
   "frame_output_missing": "分镜图输出文件缺失：{path}",
+  "frame_too_many_refs": "分镜参考图共 {count} 张，超出模型上限 {limit} 张；请合并多角色合图或减少单镜角色参考图。",
   "frame_composition_invalid": "分镜构图模型未返回有效 JSON 内容：{detail}",
   "staging_scene": "当前场景",
   "staging_frame": "首帧瞬间",

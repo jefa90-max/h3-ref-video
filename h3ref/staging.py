@@ -2,6 +2,7 @@
 import copy
 import json
 import re
+from pathlib import Path
 
 from .i18n import message
 
@@ -26,6 +27,68 @@ _V3_LOCATION_ONLY = re.compile(r'^(' + _V3_LOC_PREFIX + r')\s*(.+)$')
 
 def is_structured(composition: object) -> bool:
     return isinstance(composition, dict) and composition.get('version') in (2, 3)
+
+
+def deduplicate_paths(paths) -> list[str]:
+    seen = set()
+    out = []
+    for item in paths:
+        raw = str(item)
+        key = str(Path(raw)) if raw else ''
+        if key not in seen:
+            seen.add(key)
+            out.append(raw)
+    return out
+
+
+def group_cast_by_picture(active_cast: list[dict], all_cast: list[dict] | None = None) -> list[dict]:
+    """Group active characters by shared picture path in first-appearance order, tracking absent sheet-mates."""
+    full_cast = list(active_cast if all_cast is None else all_cast)
+
+    def key_of(person: dict, fallback_idx: int) -> str:
+        pic = person.get('picture')
+        return str(Path(str(pic))) if pic else f'__unpictured_{fallback_idx}_{person.get("name", "")}'
+
+    ordered_keys = []
+    active_by_key: dict[str, list[dict]] = {}
+    active_seen_names: dict[str, set[str]] = {}
+    for idx, person in enumerate(active_cast):
+        key = key_of(person, idx)
+        if key not in active_by_key:
+            ordered_keys.append(key)
+            active_by_key[key] = []
+            active_seen_names[key] = set()
+        name = person.get('name') or ''
+        if name not in active_seen_names[key]:
+            active_seen_names[key].add(name)
+            active_by_key[key].append(person)
+
+    all_by_key: dict[str, list[dict]] = {}
+    all_seen_names: dict[str, set[str]] = {}
+    for idx, person in enumerate(full_cast):
+        key = key_of(person, idx)
+        all_by_key.setdefault(key, [])
+        all_seen_names.setdefault(key, set())
+        name = person.get('name') or ''
+        if name not in all_seen_names[key]:
+            all_seen_names[key].add(name)
+            all_by_key[key].append(person)
+
+    groups = []
+    for key in ordered_keys:
+        active_members = active_by_key[key]
+        all_members = all_by_key.get(key) or list(active_members)
+        active_names = {c.get('name') for c in active_members}
+        absent_members = [c for c in all_members if c.get('name') not in active_names]
+        groups.append({
+            'path': str(active_members[0].get('picture') or ''),
+            'active': active_members,
+            'absent': absent_members,
+            'all': all_members,
+            'name': ' / '.join(c['name'] for c in all_members if c.get('name')),
+            'active_name': ' / '.join(c['name'] for c in active_members if c.get('name')),
+        })
+    return groups
 
 
 def validate_composition(value: object, film: dict, shot: dict, known_scenes: dict | None = None) -> dict:

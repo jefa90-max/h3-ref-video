@@ -48,6 +48,7 @@
   "reference_board": "Scene / prop board",
   "reference_required": "Upload the required references first: {names}.",
   "reference_upload_missing": "The uploaded file for \"{slot}\" is missing or invalid. Please upload it again.",
+  "too_many_references": "Total reference images ({count}) exceed the maximum of {limit}. Merge multiple characters into a shared reference sheet or reduce references.",
   "review_request": "Confirmation requires approved=true and the current storyboard version.",
   "review_changed": "The frames changed or are not ready. Refresh and review the current images.",
   "review_required": "Confirm all current storyboard images or the script plan before generating video.",

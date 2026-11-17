@@ -30,6 +30,7 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
 2. <Picture N> is the N-th reference image in input order; the input names each one as 参考图片N. Give every image a role:
    - the reference sheet (参考总表 / 总表) is a design reference: cite it inside the Subject for the sets and props it designs;
    - an image that 只约束某角色身份 defines one <Subject> (carry over every look detail from the input: hair, eyes, outfit, props);
+   - a multi-character group sheet (多角色合图) maps a single <Picture N> to multiple distinct <Subject> entries — match each active character by the exact outfit, hair and facial features specified in the input so identities never swap, and if the input mentions absent sheet-mates (未出场角色), omit those absent characters completely from subject_definitions and every shot;
    - a key-frame image (「…」这个画面的样子) is the composition reference for the matching shot when that shot is in this segment,
      otherwise say it maps to no shot in this part;
    - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: use its opening composition as guidance, not as a hard timed keyframe;
