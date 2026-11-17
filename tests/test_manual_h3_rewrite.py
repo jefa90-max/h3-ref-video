@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -288,10 +289,16 @@ class ManualH3RewriteTest(unittest.TestCase):
         self.assertEqual(r_start.status_code, 200, r_start.json)
         req = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
 
+        seg1_done = threading.Event()
+
         def flaky_rewrite(zh_text, n_images, seconds, aspect):
             if "喝茶" in zh_text:
+                assert seg1_done.wait(timeout=5)
                 raise rewrite.RewriteError("transient 502 on seg 2")
-            return _make_h3("ok-first-pass", n_images)
+            res = _make_h3("ok-first-pass", n_images)
+            if "走进屋内" in zh_text:
+                seg1_done.set()
+            return res
 
         with patch.object(rewrite, "rewrite", side_effect=flaky_rewrite):
             with self.assertRaises(rewrite.RewriteError):
@@ -314,6 +321,161 @@ class ManualH3RewriteTest(unittest.TestCase):
             segments.rewrite_prompts(resumed_req)
         self.assertEqual(len(retried), 3 - len(already_done))
         self.assertTrue(json.loads((out / "inputs/prompt-rewrite.json").read_text(encoding="utf-8"))["applied"])
+
+    def test_interrupt_before_completed_save_does_not_rebill_and_null_h3_never_resurrects_disk_file(self):
+        out, _ = self._create_historical_film_job("crash-dedup", with_clips=(1, 2, 3))
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "persist": False}, headers=self.headers)
+        snap0 = self.client.get("/api/jobs/crash-dedup").json
+        old_source = snap0["segments"][0]["source_prompt"]
+        old_h3 = snap0["segments"][0]["h3_prompt"]
+        with patch.object(self.jobs, "launch"):
+            r = self.client.post(
+                "/api/jobs/crash-dedup/segments/1/rewrite",
+                json={"prompt": "中断恢复不重复扣费词", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r.status_code, 200, r.json)
+        req = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+
+        orig_write_json = segments.write_json
+        calls = []
+
+        def crash_on_completed_write(path, payload):
+            if Path(path).name == "prompt-rewrite.json" and payload.get("completed"):
+                raise RuntimeError("power loss right after state.json save")
+            return orig_write_json(path, payload)
+
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: calls.append(zh) or _make_h3("paid-once", n)), \
+             patch.object(segments, "write_json", side_effect=crash_on_completed_write):
+            with self.assertRaises(RuntimeError):
+                segments.rewrite_segment(req)
+        self.assertEqual(len(calls), 1)
+        # Resume after crash must recognize state.json revision and NOT call rewrite() a second time
+        with patch.object(rewrite, "rewrite", side_effect=AssertionError("re-billed already saved rewrite")):
+            segments.rewrite_segment(req)
+
+        # Clip-backed segment exposes historical clip_source_prompt/clip_h3_prompt snapshot + prompts_unapplied_to_clip
+        self.jobs.records["crash-dedup"].update(status="succeeded", error=None, operation="rewrite_segment")
+        card1 = self.client.get("/api/jobs/crash-dedup").json["segments"][0]
+        self.assertTrue(card1["prompts_unapplied_to_clip"])
+        self.assertEqual(card1["clip_source_prompt"], old_source)
+        self.assertEqual(card1["clip_h3_prompt"], old_h3)
+
+        # Explicit h3=None in state.json must NEVER resurrect stale prompts/seg1.h3.txt from disk
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="新改源词尚未转英文", h3=None, h3_source=None)
+        self.assertTrue((out / "prompts/seg1.h3.txt").is_file())
+        card_null = self.client.get("/api/jobs/crash-dedup").json["segments"][0]
+        self.assertEqual(card_null["h3_prompt"], "")
+
+    def test_clipless_abandoned_segment_edit_and_stale_auto_zh_and_cli_supersession(self):
+        out, script = self._create_historical_film_job("clipless-guard", with_clips=())
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "persist": False}, headers=self.headers)
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="原生效中文词", h3=_make_h3("orig", 1), h3_source="原生效中文词", error="RH timeout")
+        write_json(out / "inputs/segment-edit.json", {
+            "number": 1, "revision": "old-vid", "version": None, "prompt": _make_h3("custom-h3", 1),
+            "prompt_format": "h3", "explicit_prompt": True, "previous": fjob.state["segs"]["0"],
+            "applied": False, "error": "failed",
+        })
+        snap0 = self.client.get("/api/jobs/clipless-guard").json
+        with patch.object(self.jobs, "launch"):
+            r = self.client.post(
+                "/api/jobs/clipless-guard/segments/1/rewrite",
+                json={"prompt": "新待转化中文草稿", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r.status_code, 200, r.json)
+        self.assertEqual(film.Job(out).state["segs"]["0"]["zh"], "原生效中文词")
+        req = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("401 bad key")), \
+             self.assertRaises(rewrite.RewriteFatalError):
+            segments.rewrite_segment(req)
+        self.jobs.records["clipless-guard"].update(status="failed", error="401 bad key", operation="rewrite_segment")
+        card = self.client.get("/api/jobs/clipless-guard").json["segments"][0]
+        self.assertEqual(card["source_prompt"], "原生效中文词")
+        self.assertEqual(card["prompt"], "新待转化中文草稿")
+
+        # Out-of-band CLI supersession: CLI updates seg 1 zh and sets h3=None while failed prompt-rewrite.json sits on disk
+        fjob_cli = film.Job(out)
+        fjob_cli.put("segs", "0", zh="CLI最新编译中文词", h3=None, h3_source=None, error="RewriteError: cli")
+        snap_cli = self.client.get("/api/jobs/clipless-guard").json
+        self.assertEqual(snap_cli["segments"][0]["prompt"], "CLI最新编译中文词")
+        segments.reconcile_pending_prompt_rewrite(out, req, archive_single_except=0, clear_all=True)
+        self.assertEqual(film.Job(out).state["segs"]["0"]["zh"], "CLI最新编译中文词")
+
+        # Stale cached automatic zh on clipless un-overridden segment (seg 2) must not be promoted to prompt_override on unedited single rewrite
+        fjob2 = film.Job(out)
+        fjob2.put("segs", "1", zh="过期自动缓存词", h3=_make_h3("stale", 2), h3_source="过期自动缓存词")
+        req2 = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        rev2 = segments.prepare_rewrite_segment(req2, 2)
+        req2.update(operation="rewrite_segment", segment=2, segment_revision=rev2)
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: _make_h3("fresh-auto", n)):
+            segments.rewrite_segment(req2)
+        seg1_saved = film.Job(out).state["segs"]["1"]
+        self.assertNotIn("prompt_override", seg1_saved)
+        self.assertNotEqual(seg1_saved["zh"], "过期自动缓存词")
+
+    def test_rewrite_endpoints_enforce_csrf_scope_dirty_review_locks_and_keys(self):
+        out, _ = self._create_historical_film_job("neg-rw", with_clips=())
+        self.assertEqual(self.client.post("/api/jobs/neg-rw/segments/rewrite", json={"scope": "missing"}).status_code, 400)
+        self.client.post("/api/config", json={"LLM_API_KEY": "", "persist": False}, headers=self.headers)
+        r_key = self.client.post("/api/jobs/neg-rw/segments/rewrite", json={"scope": "missing"}, headers=self.headers)
+        self.assertEqual(r_key.status_code, 400)
+        self.assertEqual(r_key.json["code"], "keys")
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-ok", "persist": False}, headers=self.headers)
+        r_scope = self.client.post("/api/jobs/neg-rw/segments/rewrite", json={"scope": "bogus"}, headers=self.headers)
+        self.assertEqual(r_scope.status_code, 400)
+        self.assertEqual(r_scope.json["code"], "segment_value")
+        # In-flight segment lock blocks both single and batch rewrite
+        film.Job(out).put("segs", "0", zh="词", h3=_make_h3("lock", 1), h3_source="词", task="rh-inflight", submitted=1700000000.0, phase="poll", file=None, cny=None)
+        self.assertEqual(self.client.post("/api/jobs/neg-rw/segments/rewrite", json={"scope": "all"}, headers=self.headers).json["code"], "segment_locked")
+        self.assertEqual(self.client.post("/api/jobs/neg-rw/segments/1/rewrite", json={}, headers=self.headers).json["code"], "segment_locked")
+        # Dirty storyboard review blocks batch rewrite and dirty segment rewrite
+        fjob_clean = film.Job(out)
+        fjob_clean.state["segs"].pop("0", None)
+        fjob_clean.save()
+        write_json(out / "inputs/review.json", {"dirty_segments": [1], "confirmed_version": "stale-version"})
+        self.assertEqual(self.client.post("/api/jobs/neg-rw/segments/rewrite", json={"scope": "all"}, headers=self.headers).json["code"], "review_required")
+        self.assertEqual(self.client.post("/api/jobs/neg-rw/segments/1/rewrite", json={}, headers=self.headers).json["code"], "review_required")
+
+    def test_preview_reconciled_prompt_rewrite_does_not_unlink_h3_file_before_preflight(self):
+        out, req = self._create_historical_film_job("preview-pure", with_clips=())
+        # Simulate legacy file-backed segment (state.json has no h3 key, prompts/seg1.h3.txt holds the saved H3)
+        fjob = film.Job(out)
+        fjob.state["segs"]["0"] = {"error": "transient"}
+        fjob.save()
+        h3_file = out / "prompts/seg1.h3.txt"
+        h3_file.write_text(_make_h3("legacy-disk", 1), encoding="utf-8")
+        self.assertTrue(h3_file.is_file())
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-ok", "RUNNINGHUB_API_KEY": "", "persist": False}, headers=self.headers)
+        snap = self.client.get("/api/jobs/preview-pure").json
+        with patch.object(self.jobs, "launch"):
+            r = self.client.post(
+                "/api/jobs/preview-pure/segments/1/rewrite",
+                json={"prompt": "待转化新源词", "prompt_format": "source", "prompt_version": snap["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r.status_code, 200, r.json)
+        self.jobs.records["preview-pure"].update(status="succeeded", error=None, operation="frame")
+        write_json(out / "inputs/review.json", {"dirty_segments": [2]})
+
+        # Calling /continue without RUNNINGHUB_API_KEY fails preflight (400, code=keys) after running preview_reconciled_prompt_rewrite:
+        # prompts/seg1.h3.txt MUST NOT have been deleted by the rejected preview!
+        snap_fail = self.client.get("/api/jobs/preview-pure").json
+        with patch("shutil.which", return_value="/fake/ffmpeg"):
+            r_res = self.client.post(
+                "/api/jobs/preview-pure/continue",
+                json={"approved": True, "review_version": snap_fail["review"]["version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_res.status_code, 400)
+        self.assertIn("RUNNINGHUB_API_KEY", str(r_res.json))
+        self.assertTrue(h3_file.is_file(), "Rejected preflight preview must not delete prompts/seg1.h3.txt on disk")
+
+        # Once reconcile_pending_prompt_rewrite actually commits, stale seg1.h3.txt IS cleaned up
+        segments.reconcile_pending_prompt_rewrite(out, json.loads((out / "inputs/request.json").read_text(encoding="utf-8")), archive_single_except=0, clear_all=True)
+        self.assertFalse(h3_file.is_file())
 
 
 if __name__ == "__main__":

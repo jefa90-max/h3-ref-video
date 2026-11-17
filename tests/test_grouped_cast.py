@@ -359,6 +359,52 @@ class GroupedCastTest(unittest.TestCase):
         finally:
             jobs2.close()
 
+    def test_reference_groups_negative_guards_and_symlink_path_canonicalization(self):
+        uploads = self.root / "u"
+        uploads.mkdir()
+        for name in ("a.png", "b.png"):
+            Image.new("RGB", (8, 8), "red").save(uploads / name)
+        base_film = {"aspect": "9:16", "board": True, "cast": [{"name": "A"}, {"name": "B"}, {"name": "C"}], "shots": [{"action": "A"}]}
+        for bad_groups, bad_bindings in (
+            ([["cast:0"]], {}),
+            ([["board", "cast:0"]], {}),
+            ([["cast:99", "cast:0"]], {}),
+            ([["cast:0", "cast:1"], ["cast:1", "cast:2"]], {}),
+            ([["cast:0", "cast:1"]], {"cast:0": "a.png", "cast:1": "b.png"}),
+        ):
+            with self.assertRaises(InputError):
+                references.bind_references(
+                    {"kind": "film", "demo": True, "demo_placeholders": True, "film": base_film,
+                     "reference_bindings": dict(bad_bindings), "reference_groups": bad_groups},
+                    uploads,
+                )
+        with self.assertRaises(InputError):
+            inputs.validate({"kind": "film", "demo": True, "optimize_storyboard": "false", "film": {"aspect": "9:16", "shots": [{"action": "A"}]}}, self.root)
+
+        # Non-canonical / symlinked paths resolve identically in film.load, deduplicate_paths, and group_cast_by_picture
+        real_dir = self.root / "real_refs"
+        real_dir.mkdir()
+        sheet = real_dir / "sheet.png"
+        Image.new("RGB", (8, 8), "green").save(sheet)
+        alias_dir = self.root / "alias_refs"
+        alias_dir.symlink_to(real_dir)
+        non_canon_a = str(alias_dir / "sheet.png")
+        non_canon_b = str(real_dir / ".." / "real_refs" / "sheet.png")
+        self.assertEqual(len(film.deduplicate_paths([non_canon_a, non_canon_b])), 1)
+        grouped = film.group_cast_by_picture(
+            [{"name": "甲", "picture": non_canon_a}, {"name": "乙", "picture": non_canon_b}]
+        )
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0]["name"], "甲 / 乙")
+        fjson = self.root / "canon_film.json"
+        fjson.write_text(json.dumps({
+            "aspect": "9:16",
+            "cast": [{"name": "甲", "picture": non_canon_a}],
+            "shots": [{"action": "甲站立"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        loaded = film.load(fjson)
+        self.assertEqual(loaded["cast"][0]["picture"], str(sheet.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()

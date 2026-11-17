@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from h3ref import film, frames, http, rewrite, staging
+from PIL import Image
+
+from h3ref import film, frames, http, media, rewrite, rh, staging
 
 
 def _sample_v3():
@@ -472,6 +474,67 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
         self.assertEqual(llm_mock.call_count, 1)
         self.assertIn("subject_definitions:", result)
         self.assertEqual(rewrite.problems(think_wrapped, 1), [])
+
+    def test_render_v3_character_modifier_before_name_and_cli_resume_optimize_storyboard_false(self):
+        comp = {
+            "version": 3,
+            "camera": "中景",
+            "scene": "宫殿大堂",
+            "characters": [
+                {"name": "女王", "locked_look": "九凤金冠，大红凤袍", "placement_and_pose": "画面中央，宝座上的女王神情端庄"},
+                {"name": "小明", "locked_look": "蓝校服", "placement_and_pose": "画面左侧站着小明妈妈身旁"},
+                {"name": "小明妈妈", "locked_look": "米色风衣", "placement_and_pose": "画面左侧站着小明妈妈，转身叮嘱"},
+                {"name": "侍卫", "locked_look": "玄铁铠甲", "placement_and_pose": "背对镜头伫立良久"},
+            ],
+        }
+        rendered = staging.render_opening(comp)
+        self.assertEqual(rendered.count("女王"), 1, f"Character subject duplicated: {rendered}")
+        self.assertIn("女王（九凤金冠，大红凤袍）", rendered)
+        self.assertNotIn("小明（蓝校服）妈妈", rendered)
+        self.assertIn("画面左侧站着小明妈妈（米色风衣），转身叮嘱。", rendered)
+        self.assertIn("侍卫（玄铁铠甲）背对镜头伫立良久。", rendered)
+
+        # CLI film.run persists optimize_storyboard=False across film_path=None resume
+        with tempfile.TemporaryDirectory() as tmpdir:
+            troot = Path(tmpdir).resolve()
+            out = troot / "cli-opt-resume"
+            pic = troot / "role.png"
+            Image.new("RGB", (8, 8), "blue").save(pic)
+            fjson = troot / "opt_false.json"
+            fjson.write_text(json.dumps({
+                "aspect": "9:16",
+                "cast": [{"name": "女王", "picture": str(pic)}],
+                "shots": [{"start": 0, "end": 4, "action": "女王站立"}, {"start": 4, "end": 8, "action": "女王转身"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            calls = {"n": 0}
+
+            def fail_second_draw(text, refs, aspect, output, record, task=None):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise RuntimeError("transient draw outage")
+                output.write_bytes(b"PNG")
+                return 0.1
+
+            with patch("shutil.which", return_value="/fake/ffmpeg"), \
+                 patch.object(frames, "describe_composition", side_effect=AssertionError("must skip LLM composition")) as desc_mock, \
+                 patch.object(frames, "draw", side_effect=fail_second_draw):
+                film.run(out, fjson, mode="shot", optimize_storyboard=False)
+            self.assertEqual(desc_mock.call_count, 0)
+            self.assertIs(film.Job(out).state.get("optimize_storyboard"), False)
+
+            # Resume with film_path=None must keep optimize_storyboard=False without calling describe_composition
+            with patch("shutil.which", return_value="/fake/ffmpeg"), \
+                 patch.object(frames, "describe_composition", side_effect=AssertionError("must skip LLM composition on resume")), \
+                 patch.object(frames, "draw", side_effect=lambda t, r, a, o, rec, task=None: o.write_bytes(b"PNG") or 0.1), \
+                 patch.object(rewrite, "rewrite", return_value=_valid_h3()), \
+                 patch.object(rh, "upload", return_value="u.png"), \
+                 patch.object(rh, "submit_with_retry", return_value="t-ok"), \
+                 patch.object(rh, "poll", return_value={"state": "done", "url": "https://v/1.mp4", "cny": 0.1}), \
+                 patch.object(film.http, "download", side_effect=lambda u, p: p.write_bytes(b"MP4")), \
+                 patch.object(media, "last_frame", side_effect=lambda p, o: o.write_bytes(b"JPG")), \
+                 patch.object(media, "duration", return_value=4.0), \
+                 patch.object(media, "join", side_effect=lambda clips, o: o.write_bytes(b"FILM")):
+                film.run(out, None, mode="shot")
 
 
 if __name__ == "__main__":

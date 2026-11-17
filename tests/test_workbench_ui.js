@@ -605,6 +605,8 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
 
   // Now there is 1 grouped card ("Queen / Monkey") + 1 solo card ("Monk") = 2 upload inputs
   tree = allDescendants($("film-reference-list"));
+  assert.equal(tree.filter((n) => n.className.includes("film-cast-select")).length, 0, "Lone remaining ungrouped character must not render dead-end merge checkbox");
+  assert.equal(tree.find((n) => n.className.includes("merge-cast-button")), undefined, "Merge button must hide when <2 ungrouped characters remain");
   const uploads = tree.filter((n) => n.className.includes("film-reference-upload"));
   assert.equal(uploads.length, 2);
   uploads[0].files = [{ name: "queen-monkey.png" }];
@@ -671,5 +673,127 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
   firstCheck.checked = true;
   firstCheck.events.change();
   assert.equal(allDescendants($("film-reference-list")).includes(firstCheck), true, "Checkbox toggle must not tear down card DOM");
+
+  // 9-image limit hint accounts for frames="first" (+2 frame + prev on seg 2+) and per-segment cast subsets in "shot" mode
+  const sevenCast = Array.from({ length: 7 }, (_, i) => ({ name: `Role${i + 1}`, look: "look" }));
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: sevenCast,
+    shots: [
+      { start: 0, end: 10, action: "全员站立" },
+      { start: 10, end: 20, action: "全员交谈" },
+    ],
+  });
+  context.post = async (url, body) => {
+    if (url === "/api/film/references") {
+      return {
+        film: { ...body.film, board: true },
+        slots: [
+          ...body.film.cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: "", required: true })),
+          { id: "board", kind: "board", name: "", description: "", required: true },
+        ],
+      };
+    }
+    return {};
+  };
+  $("frames").value = "shot";
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "7 cast + board + 1 shot in shot mode (9 refs) must not warn",
+  );
+  $("frames").value = "first";
+  $("frames").events.change();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    true,
+    "7 cast + board + frame + prev in first mode on seg 2 (10 refs) must warn before submit",
+  );
+});
+
+test("create.js does not fall back to all cast on characterless single-shot scenery frames", async () => {
+  const { $, element } = makeDom();
+  $("output-dir").value = "/tmp/out-root";
+  $("frames").value = "shot";
+
+  const nineCast = Array.from({ length: 9 }, (_, i) => ({ name: `Role${i + 1}`, look: "look" }));
+  const context = vm.createContext({
+    state: { language: "en", config: { output_root: "/tmp/out-root", keys: {} }, jobs: [], ready: true },
+    $, element, renderPage: null,
+    FormData: class { append() {} },
+    window: { location: { assign() {} } },
+    document: { addEventListener() {}, querySelector: () => element("div"), querySelectorAll: () => [] },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => String(v[n] ?? "")),
+    running: () => false,
+    busy: () => false,
+    renderConfig() {},
+    showError(e) { throw e; },
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    loadLanguage: async () => {},
+    request: async () => ({ config: { output_root: "/tmp/out-root", keys: {} }, jobs: [] }),
+    post: async (url, body) => {
+      if (url === "/api/film/references") {
+        return {
+          film: { ...body.film, board: true },
+          slots: [
+            ...body.film.cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: "", required: true })),
+            { id: "board", kind: "board", name: "", description: "", required: true },
+          ],
+        };
+      }
+      return {};
+    },
+    setTimeout: () => 1,
+    clearTimeout() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "create.js"), "utf8"), context);
+  await new Promise((r) => setImmediate(r));
+
+  function allDescendants(node) {
+    return [node, ...(node.children || []).flatMap(allDescendants)];
+  }
+
+  // Seg 1 starts with a characterless scenery shot, followed by a 3-role shot; Seg 2 has the remaining 6 roles.
+  // Per-shot frame references never exceed 1 (board) + 6 (roles) = 7, and segment refs never exceed 1 + 6 + 2 = 9.
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: nineCast,
+    shots: [
+      { start: 0, end: 5, action: "空山新雨后，远景云雾缭绕" },
+      { start: 5, end: 12, action: "Role1、Role2 与 Role3 沿着石阶上山" },
+      { start: 12, end: 24, action: "Role4、Role5、Role6、Role7、Role8、Role9 在山门前等候" },
+    ],
+  });
+  $("frames").value = "shot";
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "Characterless scenery shot in shot mode must use [] (board only = 1 ref), not fall back to all 9 cast (10 refs)",
+  );
+
+  $("frames").value = "first";
+  $("frames").events.change();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "Characterless opening shot (segShots[0]) in first mode must not fall back to all 9 cast",
+  );
+
+  // Conversely, when an entire segment is characterless, segment-level refs still fall back to all cast (matching film.refs)
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: nineCast,
+    shots: [{ start: 0, end: 8, action: "空山新雨后，远景云雾缭绕" }],
+  });
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    true,
+    "Whole-segment characterless fallbackAll=true must still count all 9 cast + board + first frame (11 > 9)",
+  );
 });
 

@@ -1,13 +1,16 @@
+import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
 
-from h3ref import film, http, media, rewrite, rh
+from h3ref import film, frames, http, media, rewrite, rh
 from workbench import inputs, segments, storyboard
 from workbench.i18n import InputError
 from workbench.jobs import write_json
@@ -499,7 +502,8 @@ class ReviewFixesRegressionTest(unittest.TestCase):
             )
         self.assertEqual(r_batch.status_code, 200, r_batch.json)
         batch_plan = json.loads((out / "inputs/prompt-rewrite.json").read_text(encoding="utf-8"))
-        self.assertEqual(batch_plan["targets"], [{"number": 1, "prompt": "一段待转新草稿"}])
+        self.assertEqual([(t["number"], t["prompt"]) for t in batch_plan["targets"]], [(1, "一段待转新草稿")])
+        self.assertIn("previous", batch_plan["targets"][0])
         self.jobs.records["batch-after-single-fail"].update(status="succeeded", error=None)
 
         # 2. Clipless segment failed single rewrite promoted to zh/prompt_override when superseded -> pipeline resumes,
@@ -827,6 +831,122 @@ class ReviewFixesRegressionTest(unittest.TestCase):
             with self.assertRaises(InputError) as pf_err:
                 inputs.preflight({**req_pf, "operation": "pipeline"}, {"RUNNINGHUB_API_KEY": "rh-only"})
         self.assertEqual(pf_err.exception.key, "keys")
+
+    def test_h3_wrapper_validation_execution_parity_unclosed_think_and_linear_fence_perf(self):
+        # 1. Outer text outside code fence or before subject_definitions is rejected
+        body = _valid_h3("strict", 1)
+        suffixed = f"<think>draft</think>\n```text\n{body}\n```\nExtra <Picture 99>"
+        prefixed = f"Use <Picture 99>\n{body}"
+        self.assertFalse(rewrite.is_rewritten(suffixed))
+        self.assertTrue(rewrite.problems(suffixed, 1))
+        self.assertFalse(rewrite.is_rewritten(prefixed))
+        self.assertTrue(rewrite.problems(prefixed, 1))
+
+        # 2. Unclosed <think> (truncated reasoning) is rejected in both rewrite and frames
+        unclosed_h3 = f"<think>\n{body}"
+        self.assertFalse(rewrite.is_rewritten(unclosed_h3))
+        self.assertTrue(rewrite.problems(unclosed_h3, 1))
+        unclosed_comp = {"choices": [{"message": {"content": '<think>\n```json\n{"version":3,"camera":"中景","scene":"大厅","characters":[]}\n```'}}]}
+        with patch.object(frames.http, "request", return_value=unclosed_comp), \
+             patch.object(frames.config, "llm_key", return_value="k"):
+            with self.assertRaises(frames.CompositionFormatError):
+                frames.describe_composition({"shots": [{"action": "a"}]}, {"action": "a"}, max_retries=0)
+
+        # 3. Valid closed <think> + outer fence in direct H3 regeneration strips wrapper before persistence & RunningHub
+        out, _, req = self._setup_two_seg_job("h3-strip-exec")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        film.Job(out).put("segs", "0", zh="原词", h3=body, h3_source="原词", file=str(out / "clips/seg1.mp4"), cny=0.1)
+        card = self.client.get("/api/jobs/h3-strip-exec").json["segments"][0]
+        wrapped_direct = f"<think>Use <Picture 999> with subtitles.</think>\n```text\n{body}\n```"
+        rev = segments.prepare_regeneration(
+            req, 1, card["version"], prompt=wrapped_direct, prompt_format="h3", prompt_version=card["prompt_version"]
+        )
+        req_seg = {**req, "operation": "segment", "segment": 1, "segment_revision": rev}
+        submitted_graphs = []
+        with patch("workbench.segments.shutil.which", return_value="/fake/ffmpeg"), \
+             patch.object(rh, "upload", return_value="up.png"), \
+             patch.object(rh, "submit_with_retry", side_effect=lambda g, **kw: submitted_graphs.append(g) or "t-clean"), \
+             patch.object(rh, "poll", return_value={"state": "done", "url": "https://v/1.mp4", "cny": 0.1}), \
+             patch.object(film.http, "download", side_effect=lambda u, p: p.write_bytes(b"NEW")), \
+             patch.object(media, "last_frame", side_effect=lambda p, o: o.write_bytes(b"TAIL")), \
+             patch.object(media, "duration", return_value=5):
+            segments.regenerate(req_seg)
+        sent_prompt = submitted_graphs[0][rh.PROMPT]["inputs"]["prompt"]
+        self.assertNotIn("<think>", sent_prompt)
+        self.assertNotIn("```", sent_prompt)
+        self.assertNotIn("<Picture 999>", sent_prompt)
+
+        # 4. cmd_one rejects out-of-bounds <Picture 99> in 6-section input and strips closed <think> on valid input
+        spec = importlib.util.spec_from_file_location("h3ref_cli_one", Path(__file__).parents[1] / "h3ref.py")
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+        img_one = self.root / "one.png"
+        Image.new("RGB", (8, 8)).save(img_one)
+        bad_p = self.root / "bad_h3.txt"
+        bad_p.write_text(body.replace("<Picture 1>", "<Picture 99>"), encoding="utf-8")
+        with self.assertRaises(rewrite.RewriteError):
+            cli_mod.cmd_one(SimpleNamespace(out=str(self.root / "one-bad"), image=[str(img_one)], prompt=str(bad_p), seed=1, seconds=5, aspect="9:16", check=False))
+        wrapped_p = self.root / "valid_wrapped_h3.txt"
+        wrapped_p.write_text(f"<think>draft <Picture 99></think>\n```text\n{body}\n```", encoding="utf-8")
+        out_one_ok = self.root / "one-ok"
+        with patch.object(cli_mod.rh, "upload", side_effect=RuntimeError("stop-after-h3-save")):
+            with self.assertRaisesRegex(RuntimeError, "stop-after-h3-save"):
+                cli_mod.cmd_one(SimpleNamespace(out=str(out_one_ok), image=[str(img_one)], prompt=str(wrapped_p), seed=1, seconds=5, aspect="9:16", check=False))
+        saved_one_h3 = (out_one_ok / "prompt.h3.txt").read_text(encoding="utf-8")
+        self.assertNotIn("<think>", saved_one_h3)
+        self.assertNotIn("```", saved_one_h3)
+        self.assertNotIn("<Picture 99>", saved_one_h3)
+
+        # 5. Linear-time O(N) fence handling on unclosed fences + whitespace runs (no O(N^3)/O(N^2) hang)
+        t0 = time.perf_counter()
+        bad_fence = {"choices": [{"message": {"content": "```json\n" + (" " * 5000) + '{"version":3'}}]}
+        with patch.object(frames.http, "request", return_value=bad_fence), \
+             patch.object(frames.config, "llm_key", return_value="k"):
+            with self.assertRaises(frames.CompositionFormatError):
+                frames.describe_composition({"shots": [{"action": "a"}]}, {"action": "a"}, max_retries=0)
+        self.assertLess(time.perf_counter() - t0, 2.0)
+
+        t1 = time.perf_counter()
+        self.assertFalse(rewrite.is_rewritten("```\n" + (" " * 80000) + "tail"))
+        self.assertFalse(rewrite.is_rewritten("subject_definitions:\n" + (" " * 80000) + "x"))
+        self.assertLess(time.perf_counter() - t1, 2.0)
+
+        # 6. rewrite.problems() parses sections() once, and source_rewrite_required catches missing [Shot 1]
+        with patch.object(rewrite, "sections", wraps=rewrite.sections) as sec_spy:
+            self.assertEqual(rewrite.problems(body, 1), [])
+        self.assertEqual(sec_spy.call_count, 1)
+        no_shot_h3 = body.replace("[Shot 1] ", "")
+        self.assertTrue(
+            segments.source_rewrite_required(
+                {"zh": "词", "h3": no_shot_h3, "h3_source": "词"},
+                {"source": "词", "h3": no_shot_h3, "paired": True},
+                None,
+                n_pictures=1,
+            )
+        )
+
+    def test_preserve_paired_source_not_wiped_by_preview_reconciled_segments(self):
+        out, script, req = self._setup_two_seg_job("preserve-zh")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        planned = film.plan(script["shots"])
+        auto_zh = film.compile_prompt(script, planned[0], film.refs(script, planned[0], "none"), len(planned))
+        valid_h3 = _valid_h3("paired", 1)
+        film.Job(out).put(
+            "segs", "0", zh=auto_zh, h3=valid_h3, h3_source=auto_zh,
+            file=str(out / "clips/seg1.mp4"), cny=0.1, manual_rewrite=True,
+        )
+        card = self.client.get("/api/jobs/preserve-zh").json["segments"][0]
+        rev = segments.prepare_regeneration(
+            req, 1, card["version"], prompt=valid_h3, prompt_format="h3", prompt_version=card["prompt_version"]
+        )
+        seg_edit = json.loads((out / "inputs/segment-edit.json").read_text(encoding="utf-8"))
+        self.assertTrue(seg_edit["preserve_paired_source"])
+        # Simulate supersede=True reconciliation before staged state has prompt_override (or on clipless failure)
+        reconciled, _, _ = segments.preview_reconciled_segments(out, keep_pending=False, supersede=True)
+        self.assertEqual(reconciled["0"]["zh"], auto_zh, "Paired Chinese source must not be wiped to ''")
+        self.assertNotEqual((reconciled["0"].get("prompt_override") or {}).get("format"), "h3")
 
 
 if __name__ == "__main__":

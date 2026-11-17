@@ -372,4 +372,29 @@ for (const language of ['zh-CN','en']) {
     h.render();
     assert.equal(h.state.segmentDrafts.get(2).drafts.h3?.text, 'LOCAL_UNSAVED_H3_DRAFT', 'Failed rewrite must clear pending state and never delete newer local H3 drafts');
   });
+
+  test(`rewritten clip-backed segment preserves historical clip prompts and live rewrite button carries paid framing (${language})`, async () => {
+    const h = harness(language);
+    h.job.demo = false;
+    Object.assign(h.job.segments[1], {
+      url: '/api/jobs/job-1/files/clips/seg2.mp4?v=1',
+      version: 'v1',
+      prompt: '新改中文词',
+      prompt_format: 'h3',
+      source_prompt: '新改中文词',
+      h3_prompt: 'subject_definitions:\nNew H3.',
+      prompts_unapplied_to_clip: true,
+      clip_source_prompt: '当前旧视频使用的源词',
+      clip_h3_prompt: 'subject_definitions:\nOld video H3.',
+      source_rewrite_required: false,
+    });
+    h.render();
+    const c = await h.expand(2);
+    assert.match(c.rewriteH3.textContent, /付费|paid/i, 'Live rewrite button must carry paid-action framing');
+    assert.equal(c.activeLabel.textContent, h.state.messages.segmentActivePrompts);
+    assert.equal(c.activeSource.textContent, '当前旧视频使用的源词');
+    assert.equal(c.activeH3.textContent, 'subject_definitions:\nOld video H3.');
+    assert.equal(c.attemptNote.hidden, false);
+    assert.equal(c.attemptNote.textContent, h.state.messages.segmentPromptsSavedNotInVideo);
+  });
 }

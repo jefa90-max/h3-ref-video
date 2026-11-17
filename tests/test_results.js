@@ -359,5 +359,35 @@ test("carousel keyboard guards, frame draft reconciliation, tab auto-switch, and
   assert.equal(errors.at(-1), "assembly_changed");
   assert.equal(refreshCount, beforeRefreshes + 1, "Failed runJobAction must refresh server job snapshot");
   assert.equal(state.selectedJob.assembly.version, "asm-2");
+
+  // 5. Prompt-only rewrite on clipless or partially-clipped film does not claim stageFinished or stageAwaitingAssembly
+  currentServerJob = {
+    ...currentServerJob,
+    status: "succeeded",
+    operation: "rewrite_prompts",
+    review_needed: false,
+    can_resume_pipeline: true,
+    can_assemble: false,
+    pending_assembly: false,
+    assembly: { ready: false, pending: false, version: "asm-0" },
+    segments: [
+      { number: 1, start: 0, end: 8, seconds: 8, shots: 1, url: null, version: null, prompt: "p1", prompt_format: "source", prompt_version: "pv1" },
+      { number: 2, start: 8, end: 16, seconds: 8, shots: 1, url: null, version: null, prompt: "p2", prompt_format: "source", prompt_version: "pv2" },
+    ],
+  };
+  await context.refreshJob();
+  assert.notEqual(select("stage-title").textContent, messages.stageFinished, "Clipless rewrite must not show Generation complete");
+
+  currentServerJob = {
+    ...currentServerJob,
+    pending_assembly: true,
+    assembly: { ready: false, pending: true, version: "asm-half" },
+    segments: [
+      { ...currentServerJob.segments[0], url: "/seg1.mp4", version: "v1" },
+      currentServerJob.segments[1],
+    ],
+  };
+  await context.refreshJob();
+  assert.notEqual(select("stage-title").textContent, messages.stageAwaitingAssembly, "Partial-clip rewrite must not show ready to reassemble");
 });
 
