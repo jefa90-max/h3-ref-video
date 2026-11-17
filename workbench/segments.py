@@ -158,7 +158,8 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 if not pending.get('reuse_h3') and prompt_text != prior_zh:
                     rec.update(h3=None, h3_source=None)
                 rec['zh'] = prompt_text
-                if prompt_text != prev_snap.get('zh') or prev_snap.get('prompt_override'):
+                baseline_zh = prev_snap.get('zh') or pending.get('automatic_source', '')
+                if prompt_text != baseline_zh or prev_snap.get('prompt_override'):
                     rec['prompt_override'] = {'format': fmt, 'text': prompt_text, 'source_version': pending.get('source_version')}
             changed = True
 
@@ -823,6 +824,7 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
     return {'number': number, 'revision': uuid.uuid4().hex, 'version': version, 'prompt_version': prompt_version,
             'prompt': prompt, 'prompt_format': prompt_format, 'previous': clean_previous, 'applied': False,
             'source_version': automatic['source_version'], 'reference_version': automatic['reference_version'],
+            'automatic_source': automatic['source'],
             'reuse_h3': reuse, 'preserve_paired_source': preserve_paired_source, 'explicit_prompt': edited}
 
 
@@ -878,8 +880,10 @@ def prepare_prompt(staged, request, pending, segment):
         if pending.get('preserve_paired_source'):
             if previous.get('prompt_override'):
                 staged.put('segs', index, prompt_override=previous['prompt_override'])
-        elif prompt_format == 'h3' or pending['prompt'] != previous.get('zh') or previous.get('prompt_override'):
-            staged.put('segs', index, prompt_override={'format': prompt_format, 'text': pending['prompt'], 'source_version': pending['source_version']})
+        else:
+            baseline_zh = previous.get('zh') or pending.get('automatic_source', '')
+            if prompt_format == 'h3' or pending['prompt'] != baseline_zh or previous.get('prompt_override'):
+                staged.put('segs', index, prompt_override={'format': prompt_format, 'text': pending['prompt'], 'source_version': pending['source_version']})
         staged.put('segs', index, h3_reference_version=pending['reference_version'],
                    pics=[p['kind'] for p in film.refs(request['film'], segment, request['frames'])])
     (staged.dir / 'prompts').mkdir(exist_ok=True)

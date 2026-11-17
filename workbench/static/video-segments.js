@@ -212,8 +212,13 @@ function expandSegmentEditor(card) {
   card.rebase.addEventListener("click", () => {
     if (card.rebase.disabled) return;
     const current = card.segment, format = segmentFormat(current), drafts = segmentDraftEntry(current).drafts;
-    if (drafts[format] || card.editor.value !== segmentSavedText(current, format)) {
+    if (drafts[format]) {
       drafts[format] = { text: card.editor.value, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    } else {
+      card.editor.value = segmentSavedText(current, format);
+      if (card.editorFormat === format) {
+        card.editorBaseline = { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+      }
     }
     if (format === "h3" && drafts.source) {
       drafts.source = { ...drafts.source, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
