@@ -1037,9 +1037,30 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                             self.assertEqual(rf304.status_code, 304)
                     self.assertEqual(verify_calls["count"], 1, "Unchanged verified reference image must be verified once and cached")
 
-                    # 5. storyboard.view caches shared reference stat() calls across 20 shots
-                    orig_stat = Path.stat
+                    # 5. storyboard.view caches shared reference stat() calls across 20 shots without double-statting regular files
+                    orig_os_stat = os.stat
                     actor_resolved = actor.resolve()
+                    actor_targets = {str(actor), str(actor_resolved)}
+                    direct_os_stats = {"count": 0}
+                    def counted_os_stat(target, *a, **kw):
+                        if str(target) in actor_targets:
+                            direct_os_stats["count"] += 1
+                        return orig_os_stat(target, *a, **kw)
+                    meta = {}
+                    with patch("os.stat", side_effect=counted_os_stat):
+                        mtime_ns = sb_mod._cached_mtime_ns(str(actor), {})
+                        film.reference_version([str(actor)], metadata=meta)
+                    self.assertIsNotNone(mtime_ns)
+                    self.assertIsNotNone(meta[str(actor)][1])
+                    self.assertEqual(direct_os_stats["count"], 2, f"Expected single stat per helper without is_file() re-stat, got {direct_os_stats['count']}")
+                    self.assertIsNone(sb_mod._cached_mtime_ns(str(root), {}))
+                    self.assertIsNone(sb_mod._cached_mtime_ns(str(root / "missing-ref.png"), {}))
+                    dir_and_missing_meta = {}
+                    film.reference_version([str(root), str(root / "missing-ref.png")], metadata=dir_and_missing_meta)
+                    self.assertIsNone(dir_and_missing_meta[str(root)][1])
+                    self.assertIsNone(dir_and_missing_meta[str(root / "missing-ref.png")][1])
+
+                    orig_stat = Path.stat
                     actor_stats = {"count": 0}
                     def counted_stat(p, *a, **kw):
                         if p == actor or p == actor_resolved:
@@ -1205,7 +1226,8 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
             )
             args = SimpleNamespace(out=str(one_dir), image=[str(missing_img)], prompt=str(prompt_file), seed=1, seconds=5, aspect="9:16", check=False)
             with patch.object(cli_main.rh, "poll", return_value={"state": "done", "url": "https://v/1.mp4", "cny": 0.1, "coins": 45, "run_s": 10}), \
-                 patch.object(cli_main.http, "download", side_effect=lambda u, p: p.write_bytes(b"MP4")):
+                 patch.object(cli_main.http, "download", side_effect=lambda u, p: p.write_bytes(b"MP4")), \
+                 patch.object(cli_main.media, "duration", return_value=5):
                 cli_main.cmd_one(args)
             self.assertTrue((one_dir / "clip.mp4").is_file())
 
