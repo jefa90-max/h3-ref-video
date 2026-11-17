@@ -231,4 +231,42 @@ for (const language of ['zh-CN','en']) {
     assert.match(c.editor.value, /subject_definitions:/);
     assert.equal(c.draftNote.hidden, true);
   });
+
+  test(`single-segment rewrite trims trailing whitespace and does not switch to stale H3 on failed request (${language})`, async () => {
+    const h = harness(language);
+    h.job.can_rewrite_prompts = true;
+    h.context.initializeVideoSegments();
+    h.context.renderJob(h.job);
+
+    // 1. Failed POST (returns null from runJobAction) must NOT leave segmentRewrites armed to switch to old h3_prompt
+    const origPost = h.context.post;
+    h.context.post = async () => { throw new Error('missing LLM key'); };
+    const c = await h.expand(2);
+    assert.equal(c.format.value, 'source');
+    await c.rewriteH3.fire('click');
+    h.render();
+    assert.equal(c.format.value, 'source', 'Failed rewrite POST must not switch editor to existing old H3');
+
+    // 2. Trailing newline/spaces in source draft still reconcile cleanly with trimmed backend source_prompt
+    h.context.post = origPost;
+    await h.edit('带末尾换行的中文词  \n', 2);
+    await c.rewriteH3.fire('click');
+    assert.equal(h.posted.at(-1).body.prompt, '带末尾换行的中文词');
+    const seg2 = h.state.selectedJob.segments[1];
+    h.state.selectedJob.status = 'succeeded';
+    Object.assign(seg2, {
+      editable: true,
+      can_rewrite: true,
+      can_regenerate: true,
+      task_pending: false,
+      prompt_version: 'prompt-v-trim',
+      prompt: '带末尾换行的中文词',
+      source_prompt: '带末尾换行的中文词',
+      h3_prompt: 'subject_definitions:\n<Subject 1> Trimmed.\n\nsummary:\nTrimmed.',
+      source_rewrite_required: false,
+    });
+    h.render();
+    assert.equal(c.format.value, 'h3');
+    assert.equal(c.conflict.hidden, true, 'Trimmed server source_prompt must not trigger false conflict');
+  });
 }

@@ -629,5 +629,40 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
   splitBtn.events.click();
   tree = allDescendants($("film-reference-list"));
   assert.equal(tree.filter((n) => n.className.includes("film-reference-upload")).length, 3);
+
+  // Partial upload on only 1 of 2 selected roles must NOT silently bind that solo image as a combined group sheet
+  context.state.filmBindings.clear();
+  context.renderFilmReferences();
+  tree = allDescendants($("film-reference-list"));
+  const soloUploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  soloUploads[0].files = [{ name: "queen-solo.png" }];
+  await soloUploads[0].events.change();
+  assert.equal(context.state.filmBindings.has("cast:0"), true);
+  assert.equal(context.state.filmBindings.has("cast:1"), false);
+
+  tree = allDescendants($("film-reference-list"));
+  const soloChecks = tree.filter((n) => n.className.includes("film-cast-select"));
+  soloChecks[0].checked = true;
+  soloChecks[0].events.change();
+  soloChecks[1].checked = true;
+  soloChecks[1].events.change();
+  tree = allDescendants($("film-reference-list"));
+  tree.find((n) => n.className.includes("merge-cast-button")).events.click();
+  assert.equal(context.state.filmBindings.has("cast:0"), false, "Solo image must not carry over to newly merged multi-role group");
+  assert.equal(context.state.filmBindings.has("cast:1"), false);
+
+  // Upload a 2-role group sheet for cast:0 + cast:1, then rename cast:1 in JSON -> dissolved group must clear multi-role sheet from cast:0
+  tree = allDescendants($("film-reference-list"));
+  const newGroupUploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  newGroupUploads[0].files = [{ name: "queen-monk-sheet.png" }];
+  await newGroupUploads[0].events.change();
+  assert.equal(context.state.filmBindings.has("cast:0"), true);
+  $("film-json").value = JSON.stringify({
+    cast: [{ name: "Queen", look: "gold crown" }, { name: "NewMonk", look: "red robe" }, { name: "Monkey", look: "golden armor" }],
+    shots: [{ action: "Queen talks" }],
+  });
+  await context.refreshFilmReferences();
+  assert.equal(context.state.filmGroups.length, 0);
+  assert.equal(context.state.filmBindings.has("cast:0"), false, "Dissolved 2-role group sheet must not stay bound to the surviving solo role");
 });
 
