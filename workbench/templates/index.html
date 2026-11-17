@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block scripts %}<script src="/static/create.js" defer></script>{% endblock %}
+{% block intro %}
+    <section class="intro">
+      <div><h1 data-i18n="title"></h1><p class="intro-copy" data-i18n="intro"></p></div>
+      <div class="flow-line" aria-hidden="true"><span><b>01</b><span data-i18n="stepConfig"></span></span><i>→</i><span><b>02</b><span data-i18n="stepCreate"></span></span><i>→</i><span><b>03</b><span data-i18n="stepResult"></span></span></div>
+    </section>
+
+{% endblock %}
+{% block content %}
+<div class="create-workspace">
+      <section class="editor-card panel">
+        <div class="section-heading"><div><h2 data-i18n="createTitle"></h2></div><span class="section-index">02</span></div>
+        <div class="workflow-tabs" role="tablist" data-i18n-aria="workflowLabel"><button id="tab-one" type="button" role="tab" aria-selected="false" aria-controls="one-fields" tabindex="-1"><span data-i18n="oneTitle"></span><small data-i18n="oneTabHint"></small></button><button id="tab-film" type="button" role="tab" aria-selected="true" aria-controls="film-fields" class="active"><span data-i18n="filmTitle"></span><small data-i18n="filmTabHint"></small></button></div>
+        <form id="job-form">
+          <div id="one-fields" role="tabpanel" aria-labelledby="tab-one" hidden>
+            <label><span class="label-heading"><span data-i18n="promptLabel"></span><span class="subtle" data-i18n="promptHint"></span></span><textarea id="prompt" rows="5" data-i18n-placeholder="promptPlaceholder"></textarea></label>
+            <div class="field-grid">
+              <label><span data-i18n="secondsLabel"></span><input id="seconds" type="number" min="5" max="15" step="1" value="12"></label>
+              <label><span data-i18n="aspectLabel"></span><select id="aspect"><option value="9:16" data-i18n="aspectPortrait"></option><option value="16:9" data-i18n="aspectLandscape"></option><option value="1:1" data-i18n="aspectSquare"></option></select></label>
+            </div>
+            <div class="field-grid one-options"><label><span data-i18n="seedLabel"></span><input id="seed" type="number" step="1" data-i18n-placeholder="seedPlaceholder"></label><label class="checkbox-field"><input id="check-subtitles" type="checkbox"{% if not subtitle_checks_enabled %} disabled{% endif %}><span data-i18n="{{ 'checkSubtitles' if subtitle_checks_enabled else 'checkSubtitlesPaused' }}"></span></label></div>
+            <div class="field-block"><div class="label-heading"><span data-i18n="referencesLabel"></span><span id="image-count" class="subtle"></span></div><label class="upload-zone"><input id="one-upload" type="file" accept="image/png,image/jpeg,image/webp" multiple><span class="upload-symbol" aria-hidden="true">+</span><strong data-i18n="uploadReferences"></strong><span class="hint" data-i18n="uploadReferencesHint"></span></label><p class="hint" data-i18n="referenceOrder"></p><div id="reference-list" class="reference-list"></div></div>
+          </div>
+
+          <div id="film-fields" role="tabpanel" aria-labelledby="tab-film">
+            <div class="label-heading"><label for="film-json" data-i18n="filmJsonLabel"></label><div class="button-row"><label class="button text-button file-button"><span data-i18n="importJson"></span><input id="film-import" type="file" accept=".json,.txt,application/json,text/plain"></label><a id="download-example" href="/api/film/example" download="film.example.json" class="button text-button" data-i18n="downloadExample"></a></div></div>
+            <textarea id="film-json" class="json-editor" rows="12" spellcheck="false" data-i18n-placeholder="filmJsonPlaceholder" aria-describedby="film-reference-hint film-parse-status"></textarea>
+            <p id="film-reference-hint" class="hint" data-i18n="filmReferenceHint"></p>
+            <p id="film-parse-status" class="hint" aria-live="polite"></p>
+            <section class="film-reference-section" aria-labelledby="film-references-title"><h3 id="film-references-title" data-i18n="filmReferencesTitle"></h3><p class="hint" data-i18n="filmReferencesHint"></p><div id="film-reference-list"></div><p id="film-missing-references" class="hint" aria-live="polite"></p></section>
+            <label id="demo-placeholders-field" class="checkbox-field"><input id="demo-placeholders" type="checkbox" checked><span data-i18n="demoPlaceholders"></span></label>
+            <label><span data-i18n="frameMode"></span><select id="frames"><option value="shot" data-i18n="framesShot"></option><option value="first" data-i18n="framesFirst"></option><option value="none" data-i18n="framesNone"></option></select></label>
+            <p id="frame-mode-hint" class="hint"></p>
+          </div>
+
+          <div class="output-field">
+            <label for="output-dir" data-i18n="outputLabel"></label>
+            <div class="output-picker"><input id="output-dir" readonly spellcheck="false" data-i18n-placeholder="outputPlaceholder"><button id="choose-output-folder" type="button" class="button secondary" data-i18n="chooseOutputFolder"></button></div>
+            <p class="hint" data-i18n="outputHint"></p>
+          </div>
+          <div class="run-settings live"><div class="mode-heading"><span data-i18n="runMode"></span><div class="mode-toggle"><button id="mode-demo" type="button" aria-pressed="false" data-i18n="demoMode"></button><button id="mode-live" type="button" aria-pressed="true" class="active" data-i18n="liveMode"></button></div></div><p id="mode-hint" class="hint"></p></div>
+          <div class="submit-row"><div class="button-row run-buttons"><button id="start-job" class="button primary" type="submit" disabled><span id="start-label"></span><span aria-hidden="true">↗</span></button></div><span id="submit-hint" class="hint"></span></div>
+        </form>
+      </section>
+
+<aside class="history-column">        <section class="history-card panel"><div class="history-heading"><h3 data-i18n="historyTitle"></h3><button id="refresh-history" type="button" class="button text-button" data-i18n="refreshHistory"></button></div><p id="history-empty" class="hint" data-i18n="historyEmpty"></p><div id="history-list" class="history-list"></div></section>
+        <p class="workspace-note" data-i18n="workspaceNote"></p>
+</aside>
+</div>
+{% endblock %}

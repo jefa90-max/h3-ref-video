@@ -13,13 +13,16 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.request
 from pathlib import Path
 
 from . import config, http
+from .i18n import message
 
 SECTIONS = ["subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music"]
 EXAMPLES = config.ROOT / "prompts/h3_examples.md"
+_GUIDE_LOCK = threading.Lock()
 
 RULES = """Rules learned on this workflow (they override nothing in the guide, they make it concrete):
 1. Output exactly the six sections, in order, each as `name:` on its own line followed by its text. English only, except
@@ -29,7 +32,7 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
    - an image that 只约束某角色身份 defines one <Subject> (carry over every look detail from the input: hair, eyes, outfit, props);
    - a key-frame image (「…」这个画面的样子) is the composition reference for the matching shot when that shot is in this segment,
      otherwise say it maps to no shot in this part;
-   - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: the shot starts from that picture;
+   - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: use its opening composition as guidance, not as a hard timed keyframe;
    - the previous segment's last frame (上一段的最后一个画面) is the first frame of [Shot 1] when [Shot 1] continues the same
      place and moment, otherwise a continuity reference for the set, light and characters' state.
 3. Keep every storyboard beat, in order, with its camera and action. The first shot has no timestamp; each later beat
@@ -45,7 +48,12 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
    一本正经, say plainly that the face stays blank and serious the whole time. Big reactions (shock, pain, laughing) get
    specific details: eyes snapping wide, jaw dropping, wincing with a hand on the cheek, doubled over laughing.
 8. Open detailed_description with one or two sentences of style taken from the input's style sentence, including the
-   aspect ratio, then [Shot 1]."""
+   aspect ratio, then [Shot 1].
+9. Preserve each shot's world frame and fixed objects independently of camera reversals and screen cropping. Keep body facing,
+   gaze, pose and visible appearance separate; identity references cannot replace shot-specific posture or held objects.
+   Keep prop opening direction, base direction and knot position on the object distinct from screen position/visibility.
+   Preserve the full transfer contact chain, release and landing order. Expected ends are textual plans, not generated evidence.
+   ReferenceToVideo images are composition references, not guaranteed hard timed keyframes."""
 
 NEGATIVE = re.compile(r"\b(no|not|without|never|avoid|don't|do not|free of)\b[^.\n]{0,40}\b(music|soundtrack|score|subtitles?|captions?|"
                       r"on-screen text|text overlays?|watermarks?|logos?|brands?|narration|voice-?over|singing)\b", re.I)
@@ -60,17 +68,27 @@ def guide() -> str:
     if config.GUIDE_FILE:
         return Path(config.GUIDE_FILE).expanduser().read_text(encoding="utf-8")
     cache = config.CACHE / "ref-en.txt"
-    if not cache.is_file():
-        req = urllib.request.Request(config.GUIDE_URL, headers={"User-Agent": config.UA})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                text = r.read().decode("utf-8")
-        except Exception as exc:
-            raise RewriteError(f"取不到 MiniMax 官方提示词指南（{config.GUIDE_URL}）：{type(exc).__name__}。"
-                               "下载 ref-en.txt 后用 H3_GUIDE_FILE 指向它") from None
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(text, encoding="utf-8")
-    return cache.read_text(encoding="utf-8")
+    with _GUIDE_LOCK:
+        if not cache.is_file() or not cache.stat().st_size:
+            req = urllib.request.Request(config.GUIDE_URL, headers={"User-Agent": config.UA})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    text = r.read().decode("utf-8")
+            except Exception as exc:
+                raise RewriteError(f"取不到 MiniMax 官方提示词指南（{config.GUIDE_URL}）：{type(exc).__name__}。"
+                                   "下载 ref-en.txt 后用 H3_GUIDE_FILE 指向它") from None
+            if not text.strip():
+                raise RewriteError(f"取不到 MiniMax 官方提示词指南（{config.GUIDE_URL}）：内容为空")
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=".ref-en-", suffix=".tmp", dir=cache.parent)
+            tmp_path = Path(tmp_name)
+            try:
+                with open(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                config.atomic_replace(tmp_path, cache)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        return cache.read_text(encoding="utf-8")
 
 
 def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback: str = "") -> str:
@@ -108,9 +126,13 @@ def problems(text: str, n_images: int) -> list[str]:
     for name in ("detailed_description", "overall_soundscape"):
         for m in NEGATIVE.finditer(parts[name]):
             out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
-    used = {int(n) for n in re.findall(r"<Picture (\d+)>", text)}
-    if used and max(used) > n_images:
-        out.append(f"there are only {n_images} reference images but the rewrite cites <Picture {max(used)}>")
+    for token in re.findall(r"<Picture([^>]*)>", text):
+        if not re.fullmatch(r"\s+[0-9]+\s*", token):
+            out.append(message('rewrite_picture_token', value=('<Picture' + token + '>')[:100]))
+            continue
+        number = int(token)
+        if not 1 <= number <= n_images:
+            out.append(message('rewrite_picture_bound', number=number, count=n_images))
     if "[Shot 1]" not in parts["detailed_description"]:
         out.append("detailed_description has no [Shot 1]")
     return out
@@ -143,8 +165,9 @@ def _claude(prompt: str) -> str:
         raise RewriteError("没找到 claude 命令行；装上 Claude Code，或者设 H3_REWRITER=llm 用别的模型")
     with tempfile.TemporaryDirectory() as cwd:
         proc = subprocess.run([exe, "-p", "--output-format", "json", "--max-turns", "1", "--model", config.CLAUDE_MODEL,
+                               "--tools", "", "--strict-mcp-config",
                                "--disallowedTools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task,Agent"],
-                              input=prompt, capture_output=True, text=True, timeout=900, cwd=cwd)
+                              input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, cwd=cwd)
     try:
         out = json.loads(proc.stdout)
     except ValueError:
@@ -155,10 +178,19 @@ def _claude(prompt: str) -> str:
 
 
 def _llm(prompt: str) -> str:
-    out = http.request(config.LLM_BASE + "/chat/completions", config.llm_key(),
-                       {"model": config.LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
-                       timeout=600)
-    text = ((out.get("choices") or [{}])[0].get("message") or {}).get("content")
+    llm = config.llm_settings()
+    try:
+        out = http.request(llm["base_url"] + "/chat/completions", config.llm_key(),
+                           {"model": llm["rewrite_model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
+                           timeout=600)
+    except http.HTTPResponseError as exc:
+        raise RewriteError("改写模型请求失败：" + str(exc)[:300]) from None
+    if not isinstance(out, dict):
+        raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+    choices = out.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+    text = msg.get("content")
     if not text:
         raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
     return text

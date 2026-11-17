@@ -1,0 +1,543 @@
+{
+  "film": {
+    "aspect": "9:16",
+    "look": "电影实拍",
+    "setting": "摊位与另一街道",
+    "speech": "zh",
+    "cast": [
+      {
+        "name": "阿青",
+        "aliases": [
+          "小青"
+        ],
+        "picture": "/a.jpg",
+        "look": "短发蓝衫，正面站立、毛巾挂脖"
+      },
+      {
+        "name": "阿禾",
+        "picture": "/b.jpg",
+        "look": "白衫长发"
+      }
+    ],
+    "shots": [
+      {
+        "start": 0,
+        "end": 8,
+        "camera": "背面中景跟拍",
+        "action": "阿青递袋给阿禾",
+        "line": "接好了"
+      },
+      {
+        "start": 8,
+        "end": 16,
+        "camera": "侧面近景",
+        "action": "阿青跪地侧身，阿禾托袋"
+      }
+    ]
+  },
+  "transfer_start": {
+    "version": 2,
+    "scene": "街口摊位",
+    "frame": "阿青背对镜头托袋，阿禾准备接住",
+    "orientation": "背向",
+    "scene_id": "stall",
+    "world_frame": "以摊主站在摊内面向街道为基准",
+    "fixed_objects": [
+      {
+        "name": "锅",
+        "position": "案板世界右侧"
+      }
+    ],
+    "camera": {
+      "position": "摊内阿青背后",
+      "view_direction": "朝街道",
+      "framing": "中景跟拍",
+      "axis_side": "案板内侧"
+    },
+    "characters": [
+      {
+        "name": "阿青",
+        "appearance": "短发蓝衫",
+        "position": "案板内侧一步",
+        "body_facing": "背对镜头朝街道",
+        "gaze": "望向阿禾手中的袋",
+        "pose": "背对镜头站在摊内",
+        "expression": "专注",
+        "screen_position": "画面左侧",
+        "visibility": "visible"
+      },
+      {
+        "name": "阿禾",
+        "appearance": "白衫长发",
+        "position": "案板外侧一步",
+        "body_facing": "面向阿青",
+        "gaze": "看红袋",
+        "pose": "双手准备接袋",
+        "expression": "期待",
+        "screen_position": "画面右侧",
+        "visibility": "visible"
+      }
+    ],
+    "props": [
+      {
+        "name": "红袋",
+        "holder": "阿青",
+        "contact": "双手托抱袋体两侧",
+        "position": "人物胸腹前",
+        "orientation": "袋体竖直",
+        "state": "袋口扎紧",
+        "opening_direction": "朝世界上方",
+        "base_direction": "朝世界下方",
+        "knot_position": "袋体顶部的袋口处",
+        "screen_position": "画面下半部",
+        "visibility": "visible"
+      }
+    ],
+    "action": "阿禾先双手托住红袋，阿青随后松手，袋落在阿禾双手中",
+    "expected_end": {
+      "characters": [
+        {
+          "name": "阿青",
+          "appearance": "短发蓝衫",
+          "position": "案板内侧一步",
+          "body_facing": "背对镜头朝街道",
+          "gaze": "望向阿禾手中的袋",
+          "pose": "背对镜头站在摊内",
+          "expression": "专注",
+          "screen_position": "画面左侧",
+          "visibility": "visible"
+        },
+        {
+          "name": "阿禾",
+          "appearance": "白衫长发",
+          "position": "案板外侧一步",
+          "body_facing": "面向阿青",
+          "gaze": "看红袋",
+          "pose": "双手准备接袋",
+          "expression": "期待",
+          "screen_position": "画面右侧",
+          "visibility": "visible"
+        }
+      ],
+      "props": [
+        {
+          "name": "红袋",
+          "holder": "阿禾",
+          "contact": "双手托住，递出者已经松手",
+          "position": "人物胸腹前",
+          "orientation": "袋体竖直",
+          "state": "袋口扎紧",
+          "opening_direction": "朝世界上方",
+          "base_direction": "朝世界下方",
+          "knot_position": "袋体顶部的袋口处",
+          "screen_position": "画面下半部",
+          "visibility": "visible"
+        }
+      ]
+    }
+  },
+  "transfer_end": {
+    "version": 2,
+    "scene": "街口摊位",
+    "frame": "阿青跪地侧身，阿禾托袋",
+    "orientation": "背向",
+    "scene_id": "stall",
+    "world_frame": "以摊主站在摊内面向街道为基准",
+    "fixed_objects": [
+      {
+        "name": "锅",
+        "position": "案板世界右侧"
+      }
+    ],
+    "camera": {
+      "position": "摊内阿青背后",
+      "view_direction": "朝街道",
+      "framing": "中景跟拍",
+      "axis_side": "案板内侧"
+    },
+    "characters": [
+      {
+        "name": "阿青",
+        "appearance": "短发蓝衫",
+        "position": "案板内侧一步",
+        "body_facing": "侧向镜头",
+        "gaze": "回望街道",
+        "pose": "跪地侧身托袋，毛巾在案板",
+        "expression": "专注",
+        "screen_position": "画面左侧",
+        "visibility": "visible"
+      },
+      {
+        "name": "阿禾",
+        "appearance": "白衫长发",
+        "position": "案板外侧一步",
+        "body_facing": "面向阿青",
+        "gaze": "看红袋",
+        "pose": "双手准备接袋",
+        "expression": "期待",
+        "screen_position": "画面右侧",
+        "visibility": "visible"
+      }
+    ],
+    "props": [
+      {
+        "name": "红袋",
+        "holder": "阿禾",
+        "contact": "双手托住，递出者已经松手",
+        "position": "人物胸腹前",
+        "orientation": "袋体竖直",
+        "state": "袋口扎紧",
+        "opening_direction": "朝世界上方",
+        "base_direction": "朝世界下方",
+        "knot_position": "袋体顶部的袋口处",
+        "screen_position": "画面下半部",
+        "visibility": "visible"
+      }
+    ],
+    "action": "阿禾保持托袋，阿青转头回望",
+    "expected_end": {
+      "characters": [
+        {
+          "name": "阿青",
+          "appearance": "短发蓝衫",
+          "position": "案板内侧一步",
+          "body_facing": "侧向镜头",
+          "gaze": "回望街道",
+          "pose": "跪地侧身托袋，毛巾在案板",
+          "expression": "专注",
+          "screen_position": "画面左侧",
+          "visibility": "visible"
+        },
+        {
+          "name": "阿禾",
+          "appearance": "白衫长发",
+          "position": "案板外侧一步",
+          "body_facing": "面向阿青",
+          "gaze": "看红袋",
+          "pose": "双手准备接袋",
+          "expression": "期待",
+          "screen_position": "画面右侧",
+          "visibility": "visible"
+        }
+      ],
+      "props": [
+        {
+          "name": "红袋",
+          "holder": "阿禾",
+          "contact": "双手托住，递出者已经松手",
+          "position": "人物胸腹前",
+          "orientation": "袋体竖直",
+          "state": "袋口扎紧",
+          "opening_direction": "朝世界上方",
+          "base_direction": "朝世界下方",
+          "knot_position": "袋体顶部的袋口处",
+          "screen_position": "画面下半部",
+          "visibility": "visible"
+        }
+      ]
+    }
+  },
+  "reverse_closeup": {
+    "version": 2,
+    "scene": "街口摊位",
+    "frame": "阿青跪地侧身，阿禾托袋",
+    "orientation": "背向",
+    "scene_id": "stall",
+    "world_frame": "以摊主站在摊内面向街道为基准",
+    "fixed_objects": [
+      {
+        "name": "锅",
+        "position": "案板世界右侧"
+      }
+    ],
+    "camera": {
+      "position": "街道一侧",
+      "view_direction": "朝摊内",
+      "framing": "红袋特写",
+      "axis_side": "案板外侧"
+    },
+    "characters": [
+      {
+        "name": "阿青",
+        "appearance": "短发蓝衫",
+        "position": "案板内侧一步",
+        "body_facing": "侧向镜头",
+        "gaze": "回望街道",
+        "pose": "跪地侧身托袋，毛巾在案板",
+        "expression": "专注",
+        "screen_position": "画面左侧",
+        "visibility": "visible"
+      },
+      {
+        "name": "阿禾",
+        "appearance": "白衫长发",
+        "position": "案板外侧一步",
+        "body_facing": "面向阿青",
+        "gaze": "看红袋",
+        "pose": "双手准备接袋",
+        "expression": "期待",
+        "screen_position": "画面右侧",
+        "visibility": "visible"
+      }
+    ],
+    "props": [
+      {
+        "name": "红袋",
+        "holder": "阿禾",
+        "contact": "双手托住，递出者已经松手",
+        "position": "人物胸腹前",
+        "orientation": "袋体竖直",
+        "state": "袋口扎紧",
+        "opening_direction": "朝世界上方",
+        "base_direction": "朝世界下方",
+        "knot_position": "袋体顶部的袋口处",
+        "screen_position": "画面下半部，袋底超出画面下边缘",
+        "visibility": "cropped"
+      }
+    ],
+    "action": "阿禾保持托袋，阿青转头回望",
+    "expected_end": {
+      "characters": [
+        {
+          "name": "阿青",
+          "appearance": "短发蓝衫",
+          "position": "案板内侧一步",
+          "body_facing": "侧向镜头",
+          "gaze": "回望街道",
+          "pose": "跪地侧身托袋，毛巾在案板",
+          "expression": "专注",
+          "screen_position": "画面左侧",
+          "visibility": "visible"
+        },
+        {
+          "name": "阿禾",
+          "appearance": "白衫长发",
+          "position": "案板外侧一步",
+          "body_facing": "面向阿青",
+          "gaze": "看红袋",
+          "pose": "双手准备接袋",
+          "expression": "期待",
+          "screen_position": "画面右侧",
+          "visibility": "visible"
+        }
+      ],
+      "props": [
+        {
+          "name": "红袋",
+          "holder": "阿禾",
+          "contact": "双手托住，递出者已经松手",
+          "position": "人物胸腹前",
+          "orientation": "袋体竖直",
+          "state": "袋口扎紧",
+          "opening_direction": "朝世界上方",
+          "base_direction": "朝世界下方",
+          "knot_position": "袋体顶部的袋口处",
+          "screen_position": "画面下半部",
+          "visibility": "visible"
+        }
+      ]
+    }
+  },
+  "new_scene": {
+    "version": 2,
+    "scene": "街道另一端",
+    "frame": "阿青跪地侧身，阿禾托袋",
+    "orientation": "背向",
+    "scene_id": "street",
+    "world_frame": "以路口面向北为基准",
+    "fixed_objects": [
+      {
+        "name": "锅",
+        "position": "路边店内"
+      }
+    ],
+    "camera": {
+      "position": "摊内阿青背后",
+      "view_direction": "朝街道",
+      "framing": "中景跟拍",
+      "axis_side": "案板内侧"
+    },
+    "characters": [
+      {
+        "name": "阿青",
+        "appearance": "短发蓝衫",
+        "position": "案板内侧一步",
+        "body_facing": "侧向镜头",
+        "gaze": "回望街道",
+        "pose": "跪地侧身托袋，毛巾在案板",
+        "expression": "专注",
+        "screen_position": "画面左侧",
+        "visibility": "visible"
+      },
+      {
+        "name": "阿禾",
+        "appearance": "白衫长发",
+        "position": "案板外侧一步",
+        "body_facing": "面向阿青",
+        "gaze": "看红袋",
+        "pose": "双手准备接袋",
+        "expression": "期待",
+        "screen_position": "画面右侧",
+        "visibility": "visible"
+      }
+    ],
+    "props": [
+      {
+        "name": "红袋",
+        "holder": "阿禾",
+        "contact": "双手托住，递出者已经松手",
+        "position": "人物胸腹前",
+        "orientation": "袋体竖直",
+        "state": "袋口扎紧",
+        "opening_direction": "朝世界上方",
+        "base_direction": "朝世界下方",
+        "knot_position": "袋体顶部的袋口处",
+        "screen_position": "画面下半部",
+        "visibility": "visible"
+      }
+    ],
+    "action": "阿禾保持托袋，阿青转头回望",
+    "expected_end": {
+      "characters": [
+        {
+          "name": "阿青",
+          "appearance": "短发蓝衫",
+          "position": "案板内侧一步",
+          "body_facing": "侧向镜头",
+          "gaze": "回望街道",
+          "pose": "跪地侧身托袋，毛巾在案板",
+          "expression": "专注",
+          "screen_position": "画面左侧",
+          "visibility": "visible"
+        },
+        {
+          "name": "阿禾",
+          "appearance": "白衫长发",
+          "position": "案板外侧一步",
+          "body_facing": "面向阿青",
+          "gaze": "看红袋",
+          "pose": "双手准备接袋",
+          "expression": "期待",
+          "screen_position": "画面右侧",
+          "visibility": "visible"
+        }
+      ],
+      "props": [
+        {
+          "name": "红袋",
+          "holder": "阿禾",
+          "contact": "双手托住，递出者已经松手",
+          "position": "人物胸腹前",
+          "orientation": "袋体竖直",
+          "state": "袋口扎紧",
+          "opening_direction": "朝世界上方",
+          "base_direction": "朝世界下方",
+          "knot_position": "袋体顶部的袋口处",
+          "screen_position": "画面下半部",
+          "visibility": "visible"
+        }
+      ]
+    }
+  },
+  "return_scene": {
+    "version": 2,
+    "scene": "街口摊位",
+    "frame": "阿青跪地侧身，阿禾托袋",
+    "orientation": "背向",
+    "scene_id": "stall",
+    "world_frame": "以摊主站在摊内面向街道为基准",
+    "fixed_objects": [
+      {
+        "name": "锅",
+        "position": "案板世界右侧"
+      }
+    ],
+    "camera": {
+      "position": "摊内阿青背后",
+      "view_direction": "朝街道",
+      "framing": "中景跟拍",
+      "axis_side": "案板内侧"
+    },
+    "characters": [
+      {
+        "name": "阿青",
+        "appearance": "短发蓝衫",
+        "position": "案板内侧一步",
+        "body_facing": "侧向镜头",
+        "gaze": "回望街道",
+        "pose": "跪地侧身托袋，毛巾在案板",
+        "expression": "专注",
+        "screen_position": "画面左侧",
+        "visibility": "visible"
+      },
+      {
+        "name": "阿禾",
+        "appearance": "白衫长发",
+        "position": "案板外侧一步",
+        "body_facing": "面向阿青",
+        "gaze": "看红袋",
+        "pose": "双手准备接袋",
+        "expression": "期待",
+        "screen_position": "画面右侧",
+        "visibility": "visible"
+      }
+    ],
+    "props": [
+      {
+        "name": "红袋",
+        "holder": "阿禾",
+        "contact": "双手托住，递出者已经松手",
+        "position": "人物胸腹前",
+        "orientation": "袋体竖直",
+        "state": "袋口扎紧",
+        "opening_direction": "朝世界上方",
+        "base_direction": "朝世界下方",
+        "knot_position": "袋体顶部的袋口处",
+        "screen_position": "画面下半部",
+        "visibility": "visible"
+      }
+    ],
+    "action": "阿禾保持托袋，阿青转头回望",
+    "expected_end": {
+      "characters": [
+        {
+          "name": "阿青",
+          "appearance": "短发蓝衫",
+          "position": "案板内侧一步",
+          "body_facing": "侧向镜头",
+          "gaze": "回望街道",
+          "pose": "跪地侧身托袋，毛巾在案板",
+          "expression": "专注",
+          "screen_position": "画面左侧",
+          "visibility": "visible"
+        },
+        {
+          "name": "阿禾",
+          "appearance": "白衫长发",
+          "position": "案板外侧一步",
+          "body_facing": "面向阿青",
+          "gaze": "看红袋",
+          "pose": "双手准备接袋",
+          "expression": "期待",
+          "screen_position": "画面右侧",
+          "visibility": "visible"
+        }
+      ],
+      "props": [
+        {
+          "name": "红袋",
+          "holder": "阿禾",
+          "contact": "双手托住，递出者已经松手",
+          "position": "人物胸腹前",
+          "orientation": "袋体竖直",
+          "state": "袋口扎紧",
+          "opening_direction": "朝世界上方",
+          "base_direction": "朝世界下方",
+          "knot_position": "袋体顶部的袋口处",
+          "screen_position": "画面下半部",
+          "visibility": "visible"
+        }
+      ]
+    }
+  }
+}

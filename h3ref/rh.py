@@ -7,9 +7,11 @@ RH coins (0.2 a second on the standard machine), an enterprise key pays its wall
 resumes the task instead of paying twice.
 """
 import json
+import time
 from pathlib import Path
 
 from . import config, http
+from .i18n import message
 
 # nodes of the workflow we fill in, and their types (checked when the graph is loaded)
 PROMPT, LENGTH, SIZE, STEPS, SEED = "250", "205", "230", "124", "129"
@@ -21,13 +23,27 @@ RUN_SECONDS_PER_OUTPUT_SECOND = 22     # measured 198–330 s for 10–15 s clip
 COINS_PER_RUN_SECOND = 0.2             # member key, standard machine
 
 
-class QueueFull(RuntimeError):
-    """The key runs as many tasks as it may (421 on a member key, 605 when a wallet runs short); nothing was billed."""
+class SubmissionRejected(RuntimeError):
+    """The server explicitly confirmed it did not accept a task."""
+
+
+class QueueFull(SubmissionRejected):
+    """Submission was rejected because queue (421) or machine (415) capacity is full; safe to retry."""
+
+    def __init__(self, reason: str, *, code: int = 421):
+        super().__init__(reason)
+        self.code = code
+
+
+NON_RETRYABLE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
+TERMINAL_POLL_CODES = {401, 403, 404, 807}
 
 
 def _post(path: str, body: dict, timeout: float = 60) -> dict:
     key = config.rh_key()
     out = http.request(config.RH_BASE + path, key, {"apiKey": key, **body}, timeout=timeout, tries=1 if path.endswith("/create") else 3)
+    if not isinstance(out, dict):
+        raise RuntimeError("RunningHub returned non-object response: " + json.dumps(out, ensure_ascii=False).replace(key, "[key]")[:200])
     if isinstance(out.get("data"), dict):        # connection urls carry temporary credentials
         out["data"].pop("netWssUrl", None)
         out["data"].pop("clientId", None)
@@ -79,31 +95,83 @@ def estimate_cny(seconds: float) -> float:
 
 
 def submit(g: dict) -> str:
-    out = _post("/task/openapi/create", {"workflowId": config.RH_WORKFLOW_ID, "workflow": json.dumps(g, ensure_ascii=False), "addMetadata": False})
-    task = (out.get("data") or {}).get("taskId")
-    if out.get("code") in (421, 605, 415) or any(w in str(out.get("msg") or "") for w in ("QUEUE_MAXED", "NOT_ENOUGH_BALANCE")):
-        raise QueueFull(json.dumps(out, ensure_ascii=False)[:200])
+    try:
+        out = _post("/task/openapi/create", {"workflowId": config.RH_WORKFLOW_ID, "workflow": json.dumps(g, ensure_ascii=False), "addMetadata": False})
+    except http.HTTPResponseError as exc:
+        if exc.status_code in NON_RETRYABLE_STATUSES:
+            raise SubmissionRejected(message("submission_rejected", reason=str(exc))) from exc
+        raise
+    if out.get("code") in (421, 415) or "QUEUE_MAXED" in str(out.get("msg") or ""):
+        code = 421 if out.get("code") == 421 or "QUEUE_MAXED" in str(out.get("msg") or "") else 415
+        raise QueueFull(json.dumps(out, ensure_ascii=False)[:200], code=code)
+    data = out.get("data")
+    task = data.get("taskId") if isinstance(data, dict) else None
     if out.get("code") != 0 or not task:
-        raise RuntimeError("RunningHub 没有接下任务：" + json.dumps(out, ensure_ascii=False)[:300])
+        rejected = bool((isinstance(out.get("code"), int) and out["code"] != 0)
+                        or out.get("_http_status") in NON_RETRYABLE_STATUSES or out.get("error"))
+        error = SubmissionRejected if rejected else RuntimeError
+        raise error(message("submission_rejected", reason=json.dumps(out, ensure_ascii=False)[:300]))
     return str(task)
+
+
+def submit_with_retry(g: dict, log, *, record_submission=None) -> str:
+    """Retry only explicit capacity rejections; never retry an ambiguous network failure."""
+    rejections = {421: 0, 415: 0}
+    while True:
+        if record_submission:
+            record_submission(True)
+        try:
+            return submit(g)
+        except QueueFull as exc:
+            if record_submission:
+                record_submission(False)
+            rejections[exc.code] += 1
+            attempt = rejections[exc.code]
+            limit = 31 if exc.code == 421 else 5
+            if attempt == limit:
+                detail = message("submission_exhausted", attempt=attempt, limit=limit, reason=exc)
+                log(detail)
+                raise SubmissionRejected(detail) from exc
+            log(message("submission_retry", attempt=attempt, limit=limit, seconds=60, reason=exc))
+            time.sleep(60)
+        except RuntimeError as exc:
+            if isinstance(exc, SubmissionRejected) and record_submission:
+                record_submission(False)
+            log(message("submission_failed", reason=exc))
+            raise
 
 
 def poll(task: str) -> dict:
     """{state: running|done|failed, url, cny, coins, run_seconds, error}"""
     out = _post("/task/openapi/outputs", {"taskId": task})
+    http_status = out.get("_http_status")
+    if isinstance(http_status, int) and http_status >= 400:
+        raise RuntimeError(f"RunningHub poll HTTP {http_status}: {json.dumps(out, ensure_ascii=False)[:260]}")
     code = out.get("code")
     if code in (804, 813):          # running / queued
         return {"state": "running", "queued": code == 813}
-    if code == 805:
-        reason = (out.get("data") or {}).get("failedReason") or out.get("msg")
+    msg_lower = str(out.get("msg") or "").lower()
+    if code in (401, 403) or any(tok in msg_lower for tok in ("apikey", "api_key", "unauthorized", "forbidden")):
+        raise RuntimeError(f"RunningHub poll auth error ({code}): {out.get('msg', '')}"[:300])
+    if code == 805 or code in TERMINAL_POLL_CODES:
+        reason = (out.get("data") or {}).get("failedReason") if isinstance(out.get("data"), dict) else None
+        reason = reason or out.get("msg") or f"code {code}"
         if isinstance(reason, dict):
             reason = f"{reason.get('node_name', '')} {reason.get('exception_type', '')}: {str(reason.get('exception_message', ''))[:200]}"
         return {"state": "failed", "error": str(reason)[:300]}
+    if any(tok in msg_lower for tok in ("not exist", "cancelled", "canceled")):
+        return {"state": "failed", "error": f"{code} {out.get('msg', '')}"[:300]}
+    if code == 0 and not out.get("data"):
+        return {"state": "failed", "error": "completed without output media"}
     if code != 0 or not out.get("data"):
         return {"state": "running", "note": f"{code} {out.get('msg', '')}"[:60]}
     items = out["data"]
-    item = next((d for d in items if str(d.get("fileType", "")).lower() in ("mp4", "mov", "webm")), items[0])
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return {"state": "failed", "error": "completed with invalid output list"}
+    item = next((d for d in items if isinstance(d, dict) and str(d.get("fileType", "")).lower() in ("mp4", "mov", "webm")), items[0])
+    if not item.get("fileUrl"):
+        return {"state": "failed", "error": "completed without output fileUrl"}
     coins = float(item.get("consumeCoins") or 0)
     money = float(item.get("consumeMoney") or 0)
-    return {"state": "done", "url": item.get("fileUrl"), "cny": round(money + coins * config.RH_COIN_CNY, 4), "coins": coins,
+    return {"state": "done", "url": item["fileUrl"], "cny": round(money + coins * config.RH_COIN_CNY, 4), "coins": coins,
             "money": money, "run_seconds": float(item.get("taskCostTime") or 0)}

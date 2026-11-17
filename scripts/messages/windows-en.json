@@ -1,0 +1,19 @@
+{
+  "banner": "H3 local workbench · Windows setup and start",
+  "unsupported_system": "This package supports Windows 10/11 on Intel/AMD 64-bit computers only. Current architecture: {0}.",
+  "install_busy": "Another launcher is preparing the environment. Wait for it to finish, then try again.",
+  "downloading": "Downloading {0} {1}. Initial setup requires internet access...",
+  "cache_invalid": "The cached download failed verification and will be downloaded again: {0}",
+  "checksum_failed": "Download verification failed: {0}. Expected SHA256={1}, actual={2}; the file was not used.",
+  "extracting": "Extracting {0} {1}...",
+  "runtime_incomplete": "A runtime file is missing: {0}. Run the launcher again.",
+  "runtime_reused": "Reusing installed {0} {1}.",
+  "creating_environment": "Creating this project's Python virtual environment...",
+  "installing_dependencies": "Installing Python dependencies for this project...",
+  "dependencies_reused": "Python dependencies are ready; no installation is needed.",
+  "command_failed": "Command failed with exit code {0}: {1}",
+  "starting": "Starting the local workbench and opening your browser. Keep this window open while using it; press Ctrl+C when finished.",
+  "log_location": "Setup and startup log: {0}",
+  "failed": "Startup failed: {0}",
+  "stopped": "The workbench has exited. Double-click start-windows.cmd to start it again."
+}

@@ -21,51 +21,64 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from h3ref import check, config, film, http, media, rewrite, rh  # noqa: E402
+from h3ref.i18n import message  # noqa: E402
 
 
 def cmd_one(a):
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     state_file = out / "state.json"
-    st = json.loads(state_file.read_text()) if state_file.exists() else {}
-    save = lambda: state_file.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    st = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+
+    def save():
+        tmp = state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+        config.atomic_replace(tmp, state_file)
+    clip = out / "clip.mp4"
+    if clip.exists() and st.get("cny") is not None:
+        return
+    if st.get("terminal_failed"):
+        raise RuntimeError(message("one_terminal_failed", path=state_file))
     images = [Path(p).expanduser().resolve() for p in a.image]
-    for p in images:
-        if not p.is_file():
-            raise SystemExit(f"找不到参考图：{p}")
-    text = Path(a.prompt).read_text(encoding="utf-8")
+    if not st.get("task") or not st.get("h3"):
+        for p in images:
+            if not p.is_file():
+                raise SystemExit(f"找不到参考图：{p}")
     t0 = time.time()
     if not st.get("h3"):
+        text = Path(a.prompt).read_text(encoding="utf-8")
         st["h3"] = text if rewrite.is_rewritten(text) else rewrite.rewrite(text, len(images), a.seconds, a.aspect)
         (out / "prompt.h3.txt").write_text(st["h3"], encoding="utf-8")
         save()
         print("改写好了：", out / "prompt.h3.txt")
     if not st.get("task"):
+        if st.get("submission_unknown"):
+            raise RuntimeError(message("submission_unknown", number=1, path=state_file))
         names = [rh.upload(p) for p in images]
-        st["seed"] = a.seed or random.randrange(10 ** 14, 10 ** 15)
+        st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
         g = rh.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
-        while True:
-            try:
-                st["task"] = rh.submit(g)
-                break
-            except rh.QueueFull:
-                print("RunningHub 队列满，一分钟后再交", flush=True)
-                time.sleep(60)
+        def record_submission(unknown):
+            st["submission_unknown"] = unknown
+            save()
+        st["task"] = rh.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
+                                           record_submission=record_submission)
+        st["submission_unknown"] = False
         save()
         print(f"已提交，预计 ¥{rh.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
-    while True:
+    for _ in range(360):
         res = rh.poll(st["task"])
         if res["state"] != "running":
             break
         time.sleep(20)
+    else:
+        raise RuntimeError(f"RunningHub 轮询超时：{st['task']}")
     if res["state"] == "failed":
-        st.pop("task")
+        st.update(terminal_failed=True, error=res.get("error"))
         save()
-        raise SystemExit(f"生成失败：{res.get('error')}（再跑一次会重新提交）")
-    clip = out / "clip.mp4"
+        raise RuntimeError(message("one_terminal_failed", path=state_file))
     http.download(res["url"], clip)
     st.update(cny=res["cny"], run_s=res.get("run_seconds"), wall_s=round(time.time() - t0))
-    if any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check:      # dialogue in Chinese/Japanese/Korean: look for burned subtitles
+    if config.SUBTITLE_CHECKS_ENABLED and (any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check):
         st["subtitles"] = check.subtitles(clip)
     save()
     print(f"成片 {clip}，{media.duration(clip):.1f} 秒，¥{res['cny']:.3f}，GPU {res.get('run_seconds')} 秒")
@@ -82,7 +95,7 @@ def main():
     o.add_argument("--seconds", type=int, default=12)
     o.add_argument("--aspect", default="9:16", choices=list(config.SIZES))
     o.add_argument("--seed", type=int)
-    o.add_argument("--check", action="store_true", help="生成后一定查一次烧字幕")
+    o.add_argument("--check", action="store_true", help=message("subtitle_check_help" if config.SUBTITLE_CHECKS_ENABLED else "subtitle_check_paused_help"))
     o.add_argument("--out", required=True, help="输出目录（断了再跑同一个目录会接着查结果）")
     f = sub.add_parser("film", help="一份分镜脚本出整条片")
     f.add_argument("job", type=Path)
@@ -103,7 +116,10 @@ def main():
             raise SystemExit("--seconds 只能是 5 到 15")
         cmd_one(a)
     elif a.cmd == "film":
-        film.run(a.job, a.film, a.frames, a.redo)
+        film.run(a.job, a.film, a.frames, a.redo, resume_frame_tasks=True)
+        failed = film.Job(a.job).state.get("frame_failures") or []
+        if failed:
+            raise SystemExit(message("frames_cli_incomplete", keys=", ".join(failed), path=a.job / "state.json"))
     elif a.cmd == "rewrite":
         print(rewrite.rewrite(Path(a.prompt).read_text(encoding="utf-8"), a.images, a.seconds, a.aspect))
     else:

@@ -8,15 +8,21 @@ Frame modes (--frames):
   first  one frame per segment for its first shot; later segments also get the previous segment's last frame
   none   no frames: characters and setting from words and pictures alone, segments chained on the last frame
 """
+import copy
+import errno
+import hashlib
 import json
 import math
+import os
 import random
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import check, config, frames, http, media, rewrite, rh
+from . import check, config, frames, http, media, rewrite, rh, staging
+from .i18n import message
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
 LANG = {"zh": "中文", "en": "英文", "ja": "日文", "ko": "韩文", "es": "西班牙文", "pt": "葡萄牙文"}
@@ -33,7 +39,7 @@ def _num(x) -> str:
 
 # ------------------------------------------------------------------ the storyboard
 
-def load(path: Path) -> dict:
+def load(path: Path, check_images: bool = True) -> dict:
     film = json.loads(path.read_text(encoding="utf-8"))
     base = path.parent
     if film.get("aspect", "9:16") not in config.SIZES:
@@ -42,7 +48,7 @@ def load(path: Path) -> dict:
     for c in film.get("cast") or []:
         p = Path(c["picture"]).expanduser()
         c["picture"] = str(p if p.is_absolute() else (base / p).resolve())
-        if not Path(c["picture"]).is_file():
+        if check_images and not Path(c["picture"]).is_file():
             raise SystemExit(f"找不到 {c['name']} 的参考图：{c['picture']}")
     if film.get("board"):
         p = Path(film["board"]).expanduser()
@@ -50,6 +56,9 @@ def load(path: Path) -> dict:
     shots = [s for s in film.get("shots") or [] if (s.get("action") or "").strip()]
     if not shots:
         raise SystemExit("film.json 里没有镜头（shots）")
+    limit_shots = config.max_shots()
+    if len(shots) > limit_shots:
+        raise SystemExit(f"镜头数不能超过 {limit_shots}（当前 {len(shots)}）")
     t = 0.0
     for s in shots:                                    # times made continuous; a shot without times lasts 2 s
         length = float(s["end"]) - float(s["start"]) if s.get("start") is not None and s.get("end") is not None else 2.0
@@ -77,6 +86,9 @@ def plan(shots: list[dict], max_len: int = config.MAX_SECONDS) -> list[dict]:
         a, b = float(group[0]["start"]), float(group[-1]["end"])
         out.append({"idx": i, "start": a, "end": b, "shots": group,
                     "seconds": max(config.MIN_SECONDS, min(max_len, int(math.ceil(b - a - 0.25))))})
+    limit_segs = config.max_segments()
+    if len(out) > limit_segs:
+        raise SystemExit(f"分段数不能超过 {limit_segs}（当前 {len(out)}）")
     return out
 
 
@@ -112,8 +124,11 @@ def refs(film: dict, seg: dict, mode: str) -> list[dict]:
     return out
 
 
-def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int) -> str:
+def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compositions: dict[str, dict] | None = None) -> str:
     """The segment's prompt in Chinese, written the way you would for Seedance; rewrite.py turns it into H3's format."""
+    compositions = {key: value for key, value in (compositions or {}).items()
+                    if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
+    covered = {c['name'] for comp in compositions.values() for c in comp['characters']}
     aspect = film["aspect"]
     head = (f"根据下面文字分镜生成一段{seg['seconds']}秒{ORIENT[aspect]}视频，{aspect}。"
             + (f"这是一条连续短片的第{seg['idx'] + 1}段。" if count > 1 else "")
@@ -125,7 +140,7 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int) -> str:
         if p["kind"] == "board":
             lines.append(f"参考图片{k}是本片的角色、道具和场景参考总表，只用来统一外观，不要把总表、白底、文字标注画进画面。")
         elif p["kind"] == "cast":
-            look = (p["cast"].get("look") or "").strip().rstrip("。")
+            look = "" if p["cast"]["name"] in covered else (p["cast"].get("look") or "").strip().rstrip("。")
             lines.append(f"参考图片{k}只约束{p['cast']['name']}身份" + (f"：{look}。" if look else "。"))
         elif p["kind"] == "frame":
             s = seg["shots"][p["shot"]]
@@ -140,14 +155,17 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int) -> str:
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
     out = [head, "".join(lines)]
-    if (film.get("setting") or "").strip():
+    if not compositions and (film.get("setting") or "").strip():
         out.append("场景与关键道具（全片统一）：" + film["setting"].strip())
     speech = film.get("speech") or ""
     shot_lines = []
-    for s in seg["shots"]:
+    for j, s in enumerate(seg["shots"]):
+        composition = compositions.get(_frame_key(seg["idx"], j))
         cam = (s.get("camera") or "").strip().strip("【】")
         text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
-            + (s.get("action") or "").strip().rstrip("。") + "。"
+            + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
+        if compositions and not composition and (film.get("setting") or "").strip():
+            text += "场景参考：" + film["setting"].strip()
         if speech and (s.get("line") or "").strip():
             text += "台词：" + s["line"].strip()
         shot_lines.append(text)
@@ -167,14 +185,14 @@ class Job:
         self.dir = path.resolve()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.file = self.dir / "state.json"
-        self.state = json.loads(self.file.read_text()) if self.file.exists() else {"frames": {}, "segs": {}}
+        self.state = json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists() else {"frames": {}, "segs": {}}
         self.lock = threading.RLock()
 
     def save(self):
         with self.lock:
             tmp = self.file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1))
-            tmp.replace(self.file)
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1), encoding="utf-8")
+            config.atomic_replace(tmp, self.file, sleep=time.sleep)
 
     def put(self, kind: str, key: str, **rec):
         with self.lock:
@@ -192,104 +210,258 @@ def _frame_key(i: int, j: int) -> str:
     return f"s{i + 1}-{j + 1}"
 
 
-def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict):
-    """Draw every frame the plan needs; the film's first frame first, then the rest with it as the anchor."""
-    (job.dir / "frames").mkdir(exist_ok=True)
-    wanted = [(i, p["shot"]) for i, seg in enumerate(segs) for p in pics[i] if p["kind"] == "frame"]
-    if not wanted:
-        return
+def frame_reference_paths(film: dict, shot: dict, record: dict) -> list[str]:
+    characters = record.get("character_reference_paths", [c["picture"] for c in film.get("cast") or [] if in_shots(c, [shot])])
+    return ([film["board"]] if film.get("board") else []) + characters
 
-    def one(ij, anchor):
-        i, j = ij
-        key = _frame_key(i, j)
-        out = job.dir / "frames" / f"{key}.png"
-        rec = job.state["frames"].get(key) or {}
-        if out.exists():
-            return
-        shot = segs[i]["shots"][j]
-        who = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
-        refs = ([film["board"]] if film.get("board") else []) + [c["picture"] for c in who] + ([anchor] if anchor else [])
-        text = frames.prompt(film, shot, who, bool(film.get("board")), bool(anchor))
-        for attempt in range(2):
+
+def reference_version(paths, *, metadata=None) -> str:
+    sources = []
+    metadata = {} if metadata is None else metadata
+    for source in paths:
+        key = str(source)
+        if key not in metadata:
+            path = Path(source)
             try:
-                cny = frames.draw(text, refs, film["aspect"], out, record=lambda **k: job.put("frames", key, prompt=text, **k),
-                                  task=rec.get("task") if attempt == 0 else None)
-                job.put("frames", key, file=str(out), cny=cny)
-                job.log("frame", key, f"¥{cny:.3f}")
-                return
-            except RuntimeError as exc:
-                job.log("frame failed", key, exc)
-        raise SystemExit(f"分镜图 {key} 画了两次都没成")
+                st = path.stat()
+            except OSError:
+                st = None
+            regular = st if st is not None and stat.S_ISREG(st.st_mode) else None
+            metadata[key] = (str(path.resolve()), (regular.st_mtime_ns, regular.st_size) if regular else None)
+        sources.append(metadata[key])
+    return hashlib.sha256(json.dumps(sources, ensure_ascii=False).encode()).hexdigest()
 
-    first = wanted[0]
-    one(first, None)
-    anchor = str(job.dir / "frames" / f"{_frame_key(*first)}.png")
+
+def frame_reference_versions(film: dict, segs: list[dict], records: dict) -> dict[str, str]:
+    metadata = {}
+    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {})), metadata=metadata)
+            for s in segs for j, shot in enumerate(s['shots'])}
+
+
+def saved_compositions(records: dict, *, reference_versions: dict[str, str]) -> dict[str, dict]:
+    return {key: rec['composition'] for key, rec in records.items()
+            if isinstance(rec.get('composition'), dict) and rec['composition'].get('version') == 2
+            and isinstance(rec.get('prompt'), str) and rec['prompt'].strip()
+            and rec.get('composition_prompt') == rec['prompt']
+            and rec.get('composition_reference_version')
+            and rec['composition_reference_version'] == reference_versions.get(key)}
+
+
+def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False):
+    """Plan in shot order, save before dispatch, and collect every independent drawing."""
+    (job.dir / "frames").mkdir(exist_ok=True)
+    wanted = [(i, p['shot']) for i, seg in enumerate(segs) for p in pics[i] if p['kind'] == 'frame']
+    versions = frame_reference_versions(film, segs, job.state['frames'])
+    effective = saved_compositions(job.state['frames'], reference_versions=versions)
+    known_scenes, previous, previous_key = {}, None, None
+
+    def failure(key, exc):
+        reason = f"{type(exc).__name__}: {exc}"
+        job.put('frames', key, error=reason, moderation_error=exc.reason if isinstance(exc, frames.ContentPolicyError) else None)
+        job.log('frame failed', key, reason)
+
+    def draw(key, text, references, task):
+        out = job.dir / 'frames' / f'{key}.png'
+        try:
+            cny = frames.draw(text, references, film['aspect'], out, record=lambda **k: job.put('frames', key, **k), task=task)
+            if not out.is_file():
+                raise RuntimeError(message('frame_output_missing', path=out))
+            job.put('frames', key, file=str(out), cny=cny, error=None, moderation_error=None)
+            job.log('frame', key, f'¥{cny:.3f}')
+        except Exception as exc:
+            failure(key, exc)
+
+    futures = []
     with ThreadPoolExecutor(4) as pool:
-        list(pool.map(lambda ij: one(ij, anchor), wanted[1:]))
+        for i, segment in enumerate(segs):
+            for j, shot in enumerate(segment['shots']):
+                key = _frame_key(i, j)
+                rec = job.state['frames'].get(key) or {}
+                composition = effective.get(key)
+                out = job.dir / 'frames' / f'{key}.png'
+                skip = ((i, j) not in wanted or (out.exists() and not frames.task_pending(rec))
+                        or ((rec.get('error') or rec.get('moderation_error')) and not (resume_tasks and frames.task_pending(rec))))
+                if not skip:
+                    who = [c for c in film.get('cast') or [] if in_shots(c, [shot])]
+                    references = frame_reference_paths(film, shot, rec)
+                    try:
+                        if rec.get('submission_unknown') and not rec.get('task'):
+                            raise RuntimeError(message('frame_submission_unknown', path=job.file))
+                        if rec.get('task'):
+                            text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
+                            references = rec.get('reference_paths', references)
+                        elif rec.get('prompt') or rec.get('composition'):
+                            text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
+                            job.log('staging cache', key, 'source', previous_key)
+                        else:
+                            job.log('staging plan', key, 'source', previous_key)
+                            planned = frames.describe_composition(film, shot, previous_composition=copy.deepcopy(previous), known_scenes=copy.deepcopy(known_scenes))
+                            composition = staging.validate_composition(planned, film, shot, known_scenes)
+                            text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
+                            job.put('frames', key, composition=composition, prompt=text, composition_prompt=text,
+                                    composition_reference_version=versions[key], reference_paths=references)
+                        futures.append(pool.submit(draw, key, text, references, rec.get('task')))
+                    except Exception as exc:
+                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 402, 403, 429) and not rec.get('task') and not rec.get('submission_unknown'):
+                            for future in futures:
+                                future.result()
+                            raise
+                        try:
+                            model_name = config.llm_settings()['composition_model']
+                        except ValueError:
+                            model_name = 'invalid-provider'
+                        is_policy = isinstance(exc, frames.ContentPolicyError)
+                        contextual = (exc if is_policy or rec.get('task') or rec.get('submission_unknown')
+                                      else RuntimeError(message('staging_plan_failed', frame_key=key, model=model_name,
+                                                                path=job.file, detail=str(exc))))
+                        extra = {} if rec.get('prompt') else {'prompt': frames.prompt(film, shot, who, bool(film.get('board')))}
+                        if is_policy:
+                            job.put('frames', key, **extra, error=str(contextual), moderation_error=exc.reason)
+                        else:
+                            job.put('frames', key, **extra, error=f"{type(contextual).__name__}: {contextual}")
+                        job.log('frame failed', key, f"{type(contextual).__name__}: {contextual}")
+                        composition = None
+                if composition:
+                    known_scenes[composition['scene_id']] = {k: copy.deepcopy(composition[k]) for k in ('world_frame','fixed_objects')}
+                    previous, previous_key = composition, key
+        for future in futures:
+            future.result()
+    failures = [_frame_key(i, j) for i, j in wanted
+                if job.state['frames'].get(_frame_key(i,j), {}).get('error')
+                or job.state['frames'].get(_frame_key(i,j), {}).get('moderation_error')
+                or not (job.dir / 'frames' / f'{_frame_key(i,j)}.png').is_file()]
+    job.state['frame_failures'] = failures
+    job.save()
+    return failures
+
+
+def segment_prompt_text(record: dict, automatic: str) -> str:
+    override = record.get('prompt_override') or {}
+    return override.get('text', automatic) if override.get('format') == 'source' else automatic
+
+
+def frozen_segment(record: dict) -> bool:
+    return bool(record.get('task') or record.get('submission_unknown') or record.get('terminal_failed')
+                or record.get('attempt_blocked')
+                or (record.get('file') and record.get('cny') is not None))
 
 
 def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
-    (job.dir / "prompts").mkdir(exist_ok=True)
+    (job.dir / 'prompts').mkdir(exist_ok=True)
+    compositions = saved_compositions(job.state['frames'], reference_versions=frame_reference_versions(film, segs, job.state['frames']))
 
     def one(seg):
-        i = seg["idx"]
-        zh = compile_prompt(film, seg, pics[i], len(segs))
-        (job.dir / "prompts" / f"seg{i + 1}.zh.txt").write_text(zh, encoding="utf-8")
-        rec = job.state["segs"].get(str(i)) or {}
-        if rec.get("h3") and rec.get("zh") == zh:
+        i = seg['idx']
+        rec = job.state['segs'].get(str(i)) or {}
+        if frozen_segment(rec):
             return
-        h3 = rewrite.rewrite(zh, len(pics[i]), seg["seconds"], film["aspect"])
-        (job.dir / "prompts" / f"seg{i + 1}.h3.txt").write_text(h3, encoding="utf-8")
-        job.put("segs", str(i), zh=zh, h3=h3)
-        job.log("prompt", f"seg{i + 1}", f"{len(pics[i])} pictures")
-    with ThreadPoolExecutor(3) as pool:
-        list(pool.map(one, segs))
+        if (rec.get('prompt_override') or {}).get('format') == 'h3':
+            issues = rewrite.problems(rec.get('h3') or '', len(pics[i]))
+            if issues:
+                detail = '; '.join(issues)
+                job.put('segs', str(i), error=f"RewriteError: {detail}")
+                raise rewrite.RewriteError(detail)
+            return
+        zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
+        paths = _picture_paths(job, seg, pics[i])
+        reference = reference_version(paths) if all(path.is_file() for path in paths) else None
+        if (rec.get('h3') and rec.get('zh') == zh and rec.get('h3_source', rec.get('zh')) == zh
+                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)):
+            return
+        try:
+            h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
+        except Exception as exc:
+            (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+            job.put('segs', str(i), zh=zh, h3=None, h3_source=None, error=f"{type(exc).__name__}: {exc}")
+            raise
+        (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+        (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(h3, encoding='utf-8')
+        job.put('segs', str(i), zh=zh, h3=h3, h3_source=zh, h3_reference_version=reference, error=None)
+        job.log('prompt', f'seg{i + 1}', f'{len(pics[i])} pictures')
+    abort = threading.Event()
+    def run_one(seg):
+        if abort.is_set():
+            return
+        try:
+            one(seg)
+        except BaseException:
+            abort.set()
+            raise
+    pool = ThreadPoolExecutor(3)
+    try:
+        futures = [pool.submit(run_one, seg) for seg in segs]
+        for future in futures:
+            future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
-def _picture_paths(job: Job, seg: dict, pics: list[dict]) -> list[Path]:
+def picture_paths(output_dir: Path, seg: dict, pics: list[dict]) -> list[Path]:
     out = []
     for p in pics:
         if p["kind"] in ("board", "cast"):
             out.append(Path(p["path"]))
         elif p["kind"] == "frame":
-            out.append(job.dir / "frames" / f"{_frame_key(seg['idx'], p['shot'])}.png")
+            out.append(output_dir / "frames" / f"{_frame_key(seg['idx'], p['shot'])}.png")
         else:
-            out.append(job.dir / "clips" / f"seg{seg['idx']}-last.jpg")
+            out.append(output_dir / "clips" / f"seg{seg['idx']}-last.jpg")
     return out
 
 
-def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict]) -> dict:
+def _picture_paths(job: Job, seg: dict, pics: list[dict]) -> list[Path]:
+    return picture_paths(job.dir, seg, pics)
+
+
+def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None) -> dict:
+    try:
+        return _generate_segment(job, film, seg, pics, reference_paths=reference_paths)
+    except (Exception, SystemExit) as exc:
+        rec = job.state['segs'].get(str(seg['idx']), {})
+        if not rec.get('terminal_failed'):
+            job.put('segs', str(seg['idx']), error=message('segment_generation_failed', number=seg['idx'] + 1,
+                    phase=rec.get('phase', 'prepare'), error_type=type(exc).__name__), error_code='SEGMENT_GENERATION_FAILED')
+        raise
+
+
+def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
     rec = job.state["segs"].get(str(i)) or {}
     if out.exists() and rec.get("cny") is not None:
         return rec
+    if rec.get("terminal_failed"):
+        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
     if not rec.get("task"):
-        paths = _picture_paths(job, seg, pics)
+        if rec.get("submission_unknown"):
+            raise RuntimeError(message("submission_unknown", number=i + 1, path=str(job.file)))
+        paths = _picture_paths(job, seg, pics) if reference_paths is None else reference_paths
         missing = [str(p) for p in paths if not p.exists()]
         if missing:
             raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
+        job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
         names = [rh.upload(p) for p in paths]
-        seed = int(rec.get("seed") or random.randrange(10 ** 14, 10 ** 15))
+        seed = int(rec["seed"] if rec.get("seed") is not None else random.randrange(10 ** 14, 10 ** 15))
         g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
-        while True:
-            try:
-                task = rh.submit(g)
-                break
-            except rh.QueueFull:
-                time.sleep(60)
-        job.put("segs", str(i), task=task, seed=seed, submitted=time.time())
+        job.put("segs", str(i), phase="submit")
+        task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail),
+                                    record_submission=lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed))
+        job.put("segs", str(i), task=task, seed=seed, submitted=time.time(), submission_unknown=False)
         job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
         rec = job.state["segs"][str(i)]
-    while True:
+    job.put("segs", str(i), phase="poll")
+    for _ in range(360):
         st = rh.poll(rec["task"])
         if st["state"] != "running":
             break
         time.sleep(20)
+    else:
+        raise RuntimeError(f"RunningHub poll timed out for seg{i + 1} task {rec['task']}")
     if st["state"] == "failed":
-        job.put("segs", str(i), task=None, error=st.get("error"))
-        raise RuntimeError(f"第 {i + 1} 段生成失败：{st.get('error')}（再跑一次 run 会重新提交）")
+        job.put("segs", str(i), terminal_failed=True, error=st.get("error"))
+        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
+    job.put("segs", str(i), phase="download")
     http.download(st["url"], out)
+    job.put("segs", str(i), phase="tail")
     media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
     job.put("segs", str(i), file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
             wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
@@ -297,30 +469,126 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict]) -> dict:
     return job.state["segs"][str(i)]
 
 
+def _has_inflight_task(job: Job, seg: dict) -> bool:
+    rec = job.state["segs"].get(str(seg["idx"])) or {}
+    clip = job.dir / "clips" / f"seg{seg['idx'] + 1}.mp4"
+    return bool(rec.get("task") and not rec.get("terminal_failed") and not (clip.exists() and rec.get("cny") is not None))
+
+
+def preexisting_segment_blocker(job: Job, segs: list[dict]) -> dict | None:
+    for seg in segs:
+        rec = job.state["segs"].get(str(seg["idx"])) or {}
+        clip = job.dir / "clips" / f"seg{seg['idx'] + 1}.mp4"
+        if clip.exists() and rec.get("cny") is not None:
+            continue
+        if rec.get("terminal_failed") or (rec.get("submission_unknown") and not rec.get("task")) or rec.get("attempt_blocked"):
+            return seg
+    return None
+
+
 def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str):
     (job.dir / "clips").mkdir(exist_ok=True)
     chained = any(p["kind"] == "prev" for ps in pics.values() for p in ps)
+    blocker = preexisting_segment_blocker(job, segs)
+    if blocker is not None:
+        inflight_segs = [s for s in segs if _has_inflight_task(job, s)]
+        first_error = None
+        if chained:
+            for s in inflight_segs:
+                try:
+                    gen_segment(job, film, s, pics[s["idx"]])
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        elif inflight_segs:
+            pool = ThreadPoolExecutor(max(1, config.RH_CONCURRENCY))
+            try:
+                futures = [pool.submit(gen_segment, job, film, s, pics[s["idx"]]) for s in inflight_segs]
+                for future in futures:
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+        if first_error is not None:
+            raise first_error
+        blocker_rec = job.state["segs"].get(str(blocker["idx"])) or {}
+        if blocker_rec.get("attempt_blocked") and not blocker_rec.get("terminal_failed"):
+            raise RuntimeError(blocker_rec.get("error") or message(
+                "segment_generation_failed", number=blocker["idx"] + 1, phase="prepare", error_type="RuntimeError"))
+        gen_segment(job, film, blocker, pics[blocker["idx"]])
+        return
     if chained:                                         # each segment starts from the one before
+        first_error = None
         for seg in segs:
-            gen_segment(job, film, seg, pics[seg["idx"]])
+            if first_error is not None and not _has_inflight_task(job, seg):
+                continue
+            try:
+                gen_segment(job, film, seg, pics[seg["idx"]])
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
     else:
-        with ThreadPoolExecutor(max(1, config.RH_CONCURRENCY)) as pool:
-            list(pool.map(lambda s: gen_segment(job, film, s, pics[s["idx"]]), segs))
+        inflight_segs = [s for s in segs if _has_inflight_task(job, s)]
+        other_segs = [s for s in segs if not _has_inflight_task(job, s)]
+        abort = threading.Event()
+        def run_other(seg):
+            if abort.is_set():
+                return
+            try:
+                gen_segment(job, film, seg, pics[seg["idx"]])
+            except BaseException:
+                abort.set()
+                raise
+        pool = ThreadPoolExecutor(max(1, config.RH_CONCURRENCY))
+        first_error = None
+        try:
+            inflight_futures = [pool.submit(gen_segment, job, film, s, pics[s["idx"]]) for s in inflight_segs]
+            other_futures = [pool.submit(run_other, s) for s in other_segs]
+            for future in inflight_futures:
+                try:
+                    future.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            for future in other_futures:
+                try:
+                    future.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    abort.set()
+                    for pending_future in other_futures:
+                        pending_future.cancel()
+            if first_error is not None:
+                raise first_error
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def stage_check(job: Job, film: dict, segs: list[dict]):
     """Burned-subtitle check on every segment with lines (and every segment when the film has any lines)."""
+    if not config.SUBTITLE_CHECKS_ENABLED:
+        return
     if not film.get("speech") or not any((s.get("line") or "").strip() for s in film["shots"]):
         return
+    total_segments = len(plan(film["shots"]))
     for seg in segs:
         rec = job.state["segs"].get(str(seg["idx"])) or {}
         if "subtitles" in rec or not rec.get("file"):
             continue
+        job.log("check", message("subtitle_check_start", number=seg["idx"] + 1, total=total_segments))
         try:
             res = check.subtitles(Path(rec["file"]))
         except Exception as exc:                        # a check that can't run is reported, not fatal
             res = {"checked": False, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
         job.put("segs", str(seg["idx"]), subtitles=res)
+        job.log("check", message("subtitle_check_failed", number=seg["idx"] + 1, error=res["error"]) if res.get("error")
+                else message("subtitle_check_done", number=seg["idx"] + 1))
         if res.get("burned_text"):
             job.log("SUBTITLES", f"seg{seg['idx'] + 1}", res.get("text"))
 
@@ -349,7 +617,103 @@ def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Pa
     return p
 
 
-def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None) -> Path:
+def _segment_task_unresolved(rec: dict) -> bool:
+    if rec.get("submission_unknown") and not rec.get("task"):
+        return True
+    if not rec.get("task") or rec.get("terminal_failed") or (rec.get("file") and rec.get("cny") is not None) or "subtitles" in rec:
+        return False
+    return bool(rec.get("submitted") or rec.get("phase") in ("submit", "poll", "download", "tail") or ("file" in rec and not rec.get("file")))
+
+
+def invalidated_segment_records(records: dict, mode: str, redo: list[int] | None) -> dict:
+    return {k: (dict(rec) if _segment_task_unresolved(rec) else
+                {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override") if key in rec})
+            for k, rec in records.items()
+            if any(int(k) == n - 1 or (mode != "shot" and int(k) > n - 1) for n in redo or [])}
+
+
+def unaffected_segment_blocker(job: Job, mode: str, redo: list[int] | None, *, planned_count: int | None = None) -> dict | None:
+    raw_inv = invalidated_segment_records(job.state["segs"], mode, redo)
+    actually_invalidated = {
+        k for k in raw_inv
+        if not _segment_task_unresolved(job.state["segs"].get(k, {}))
+    }
+    indices = (
+        range(planned_count)
+        if planned_count is not None
+        else [int(k) for k in sorted(job.state["segs"], key=int)]
+    )
+    unaffected = [{"idx": idx} for idx in indices if str(idx) not in actually_invalidated]
+    return preexisting_segment_blocker(job, unaffected)
+
+
+def invalidate_segments(job: Job, mode: str, redo: list[int] | None):
+    """The --redo invalidation rule, shared with the workbench's reviewed-frame continuation."""
+    for k, rec in invalidated_segment_records(job.state["segs"], mode, redo).items():
+        if _segment_task_unresolved(job.state["segs"].get(k, {})):
+            continue
+        job.state["segs"][k] = rec
+        (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
+        (job.dir / "clips" / f"seg{int(k) + 1}-last.jpg").unlink(missing_ok=True)
+    job.save()
+
+
+_IN_WORKBENCH_RUNNER = threading.local()
+
+
+def _workbench_activity_locked(job_dir: Path) -> Path | None:
+    in_wb = getattr(_IN_WORKBENCH_RUNNER, "active", False) or os.environ.get("H3_WORKBENCH_WORKER") == "1"
+    if not in_wb and os.name != "nt":
+        lock_path = job_dir / "inputs" / "worker.lock"
+        if lock_path.exists():
+            import fcntl
+            try:
+                with lock_path.open("a+b") as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return lock_path
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    return lock_path
+    pending_path = job_dir / "inputs" / "segment-edit.json"
+    if pending_path.exists():
+        try:
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return pending_path
+        if pending and not pending.get("applied"):
+            if pending.get("publishing") or pending.get("generated"):
+                return pending_path
+            revision = str(pending.get("revision") or "").strip()
+            number = pending.get("number")
+            if revision and isinstance(number, int) and number >= 1:
+                staged_file = job_dir / "inputs" / f"segment-{revision}" / "state.json"
+                if staged_file.is_file():
+                    try:
+                        staged = json.loads(staged_file.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        return pending_path
+                    staged_rec = (staged.get("segs") or {}).get(str(number - 1)) or {}
+                    if _segment_task_unresolved(staged_rec):
+                        return pending_path
+    frame_pending_path = job_dir / "inputs" / "frame-edit.json"
+    if frame_pending_path.exists():
+        try:
+            frame_pending = json.loads(frame_pending_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return frame_pending_path
+        if frame_pending and not frame_pending.get("applied"):
+            if (frame_pending.get("downloaded")
+                    or (frame_pending.get("submission_unknown") and not frame_pending.get("task"))
+                    or (frame_pending.get("task") and not frame_pending.get("task_failed") and not frame_pending.get("moderation_error"))):
+                return frame_pending_path
+    return None
+
+
+def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None,
+        *, resume_frame_tasks: bool = False) -> Path:
     job = Job(job_dir)
     if film_path:
         job.state["film_path"] = str(Path(film_path).resolve())
@@ -357,25 +721,31 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     if not job.state.get("film_path"):
         raise SystemExit("新任务要给 --film")
     mode = job.state.get("mode", mode)
+    locked_artifact = _workbench_activity_locked(job.dir)
+    if locked_artifact is not None:
+        raise RuntimeError(message("segment_publication_pending", path=locked_artifact))
     film = load(Path(job.state["film_path"]))
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}
-    for n in redo or []:                                # a new seed for these segments (and, chained, everything after)
-        for k in [k for k in job.state["segs"] if int(k) == n - 1 or (mode != "shot" and int(k) > n - 1)]:
-            rec = job.state["segs"][k]
-            job.state["segs"][k] = {"zh": rec.get("zh"), "h3": rec.get("h3")}
-            (job.dir / "clips" / f"seg{int(k) + 1}.mp4").unlink(missing_ok=True)
+    if redo and unaffected_segment_blocker(job, mode, redo, planned_count=len(segs)) is None:
+        invalidate_segments(job, mode, redo)
     job.state["t_start"] = time.time()
     job.save()
     job.log("plan", f"{len(segs)} segments", " / ".join(f"{s['seconds']}s·{len(s['shots'])} shots·{len(pics[s['idx']])} pictures" for s in segs))
     for s in segs:
         job.put("segs", str(s["idx"]), pics=[p["kind"] for p in pics[s["idx"]]])
-    stage_frames(job, film, segs, pics)
-    stage_prompts(job, film, segs, pics)
+    failures = stage_frames(job, film, segs, pics, resume_tasks=resume_frame_tasks)
+    if failures:
+        job.log("frames", message("frames_partial", count=len(failures)))
+        return job.dir
+    if preexisting_segment_blocker(job, segs) is None:
+        stage_prompts(job, film, segs, pics)
     stage_generate(job, film, segs, pics, mode)
-    stage_check(job, film, segs)
     final = job.dir / "film.mp4"
+    job.log("assemble", message("film_assembly_start", count=len(segs)))
     media.join([Path(job.state["segs"][str(s["idx"])]["file"]) for s in segs], final)
+    job.log("assembled", message("film_assembly_done", path=final))
+    stage_check(job, film, segs)
     rep = report(job, film, segs, mode, final)
     job.log("film", final, "report", rep)
     return final

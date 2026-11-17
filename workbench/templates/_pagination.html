@@ -1,0 +1,16 @@
+{% macro pagination(prefix, aria_key, label_id) -%}
+<nav id="{{ prefix }}-pagination" class="review-pagination" data-i18n-aria="{{ aria_key }}">
+  <div class="pagination-buttons">
+    <button id="{{ prefix }}-first" type="button" class="button secondary" data-i18n="firstPage"></button>
+    <button id="{{ prefix }}-previous" type="button" class="button secondary" data-i18n="previousPage"></button>
+    <span id="{{ label_id }}" class="hint" aria-live="polite"></span>
+    <button id="{{ prefix }}-next" type="button" class="button secondary" data-i18n="nextPage"></button>
+    <button id="{{ prefix }}-last" type="button" class="button secondary" data-i18n="lastPage"></button>
+  </div>
+  <form id="{{ prefix }}-jump-form" class="page-jump" novalidate>
+    <label for="{{ prefix }}-input" data-i18n="pageNumberLabel"></label>
+    <input id="{{ prefix }}-input" type="number" inputmode="numeric" min="1" step="1" required>
+    <button id="{{ prefix }}-jump" type="submit" class="button secondary" data-i18n="jumpToPage"></button>
+  </form>
+</nav>
+{%- endmacro %}
