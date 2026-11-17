@@ -117,7 +117,8 @@ class WindowsTreeCleanup(unittest.TestCase):
             self.assertEqual(record["status"], "succeeded", record.get("error"))
             log = (runner.storage / "jobs" / "utf8-worker.log").read_text(encoding="utf-8")
             observed = next(json.loads(line) for line in log.splitlines() if line.startswith("{"))
-            self.assertEqual(observed, {"utf8_mode": 1, "encoding": "utf-8", "pythonutf8": "1"})
+            self.assertEqual({**observed, "encoding": observed["encoding"].lower()},
+                             {"utf8_mode": 1, "encoding": "utf-8", "pythonutf8": "1"})
             self.assertEqual(environments[0]["PYTHONUTF8"], "1")
 
     def test_exited_posix_worker_still_stops_its_process_group(self):

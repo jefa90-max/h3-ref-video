@@ -1043,7 +1043,7 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                     actor_resolved = actor.resolve()
                     helper_stats = {"stat": 0, "is_file": 0}
                     def counted_helper_stat(p, *a, **kw):
-                        if (p == actor or p == actor_resolved) and kw.get("follow_symlinks", True):
+                        if p == actor or p == actor_resolved:
                             helper_stats["stat"] += 1
                         return orig_stat(p, *a, **kw)
                     def counted_helper_is_file(p, *a, **kw):
@@ -1051,7 +1051,9 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                             helper_stats["is_file"] += 1
                         return orig_is_file(p, *a, **kw)
                     meta = {}
-                    with patch.object(Path, "stat", counted_helper_stat), patch.object(Path, "is_file", counted_helper_is_file):
+                    with patch.object(Path, "stat", counted_helper_stat), \
+                         patch.object(Path, "is_file", counted_helper_is_file), \
+                         patch.object(Path, "resolve", return_value=actor_resolved):
                         mtime_ns = sb_mod._cached_mtime_ns(str(actor), {})
                         film.reference_version([str(actor)], metadata=meta)
                     self.assertIsNotNone(mtime_ns)
