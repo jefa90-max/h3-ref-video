@@ -66,10 +66,11 @@ function createFrameReferenceEditor(frame, changed) {
     const catalog = state.selectedJob?.character_references || [];
     const selected = new Set(frameCharacterReferences(frame).map((reference) => reference.path));
     const available = catalog.filter((reference) => !selected.has(reference.path));
+    const atLimit = references.length >= 9;
     const toggle = element("button", "button secondary frame-reference-action frame-character-toggle", t("addFrameCharacters"));
     toggle.type = "button";
-    toggle.dataset.enabled = String(Boolean(frame.references_editable && available.length));
-    toggle.setAttribute("aria-expanded", String(pickerOpen));
+    toggle.dataset.enabled = String(Boolean(frame.references_editable && available.length && !atLimit));
+    toggle.setAttribute("aria-expanded", String(pickerOpen && !atLimit));
     toggle.addEventListener("click", () => {
       if (toggle.disabled) return;
       pickerOpen = !pickerOpen;
@@ -79,13 +80,14 @@ function createFrameReferenceEditor(frame, changed) {
     section.append(toggle);
     if (!catalog.length) section.append(element("p", "hint", t("frameCharacterCatalogEmpty")));
     else if (!available.length) section.append(element("p", "hint", t("frameCharactersAllSelected")));
-    if (pickerOpen && available.length) {
+    else if (atLimit) section.append(element("p", "hint frame-reference-warning", t("frameReferencesAtLimit")));
+    if (pickerOpen && available.length && !atLimit) {
       const picker = element("div", "frame-character-picker");
       for (const reference of available) {
         const name = reference.name || t("frameReference_character");
         const option = element("button", "frame-character-option frame-reference-action");
         option.type = "button";
-        option.dataset.enabled = String(Boolean(frame.references_editable && reference.url));
+        option.dataset.enabled = String(Boolean(frame.references_editable && reference.url && !atLimit));
         option.setAttribute("aria-label", t("addNamedFrameCharacter", { name }));
         if (reference.url) {
           const preview = element("span", "frame-reference-preview");

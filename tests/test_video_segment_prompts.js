@@ -180,4 +180,55 @@ for (const language of ['zh-CN','en']) {
     h.job.segments[1].source_rewrite_required=false;h.job.segments[1].source_changed=true;h.context.renderJob(h.job);
     assert.equal(c.cost.textContent,h.state.messages.segmentVideoCost);
   });
+
+  test(`manual single-segment and batch H3 rewrite buttons convert without generating video and switch to h3 view (${language})`, async () => {
+    const h = harness(language);
+    h.job.can_rewrite_prompts = true;
+    h.job.missing_h3_count = 2;
+    h.context.initializeVideoSegments();
+    h.context.renderJob(h.job);
+
+    assert.equal(h.select('rewrite-missing-prompts').disabled, false);
+    assert.equal(h.select('rewrite-all-prompts').disabled, false);
+
+    // Batch missing rewrite posts scope: "missing"
+    await h.select('rewrite-missing-prompts').fire('click');
+    assert.equal(h.posted.at(-1).url, '/api/jobs/job-1/segments/rewrite');
+    assert.deepEqual(h.posted.at(-1).body, { scope: 'missing' });
+
+    // Restore idle state, edit segment 2 source prompt and click single-segment rewrite button
+    h.state.selectedJob.status = 'succeeded';
+    h.state.selectedJob.can_rewrite_prompts = true;
+    h.render();
+    const c = await h.edit('女王轻推婚书望向唐僧');
+    assert.ok(c.rewriteH3, 'single-segment rewrite button must exist');
+    assert.equal(c.rewriteH3.disabled, false);
+    await c.rewriteH3.fire('click');
+    assert.equal(h.posted.at(-1).url, '/api/jobs/job-1/segments/2/rewrite');
+    assert.deepEqual(h.posted.at(-1).body, {
+      prompt: '女王轻推婚书望向唐僧',
+      prompt_format: 'source',
+      prompt_version: 'prompt-v2',
+    });
+
+    // Simulate worker completion with newly rewritten H3 prompt -> editor auto-switches to h3 view!
+    const seg2 = h.state.selectedJob.segments[1];
+    h.state.selectedJob.status = 'succeeded';
+    Object.assign(seg2, {
+      editable: true,
+      can_rewrite: true,
+      can_regenerate: true,
+      task_pending: false,
+      prompt_version: 'prompt-v-rewritten',
+      prompt: '女王轻推婚书望向唐僧',
+      source_prompt: '女王轻推婚书望向唐僧',
+      h3_prompt: 'subject_definitions:\n<Subject 1> Queen from <Picture 1>.\n\nsummary:\nHall.',
+      source_rewrite_required: false,
+      applied_revision: 'revision-rw-1',
+    });
+    h.render();
+    assert.equal(c.format.value, 'h3');
+    assert.match(c.editor.value, /subject_definitions:/);
+    assert.equal(c.draftNote.hidden, true);
+  });
 }

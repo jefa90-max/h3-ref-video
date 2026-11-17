@@ -120,3 +120,20 @@ test("the picker explains an empty catalog or all-selected catalog and locks dur
   add.click();
   assert.equal(ui.state.frameReferenceDrafts.size, 0);
 });
+
+test("the picker disables adding a 10th reference image when the 9-image limit is reached", () => {
+  const ui = fixture();
+  const extraRoles = Array.from({ length: 8 }, (_, idx) => ({
+    kind: "character",
+    name: `Role ${idx + 1}`,
+    path: `/initial/r${idx + 1}.png`,
+    url: `/characters/${idx + 1}`,
+  }));
+  const ninthRole = { kind: "character", name: "Role 9", path: "/initial/r9.png", url: "/characters/9" };
+  ui.frame.references = [{ kind: "board", path: "/initial/board.png", url: "/board.png" }, ...extraRoles];
+  ui.state.selectedJob.character_references = [...extraRoles, ninthRole];
+  ui.render();
+  const toggle = ui.nodes().find((node) => node.className.includes("frame-character-toggle"));
+  assert.equal(toggle.disabled, true);
+  assert.ok(ui.nodes().some((node) => node.textContent === ui.messages.frameReferencesAtLimit));
+});

@@ -34,7 +34,7 @@ function renderResultTabs(job) {
     $("segments-panel").hidden = false;
     return;
   }
-  const videoOperation = ["pipeline", "segment", "assemble"].includes(job.operation);
+  const videoOperation = ["pipeline", "segment", "assemble", "rewrite_segment", "rewrite_prompts"].includes(job.operation);
   const operation = `${job.operation}:${job.operation_id || job.created_at}`;
   if (state.resultTab === null) {
     const hasVideo = (job.segments || []).some((segment) => segment.url);
@@ -66,18 +66,36 @@ function segmentDraftEntry(segment) {
 }
 
 function reconcileSegmentSubmissions(job) {
+  state.segmentRewrites ??= new Map();
   for (const segment of job.segments || []) {
     const submitted = state.segmentSubmissions.get(segment.number);
-    if (!submitted?.revision || segment.applied_revision !== submitted.revision) continue;
-    const active = submitted.prompt_format === "source" ? segment.source_prompt : segment.h3_prompt;
-    if (active !== submitted.prompt) continue;
-    const entry = state.segmentDrafts.get(segment.number);
-    if (entry?.drafts[submitted.prompt_format]?.text === submitted.prompt) {
-      delete entry.drafts[submitted.prompt_format];
-      const card = state.segmentCards.get(segment.number);
-      if (card?.editorFormat === submitted.prompt_format) card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+    if (submitted?.revision && segment.applied_revision === submitted.revision) {
+      const active = submitted.prompt_format === "source" ? segment.source_prompt : segment.h3_prompt;
+      if (active === submitted.prompt) {
+        const entry = state.segmentDrafts.get(segment.number);
+        if (entry?.drafts[submitted.prompt_format]?.text === submitted.prompt) {
+          delete entry.drafts[submitted.prompt_format];
+          const card = state.segmentCards.get(segment.number);
+          if (card?.editorFormat === submitted.prompt_format) card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+        }
+        state.segmentSubmissions.delete(segment.number);
+      }
     }
-    state.segmentSubmissions.delete(segment.number);
+    const rewritePending = state.segmentRewrites.get(segment.number);
+    if (rewritePending && job.status === "succeeded" && segment.h3_prompt && segment.source_prompt === rewritePending.prompt) {
+      const entry = segmentDraftEntry(segment);
+      if (entry.drafts.source?.text === rewritePending.prompt) {
+        delete entry.drafts.source;
+      }
+      delete entry.drafts.h3;
+      entry.selectedFormat = "h3";
+      const card = state.segmentCards.get(segment.number);
+      if (card) {
+        card.editorFormat = null;
+        card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+      }
+      state.segmentRewrites.delete(segment.number);
+    }
   }
 }
 
@@ -123,6 +141,14 @@ function refreshSegmentControls(card, job, syncText = false) {
       control.dataset.enabled = String(Boolean(segment.editable));
       control.disabled = (locked || !segment.editable) && !(control === card.editor && card.composing);
     }
+    const sourceDraft = state.segmentDrafts.get(segment.number)?.drafts.source;
+    const sourceText = format === "source" ? text : (sourceDraft?.text ?? (segment.source_prompt || segment.automatic_source_prompt || ""));
+    const sourceBaseline = (format === "source" ? draft : sourceDraft) || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+    const sourceConflict = sourceBaseline.basePromptVersion !== segment.prompt_version || sourceBaseline.baseClipVersion !== segment.version;
+    const canRewrite = Boolean((segment.can_rewrite ?? segment.editable) && !locked && sourceText.trim() && !sourceConflict);
+    card.rewriteH3.textContent = t(job.demo ? "segmentRewriteH3Demo" : "segmentRewriteH3Live");
+    card.rewriteH3.dataset.enabled = String(canRewrite);
+    card.rewriteH3.disabled = !canRewrite;
   }
 }
 
@@ -140,10 +166,13 @@ function expandSegmentEditor(card) {
   card.otherDraft = element("p", "hint");
   card.conflict = element("p", "hint segment-conflict"); card.conflict.id = `${prefix}-conflict`;
   card.rebase = element("button", "button secondary segment-rebase segment-control"); card.rebase.type = "button";
+  const editorActions = element("div", "segment-editor-actions");
+  card.rewriteH3 = element("button", "button secondary segment-rewrite-h3 segment-control"); card.rewriteH3.type = "button";
+  editorActions.append(card.rewriteH3);
   const active = element("details", "segment-active-prompts"); card.activeLabel = element("summary");
   card.activeSource = element("pre"); card.activeH3 = element("pre"); active.append(card.activeLabel, card.activeSource, card.activeH3);
   card.references = element("div", "segment-references hint");
-  card.details.append(card.formatLabel, card.format, card.promptLabel, card.editor, card.draftNote, card.otherDraft, card.conflict, card.rebase, active, card.references);
+  card.details.append(card.formatLabel, card.format, card.promptLabel, card.editor, card.draftNote, card.otherDraft, card.conflict, card.rebase, editorActions, active, card.references);
   card.editor.addEventListener("input", () => {
     const current = card.segment, format = segmentFormat(current), drafts = segmentDraftEntry(current).drafts;
     drafts[format] = { ...(drafts[format] || card.editorBaseline), text: card.editor.value };
@@ -163,6 +192,25 @@ function expandSegmentEditor(card) {
     const current = card.segment, format = segmentFormat(current);
     segmentDraftEntry(current).drafts[format] = { text: card.editor.value, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
     refreshSegmentControls(card, state.selectedJob);
+  });
+  card.rewriteH3.addEventListener("click", async () => {
+    if (card.rewriteH3.disabled) return;
+    state.segmentRewrites ??= new Map();
+    const current = card.segment, format = segmentFormat(current);
+    const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
+    const sourceText = format === "source"
+      ? (state.segmentDrafts.get(current.number)?.drafts.source?.text ?? segmentSavedText(current, "source"))
+      : (sourceDraft?.text ?? (current.source_prompt || current.automatic_source_prompt || ""));
+    const baseline = (format === "source" ? sourceDraft : sourceDraft) || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    const payload = { prompt: sourceText, prompt_format: "source", prompt_version: baseline.basePromptVersion };
+    state.segmentRewrites.set(current.number, { prompt: sourceText, revision: null });
+    const accepted = await runJobAction(`/api/jobs/${encodeURIComponent(state.selectedJob.id)}/segments/${current.number}/rewrite`, payload);
+    if (accepted) {
+      const updated = accepted.segments?.find(item => item.number === current.number);
+      const tracked = state.segmentRewrites.get(current.number);
+      if (tracked) tracked.revision = updated?.attempt_revision || updated?.applied_revision || null;
+      renderVideoSegments(accepted);
+    }
   });
   refreshSegmentControls(card, state.selectedJob, true);
 }
@@ -223,9 +271,10 @@ function createSegmentCard(segment) {
 
 function renderVideoSegments(job) {
   $("segments-section").hidden = job.kind !== "film";
+  state.segmentRewrites ??= new Map();
   if (state.segmentJobId !== job.id) {
     for (const card of state.segmentCards.values()) removeSegmentCard(card);
-    state.segmentCards.clear(); state.segmentDrafts.clear(); state.expandedSegments.clear(); state.segmentSubmissions.clear();
+    state.segmentCards.clear(); state.segmentDrafts.clear(); state.expandedSegments.clear(); state.segmentSubmissions.clear(); state.segmentRewrites.clear();
     state.segmentPage = 1; state.segmentJobId = job.id;
   }
   if (job.kind !== "film") return;
@@ -235,6 +284,13 @@ function renderVideoSegments(job) {
   $("segments-summary").textContent = t("segmentsSummary", { ready: segments.filter(s => s.url).length, total: segments.length });
   $("segments-page-label").textContent = t("segmentPageLabel", { page: state.segmentPage, pages, count: segments.length });
   renderPagination("segments", state.segmentPage, pages);
+  const canBatchRewrite = Boolean(job.can_rewrite_prompts && !state.submitting && !running(job));
+  const missingCount = Number(job.missing_h3_count || 0);
+  $("rewrite-missing-prompts").textContent = missingCount > 0 ? t("rewriteMissingPromptsCount", { count: missingCount }) : t("rewriteMissingPrompts");
+  $("rewrite-missing-prompts").disabled = !canBatchRewrite || missingCount <= 0;
+  $("rewrite-all-prompts").textContent = t("rewriteAllPrompts");
+  $("rewrite-all-prompts").disabled = !canBatchRewrite || !segments.length;
+  $("segments-rewrite-hint").textContent = t("segmentsRewriteHint");
   $("assembly-notice").hidden = !job.pending_video && !job.pending_assembly;
   $("assembly-notice").textContent = t(job.pending_video ? "segmentsNeedFrames" : "assemblyPending");
   $("assembly-hint").textContent = t(job.pending_video ? "segmentsNeedFrames" : job.assembly?.ready ? "assemblyHint" : "assemblyMissing");
@@ -297,5 +353,17 @@ function initializeVideoSegments() {
   $("assemble-job").addEventListener("click", async () => {
     const job = state.selectedJob;
     if (job?.can_assemble) await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/assemble`, { version: job.assembly.version });
+  });
+  $("rewrite-missing-prompts").addEventListener("click", async () => {
+    const job = state.selectedJob;
+    if (!$("rewrite-missing-prompts").disabled && job?.can_rewrite_prompts) {
+      await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/segments/rewrite`, { scope: "missing" });
+    }
+  });
+  $("rewrite-all-prompts").addEventListener("click", async () => {
+    const job = state.selectedJob;
+    if (!$("rewrite-all-prompts").disabled && job?.can_rewrite_prompts) {
+      await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/segments/rewrite`, { scope: "all" });
+    }
   });
 }

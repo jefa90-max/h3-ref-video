@@ -523,3 +523,111 @@ test("create.js validates job-form submission, retains matching cast bindings, a
   assert.deepEqual(filmPost.body.reference_bindings, { "cast:0": "alice.png", "cast:1": "charlie.png" });
 });
 
+test("create.js supports optimize_storyboard toggle and merging/splitting multi-character reference groups", async () => {
+  const { $, element } = makeDom();
+  const posted = [];
+  let uploadCounter = 0;
+  $("output-dir").value = "/tmp/out-root";
+  $("frames").value = "shot";
+
+  const context = vm.createContext({
+    state: { language: "en", config: { output_root: "/tmp/out-root", keys: {} }, jobs: [], ready: true },
+    $, element, renderPage: null,
+    FormData: class { append() {} },
+    window: { location: { assign() {} } },
+    document: { addEventListener() {}, querySelector: () => element("div"), querySelectorAll: () => [] },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => String(v[n] ?? "")),
+    running: () => false,
+    busy: () => false,
+    renderConfig() {},
+    showError(e) { throw e; },
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    loadLanguage: async () => {},
+    request: async (url) => {
+      if (url === "/api/uploads") {
+        uploadCounter += 1;
+        return { files: [{ id: `group-${uploadCounter}.png`, name: `g${uploadCounter}.png`, path: `/tmp/g${uploadCounter}.png`, url: `/u/g${uploadCounter}` }] };
+      }
+      return { config: { output_root: "/tmp/out-root", keys: {} }, jobs: [] };
+    },
+    post: async (url, body) => {
+      posted.push({ url, body: structuredClone(body) });
+      if (url === "/api/film/references") {
+        const cast = body.film.cast || [];
+        return {
+          film: body.film,
+          slots: cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: c.look || "", required: true })),
+        };
+      }
+      return { id: "job-grouped" };
+    },
+    setTimeout: () => 1,
+    clearTimeout() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "create.js"), "utf8"), context);
+  await new Promise((r) => setImmediate(r));
+
+  // Default optimize_storyboard is checked; switching frames to "none" disables it
+  assert.equal($("optimize-storyboard").checked, true);
+  $("frames").value = "none";
+  $("frames").events.change();
+  assert.equal($("optimize-storyboard").disabled, true);
+  $("frames").value = "shot";
+  $("frames").events.change();
+  assert.equal($("optimize-storyboard").disabled, false);
+  $("optimize-storyboard").checked = false;
+  $("optimize-storyboard").events.change();
+
+  // Load 3 characters, merge cast:0 and cast:2 into one group card, upload once for both
+  $("film-json").value = JSON.stringify({
+    cast: [{ name: "Queen", look: "gold crown" }, { name: "Monk", look: "red robe" }, { name: "Monkey", look: "golden armor" }],
+    shots: [{ action: "Queen and Monkey talk" }],
+  });
+  await context.refreshFilmReferences();
+
+  function allDescendants(node) {
+    return [node, ...(node.children || []).flatMap(allDescendants)];
+  }
+  let tree = allDescendants($("film-reference-list"));
+  const checkboxes = tree.filter((n) => n.className.includes("film-cast-select"));
+  assert.equal(checkboxes.length, 3);
+  checkboxes[0].checked = true;
+  checkboxes[0].events.change();
+  checkboxes[2].checked = true;
+  checkboxes[2].events.change();
+
+  tree = allDescendants($("film-reference-list"));
+  const mergeBtn = tree.find((n) => n.className.includes("merge-cast-button"));
+  assert.ok(mergeBtn && !mergeBtn.disabled);
+  mergeBtn.events.click();
+
+  // Now there is 1 grouped card ("Queen / Monkey") + 1 solo card ("Monk") = 2 upload inputs
+  tree = allDescendants($("film-reference-list"));
+  const uploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  assert.equal(uploads.length, 2);
+  uploads[0].files = [{ name: "queen-monkey.png" }];
+  await uploads[0].events.change();
+  uploads[1].files = [{ name: "monk.png" }];
+  await uploads[1].events.change();
+
+  await $("job-form").events.submit({ preventDefault() {} });
+  const jobPost = posted.filter((p) => p.url === "/api/jobs").at(-1);
+  assert.equal(jobPost.body.optimize_storyboard, false);
+  assert.deepEqual(jobPost.body.reference_bindings, {
+    "cast:0": "group-1.png",
+    "cast:2": "group-1.png",
+    "cast:1": "group-2.png",
+  });
+  assert.deepEqual(jobPost.body.reference_groups, [["cast:0", "cast:2"]]);
+
+  // Splitting the group restores 3 individual cards
+  tree = allDescendants($("film-reference-list"));
+  const splitBtn = tree.find((n) => n.className.includes("film-group-split"));
+  assert.ok(splitBtn);
+  splitBtn.events.click();
+  tree = allDescendants($("film-reference-list"));
+  assert.equal(tree.filter((n) => n.className.includes("film-reference-upload")).length, 3);
+});
+
