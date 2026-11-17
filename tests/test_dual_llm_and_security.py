@@ -1293,6 +1293,23 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
             (live_dir / "inputs" / "segment-rev3" / "state.json").write_text(json.dumps({"segs": {"0": {"error": "pre-task err"}}}), encoding="utf-8")
             segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=False)
             self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("task"), "accepted-cli-task")
+            # Stale staged terminal_failed also cannot overwrite live CLI task or submission_unknown lock (fc/fix-check#1)
+            (live_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev3", "applied": False, "explicit_prompt": True, "prompt": "dead edit", "prompt_format": "source", "previous": {"revision": None}}),
+                encoding="utf-8",
+            )
+            (live_dir / "inputs" / "segment-rev3" / "state.json").write_text(
+                json.dumps({"segs": {"0": {"task": "dead-staged", "terminal_failed": True, "error": "oom"}}}),
+                encoding="utf-8",
+            )
+            ljob2 = film.Job(live_dir)
+            ljob2.state["segs"]["0"] = {"task": "live-cli-2", "submitted": 2.0, "zh": "cli-zh-2", "h3": "cli-h3-2"}
+            ljob2.save()
+            ctx_live = segments.read_context({"output_dir": str(live_dir)})
+            self.assertEqual(segments.attempt_record({"output_dir": str(live_dir)}, ctx_live, 1), ({}, {}))
+            segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=False)
+            self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("task"), "live-cli-2")
+            self.assertNotIn("terminal_failed", film.Job(live_dir).state["segs"]["0"])
 
             # 11. D9/Step 11: unaffected_segment_blocker ignores orphan trailing segments and blocks submission_unknown inside redo
             orphan_dir = root / "orphan-redo"

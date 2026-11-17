@@ -94,41 +94,43 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 rec['prompt_override'] = {'format': fmt, 'text': prompt_text, 'source_version': pending.get('source_version')}
             changed = True
 
+    rec_locked_live = task_unresolved(rec) or (rec.get('submission_unknown') and not rec.get('task'))
     if supersede:
         if rec.pop('unapplied_edit', None) is not None or rec.pop('attempt_blocked', None) is not None:
             changed = True
-        if staged.get('prompt_override') or (pending.get('explicit_prompt') and pending.get('prompt_format') in ('source', 'h3')):
+        if not rec_locked_live and (staged.get('prompt_override') or (pending.get('explicit_prompt') and pending.get('prompt_format') in ('source', 'h3'))):
             apply_prompt_fields()
         should_unlink = True
     elif not has_clip:
-        rec_locked_live = task_unresolved(rec) or (rec.get('submission_unknown') and not rec.get('task'))
         if rec.pop('unapplied_edit', None) is not None:
             changed = True
-        if not rec_locked_live or staged.get('task') or staged.get('terminal_failed') or staged.get('submission_unknown'):
+        if rec_locked_live:
+            should_unlink = True
+        else:
             apply_prompt_fields()
-        if staged.get('terminal_failed'):
-            rec.pop('attempt_blocked', None)
-            rec.update(terminal_failed=True, task=staged.get('task'),
-                       error=staged.get('error') or pending.get('error'), file=None, cny=None)
-            changed = True
-        elif not staged.get('task') and not staged.get('submission_unknown') and not rec_locked_live:
-            for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
-                              'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
-                              'error_code', 'attempt_blocked'):
-                if rec.pop(stale_key, None) is not None:
+            if staged.get('terminal_failed'):
+                rec.pop('attempt_blocked', None)
+                rec.update(terminal_failed=True, task=staged.get('task'),
+                           error=staged.get('error') or pending.get('error'), file=None, cny=None)
+                changed = True
+            elif not staged.get('task') and not staged.get('submission_unknown'):
+                for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
+                                  'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
+                                  'error_code', 'attempt_blocked'):
+                    if rec.pop(stale_key, None) is not None:
+                        changed = True
+                err = staged.get('error') or pending.get('error')
+                if err:
+                    rec['error'] = err
+                    if drain_siblings:
+                        rec['attempt_blocked'] = True
                     changed = True
-            err = staged.get('error') or pending.get('error')
-            if err:
-                rec['error'] = err
-                if drain_siblings:
-                    rec['attempt_blocked'] = True
+                elif rec.pop('error', None) is not None:
+                    changed = True
+            elif staged.get('error') or pending.get('error'):
+                rec['error'] = staged.get('error') or pending.get('error')
                 changed = True
-            elif rec.pop('error', None) is not None:
-                changed = True
-        elif not rec_locked_live and (staged.get('error') or pending.get('error')):
-            rec['error'] = staged.get('error') or pending.get('error')
-            changed = True
-        should_unlink = (not keep_pending) if staged.get('terminal_failed') else True
+            should_unlink = (not keep_pending) if staged.get('terminal_failed') else True
     elif not keep_pending:
         rec['unapplied_edit'] = {
             'revision': pending.get('revision'),
@@ -275,7 +277,12 @@ def attempt_record(request, context, number):
         return {}, {}
     active = context['records'].get(str(number - 1), {})
     prev = pending.get('previous') or {}
-    if active.get('revision') != prev.get('revision') and not pending.get('publishing'):
+    active_advanced = (
+        active.get('revision') != prev.get('revision')
+        or (bool(active.get('task')) and active.get('task') != prev.get('task'))
+        or (active.get('submission_unknown') and not active.get('task') and not (prev.get('submission_unknown') and not prev.get('task')))
+    )
+    if active_advanced and not pending.get('publishing'):
         return {}, {}
     if 'staged' not in context:
         path = Path(request['output_dir']) / 'inputs' / f"segment-{pending['revision']}" / 'state.json'
