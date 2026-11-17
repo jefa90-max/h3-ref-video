@@ -63,6 +63,13 @@ class RewriteError(RuntimeError):
     pass
 
 
+class RewriteFatalError(RewriteError):
+    pass
+
+
+FATAL_REWRITE_STATUSES = {401, 402, 403, 404}
+
+
 def guide() -> str:
     """MiniMax's full-reference guide: a local copy when H3_GUIDE_FILE is set, else fetched once and cached."""
     if config.GUIDE_FILE:
@@ -105,7 +112,9 @@ def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback
 
 
 def sections(text: str) -> dict:
-    """{section name: body}; raises when a section is missing or out of order."""
+    """{section name: body}; raises when a section is missing, empty, or out of order."""
+    if not isinstance(text, str) or not text.strip():
+        raise RewriteError(message("rewrite_empty"))
     found = [(m.start(), m.group(1)) for m in re.finditer(r"^\s*(" + "|".join(SECTIONS) + r")\s*:", text, re.M)]
     names = [n for _, n in found]
     if names != SECTIONS:
@@ -114,6 +123,9 @@ def sections(text: str) -> dict:
     for k, (pos, name) in enumerate(found):
         end = found[k + 1][0] if k + 1 < len(found) else len(text)
         out[name] = text[pos:end].split(":", 1)[1].strip()
+    empty = [name for name in SECTIONS if not out[name]]
+    if empty:
+        raise RewriteError(message("rewrite_empty_sections", names="、".join(empty)))
     return out
 
 
@@ -162,7 +174,7 @@ def _claude(prompt: str) -> str:
     from an empty directory so no project files are read."""
     exe = claude_bin()
     if not exe:
-        raise RewriteError("没找到 claude 命令行；装上 Claude Code，或者设 H3_REWRITER=llm 用别的模型")
+        raise RewriteFatalError("没找到 claude 命令行；装上 Claude Code，或者设 H3_REWRITER=llm 用别的模型")
     with tempfile.TemporaryDirectory() as cwd:
         proc = subprocess.run([exe, "-p", "--output-format", "json", "--max-turns", "1", "--model", config.CLAUDE_MODEL,
                                "--tools", "", "--strict-mcp-config",
@@ -174,7 +186,10 @@ def _claude(prompt: str) -> str:
         raise RewriteError(f"Claude 没有返回结果：{(proc.stderr or proc.stdout)[:300]}") from None
     if out.get("is_error"):
         raise RewriteError(f"Claude 调用失败：{str(out.get('result'))[:300]}")
-    return str(out.get("result", ""))
+    result = str(out.get("result") or "")
+    if not result.strip():
+        raise RewriteError("Claude 没有返回内容")
+    return result
 
 
 def _llm(prompt: str) -> str:
@@ -184,14 +199,30 @@ def _llm(prompt: str) -> str:
                            {"model": llm["rewrite_model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
                            timeout=600)
     except http.HTTPResponseError as exc:
-        raise RewriteError("改写模型请求失败：" + str(exc)[:300]) from None
+        err_cls = RewriteFatalError if exc.status_code in FATAL_REWRITE_STATUSES else RewriteError
+        raise err_cls("改写模型请求失败：" + str(exc)[:300]) from None
     if not isinstance(out, dict):
         raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+    if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+        err_obj = out.get("error")
+        detail = json.dumps(out, ensure_ascii=False)
+        low = detail.lower()
+        http_status = out.get("_http_status")
+        raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
+        is_fatal = (
+            http_status in FATAL_REWRITE_STATUSES
+            or raw_code in (*FATAL_REWRITE_STATUSES, "invalid_api_key", "api_key_invalid", "unauthorized",
+                            "authentication_error", "insufficient_quota", "billing_hard_limit_reached", "model_not_found")
+            or any(tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid",
+                                          "incorrect api key", "unauthorized", "forbidden", "insufficient_quota", "model_not_found"))
+        )
+        err_cls = RewriteFatalError if is_fatal else RewriteError
+        raise err_cls("改写模型请求失败：" + detail[:300])
     choices = out.get("choices")
     first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
     msg = first.get("message") if isinstance(first.get("message"), dict) else {}
     text = msg.get("content")
-    if not text:
+    if not isinstance(text, str) or not text.strip():
         raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
     return text
 
@@ -202,18 +233,26 @@ def backend() -> str:
     return "claude" if claude_bin() else "llm"
 
 
-def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str) -> str:
-    """The H3 prompt for one clip. Two tries: the second one is told what was wrong with the first."""
+def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str, *, max_retries: int = 6) -> str:
+    """The H3 prompt for one clip. Retries up to `max_retries` times with concrete validation feedback."""
     call = _claude if backend() == "claude" else _llm
+    attempts = max(1, int(max_retries) + 1)
     feedback = ""
-    for _ in range(2):
-        text = call(request(prompt_zh, n_images, seconds, aspect, feedback))
-        text = re.sub(r"^```\w*\n|\n```$", "", text.strip())
-        issues = problems(text, n_images)
-        if not issues:
-            return assemble(sections(text))
+    for _ in range(attempts):
+        req_text = request(prompt_zh, n_images, seconds, aspect, feedback)
+        try:
+            raw = call(req_text)
+        except RewriteFatalError:
+            raise
+        except RewriteError as exc:
+            issues = [str(exc)]
+        else:
+            cleaned = re.sub(r"^```\w*\s*\n?|\n?\s*```$", "", (raw or "").strip()).strip()
+            issues = [message("rewrite_empty")] if not cleaned else problems(cleaned, n_images)
+            if not issues:
+                return assemble(sections(cleaned))
         feedback = "\n".join(f"- {x}" for x in issues)
-    raise RewriteError("改写成 H3 格式两次都没过检查：" + feedback.replace("\n", " ")[:300])
+    raise RewriteError(message("rewrite_exhausted", attempts=attempts, detail=feedback.replace("\n", " ")[:300]))
 
 
 def is_rewritten(text: str) -> bool:

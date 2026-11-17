@@ -162,8 +162,14 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     for j, s in enumerate(seg["shots"]):
         composition = compositions.get(_frame_key(seg["idx"], j))
         cam = (s.get("camera") or "").strip().strip("【】")
-        text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
-            + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
+        if composition and composition.get("version") == 3:
+            comp_cam = composition["camera"].strip().strip("【】").rstrip("。；; ")
+            cam_label = f"{cam}，{comp_cam}" if cam and cam not in comp_cam else (comp_cam or cam)
+            act = (s.get("action") or "").strip().rstrip("。；; ")
+            text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：【{cam_label}】{staging.render_scene_and_characters(composition)}动作过程：{act}。"
+        else:
+            text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
+                + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
         if compositions and not composition and (film.get("setting") or "").strip():
             text += "场景参考：" + film["setting"].strip()
         if speech and (s.get("line") or "").strip():
@@ -240,20 +246,21 @@ def frame_reference_versions(film: dict, segs: list[dict], records: dict) -> dic
 
 def saved_compositions(records: dict, *, reference_versions: dict[str, str]) -> dict[str, dict]:
     return {key: rec['composition'] for key, rec in records.items()
-            if isinstance(rec.get('composition'), dict) and rec['composition'].get('version') == 2
+            if staging.is_structured(rec.get('composition'))
             and isinstance(rec.get('prompt'), str) and rec['prompt'].strip()
             and rec.get('composition_prompt') == rec['prompt']
             and rec.get('composition_reference_version')
             and rec['composition_reference_version'] == reference_versions.get(key)}
 
 
-def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False):
+def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False,
+                 optimize_storyboard: bool = True):
     """Plan in shot order, save before dispatch, and collect every independent drawing."""
     (job.dir / "frames").mkdir(exist_ok=True)
     wanted = [(i, p['shot']) for i, seg in enumerate(segs) for p in pics[i] if p['kind'] == 'frame']
     versions = frame_reference_versions(film, segs, job.state['frames'])
     effective = saved_compositions(job.state['frames'], reference_versions=versions)
-    known_scenes, previous, previous_key = {}, None, None
+    known_scenes, locked_looks, previous, previous_key = {}, {}, None, None
 
     def failure(key, exc):
         reason = f"{type(exc).__name__}: {exc}"
@@ -293,16 +300,37 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                         elif rec.get('prompt') or rec.get('composition'):
                             text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             job.log('staging cache', key, 'source', previous_key)
+                        elif not optimize_storyboard:
+                            composition = None
+                            text = frames.prompt(film, shot, who, bool(film.get('board')), None)
+                            job.put('frames', key, composition=None, prompt=text, reference_paths=references)
                         else:
                             job.log('staging plan', key, 'source', previous_key)
-                            planned = frames.describe_composition(film, shot, previous_composition=copy.deepcopy(previous), known_scenes=copy.deepcopy(known_scenes))
-                            composition = staging.validate_composition(planned, film, shot, known_scenes)
-                            text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
-                            job.put('frames', key, composition=composition, prompt=text, composition_prompt=text,
-                                    composition_reference_version=versions[key], reference_paths=references)
+                            try:
+                                planned = frames.describe_composition(
+                                    film, shot,
+                                    previous_composition=copy.deepcopy(previous),
+                                    known_scenes=copy.deepcopy(known_scenes),
+                                    locked_looks=dict(locked_looks),
+                                )
+                                composition = staging.validate_composition(planned, film, shot, known_scenes)
+                                if composition.get('version') == 3:
+                                    for ch in composition.get('characters') or []:
+                                        if ch['name'] in locked_looks:
+                                            ch['locked_look'] = locked_looks[ch['name']]
+                                        else:
+                                            locked_looks[ch['name']] = ch['locked_look']
+                                text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
+                                job.put('frames', key, composition=composition, prompt=text, composition_prompt=text,
+                                        composition_reference_version=versions[key], reference_paths=references)
+                            except frames.CompositionFormatError as exc:
+                                composition = None
+                                job.log('staging fallback', key, message('frame_composition_fallback', frame_key=key, detail=str(exc)))
+                                text = frames.prompt(film, shot, who, bool(film.get('board')), None)
+                                job.put('frames', key, composition=None, prompt=text, reference_paths=references)
                         futures.append(pool.submit(draw, key, text, references, rec.get('task')))
                     except Exception as exc:
-                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 402, 403, 429) and not rec.get('task') and not rec.get('submission_unknown'):
+                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 402, 403, 404, 429) and not rec.get('task') and not rec.get('submission_unknown'):
                             for future in futures:
                                 future.result()
                             raise
@@ -322,7 +350,12 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                         job.log('frame failed', key, f"{type(contextual).__name__}: {contextual}")
                         composition = None
                 if composition:
-                    known_scenes[composition['scene_id']] = {k: copy.deepcopy(composition[k]) for k in ('world_frame','fixed_objects')}
+                    if composition.get('version') == 2:
+                        known_scenes[composition['scene_id']] = {k: copy.deepcopy(composition[k]) for k in ('world_frame', 'fixed_objects')}
+                    elif composition.get('version') == 3:
+                        for ch in composition.get('characters') or []:
+                            if ch.get('name') and ch.get('locked_look'):
+                                locked_looks.setdefault(ch['name'], ch['locked_look'])
                     previous, previous_key = composition, key
         for future in futures:
             future.result()
@@ -713,14 +746,18 @@ def _workbench_activity_locked(job_dir: Path) -> Path | None:
 
 
 def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None,
-        *, resume_frame_tasks: bool = False) -> Path:
+        *, resume_frame_tasks: bool = False, optimize_storyboard: bool = True) -> Path:
     job = Job(job_dir)
     if film_path:
         job.state["film_path"] = str(Path(film_path).resolve())
         job.state["mode"] = mode
+        job.state["optimize_storyboard"] = bool(optimize_storyboard)
+    elif not optimize_storyboard:
+        job.state["optimize_storyboard"] = False
     if not job.state.get("film_path"):
         raise SystemExit("新任务要给 --film")
     mode = job.state.get("mode", mode)
+    optimize = bool(job.state.get("optimize_storyboard", optimize_storyboard))
     locked_artifact = _workbench_activity_locked(job.dir)
     if locked_artifact is not None:
         raise RuntimeError(message("segment_publication_pending", path=locked_artifact))
@@ -734,7 +771,7 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     job.log("plan", f"{len(segs)} segments", " / ".join(f"{s['seconds']}s·{len(s['shots'])} shots·{len(pics[s['idx']])} pictures" for s in segs))
     for s in segs:
         job.put("segs", str(s["idx"]), pics=[p["kind"] for p in pics[s["idx"]]])
-    failures = stage_frames(job, film, segs, pics, resume_tasks=resume_frame_tasks)
+    failures = stage_frames(job, film, segs, pics, resume_tasks=resume_frame_tasks, optimize_storyboard=optimize)
     if failures:
         job.log("frames", message("frames_partial", count=len(failures)))
         return job.dir

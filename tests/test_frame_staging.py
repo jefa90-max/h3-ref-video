@@ -47,8 +47,9 @@ class FrameStaging(unittest.TestCase):
         invalid = copy.deepcopy(self.fixture['transfer_end'])
         del invalid['characters'][0]['gaze']
         bad['choices'][0]['message']['content']=json.dumps(invalid)
-        with patch.object(frames.http,'request',return_value=bad), patch.object(frames.config,'llm_key',return_value='offline'), self.assertRaisesRegex(ValueError,'gaze'):
+        with patch.object(frames.http,'request',return_value=bad) as bad_req, patch.object(frames.config,'llm_key',return_value='offline'), self.assertRaisesRegex(frames.CompositionFormatError,'gaze'):
             frames.describe_composition(self.script,self.script['shots'][1])
+        self.assertEqual(bad_req.call_count, 4)
 
     def test_board_optional_reference_numbers_match_upload_order(self):
         for board,first in ((False,1),(True,2)):

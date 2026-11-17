@@ -46,12 +46,17 @@
   "staging_axis_side": "轴线侧",
   "staging_invalid": "调度字段 {path}={value}；要求 {expected}。",
   "staging_known_layout": "逐字复用场景 {scene_id} 的已知固定布局",
-  "staging_plan_failed": "STAGING_INVALID {frame_key} schema=2 model={model}，记录 {path}：{detail}。文字规划请求可能已收费；请手动修改此图提示词后仅重生成图片，不要自动重试规划。",
+  "staging_plan_failed": "STAGING_INVALID {frame_key} schema=3 model={model}，记录 {path}：{detail}。文字规划请求可能已收费；请手动修改此图提示词后仅重生成图片，不要自动重试规划。",
+  "frame_composition_fallback": "分镜 {frame_key} 构图优化连续失败，已回退使用原始剧本分镜提示词：{detail}",
+  "optimize_storyboard_help": "跳过语言模型分镜提示词优化，直接使用原始剧本分镜词生图",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}；记录 {path}。其它镜头已处理；请在工作台手动修复失败图后继续。",
   "segment_terminal_failed": "TERMINAL_FAILED 第 {number} 段远端任务已终态失败，续跑不会重新付费。请在片段卡片明确发起新一次生成；记录 {path}。",
   "one_terminal_failed": "TERMINAL_FAILED 单条片段远端任务已终态失败，自动续跑不会重复付费。请新建任务或使用新输出目录（或手动清除 {path} 中的 terminal_failed）。",
   "segment_publication_pending": "视频片段发布尚未提交，请先在工作台续跑完成发布：{path}。",
   "segment_generation_failed": "第 {number} 段生成在 {phase} 阶段失败（{error_type}）。失败已保存；请检查日志后修词或恢复原任务。",
   "rewrite_picture_token": "无效图片引用 {value}；要求 <Picture N>，N 为正整数。",
-  "rewrite_picture_bound": "图片引用 <Picture {number}> 超出实际范围 1..{count}。"
+  "rewrite_picture_bound": "图片引用 <Picture {number}> 超出实际范围 1..{count}。",
+  "rewrite_empty": "改写输出为空，必须按顺序输出完整的六个非空段落。",
+  "rewrite_empty_sections": "以下段落内容为空：{names}。",
+  "rewrite_exhausted": "改写成 H3 格式连续 {attempts} 次都没过检查：{detail}"
 }
