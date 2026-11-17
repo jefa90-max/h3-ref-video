@@ -1,19 +1,19 @@
 # 工作台与 CLI 对照
 
-核对范围：`h3ref.py`、`h3ref/*`、`workbench/*`、`SKILL.md`、`prompts/h3_examples.md`、`examples/film.example.json`。核对日期：2026-11-08。
+核对范围：`h3ref.py`、`h3ref/*`、`workbench/*`、`SKILL.md`、`prompts/h3_examples.md`、`examples/film.example.json`。核对日期：2026-11-16。
 
 | 步骤 | 原仓库实现 | 工作台行为与修正 |
 | --- | --- | --- |
 | one 输入 | 默认 12 秒，5–15 秒，三种画幅，参考图顺序，seed/check | 同参数调用 `h3ref.py one`；字幕检查目前暂停，check 参数保留兼容但不执行检查，页面选项禁用 |
 | one 改写 | 已有六段式原样使用；否则 rewrite 模块读取官方指南、RULES、示例并调用改写器 | 完全复用；不拼另一套系统提示词；界面根据缓存和最终提示词判断配置需求 |
-| film 解析 | `film.load` 过滤空 action、默认 2 秒、至少 0.5 秒、时间归一化 | 删除 UI 重复时间算法，直接使用原 load；页面从角色/总表清单绑定上传文件，启动时保存绝对路径 |
-| 切段与参考图 | `film.plan / refs / compile_prompt`，总数不超过 9 张，shot/first/none | 直接使用相同函数；显示实际参与生成的分镜，不承诺超出参考图预算的镜头都有图 |
+| film 解析 | `film.load` 过滤空 action、默认 2 秒、至少 0.5 秒、时间归一化与 `H3_MAX_SHOTS` 上限 | 删除 UI 重复时间算法，先做 0–3600 秒有限数值校验再调用原 load；页面从角色/总表清单绑定上传文件，启动时保存绝对路径 |
+| 切段与参考图 | `film.plan / refs / compile_prompt`（含 `H3_MAX_SEGMENTS` 上限），总数不超过 9 张，shot/first/none | 直接使用相同函数；显示实际参与生成的分镜，不承诺超出参考图预算的镜头都有图 |
 | 画图 | `film.stage_frames` → `frames.describe_composition / prompt / draw` | 完整出片和“先生成分镜”使用同一阶段；先按当前镜头整理场景、画面及朝向并缓存，再组装带整片分镜号的提示词；总表→角色顺序一致，不引用首张分镜 |
 | 视频提示词 | `stage_prompts` → 原 rewrite，官方六段式 | 真实流水线完全沿用；分镜卡片修改图像生成提示词，视频片段卡片可查看或修改单段源词 / H3 提示词并局部重生成 |
 | 出片与检查 | 原 RunningHub 工作流、轮询、拼接、report；字幕检查目前暂停 | one 直接调用 CLI；film 先调用 stage_frames，全部确认后才调用原 CLI / film.run；整片及单段重生成均跳过字幕检查 |
 | 单镜重出 | `frames.draw` 是原图像 API；CLI 的 `--redo` 只重做视频 | 单镜用原 draw；成功后替换，失败保留旧图。已有 task 但结果未知时只查询原任务，不能用新编辑覆盖；明确终止失败后才允许卡片新生成，审核拒绝须先改词 |
 | 更新成片 | `--redo`：shot 只重做所属段；first/none 从该段向后重做 | 抽取原失效逻辑为 `film.invalidate_segments`，CLI 与 UI 共用；失效只应用一次，网络失败续跑不会清掉刚提交的新 task |
-| 配置与恢复 | 根目录 .env / 环境变量；state.json 恢复 | 同配置入口与状态；按当前阶段和缓存预检，先画图只需 APIMart。RunningHub 提交结果未知时阻止重提，须核对远端并补回 task；分镜轮询网络故障继续其它图，用户续跑仅查询原 task。暂停字幕检查期间不要求视觉模型密钥，也不新增字幕检查记录 |
+| 配置与恢复 | 根目录 .env / 环境变量；`LLM_PROVIDER`（`apimart` / `gemini`）与阶段独立模型；state.json 恢复 | 同配置入口与状态；按当前阶段和缓存预检，先画图需 `APIMART_API_KEY` 及所选文字服务密钥（默认 APIMart 共用同一 key，选 Gemini 另需 `GEMINI_API_KEY`，自定义地址需 `LLM_API_KEY`；构图已缓存或单镜重出只需 APIMart）。RunningHub 提交结果未知时阻止重提，须核对远端并补回 task；分镜轮询网络故障继续其它图，用户续跑仅查询原 task。工作台运行或存在未决单图／单段编辑时，CLI `film` 阻止并发写入。暂停字幕检查期间不要求视觉模型密钥，也不新增字幕检查记录 |
 
 ## 有意保留的 UI 差异
 
