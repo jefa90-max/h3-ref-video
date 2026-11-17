@@ -1028,6 +1028,27 @@ class ReviewFixesRegressionTest(unittest.TestCase):
             comp = frames.describe_composition(script, script["shots"][0], max_retries=0)
         self.assertEqual(comp["version"], 3)
 
+        # 4. p2/red-team#2: Regenerating an untouched clipless segment (before stage_prompts wrote zh) with its default
+        # automatic source prompt must NOT write a permanent prompt_override or trigger false source_changed!
+        untouched_card2 = self.client.get("/api/jobs/clipless-stage-prompts").json["segments"][1]
+        rev_u2 = segments.prepare_regeneration(
+            req, 2, untouched_card2["version"],
+            prompt=untouched_card2["prompt"],
+            prompt_format="source",
+            prompt_version=untouched_card2["prompt_version"],
+        )
+        staged_u2 = film.Job(out / "inputs" / f"segment-{rev_u2}")
+        seg_edit_u2 = json.loads((out / "inputs" / "segment-edit.json").read_text(encoding="utf-8"))
+        with patch.object(film.rewrite, "rewrite", return_value=_valid_h3("auto_seg2", 1)):
+            segments.prepare_prompt(staged_u2, req, seg_edit_u2, planned[1])
+        self.assertNotIn(
+            "prompt_override",
+            staged_u2.state["segs"]["1"],
+            "Untouched automatic source prompt on clipless segment must not freeze a permanent prompt_override",
+        )
+        reconciled_u2, _, _ = segments.preview_reconciled_segments(out, keep_pending=False, supersede=False)
+        self.assertNotIn("prompt_override", reconciled_u2["1"])
+
 
 if __name__ == "__main__":
     unittest.main()

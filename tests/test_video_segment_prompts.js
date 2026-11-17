@@ -449,5 +449,25 @@ for (const language of ['zh-CN','en']) {
     assert.equal(c.rebase.hidden, false, 'Rebase button must be visible in H3 view when source draft conflicts');
     await c.rebase.fire('click');
     assert.equal(c.rewriteH3.disabled, false, 'Rebasing from H3 view must unblock rewriteH3');
+
+    // p2/red-team#1: If editor is focused in H3 view WITHOUT local H3 edits while server updates h3_prompt + prompt_version,
+    // clicking rebase for a stale source draft must NOT fabricate a phantom H3 draft from the stale displayed H3 text!
+    c.format.value = 'source';
+    await c.format.fire('change');
+    c.editor.value = '另一版待转化的源草稿';
+    await c.editor.fire('input');
+    c.format.value = 'h3';
+    await c.format.fire('change');
+    c.editor.focus();
+    h.state.selectedJob.segments[1].h3_prompt = 'subject_definitions:\nServer updated H3 v11.';
+    h.state.selectedJob.segments[1].prompt_version = 'prompt-v11';
+    h.render();
+    assert.equal(c.conflict.hidden, false);
+    h.document.activeElement = c.rebase;
+    await c.rebase.fire('click');
+    assert.equal(h.state.segmentDrafts.get(2)?.drafts?.h3, undefined, 'Rebase on untouched focused H3 editor must not fabricate drafts.h3');
+    assert.equal(c.editor.value, 'subject_definitions:\nServer updated H3 v11.', 'Untouched focused editor adopts latest server text on rebase');
+    assert.equal(c.conflict.hidden, true, 'Conflict clears after rebase');
+    assert.equal(c.rewriteH3.disabled, false, 'rewriteH3 stays enabled without phantom H3 draft');
   });
 }
