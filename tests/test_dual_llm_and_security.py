@@ -1345,6 +1345,30 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                 self.assertTrue(s_sup["can_resume_video"])
             finally:
                 jm_sup.close()
+            # D12: CLI paid h3 rewrite (same zh, pre-task abort) and CLI --redo after H3-override terminal_failed supersede stale segment-edit.json
+            (live_dir / "inputs" / "segment-rev4").mkdir(exist_ok=True)
+            (live_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev4", "applied": False, "explicit_prompt": True, "prompt": "edited zh", "prompt_format": "source", "reuse_h3": False, "previous": {"zh": "compiled-zh", "h3": "old-h3", "revision": None, "task": None}}),
+                encoding="utf-8",
+            )
+            (live_dir / "inputs" / "segment-rev4" / "state.json").write_text(json.dumps({"segs": {"0": {"zh": "edited zh", "error": "wb err"}}}), encoding="utf-8")
+            ljob5 = film.Job(live_dir)
+            ljob5.state["segs"]["0"] = {"zh": "compiled-zh", "h3": "paid-cli-h3", "h3_source": "compiled-zh"}
+            ljob5.save()
+            segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=True)
+            self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("h3"), "paid-cli-h3")
+            self.assertFalse((live_dir / "inputs" / "segment-edit.json").exists())
+            (live_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev4", "applied": False, "explicit_prompt": True, "prompt": "H3 OVERRIDE", "prompt_format": "h3", "previous": {"zh": "compiled-zh", "h3": "old-h3", "revision": None, "task": None}}),
+                encoding="utf-8",
+            )
+            (live_dir / "inputs" / "segment-rev4" / "state.json").write_text(json.dumps({"segs": {"0": {"task": "dead-wb", "terminal_failed": True, "error": "wb dead"}}}), encoding="utf-8")
+            ljob6 = film.Job(live_dir)
+            ljob6.state["segs"]["0"] = {"zh": "", "h3": "H3 OVERRIDE", "prompt_override": {"format": "h3", "text": "H3 OVERRIDE", "source_version": "v1"}}
+            ljob6.save()
+            segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=False)
+            self.assertNotIn("terminal_failed", film.Job(live_dir).state["segs"]["0"])
+            self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("h3"), "H3 OVERRIDE")
 
             # 11. D9/Step 11: unaffected_segment_blocker ignores orphan trailing segments and blocks submission_unknown inside redo
             orphan_dir = root / "orphan-redo"
