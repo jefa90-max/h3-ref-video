@@ -1310,6 +1310,41 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
             segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=False)
             self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("task"), "live-cli-2")
             self.assertNotIn("terminal_failed", film.Job(live_dir).state["segs"]["0"])
+            # D11 (fc2/fix-check#1, #2, #3): unified pending_superseded across settled CLI terminal_failed, snapshot resume routing, and keep_pending
+            (live_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev3", "applied": False, "explicit_prompt": True, "prompt": "stale pretask", "prompt_format": "source", "previous": {"revision": None, "task": None}, "error": "pretask err"}),
+                encoding="utf-8",
+            )
+            (live_dir / "inputs" / "segment-rev3" / "state.json").write_text(json.dumps({"segs": {"0": {"error": "pretask err"}}}), encoding="utf-8")
+            ljob3 = film.Job(live_dir)
+            ljob3.state["segs"]["0"] = {"task": "cli-settled-dead", "terminal_failed": True, "error": "cli oom", "zh": "cli-zh-3", "h3": "cli-h3-3"}
+            ljob3.save()
+            segments.reconcile_pending_segment(live_dir, keep_pending=False, supersede=False)
+            self.assertTrue(film.Job(live_dir).state["segs"]["0"].get("terminal_failed"))
+            self.assertEqual(film.Job(live_dir).state["segs"]["0"].get("task"), "cli-settled-dead")
+            # Superseded segment-edit.json with in-flight CLI task routes Jobs.snapshot to can_resume_pipeline=True and blocks segments.preflight
+            (live_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"number": 1, "revision": "rev3", "applied": False, "explicit_prompt": True, "prompt": "stale pretask", "prompt_format": "source", "previous": {"revision": None, "task": None}, "error": "pretask err"}),
+                encoding="utf-8",
+            )
+            ljob4 = film.Job(live_dir)
+            ljob4.state["segs"]["0"] = {"task": "cli-inflight", "submitted": 3.0, "zh": "cli-zh-4", "h3": "cli-h3-4"}
+            ljob4.save()
+            live_req = {"kind": "film", "demo": False, "frames": "none", "operation": "segment", "segment": 1, "segment_revision": "rev3", "output_dir": str(live_dir), "film": {"aspect": "9:16", "shots": [{"start": 0, "end": 8, "action": "s1"}]}}
+            (live_dir / "inputs" / "request.json").write_text(json.dumps(live_req), encoding="utf-8")
+            with patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                with self.assertRaises(InputError):
+                    segments.preflight(live_req, {"RUNNINGHUB_API_KEY": "rh"})
+            jm_sup = Jobs(root / "st-sup", root)
+            try:
+                jm_sup.records["sup1"] = {"id": "sup1", "kind": "film", "demo": False, "output_dir": str(live_dir), "created_at": "2026-11-16T00:00:00+0000", "status": "failed", "error": "pretask err", "lang": "en", "operation": "segment"}
+                s_sup0 = jm_sup.snapshot("sup1")
+                (live_dir / "inputs" / "review.json").write_text(json.dumps({"dirty_segments": [], "confirmed_version": s_sup0["review"]["version"]}), encoding="utf-8")
+                s_sup = jm_sup.snapshot("sup1")
+                self.assertTrue(s_sup["can_resume_pipeline"])
+                self.assertTrue(s_sup["can_resume_video"])
+            finally:
+                jm_sup.close()
 
             # 11. D9/Step 11: unaffected_segment_blocker ignores orphan trailing segments and blocks submission_unknown inside redo
             orphan_dir = root / "orphan-redo"

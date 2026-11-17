@@ -290,8 +290,9 @@ class Jobs:
                     card["error"] = self.redact(str(card["error"]))
             result["segment_number"] = saved.get("segment") if saved.get("operation") == "segment" else None
             unfinished = [card for card in result['segments'] if not card['url'] or card['task_pending']]
-            pending_seg = context['pending']
-            _, pending_staged = segments.attempt_record(saved, context, pending_seg.get('number', 0)) if pending_seg else ({}, {})
+            raw_pending_seg = context['pending']
+            pending_seg, pending_staged = segments.attempt_record(saved, context, raw_pending_seg.get('number', 0)) if raw_pending_seg else ({}, {})
+            pending_superseded = bool(raw_pending_seg and not raw_pending_seg.get('applied') and not pending_seg)
             pending_card = next((c for c in result['segments'] if c['number'] == pending_seg.get('number')), None) if pending_seg else None
             pending_has_clip = bool(pending_card and pending_card.get('url'))
             sibling_cards = [c for c in result['segments'] if c['number'] != pending_seg.get('number')] if pending_seg else []
@@ -303,6 +304,22 @@ class Jobs:
             has_runnable_clipless_sibling = not has_blocking_sibling and any(
                 not c['url'] and not c['terminal_failed'] and not c['submission_unknown']
                 for c in sibling_cards
+            )
+            any_blocking_card = any(
+                c['submission_unknown'] or (c['terminal_failed'] and not c['url'])
+                for c in result['segments']
+            )
+            any_runnable_unfinished = any(
+                c['task_pending'] or (not c['url'] and not c['terminal_failed'] and not c['submission_unknown'])
+                for c in result['segments']
+            )
+            can_resume_superseded = bool(
+                pending_superseded
+                and not any(c['submission_unknown'] for c in result['segments'])
+                and (
+                    any(c['task_pending'] for c in result['segments'])
+                    or (any_runnable_unfinished and not any_blocking_card)
+                )
             )
             pending_settled_dead = bool(
                 pending_seg and not pending_seg.get('applied')
@@ -316,7 +333,7 @@ class Jobs:
                 )
             )
             result['can_resume_pipeline'] = bool(saved.get('operation') == 'segment'
-                    and (pending_seg.get('applied') or pending_settled_dead)
+                    and (raw_pending_seg.get('applied') or can_resume_superseded or pending_settled_dead)
                     and unfinished and result['review']['complete'] and not result['pending_video'])
             if result['can_resume_pipeline']:
                 result['segment_number'] = None
@@ -328,6 +345,8 @@ class Jobs:
                         (active_frame.get("submission_unknown") and not active_frame.get("task"))
                         or active_frame.get("task_failed") or active_frame.get("moderation_error")
                     )
+            elif saved.get("operation") == "segment" and pending_superseded and not result["can_resume_pipeline"]:
+                result["can_resume_video"] = False
             else:
                 targets = [card for card in result["segments"] if result["segment_number"] is None or card["number"] == result["segment_number"]]
                 has_unknown = any(card["submission_unknown"] for card in targets)

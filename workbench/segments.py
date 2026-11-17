@@ -57,6 +57,41 @@ def artifact_context(out):
     return {'pending': pending, 'publication_current': publication_current, 'file_versions': {}}
 
 
+def pending_superseded(active, pending, staged):
+    if not pending or pending.get('applied') or pending.get('publishing') or pending.get('generated'):
+        return False
+    prev = pending.get('previous') or {}
+    if active.get('revision') != prev.get('revision'):
+        return True
+    has_snapshot = not prev or set(prev.keys()) != {'revision'}
+    reconciled_terminal = bool(staged.get('terminal_failed') and active.get('terminal_failed') and active.get('task') == staged.get('task'))
+    active_task = active.get('task')
+    if active_task is not None and not reconciled_terminal:
+        if (has_snapshot and active_task != prev.get('task')) or (not has_snapshot and task_unresolved(active)):
+            return True
+    if active_task is None and 'task' in prev and prev.get('task') is not None and not reconciled_terminal:
+        return True
+    if has_snapshot and bool(active.get('file')) != bool(prev.get('file')) and not (reconciled_terminal and not active.get('file')):
+        return True
+    if has_snapshot and bool(active.get('terminal_failed')) != bool(prev.get('terminal_failed')) and not reconciled_terminal:
+        return True
+    active_unknown = bool(active.get('submission_unknown') and not active_task)
+    prev_unknown = bool(prev.get('submission_unknown') and not prev.get('task'))
+    staged_unknown = bool(staged.get('submission_unknown') and not staged.get('task'))
+    if active_unknown and not prev_unknown and not staged_unknown:
+        return True
+    expected_zh = (
+        staged['zh'] if 'zh' in staged
+        else ('' if pending.get('prompt_format') == 'h3' else pending.get('prompt', ''))
+        if ('prompt_override' not in staged and pending.get('explicit_prompt') and pending.get('prompt_format') in ('source', 'h3'))
+        else prev.get('zh')
+    )
+    active_source = '' if (active.get('prompt_override') or {}).get('format') == 'h3' else active.get('zh')
+    if active_source and 'zh' in prev and active_source != prev.get('zh') and not (reconciled_terminal and active_source == expected_zh):
+        return True
+    return False
+
+
 def preview_reconciled_segments(out, records=None, *, keep_pending=False, supersede=False, drain_siblings=False):
     out = Path(out)
     pending_path = out / 'inputs' / 'segment-edit.json'
@@ -73,6 +108,11 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
     rec = dict(base_records.get(index, {}))
     changed = False
     should_unlink = not keep_pending
+    if pending_superseded(rec, pending, staged):
+        if supersede and (rec.pop('unapplied_edit', None) is not None or rec.pop('attempt_blocked', None) is not None):
+            changed = True
+            base_records[index] = rec
+        return base_records, changed, True
 
     def apply_prompt_fields():
         nonlocal changed
@@ -276,17 +316,11 @@ def attempt_record(request, context, number):
     if pending.get('number') != number or pending.get('applied'):
         return {}, {}
     active = context['records'].get(str(number - 1), {})
-    prev = pending.get('previous') or {}
-    active_advanced = (
-        active.get('revision') != prev.get('revision')
-        or (bool(active.get('task')) and active.get('task') != prev.get('task'))
-        or (active.get('submission_unknown') and not active.get('task') and not (prev.get('submission_unknown') and not prev.get('task')))
-    )
-    if active_advanced and not pending.get('publishing'):
-        return {}, {}
     if 'staged' not in context:
         path = Path(request['output_dir']) / 'inputs' / f"segment-{pending['revision']}" / 'state.json'
         context['staged'] = read_json(path, {}).get('segs', {}).get(str(number - 1), {})
+    if pending_superseded(active, pending, context['staged']):
+        return {}, {}
     return pending, context['staged']
 
 
@@ -374,6 +408,9 @@ def preflight(request, env):
     if pending.get('applied') or pending.get('generated'):
         return
     staged = read_json(out / 'inputs' / f"segment-{pending.get('revision', '')}" / 'state.json', {}).get('segs', {}).get(str(segment['idx']), {})
+    active_rec = read_json(out / 'state.json', {}).get('segs', {}).get(str(segment['idx']), {})
+    if '_segment_preparation' not in request and pending_superseded(active_rec, pending, staged):
+        raise InputError('segment_changed', number=request['segment'])
     if staged.get('terminal_failed'):
         raise InputError('segment_terminal', number=request['segment'])
     if staged.get('submission_unknown') and not staged.get('task'):
@@ -525,6 +562,9 @@ def _regenerate(request):
     if not pending.get("publishing") and clip_version(target, out) != pending["version"]:
         raise InputError("segment_changed", number=number)
     staged = film.Job(out / "inputs" / f"segment-{pending['revision']}")
+    active_rec = read_json(out / "state.json", {}).get("segs", {}).get(index, {})
+    if pending_superseded(active_rec, pending, staged.state["segs"].get(index, {})):
+        raise InputError("segment_changed", number=number)
     (staged.dir / "clips").mkdir(exist_ok=True)
     candidate = staged.dir / "clips" / target.name
     candidate_tail = candidate.with_name(tail.name)
