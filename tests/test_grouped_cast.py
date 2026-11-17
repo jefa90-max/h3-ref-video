@@ -181,14 +181,16 @@ class GroupedCastTest(unittest.TestCase):
             frames.submit("prompt", ten_paths, "9:16", before_submit=lambda: flag.update(called=True))
         self.assertFalse(flag["called"])
 
-        # 2. inputs.validate rejects shot where board (1) + 9 unique cast pictures = 10 > 9 even in mode="shot"
+        # 2. inputs.validate matches film.refs: in mode="first" board (1) + 9 cast + frame (1) = 11 > 9 rejects;
+        # in mode="shot" when s1-1 IS scheduled (1 active cast in segment) and saved_frames binds 9 cast + board = 10 > 9, rejects;
+        # whereas in mode="shot" with 9 cast + board + group-word shot (film.refs drops board & omits frames -> 9 <= 9), succeeds!
         board_path = self.root / "b.png"
         Image.new("RGB", (8, 8), "white").save(board_path)
         nine_cast = [{"name": f"人{i}", "picture": str(ten_paths[i])} for i in range(9)]
-        over_shot_payload = {
+        over_first_payload = {
             "kind": "film",
             "demo": False,
-            "frames": "shot",
+            "frames": "first",
             "film": {
                 "aspect": "9:16",
                 "board": str(board_path),
@@ -197,7 +199,29 @@ class GroupedCastTest(unittest.TestCase):
             },
         }
         with self.assertRaises(InputError):
-            inputs.validate(over_shot_payload, self.root)
+            inputs.validate(over_first_payload, self.root)
+        saved_over_dir = self.root / "saved-over"
+        saved_over_dir.mkdir(exist_ok=True)
+        (saved_over_dir / "state.json").write_text(
+            json.dumps({"frames": {"s1-1": {"character_reference_paths": [str(ten_paths[i]) for i in range(9)]}}}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(InputError):
+            inputs.validate(
+                {
+                    "kind": "film",
+                    "demo": False,
+                    "frames": "shot",
+                    "output_dir": str(saved_over_dir),
+                    "film": {
+                        "aspect": "9:16",
+                        "board": str(board_path),
+                        "cast": nine_cast,
+                        "shots": [{"start": 0, "end": 5, "action": "人0独自站立"}],
+                    },
+                },
+                self.root,
+            )
 
         # 3. jobs.edit_frame rejects selecting 9 unique cast sheets when board is present (1 + 9 = 10 > 9)
         app = create_app(self.root / "storage", self.root / ".env")

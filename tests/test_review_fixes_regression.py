@@ -948,6 +948,86 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         self.assertEqual(reconciled["0"]["zh"], auto_zh, "Paired Chinese source must not be wiped to ''")
         self.assertNotEqual((reconciled["0"].get("prompt_override") or {}).get("format"), "h3")
 
+    def test_pass1_ship_review_regressions_parity_clipless_regenerate_and_unicode_think(self):
+        from workbench import inputs as wb_inputs
+
+        # 1. red-team#1: 9 cast sheets + board + group-word shot ('众人') in frames='shot' mode
+        # film.refs drops board and omits frame slots (9 refs total), so workbench inputs.validate must succeed (CLI parity)
+        nine_sheets = []
+        for idx in range(9):
+            p = self.root / f"sheet_{idx}.png"
+            Image.new("RGB", (8, 8), "green").save(p)
+            nine_sheets.append(p)
+        board_p = self.root / "board_9.png"
+        Image.new("RGB", (8, 8), "blue").save(board_p)
+        nine_cast = [
+            {"name": f"角色{idx * 2 + 1}", "picture": str(nine_sheets[idx])}
+            for idx in range(9)
+        ] + [
+            {"name": f"角色{idx * 2 + 2}", "picture": str(nine_sheets[idx])}
+            for idx in range(9)
+        ]
+        validated = wb_inputs.validate(
+            {
+                "kind": "film",
+                "demo": False,
+                "frames": "shot",
+                "output_root": str(self.root),
+                "film": {
+                    "board": str(board_p),
+                    "cast": nine_cast,
+                    "shots": [{"start": 0, "end": 6, "action": "众人在议事厅集合商议"}],
+                },
+            },
+            self.root,
+        )
+        self.assertEqual(validated["frames"], "shot")
+
+        # 2. red-team#2: Clipless segment with saved stage_prompts H3 (no manual_rewrite, no error) AND clean clipless direct H3 edit
+        out, script, req = self._setup_two_seg_job("clipless-stage-prompts")
+        planned = film.plan(script["shots"])
+        zh0 = film.compile_prompt(script, planned[0], film.refs(script, planned[0], "none"), len(planned))
+        h3_0 = _valid_h3("stage_prompts_seg1", 1)
+        film.Job(out).put("segs", "0", zh=zh0, h3=h3_0, h3_source=zh0)
+        snap = self.client.get("/api/jobs/clipless-stage-prompts").json
+        card1, card2 = snap["segments"][0], snap["segments"][1]
+        self.assertTrue(card1["can_regenerate"], "Segment with saved stage_prompts H3 must be regenerable without redundant rewrite")
+        self.assertTrue(card2["can_regenerate"], "Editable clipless segment must allow direct regeneration without stranding H3 drafts")
+        plan1 = segments.regeneration_plan(
+            req, 1, card1["version"], prompt=card1["prompt"], prompt_format="source", prompt_version=card1["prompt_version"]
+        )
+        self.assertTrue(plan1["reuse_h3"], "Saved stage_prompts H3 must be reused without extra LLM rewrite cost")
+        direct_h3_2 = _valid_h3("direct_seg2", 1)
+        plan2 = segments.regeneration_plan(
+            req, 2, card2["version"], prompt=direct_h3_2, prompt_format="h3", prompt_version=card2["prompt_version"]
+        )
+        self.assertEqual(plan2["prompt_format"], "h3")
+
+        # 3. red-team#4: Unicode casefold expansion (U+0130 'İ' -> 'i\u0307' in .lower()) inside <think>...</think>
+        valid_body = _valid_h3("unicode_istanbul", 1)
+        wrapped_h3 = f"<THINK>İstanbul İİİİİ reasoning block</ThInK>\n{valid_body}"
+        stripped = rewrite.strip_h3_wrappers(wrapped_h3)
+        self.assertTrue(stripped.startswith("subject_definitions:\n"), f"Truncated header: {stripped[:40]!r}")
+        self.assertEqual(rewrite.problems(stripped, 1), [])
+
+        comp_reply = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "<THINK>İstanbul İİİİİ camera check</think>"
+                            '{"version":3,"camera":"中景平视","scene":"室内木桌",'
+                            '"characters":[{"name":"阿青","locked_look":"青衫束发","placement_and_pose":"微笑站立在桌前"}]}'
+                        )
+                    }
+                }
+            ]
+        }
+        with patch.object(frames.http, "request", return_value=comp_reply), \
+             patch.object(frames.config, "llm_key", return_value="k"):
+            comp = frames.describe_composition(script, script["shots"][0], max_retries=0)
+        self.assertEqual(comp["version"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

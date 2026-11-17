@@ -795,5 +795,38 @@ test("create.js does not fall back to all cast on characterless single-shot scen
     true,
     "Whole-segment characterless fallbackAll=true must still count all 9 cast + board + first frame (11 > 9)",
   );
+
+  // red-team#1: In shot mode, 9 cast sheets + board + group-word shot ('众人') drops board and omits frame slots (total 9 <= 9),
+  // matching film.refs() so create.js must NOT show a false over-limit error.
+  $("frames").value = "shot";
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: nineCast,
+    shots: [{ start: 0, end: 6, action: "众人在议事厅集合商议" }],
+  });
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "9 cast sheets + board in shot mode drops board and omits frames (9 <= 9), matching film.refs",
+  );
+
+  // specialist-batched#1: Malformed non-array shots ({}) and non-array aliases ({} / string) during import/typing must NOT throw TypeError or lock #film-json
+  await $("film-import").events.change({
+    target: {
+      files: [{
+        name: "partial.json",
+        size: 120,
+        text: async () => JSON.stringify({
+          cast: [{ name: "Role1", aliases: { bad: 1 } }, { name: "Role2", aliases: "not-array" }],
+          shots: { not: "an-array" },
+        }),
+      }],
+      value: "partial.json",
+    },
+  });
+  assert.equal($("film-json").readOnly, false, "#film-json must unlock cleanly even when shots/aliases are malformed");
+  assert.equal($("film-import").disabled, false, "#film-import must unlock cleanly even when shots/aliases are malformed");
+  assert.ok($("film-reference-list").children.length >= 2, "Cast upload cards must still render when shots/aliases are malformed");
 });
 
