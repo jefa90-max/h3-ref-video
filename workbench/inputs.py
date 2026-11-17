@@ -156,9 +156,24 @@ def validate(payload, root):
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
         if job["frames"] != "none":
-            checked_shots = loaded["shots"] if job["frames"] == "shot" else [seg["shots"][0] for seg in planned]
-            for shot in checked_shots:
-                frame_refs = film.frame_reference_paths(loaded, shot, {})
+            saved_frames = {}
+            if job["output_dir"]:
+                out_cand = Path(job["output_dir"]).expanduser()
+                out_cand = (out_cand if out_cand.is_absolute() else root / out_cand).resolve()
+                state_cand = out_cand / "state.json"
+                if state_cand.is_file():
+                    try:
+                        saved_frames = json.loads(state_cand.read_text(encoding="utf-8")).get("frames") or {}
+                    except (OSError, ValueError):
+                        saved_frames = {}
+            checked_shots = (
+                [(seg["idx"], j, shot) for seg in planned for j, shot in enumerate(seg["shots"])]
+                if job["frames"] == "shot"
+                else [(seg["idx"], 0, seg["shots"][0]) for seg in planned]
+            )
+            for seg_idx, shot_idx, shot in checked_shots:
+                fkey = f"s{seg_idx + 1}-{shot_idx + 1}"
+                frame_refs = film.frame_reference_paths(loaded, shot, saved_frames.get(fkey, {}))
                 if len(frame_refs) > config.MAX_IMAGES:
                     raise InputError("too_many_references", count=len(frame_refs), limit=config.MAX_IMAGES)
     return job
@@ -228,8 +243,13 @@ def preflight(job, env):
                         paths = film.picture_paths(out, segment, pics) if out is not None else []
                         tail_invalidated = any(p["kind"] == "prev" and (segment["idx"] - 1) in invalidated for p in pics)
                         reference = film.reference_version(paths) if (out is not None and not tail_invalidated and all(p.is_file() for p in paths)) else None
-                        needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh and rec.get("h3_source", rec.get("zh")) == zh
-                                              and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference))
+                        needs_rewrite |= not (
+                            rec.get("h3")
+                            and rec.get("zh") == zh
+                            and rec.get("h3_source", rec.get("zh")) == zh
+                            and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference)
+                            and ("subject_definitions:" not in rec["h3"] or not film.rewrite.cached_problems(rec["h3"], len(pics)))
+                        )
                     needs_rh |= not (out and segment["idx"] not in invalidated and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists() and rec.get("cny") is not None)
         if operation == "frame":
             needs_frames = True

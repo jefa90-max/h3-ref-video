@@ -68,7 +68,7 @@ class RewriteFatalError(RewriteError):
     pass
 
 
-FATAL_REWRITE_STATUSES = {400, 401, 402, 403, 404, 429}
+FATAL_REWRITE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
 
 
 def guide() -> str:
@@ -112,9 +112,20 @@ def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback
         "Write the rewrite now: the six sections only."]).strip()
 
 
+def _strip_reasoning_and_fences(raw: str) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+    fenced = re.search(r"```(?:\w+)?\s*([\s\S]*?)```", cleaned)
+    if fenced:
+        return fenced.group(1).strip()
+    return re.sub(r"^```\w*\s*\n?|\n?\s*```$", "", cleaned).strip()
+
+
 def sections(text: str) -> dict:
     """{section name: body}; raises when a section is missing, empty, or out of order."""
-    if not isinstance(text, str) or not text.strip():
+    text = _strip_reasoning_and_fences(text)
+    if not text:
         raise RewriteError(message("rewrite_empty"))
     found = [(m.start(), m.group(1)) for m in re.finditer(r"^\s*(" + "|".join(SECTIONS) + r")\s*:", text, re.M)]
     names = [n for _, n in found]
@@ -130,22 +141,35 @@ def sections(text: str) -> dict:
     return out
 
 
-def problems(text: str, n_images: int) -> list[str]:
+def cached_problems(text: str, n_images: int) -> list[str]:
+    """Structural and <Picture N> bound checks for cached paired H3 prompts."""
     try:
         parts = sections(text)
     except RewriteError as exc:
         return [str(exc)]
     out = []
-    for name in ("detailed_description", "overall_soundscape"):
-        for m in NEGATIVE.finditer(parts[name]):
-            out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
-    for token in re.findall(r"<Picture([^>]*)>", text):
+    section_body = "\n".join(parts.values())
+    for token in re.findall(r"<Picture([^>]*)>", section_body):
         if not re.fullmatch(r"\s+[0-9]+\s*", token):
             out.append(message('rewrite_picture_token', value=('<Picture' + token + '>')[:100]))
             continue
         number = int(token)
         if not 1 <= number <= n_images:
             out.append(message('rewrite_picture_bound', number=number, count=n_images))
+    return out
+
+
+def problems(text: str, n_images: int) -> list[str]:
+    issues = cached_problems(text, n_images)
+    try:
+        parts = sections(text)
+    except RewriteError:
+        return issues
+    out = []
+    for name in ("detailed_description", "overall_soundscape"):
+        for m in NEGATIVE.finditer(parts[name]):
+            out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
+    out.extend(issues)
     if "[Shot 1]" not in parts["detailed_description"]:
         out.append("detailed_description has no [Shot 1]")
     return out
@@ -184,9 +208,10 @@ def _claude(prompt: str) -> str:
     try:
         out = json.loads(proc.stdout)
     except ValueError:
-        raise RewriteError(f"Claude 没有返回结果：{(proc.stderr or proc.stdout)[:300]}") from None
+        err_cls = RewriteFatalError if proc.returncode else RewriteError
+        raise err_cls(f"Claude 没有返回结果：{(proc.stderr or proc.stdout)[:300]}") from None
     if out.get("is_error"):
-        raise RewriteError(f"Claude 调用失败：{str(out.get('result'))[:300]}")
+        raise RewriteFatalError(f"Claude 调用失败：{str(out.get('result'))[:300]}")
     result = str(out.get("result") or "")
     if not result.strip():
         raise RewriteError("Claude 没有返回内容")
@@ -205,8 +230,17 @@ def _llm(prompt: str) -> str:
     if not isinstance(out, dict):
         raise RewriteError(message("rewrite_empty"))
     if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+        err_obj = out.get("error")
+        http_status = out.get("_http_status")
+        raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
         detail = json.dumps(out, ensure_ascii=False)
-        raise RewriteFatalError("改写模型请求失败：" + detail[:300])
+        low = detail.lower()
+        is_transient_5xx = (
+            (isinstance(http_status, int) and http_status >= 500 and raw_code not in FATAL_REWRITE_STATUSES)
+            or (isinstance(raw_code, int) and raw_code >= 500)
+        ) and not any(tok in low for tok in ("invalid_api_key", "api_key_invalid", "unauthorized", "insufficient_quota", "model_not_found"))
+        err_cls = RewriteError if is_transient_5xx else RewriteFatalError
+        raise err_cls("改写模型请求失败：" + detail[:300])
     choices = out.get("choices")
     first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
     msg = first.get("message") if isinstance(first.get("message"), dict) else {}
@@ -236,7 +270,7 @@ def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str, *, max_r
         except RewriteError as exc:
             issues = [str(exc)]
         else:
-            cleaned = re.sub(r"^```\w*\s*\n?|\n?\s*```$", "", (raw or "").strip()).strip()
+            cleaned = _strip_reasoning_and_fences(raw or "")
             issues = [message("rewrite_empty")] if not cleaned else problems(cleaned, n_images)
             if not issues:
                 return assemble(sections(cleaned))

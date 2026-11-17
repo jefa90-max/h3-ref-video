@@ -281,8 +281,8 @@ function renderJob(job) {
   $("resume-job").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
   $("resume-job").textContent = t(job.can_resume_frames ? "resumeFrames" : "resumeJob");
   $("resume-hint").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
-  const blockedSegment = ["pipeline", "segment"].includes(job.operation)
-    ? (job.segments || []).find((segment) => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || segment.terminal_failed))
+  const blockedSegment = ["pipeline", "segment", "rewrite_segment", "rewrite_prompts"].includes(job.operation)
+    ? (job.segments || []).find((segment) => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || (segment.terminal_failed && (job.operation !== "rewrite_segment" && job.operation !== "rewrite_prompts" || job.can_resume_pipeline))))
     : null;
   $("resume-hint").textContent = t(job.can_resume_video === false ? (blockedSegment ? (blockedSegment.submission_unknown ? "segmentSubmissionUnknown" : "segmentTerminalFailed") : "resumeBlockedHint") : "resumeHint");
   $("review-section").hidden = job.kind !== "film";

@@ -62,7 +62,11 @@ def bind_references(payload, upload_dir: Path, lang="zh-CN"):
                     invalid(f"reference_groups[{g_idx}][{m_idx}]", slot_id, "choice")
                 seen_members.add(slot_id)
                 normalized_members.append(slot_id)
-            bound_values = {bindings[m] for m in normalized_members if bindings.get(m) is not None}
+            bound_values = set()
+            for m in normalized_members:
+                if bindings.get(m) is not None:
+                    bindings[m] = text(bindings[m], f"reference_bindings.{m}")
+                    bound_values.add(bindings[m])
             if len(bound_values) > 1:
                 invalid(f"reference_groups[{g_idx}]", normalized_members, "choice")
             if len(bound_values) == 1:

@@ -335,10 +335,20 @@ class Jobs:
                 )
             )
             pending_clear = not raw_pending_seg or bool(raw_pending_seg.get('applied') or can_resume_superseded or pending_settled_dead)
+            any_unknown_card = any(c['submission_unknown'] for c in result['segments'])
+            has_inflight_card = any(c['task_pending'] for c in result['segments'])
             result['can_resume_pipeline'] = bool(
                 (
                     (saved.get('operation') == 'segment' and (raw_pending_seg.get('applied') or can_resume_superseded or pending_settled_dead))
-                    or (saved.get('operation') in ('rewrite_segment', 'rewrite_prompts') and record['status'] == 'succeeded' and pending_clear)
+                    or (
+                        saved.get('operation') in ('rewrite_segment', 'rewrite_prompts')
+                        and pending_clear
+                        and not any_unknown_card
+                        and (
+                            (record['status'] == 'succeeded' and (has_inflight_card or (any_runnable_unfinished and not any_blocking_card)))
+                            or (record['status'] in ('failed', 'interrupted') and has_inflight_card)
+                        )
+                    )
                 )
                 and unfinished and result['review']['complete'] and not result['pending_video']
             )
@@ -346,7 +356,12 @@ class Jobs:
                 result['segment_number'] = None
             if saved.get("operation") in ("frames", "frame", "assemble", "rewrite_segment", "rewrite_prompts") and not result["can_resume_pipeline"]:
                 if saved.get("operation") in ("rewrite_segment", "rewrite_prompts"):
-                    result["can_resume_video"] = not any(card["submission_unknown"] for card in result["segments"])
+                    raw_prompt_rw = context.get("prompt_rewrite") or {}
+                    if saved.get("operation") == "rewrite_segment" and raw_prompt_rw and not raw_prompt_rw.get("applied"):
+                        rw_targets = [c for c in result["segments"] if not result["segment_number"] or c["number"] == result["segment_number"]]
+                    else:
+                        rw_targets = result["segments"]
+                    result["can_resume_video"] = not any(card["submission_unknown"] for card in rw_targets)
                 elif result["can_resume_frames"]:
                     result["can_resume_video"] = not any(frame.get("submission_unknown") for frame in result["storyboard"])
                 else:
@@ -364,7 +379,7 @@ class Jobs:
                 has_inflight = any(card["task_pending"] for card in targets)
                 result["can_resume_video"] = not has_unknown and (
                     not has_terminal or (
-                        record["status"] in ("failed", "interrupted")
+                        (record["status"] in ("failed", "interrupted") or saved.get("operation") in ("rewrite_segment", "rewrite_prompts"))
                         and is_pipeline_target
                         and has_inflight
                     )
@@ -379,7 +394,11 @@ class Jobs:
             result["can_rewrite_prompts"] = bool(editable and not has_locked_segment)
             result["missing_h3_count"] = sum(1 for card in result["segments"] if card.get("h3_missing"))
         out = Path(record['output_dir'])
-        if segments.clip_version(out / 'inputs' / 'segment-edit.json', out) != context['pending_stamp']:
+        current_stamp = (
+            segments.clip_version(out / 'inputs' / 'segment-edit.json', out),
+            segments.clip_version(out / 'inputs' / 'prompt-rewrite.json', out),
+        )
+        if current_stamp != context['pending_stamp']:
             return None
         return result
 
@@ -549,6 +568,7 @@ class Jobs:
             pending = {"key": key, "prompt": prompt, "revision": uuid.uuid4().hex,
                        "character_reference_paths": characters, "reference_paths": reference_paths,
                        "previous": previous, "task": None, "applied": False}
+            segments.reconcile_pending_prompt_rewrite(out, request, archive_single_except=0, clear_all=True)
             write_json(out / "inputs" / "frame-edit.json", pending)
             return self.restart(record, request, env)
 
@@ -596,9 +616,15 @@ class Jobs:
             elif not snapshot["review"]["complete"]:
                 raise InputError("review_required")
             request.update(operation="pipeline", redo=review_state(out).get("dirty_segments", []), reset_applied=False)
+            reconciled_segs = None
+            seg_changed = False
             if seg_pending and not seg_pending.get("applied"):
                 in_affected = seg_pending.get("number") in affected
-                reconciled_segs, _, _ = segments.preview_reconciled_segments(out, keep_pending=not in_affected, supersede=in_affected)
+                reconciled_segs, seg_changed, _ = segments.preview_reconciled_segments(out, keep_pending=not in_affected, supersede=in_affected)
+            reconciled_segs, rw_changed, _ = segments.preview_reconciled_prompt_rewrite(
+                out, request, base_records=reconciled_segs, archive_single_except=0, redo_numbers=affected,
+            )
+            if seg_changed or rw_changed:
                 request["_reconciled_segs"] = reconciled_segs
             try:
                 preflight(request, env)
@@ -611,6 +637,7 @@ class Jobs:
             if seg_pending and not seg_pending.get("applied"):
                 in_affected = seg_pending.get("number") in affected
                 segments.reconcile_pending_segment(out, keep_pending=not in_affected, supersede=in_affected)
+            segments.reconcile_pending_prompt_rewrite(out, request, archive_single_except=0, clear_all=True, redo_numbers=affected)
             return self.restart(record, request, env)
 
     def restart(self, record, request, env):
@@ -624,7 +651,7 @@ class Jobs:
         self.launch(record, request, env)
         return self.snapshot(record["id"])
 
-    def start_video_operation(self, identifier, operation, env, version=None, number=None, *, prompt=None, prompt_format=None, prompt_version=None, scope=None):
+    def start_video_operation(self, identifier, operation, env, version=None, number=None, *, prompt=None, prompt_format=None, prompt_version=None, scope=None, edited=None):
         from . import segments
         with self.lock:
             self.available()
@@ -663,7 +690,7 @@ class Jobs:
             if operation == "segment":
                 request["segment_revision"] = segments.prepare_regeneration(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
             elif operation == "rewrite_segment":
-                request["segment_revision"] = segments.prepare_rewrite_segment(request, number, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
+                request["segment_revision"] = segments.prepare_rewrite_segment(request, number, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version, edited=edited)
             elif operation == "rewrite_prompts":
                 request["segment_revision"] = segments.prepare_rewrite_prompts(request, scope=scope)
             else:
@@ -720,7 +747,7 @@ class Jobs:
                 and not any(c["submission_unknown"] for c in snapshot["segments"])
                 and any(c["task_pending"] for c in snapshot["segments"])
             )
-            if request["kind"] == "film" and request["operation"] in ("frame", "segment", "pipeline") and snapshot.get("can_resume_video") is False and not can_drain_pipeline:
+            if request["kind"] == "film" and request["operation"] in ("frame", "segment", "pipeline", "rewrite_segment", "rewrite_prompts", "assemble") and snapshot.get("can_resume_video") is False and not can_drain_pipeline:
                 raise InputError("resume")
             if request["kind"] == "film" and request["operation"] == "frames":
                 request["resume_frame_tasks"] = True
@@ -731,6 +758,10 @@ class Jobs:
                 reconciled_segs, _, _ = segments.preview_reconciled_segments(
                     out_dir, keep_pending=False, supersede=False, drain_siblings=has_inflight_segments,
                 )
+                if remaining_pipeline:
+                    reconciled_segs, _, _ = segments.preview_reconciled_prompt_rewrite(
+                        out_dir, request, base_records=reconciled_segs, archive_single_except=0, drain_siblings=has_inflight_segments,
+                    )
                 if unblock_pipeline:
                     reconciled_segs = {
                         k: ({rk: rv for rk, rv in rec.items() if rk not in ("attempt_blocked", "error")}
@@ -745,6 +776,7 @@ class Jobs:
             if remaining_pipeline:
                 from . import segments
                 segments.reconcile_pending_segment(out_dir, keep_pending=False, supersede=False, drain_siblings=has_inflight_segments)
+                segments.reconcile_pending_prompt_rewrite(out_dir, request, archive_single_except=0, clear_all=True, drain_siblings=has_inflight_segments)
             if unblock_pipeline:
                 from h3ref import film
                 job = film.Job(out_dir)

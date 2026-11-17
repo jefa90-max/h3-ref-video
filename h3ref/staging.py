@@ -8,7 +8,6 @@ from .i18n import message
 
 CAMERA_FIELDS = ('position', 'view_direction', 'framing', 'axis_side')
 CHARACTER_FIELDS = ('name', 'appearance', 'position', 'body_facing', 'gaze', 'pose', 'expression', 'screen_position', 'visibility')
-V3_CHARACTER_FIELDS = ('name', 'locked_look', 'placement_and_pose')
 PROP_FIELDS = ('name', 'holder', 'contact', 'position', 'orientation', 'state', 'opening_direction', 'base_direction', 'knot_position', 'screen_position', 'visibility')
 PARTS = ('opening_direction', 'base_direction', 'knot_position')
 VISIBILITY = ('visible', 'cropped', 'occluded', 'offscreen')
@@ -16,13 +15,13 @@ VISIBILITY = ('visible', 'cropped', 'occluded', 'offscreen')
 _V3_LOC_PREFIX = (
     r'(?:在|于)?(?:画面|镜头|前景|中景|背景|后景|远景|近景)?'
     r'(?:正中|中央|中间|左侧|右侧|左边|右边|左方|右方|左前|右前|左后|右后|前方|后方|深处|一侧|角落)'
-    r'(?:偏左|偏右|偏前|偏后|处)?'
+    r'(?:偏左方|偏右方|偏前方|偏后方|偏左|偏右|偏前|偏后|处)?'
 )
 _V3_PLACEMENT_VERB = re.compile(
     r'^(' + _V3_LOC_PREFIX + r'\s*(?:(?:正|半|侧身|微微)?(?:站着|坐着|跪着|蹲着|躺着|趴着|靠着|倚着|立着))?)'
     r'\s*(?:[，,]\s*(.*)|$)'
 )
-_V3_LOCATION_ONLY = re.compile(r'^(' + _V3_LOC_PREFIX + r')\s*(.+)$')
+_V3_LOCATION_ONLY = re.compile(r'^(' + _V3_LOC_PREFIX + r')\s*[，,]\s*(.+)$')
 
 
 def is_structured(composition: object) -> bool:
@@ -86,7 +85,6 @@ def group_cast_by_picture(active_cast: list[dict], all_cast: list[dict] | None =
             'absent': absent_members,
             'all': all_members,
             'name': ' / '.join(c['name'] for c in all_members if c.get('name')),
-            'active_name': ' / '.join(c['name'] for c in active_members if c.get('name')),
         })
     return groups
 
@@ -182,13 +180,23 @@ def _states(items, fields):
                      for item in items)
 
 
-def _render_v3_character(character: dict) -> str:
+def _render_v3_character(character: dict, other_names: set[str] | None = None) -> str:
     name = character['name'].strip()
     look = character['locked_look'].strip().rstrip('。；;，, ')
     pose = character['placement_and_pose'].strip().rstrip('。；; ')
     tagged = f'{name}（{look}）'
-    if name in pose:
-        sentence = re.sub(re.escape(name) + r'\s*(?:（[^）]*）|\([^)]*\))?', lambda _: tagged, pose, count=1)
+    subject_re = re.compile(
+        r'^((?:' + _V3_LOC_PREFIX + r'\s*(?:(?:(?:正|半|侧身|微微)?(?:站着|坐着|跪着|蹲着|躺着|趴着|靠着|倚着|立着))\s*|[，,]\s*))?)'
+        + re.escape(name)
+        + r'(\s*(?:（[^）]*）|\([^)]*\))?)'
+    )
+    subj_matched = subject_re.match(pose)
+    from_name = pose[len(subj_matched.group(1)):] if subj_matched else ''
+    longer_cast_match = bool(other_names and any(other != name and from_name.startswith(other) for other in other_names))
+    if subj_matched and not longer_cast_match:
+        note = (subj_matched.group(2) or '').strip()
+        kept_note = note if (note and look not in note) else ''
+        sentence = f"{subj_matched.group(1)}{tagged}{kept_note}{pose[subj_matched.end():]}"
     else:
         matched = _V3_PLACEMENT_VERB.match(pose)
         if matched:
@@ -206,7 +214,9 @@ def _render_v3_character(character: dict) -> str:
 
 def render_scene_and_characters(composition: dict) -> str:
     scene_body = re.sub(r'^场景(?:为|是|：|:)\s*', '', composition['scene'].strip()).rstrip('。；; ')
-    char_line = ''.join(_render_v3_character(c) for c in composition.get('characters') or [])
+    chars = composition.get('characters') or []
+    all_names = {c['name'].strip() for c in chars if c.get('name')}
+    char_line = ''.join(_render_v3_character(c, all_names) for c in chars)
     return f'场景为{scene_body}。' + char_line
 
 
@@ -216,7 +226,9 @@ def render_opening(composition: dict) -> str:
         cam_body = re.sub(r'^机位(?:与构图)?(?:：|:)\s*', '', c['camera'].strip()).rstrip('。；; ')
         scene_body = re.sub(r'^场景(?:为|是|：|:)\s*', '', c['scene'].strip()).rstrip('。；; ')
         lines = [f'机位与构图：{cam_body}。', f'场景为{scene_body}。']
-        char_line = ''.join(_render_v3_character(ch) for ch in c.get('characters') or [])
+        chars = c.get('characters') or []
+        all_names = {ch['name'].strip() for ch in chars if ch.get('name')}
+        char_line = ''.join(_render_v3_character(ch, all_names) for ch in chars)
         if char_line:
             lines.append(char_line)
         return '\n'.join(lines)
@@ -228,11 +240,7 @@ def render_opening(composition: dict) -> str:
                       f"{message('staging_props')}: " + _states(c['props'], PROP_FIELDS)))
 
 
-def render_motion(composition: dict, action: str = '') -> str:
-    if composition.get('version') == 3:
-        cam_body = composition['camera'].strip().strip('【】').rstrip('。；; ')
-        act = action.strip().rstrip('。；; ')
-        return f'【{cam_body}】{render_scene_and_characters(composition)}' + (f'动作过程：{act}' if act else '')
+def render_motion(composition: dict) -> str:
     end = composition['expected_end']
     return '\n'.join((render_opening(composition), f"{message('staging_action')}: {composition['action']}",
                       message('staging_expected_end') + ':\n' + _states(end['characters'], CHARACTER_FIELDS)

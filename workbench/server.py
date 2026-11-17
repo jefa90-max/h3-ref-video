@@ -372,9 +372,10 @@ def create_app(storage=None, env_path=None):
             invalid("segment", values, "object")
         with jobs.lock:
             edited = any(key in values for key in ('prompt', 'prompt_format', 'prompt_version'))
+            fmt = values['prompt_format'] if 'prompt_format' in values else ('source' if edited else None)
             return jsonify(jobs.start_video_operation(identifier, 'rewrite_segment', dict(env), None, number,
-                prompt=values.get('prompt'), prompt_format=values.get('prompt_format', 'source') if edited else None,
-                prompt_version=values.get('prompt_version', '') if edited else None))
+                prompt=values.get('prompt'), prompt_format=fmt,
+                prompt_version=values.get('prompt_version', '') if edited else None, edited=edited))
 
     @app.post("/api/jobs/<identifier>/segments/rewrite")
     def rewrite_prompts(identifier):

@@ -131,7 +131,9 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
             if not isinstance(raw_content, str) or not raw_content.strip():
                 raise ValueError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300]))
             raw_reply = raw_content.strip()
-            cleaned = re.sub(r"^```\w*\s*|\s*```$", "", raw_reply).strip()
+            cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_reply, flags=re.IGNORECASE).strip()
+            fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
+            cleaned = fenced.group(1).strip() if fenced else re.sub(r"^```\w*\s*|\s*```$", "", cleaned).strip()
             composition = json.loads(cleaned)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             last_error = str(exc) if isinstance(exc, ValueError) else message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])
@@ -146,8 +148,7 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
                         if ch["name"] in locked_looks:
                             ch["locked_look"] = locked_looks[ch["name"]]
                 return validated
-        if raw_reply:
-            retry_messages.append({"role": "assistant", "content": raw_reply[:2000]})
+        retry_messages.append({"role": "assistant", "content": raw_reply[:2000] if raw_reply else "(empty response)"})
         retry_messages.append({
             "role": "user",
             "content": f"上一轮输出未通过校验：{last_error}。请修正问题，严格只输出合法的 composition v3 JSON 对象，所有必填字段非空，不加代码块。",

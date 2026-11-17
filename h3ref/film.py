@@ -328,6 +328,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                             references = rec.get('reference_paths', references)
                         elif rec.get('prompt') or rec.get('composition'):
                             text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
+                            references = rec.get('reference_paths', references)
                             job.log('staging cache', key, 'source', previous_key)
                         elif not optimize_storyboard:
                             composition = None
@@ -428,7 +429,12 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
         paths = _picture_paths(job, seg, pics[i])
         reference = reference_version(paths) if all(path.is_file() for path in paths) else None
         if (rec.get('h3') and rec.get('zh') == zh and rec.get('h3_source', rec.get('zh')) == zh
-                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)):
+                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)
+                and ('subject_definitions:' not in rec['h3'] or not rewrite.cached_problems(rec['h3'], len(pics[i])))):
+            if 'unapplied_edit' in rec:
+                with job.lock:
+                    job.state['segs'][str(i)].pop('unapplied_edit', None)
+                    job.save()
             return
         try:
             h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
@@ -438,7 +444,11 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
             raise
         (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
         (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(h3, encoding='utf-8')
-        job.put('segs', str(i), zh=zh, h3=h3, h3_source=zh, h3_reference_version=reference, error=None)
+        with job.lock:
+            cur = job.state['segs'].setdefault(str(i), {})
+            cur.pop('unapplied_edit', None)
+            cur.update(zh=zh, h3=h3, h3_source=zh, h3_reference_version=reference, error=None)
+            job.save()
         job.log('prompt', f'seg{i + 1}', f'{len(pics[i])} pictures')
     abort = threading.Event()
     def run_one(seg):
@@ -689,7 +699,7 @@ def _segment_task_unresolved(rec: dict) -> bool:
 
 def invalidated_segment_records(records: dict, mode: str, redo: list[int] | None) -> dict:
     return {k: (dict(rec) if _segment_task_unresolved(rec) else
-                {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override") if key in rec})
+                {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override", "manual_rewrite") if key in rec})
             for k, rec in records.items()
             if any(int(k) == n - 1 or (mode != "shot" and int(k) > n - 1) for n in redo or [])}
 

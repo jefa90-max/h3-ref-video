@@ -13,7 +13,10 @@ from .jobs import write_json
 
 
 def read_json(path, default):
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    except FileNotFoundError:
+        return default
 
 
 def plan(request, check_images=True, *, records=None):

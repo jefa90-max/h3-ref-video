@@ -347,6 +347,7 @@
   "segmentDraftConflict": "The current prompt or clip version changed. Your draft is preserved. Review the prompts used by the current video, then explicitly adopt its version.",
   "segmentRebaseDraft": "Use this draft with the current version",
   "segmentActivePrompts": "Prompts used by the current video (source / H3)",
+  "segmentSavedPrompts": "Saved prompts for this segment (source / H3)",
   "segmentNoActiveSource": "No active source prompt. A direct H3 version is not paired with the old source. Switching to source creates a new draft.",
   "segmentNoActiveH3": "No active H3 can be recovered. Offline demos do not fabricate model output.",
   "segmentRetryCurrent": "Generate this segment again with this prompt",
@@ -373,6 +374,7 @@
   "selectCastForGroup": "Select to merge",
   "mergeSelectedCast": "Merge selected into one sheet ({count} selected)",
   "filmGroupedCastName": "Combined cast sheet · {names}",
+  "filmCastMemberDescription": "{name}: {description}",
   "splitCastGroup": "Split into individual uploads",
   "castMerged": "Merged into a combined cast sheet: {names}. Upload one image containing these characters.",
   "castSplit": "Split cast group: {names}. Upload separate images for each character.",
@@ -382,9 +384,10 @@
   "rewriteMissingPrompts": "Convert missing English prompts",
   "rewriteMissingPromptsCount": "Convert missing English prompts ({count})",
   "rewriteAllPrompts": "Re-convert all English prompts",
-  "segmentsRewriteHint": "Updates and saves English H3 prompts using the text model only, without calling RunningHub or replacing existing clips; subsequent segment regenerations reuse them automatically.",
+  "segmentsRewriteHint": "Updates and saves English H3 prompts using the text model only (text model charges may apply), without calling RunningHub or replacing existing clips; subsequent segment regenerations reuse them automatically.",
+  "segmentsRewriteDemoHint": "Offline demo mode: generates local six-section English preview prompts only, with no model calls or charges.",
   "operationRewriteSegment": "Convert segment prompt",
   "operationRewritePrompts": "Convert film prompts",
   "stageRewritingPrompts": "Converting English H3 prompts",
-  "stageRewritingPromptsHint": "Generating and saving six-section English prompts only; no paid video generation will start."
+  "stageRewritingPromptsHint": "Generating and saving six-section English prompts via the text model (text model charges may apply); no paid video generation will start."
 }

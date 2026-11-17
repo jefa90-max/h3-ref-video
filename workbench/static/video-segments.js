@@ -82,23 +82,24 @@ function reconcileSegmentSubmissions(job) {
       }
     }
     const rewritePending = state.segmentRewrites.get(segment.number);
-    if (rewritePending) {
-      if (["failed", "interrupted"].includes(job.status)) {
-        state.segmentRewrites.delete(segment.number);
-      } else if (job.status === "succeeded" && segment.h3_prompt && segment.source_prompt === rewritePending.prompt) {
+    if (rewritePending && ["failed", "interrupted"].includes(job.status)) {
+      state.segmentRewrites.delete(segment.number);
+    } else if (rewritePending && job.status === "succeeded") {
+      if (segment.h3_prompt && segment.source_prompt === rewritePending.prompt && !segment.source_rewrite_required) {
         const entry = segmentDraftEntry(segment);
         if (entry.drafts.source?.text?.trim() === rewritePending.prompt) {
           delete entry.drafts.source;
         }
-        delete entry.drafts.h3;
-        entry.selectedFormat = "h3";
-        const card = state.segmentCards.get(segment.number);
-        if (card) {
-          card.editorFormat = null;
-          card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+        if (!entry.drafts.h3) {
+          entry.selectedFormat = "h3";
+          const card = state.segmentCards.get(segment.number);
+          if (card) {
+            card.editorFormat = null;
+            card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+          }
         }
-        state.segmentRewrites.delete(segment.number);
       }
+      state.segmentRewrites.delete(segment.number);
     }
   }
 }
@@ -124,7 +125,7 @@ function refreshSegmentControls(card, job, syncText = false) {
     card.draftNote.hidden = !draft;
     card.otherDraft.textContent = t("segmentOtherFormatDraft");
     card.otherDraft.hidden = !state.segmentDrafts.get(segment.number)?.drafts[format === "source" ? "h3" : "source"];
-    card.activeLabel.textContent = t("segmentActivePrompts");
+    card.activeLabel.textContent = t(segment.url ? "segmentActivePrompts" : "segmentSavedPrompts");
     card.activeSource.textContent = segment.source_prompt || t("segmentNoActiveSource");
     card.activeH3.textContent = segment.h3_prompt || t("segmentNoActiveH3");
   }
@@ -146,10 +147,11 @@ function refreshSegmentControls(card, job, syncText = false) {
       control.disabled = (locked || !segment.editable) && !(control === card.editor && card.composing);
     }
     const sourceDraft = state.segmentDrafts.get(segment.number)?.drafts.source;
-    const sourceText = format === "source" ? text : (sourceDraft?.text ?? (segment.source_prompt || segment.automatic_source_prompt || ""));
+    const sourceText = format === "source" ? text : (sourceDraft?.text ?? segmentSavedText(segment, "source"));
     const sourceBaseline = (format === "source" ? draft : sourceDraft) || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
     const sourceConflict = sourceBaseline.basePromptVersion !== segment.prompt_version || sourceBaseline.baseClipVersion !== segment.version;
-    const canRewrite = Boolean((segment.can_rewrite ?? segment.editable) && !locked && sourceText.trim() && !sourceConflict);
+    const hasUnsavedH3Draft = format === "h3" && Boolean(state.segmentDrafts.get(segment.number)?.drafts.h3);
+    const canRewrite = Boolean((segment.can_rewrite ?? segment.editable) && !locked && sourceText.trim() && !sourceConflict && !hasUnsavedH3Draft);
     card.rewriteH3.textContent = t(job.demo ? "segmentRewriteH3Demo" : "segmentRewriteH3Live");
     card.rewriteH3.dataset.enabled = String(canRewrite);
     card.rewriteH3.disabled = !canRewrite;
@@ -204,7 +206,7 @@ function expandSegmentEditor(card) {
     const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
     const sourceText = format === "source"
       ? (sourceDraft?.text ?? segmentSavedText(current, "source"))
-      : (sourceDraft?.text ?? (current.source_prompt || current.automatic_source_prompt || ""));
+      : (sourceDraft?.text ?? segmentSavedText(current, "source"));
     const trimmedSource = sourceText.trim();
     if (!trimmedSource) return;
     const baseline = sourceDraft || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
@@ -212,6 +214,15 @@ function expandSegmentEditor(card) {
     const accepted = await runJobAction(`/api/jobs/${encodeURIComponent(state.selectedJob.id)}/segments/${current.number}/rewrite`, payload);
     if (accepted) {
       const updated = accepted.segments?.find(item => item.number === current.number);
+      if (updated?.prompt_version) {
+        if (sourceDraft && sourceDraft.text.trim() === trimmedSource) {
+          sourceDraft.basePromptVersion = updated.prompt_version;
+          sourceDraft.baseClipVersion = updated.version;
+        }
+        if (card.editorFormat === "source") {
+          card.editorBaseline = { basePromptVersion: updated.prompt_version, baseClipVersion: updated.version };
+        }
+      }
       state.segmentRewrites.set(current.number, {
         prompt: trimmedSource,
         revision: updated?.attempt_revision || updated?.applied_revision || null,
@@ -260,9 +271,13 @@ function createSegmentCard(segment) {
   card.regenerate.addEventListener("click", async () => {
     if (card.regenerate.disabled) return;
     const current = card.segment, format = segmentFormat(current), draft = state.segmentDrafts.get(current.number)?.drafts[format];
-    const text = draft?.text ?? segmentSavedText(current, format);
+    const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
+    const rawText = draft?.text ?? segmentSavedText(current, format);
+    const preservePairedSource = format === "h3" && !draft && !sourceDraft && Boolean(current.source_prompt) && Boolean(current.h3_prompt) && rawText === current.h3_prompt && !current.source_rewrite_required;
+    const submitFormat = preservePairedSource ? "source" : format;
+    const text = preservePairedSource ? current.source_prompt : rawText;
     const baseline = draft || card.editorBaseline || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
-    const payload = { prompt: text, prompt_format: format, prompt_version: baseline.basePromptVersion, version: baseline.baseClipVersion };
+    const payload = { prompt: text, prompt_format: submitFormat, prompt_version: baseline.basePromptVersion, version: baseline.baseClipVersion };
     const submission = { ...payload, revision: null }; state.segmentSubmissions.set(current.number, submission);
     const accepted = await runJobAction(`/api/jobs/${encodeURIComponent(state.selectedJob.id)}/segments/${current.number}/regenerate`, payload);
     if (accepted) {
@@ -297,7 +312,7 @@ function renderVideoSegments(job) {
   $("rewrite-missing-prompts").disabled = !canBatchRewrite || missingCount <= 0;
   $("rewrite-all-prompts").textContent = t("rewriteAllPrompts");
   $("rewrite-all-prompts").disabled = !canBatchRewrite || !segments.length;
-  $("segments-rewrite-hint").textContent = t("segmentsRewriteHint");
+  $("segments-rewrite-hint").textContent = t(job.demo ? "segmentsRewriteDemoHint" : "segmentsRewriteHint");
   $("assembly-notice").hidden = !job.pending_video && !job.pending_assembly;
   $("assembly-notice").textContent = t(job.pending_video ? "segmentsNeedFrames" : "assemblyPending");
   $("assembly-hint").textContent = t(job.pending_video ? "segmentsNeedFrames" : job.assembly?.ready ? "assemblyHint" : "assemblyMissing");

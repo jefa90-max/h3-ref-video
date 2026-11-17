@@ -178,6 +178,7 @@ function renderFilmReferences() {
   }
   const castSlots = state.filmSlots.filter((s) => s.kind === "cast");
   const controlsLocked = state.uploading || state.filmImporting || state.submitting || state.filmParsing || !state.film;
+  let mergeBtn = null;
   if (castSlots.length >= 2) {
     const groupedMemberCount = state.filmGroups.reduce((sum, g) => sum + g.slotIds.length, 0);
     const castSheetCount = (castSlots.length - groupedMemberCount) + state.filmGroups.length;
@@ -189,7 +190,7 @@ function renderFilmReferences() {
     if (totalRefs > 9) {
       info.append(element("p", "hint field-error", t("filmCastOverLimitHint", { total: totalRefs, max: 9 })));
     }
-    const mergeBtn = element("button", "button secondary merge-cast-button", t("mergeSelectedCast", { count: state.selectedCastSlots.size }));
+    mergeBtn = element("button", "button secondary merge-cast-button", t("mergeSelectedCast", { count: state.selectedCastSlots.size }));
     mergeBtn.type = "button";
     mergeBtn.disabled = controlsLocked || state.selectedCastSlots.size < 2;
     mergeBtn.addEventListener("click", () => {
@@ -224,11 +225,12 @@ function renderFilmReferences() {
       const heading = element("div", "label-heading");
       heading.append(element("strong", "", name), element("span", "subtle", t("referenceRequired")));
       card.append(heading);
-      const descText = members.map((m) => (m.description ? `${m.name}：${m.description}` : m.name)).join("\n");
+      const descText = members.map((m) => (m.description ? t("filmCastMemberDescription", { name: m.name, description: m.description }) : m.name)).join("\n");
       if (descText) card.append(element("p", "hint film-reference-description", descText));
       card.append(element("p", `film-reference-state${binding ? " uploaded" : ""}`, t(binding ? "referenceUploaded" : "referencePending")));
       if (binding) {
         const preview = element("img", "film-reference-preview");
+        preview.loading = "lazy";
         preview.src = binding.file.url;
         preview.alt = t("filmReferencePreview", { name });
         card.append(preview, element("p", "hint film-reference-filename", binding.file.name));
@@ -294,7 +296,12 @@ function renderFilmReferences() {
       checkbox.addEventListener("change", () => {
         if (checkbox.checked) state.selectedCastSlots.add(slot.id);
         else state.selectedCastSlots.delete(slot.id);
-        renderFilmReferences();
+        if (mergeBtn) {
+          const lockedNow = state.uploading || state.filmImporting || state.submitting || state.filmParsing || !state.film;
+          mergeBtn.textContent = t("mergeSelectedCast", { count: state.selectedCastSlots.size });
+          mergeBtn.disabled = lockedNow || state.selectedCastSlots.size < 2;
+        }
+        renderMode();
       });
       checkWrap.append(checkbox, element("strong", "", name));
       heading.append(checkWrap, element("span", "subtle", t(slot.required ? "referenceRequired" : "optional")));
@@ -306,6 +313,7 @@ function renderFilmReferences() {
     card.append(element("p", `film-reference-state${binding ? " uploaded" : ""}`, t(binding ? "referenceUploaded" : "referencePending")));
     if (binding) {
       const preview = element("img", "film-reference-preview");
+      preview.loading = "lazy";
       preview.src = binding.file.url;
       preview.alt = t("filmReferencePreview", { name });
       card.append(preview, element("p", "hint film-reference-filename", binding.file.name));
