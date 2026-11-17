@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config, http, media, staging
+from . import config, http, media, rewrite, staging
 from .i18n import message
 
 ORIENT = {"9:16": "竖屏", "16:9": "横屏", "1:1": "方形"}
@@ -41,23 +41,10 @@ class CompositionFormatError(RuntimeError):
 
 
 def _extract_composition_json_text(raw_reply: str) -> str:
-    lower = raw_reply.lower()
-    pos = 0
-    chunks = []
-    while True:
-        start = lower.find("<think>", pos)
-        if start == -1:
-            chunks.append(raw_reply[pos:])
-            break
-        chunks.append(raw_reply[pos:start])
-        end = lower.find("</think>", start + 7)
-        if end == -1:
-            raise ValueError(message("frame_composition_invalid", detail=raw_reply[:300]))
-        pos = end + 8
-    cleaned = "".join(chunks).strip()
-    low_rem = cleaned.lower()
-    if "<think" in low_rem or "</think" in low_rem:
-        raise ValueError(message("frame_composition_invalid", detail=raw_reply[:300]))
+    cleaned = rewrite.strip_think_blocks(
+        raw_reply,
+        lambda: ValueError(message("frame_composition_invalid", detail=raw_reply[:300])),
+    )
     fence_open = cleaned.find("```")
     if fence_open != -1:
         fence_close = cleaned.find("```", fence_open + 3)

@@ -112,25 +112,33 @@ def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback
         "Write the rewrite now: the six sections only."]).strip()
 
 
-def _strip_think_blocks_linear(raw: str) -> str:
-    lower = raw.lower()
+_THINK_EXACT_RE = re.compile(r"<think>|</think>", re.IGNORECASE)
+_THINK_ANY_RE = re.compile(r"</?think", re.IGNORECASE)
+
+
+def strip_think_blocks(raw: str, error_factory) -> str:
     pos = 0
     chunks = []
     while True:
-        start = lower.find("<think>", pos)
-        if start == -1:
+        open_match = _THINK_EXACT_RE.search(raw, pos)
+        if open_match is None:
             chunks.append(raw[pos:])
             break
-        chunks.append(raw[pos:start])
-        end = lower.find("</think>", start + 7)
-        if end == -1:
-            raise RewriteError(message("rewrite_empty"))
-        pos = end + 8
+        if open_match.group(0)[1] == "/":
+            raise error_factory()
+        chunks.append(raw[pos:open_match.start()])
+        close_match = _THINK_EXACT_RE.search(raw, open_match.end())
+        if close_match is None or close_match.group(0)[1] != "/":
+            raise error_factory()
+        pos = close_match.end()
     rem = "".join(chunks)
-    low_rem = rem.lower()
-    if "<think" in low_rem or "</think" in low_rem:
-        raise RewriteError(message("rewrite_empty"))
+    if _THINK_ANY_RE.search(rem):
+        raise error_factory()
     return rem.strip()
+
+
+def _strip_think_blocks_linear(raw: str) -> str:
+    return strip_think_blocks(raw, lambda: RewriteError(message("rewrite_empty")))
 
 
 def _strip_reasoning_and_fences(raw: str) -> str:

@@ -101,6 +101,16 @@ function reconcileSegmentSubmissions(job) {
       }
       state.segmentRewrites.delete(segment.number);
     }
+    if (job.status === "succeeded" && ["rewrite_segment", "rewrite_prompts"].includes(job.operation) && segment.h3_prompt && !segment.source_rewrite_required) {
+      const entry = state.segmentDrafts.get(segment.number);
+      if (entry?.drafts.source?.text?.trim() === segment.source_prompt) {
+        delete entry.drafts.source;
+        const card = state.segmentCards.get(segment.number);
+        if (card?.editorFormat === "source") {
+          card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+        }
+      }
+    }
   }
 }
 
@@ -143,18 +153,19 @@ function refreshSegmentControls(card, job, syncText = false) {
   card.regenerate.textContent = t(segment.terminal_failed ? "segmentRetryCurrent" : job.demo ? "regenerateSegmentDemo" : "regenerateSegmentLive");
   card.cost.textContent = t(job.demo ? "segmentDemoHint" : format === "source" && (text !== segment.source_prompt || !segment.h3_prompt || segment.source_rewrite_required) ? "segmentSourceCost" : "segmentVideoCost");
   if (card.editor) {
-    card.conflict.textContent = t("segmentDraftConflict");
-    card.conflict.hidden = !conflict;
-    card.rebase.textContent = t("segmentRebaseDraft");
-    card.rebase.hidden = !conflict;
-    for (const control of [card.editor, card.format, card.rebase]) {
-      control.dataset.enabled = String(Boolean(segment.editable));
-      control.disabled = (locked || !segment.editable) && !(control === card.editor && card.composing);
-    }
     const sourceDraft = state.segmentDrafts.get(segment.number)?.drafts.source;
     const sourceText = format === "source" ? text : (sourceDraft?.text ?? segmentSavedText(segment, "source"));
     const sourceBaseline = (format === "source" ? draft : sourceDraft) || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
     const sourceConflict = sourceBaseline.basePromptVersion !== segment.prompt_version || sourceBaseline.baseClipVersion !== segment.version;
+    const shownConflict = conflict || (format === "h3" && Boolean(sourceDraft) && sourceConflict);
+    card.conflict.textContent = t(conflict ? "segmentDraftConflict" : "segmentSourceDraftConflict");
+    card.conflict.hidden = !shownConflict;
+    card.rebase.textContent = t("segmentRebaseDraft");
+    card.rebase.hidden = !shownConflict;
+    for (const control of [card.editor, card.format, card.rebase]) {
+      control.dataset.enabled = String(Boolean(segment.editable));
+      control.disabled = (locked || !segment.editable) && !(control === card.editor && card.composing);
+    }
     const hasUnsavedH3Draft = format === "h3" && Boolean(state.segmentDrafts.get(segment.number)?.drafts.h3);
     const canRewrite = Boolean((segment.can_rewrite ?? segment.editable) && !locked && sourceText.trim() && !sourceConflict && !hasUnsavedH3Draft);
     card.rewriteH3.textContent = t(job.demo ? "segmentRewriteH3Demo" : "segmentRewriteH3Live");
@@ -200,8 +211,13 @@ function expandSegmentEditor(card) {
   });
   card.rebase.addEventListener("click", () => {
     if (card.rebase.disabled) return;
-    const current = card.segment, format = segmentFormat(current);
-    segmentDraftEntry(current).drafts[format] = { text: card.editor.value, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    const current = card.segment, format = segmentFormat(current), drafts = segmentDraftEntry(current).drafts;
+    if (drafts[format] || card.editor.value !== segmentSavedText(current, format)) {
+      drafts[format] = { text: card.editor.value, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    }
+    if (format === "h3" && drafts.source) {
+      drafts.source = { ...drafts.source, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    }
     refreshSegmentControls(card, state.selectedJob);
   });
   card.rewriteH3.addEventListener("click", async () => {
@@ -311,10 +327,14 @@ function renderVideoSegments(job) {
   renderPagination("segments", state.segmentPage, pages);
   const canBatchRewrite = Boolean(job.can_rewrite_prompts && !state.submitting && !running(job));
   const missingCount = Number(job.missing_h3_count || 0);
-  $("rewrite-missing-prompts").textContent = missingCount > 0 ? t("rewriteMissingPromptsCount", { count: missingCount }) : t("rewriteMissingPrompts");
+  const missingKey = job.demo
+    ? (missingCount > 0 ? "rewriteMissingPromptsCount" : "rewriteMissingPrompts")
+    : (missingCount > 0 ? "rewriteMissingPromptsLiveCount" : "rewriteMissingPromptsLive");
+  $("rewrite-missing-prompts").textContent = t(missingKey, { count: missingCount });
   $("rewrite-missing-prompts").disabled = !canBatchRewrite || missingCount <= 0;
-  $("rewrite-all-prompts").textContent = t("rewriteAllPrompts");
+  $("rewrite-all-prompts").textContent = t(job.demo ? "rewriteAllPrompts" : "rewriteAllPromptsLive");
   $("rewrite-all-prompts").disabled = !canBatchRewrite || !segments.length;
+  $("segments-rewrite-toolbar").className = job.demo ? "segments-rewrite-toolbar" : "segments-rewrite-toolbar live-paid";
   $("segments-rewrite-hint").textContent = t(job.demo ? "segmentsRewriteDemoHint" : "segmentsRewriteHint");
   $("assembly-notice").hidden = !job.pending_video && !job.pending_assembly;
   $("assembly-notice").textContent = t(job.pending_video ? "segmentsNeedFrames" : "assemblyPending");

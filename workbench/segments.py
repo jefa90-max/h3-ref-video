@@ -646,7 +646,7 @@ def view(request, artifacts, editable, *, context=None, editable_numbers=None):
         override = record.get('prompt_override') or {}
         default_prompt = (pair['source'] or automatic['source']) if fmt == 'source' else pair['h3']
         prompt = single_rw.get('prompt') if single_rw.get('prompt') is not None else (pending.get('prompt') if pending else (unapplied.get('prompt') if unapplied.get('prompt') is not None else default_prompt))
-        recoverable = bool(prompt and (version or error or terminal or record.get('error') or record.get('terminal_failed') or record.get('manual_rewrite') or unsubmitted_pending))
+        recoverable = bool(prompt or pair['h3'] or automatic['source'])
         card_editable = editable if editable_numbers is None else (editable and number in editable_numbers)
         can_edit_card = bool(card_editable and not task_pending and not unknown and not publishing)
         can_generate = bool(can_edit_card and recoverable)
@@ -793,13 +793,8 @@ def regeneration_plan(request, number, version, *, prompt=None, prompt_format=No
                 raise InputError('segment_value', field=field, value=json.dumps(value, ensure_ascii=False)[:100], expected=message("segment_expected_" + field, request["lang"]))
         if prompt_version != segment_prompt_version(previous, current, pending, reference_version=automatic['reference_version'], rewrite_pending=rw_pending):
             raise InputError('segment_prompt_changed', field='prompt_version', number=number)
-        unsubmitted_pending = bool((pending and not pending.get('applied') and not attempted.get('task') and not attempted.get('submission_unknown')) or rw_pending)
-        if not current and not (attempted.get('terminal_failed') or previous.get('terminal_failed')
-                                or attempted.get('error') or previous.get('error') or previous.get('manual_rewrite')
-                                or pending.get('error') or unsubmitted_pending):
-            raise InputError('segment_prompt', number=number)
     else:
-        if pending or not current or (not request['demo'] and not pair['h3']):
+        if pending or (not current and not pair['h3']) or (not request['demo'] and not pair['h3']):
             raise InputError('segment_prompt', number=number)
         prompt_format = 'source' if pair['source'] else 'h3'
         prompt = pair['source'] if pair['source'] else pair['h3']

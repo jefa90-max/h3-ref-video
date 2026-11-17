@@ -168,8 +168,8 @@ async function refreshFilmReferences({ reset = false, format = false } = {}) {
 const FILM_GROUP_WORDS = ["两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both"];
 
 function peakFilmReferences(castSlots, groupBySlot, boardCount) {
-  const rawShots = (state.film?.shots || []).filter((s) => String(s?.action || "").trim());
-  const cast = state.film?.cast || [];
+  const rawShots = (Array.isArray(state.film?.shots) ? state.film.shots : []).filter((s) => typeof s?.action === "string" && s.action.trim());
+  const cast = Array.isArray(state.film?.cast) ? state.film.cast : [];
   const framesMode = $("frames")?.value || "shot";
   const sheetKey = (idx) => {
     const slotId = `cast:${idx}`;
@@ -205,17 +205,28 @@ function peakFilmReferences(castSlots, groupBySlot, boardCount) {
     segments.at(-1).push(s);
   }
   const activeIndicesInShots = (shotList, fallbackAll = false) => {
-    const text = shotList.map((s) => `${s.action || ""} ${s.line || ""}`).join(" ");
+    const text = shotList.map((s) => `${typeof s?.action === "string" ? s.action : ""} ${typeof s?.line === "string" ? s.line : ""}`).join(" ");
     if (FILM_GROUP_WORDS.some((w) => text.includes(w))) return cast.map((_, i) => i);
-    const matched = cast.map((c, i) => ([c.name, ...(c.aliases || [])].some((n) => n && text.includes(n)) ? i : -1)).filter((i) => i >= 0);
+    const matched = cast.map((c, i) => {
+      const aliases = Array.isArray(c?.aliases) ? c.aliases.filter((a) => typeof a === "string" && a) : [];
+      const names = [typeof c?.name === "string" ? c.name : "", ...aliases];
+      return names.some((n) => n && text.includes(n)) ? i : -1;
+    }).filter((i) => i >= 0);
     return matched.length ? matched : (fallbackAll ? cast.map((_, i) => i) : []);
   };
   let peak = 0;
   segments.forEach((segShots, segIdx) => {
     const segSheets = new Set(activeIndicesInShots(segShots, true).map(sheetKey)).size;
     if (framesMode === "shot") {
-      peak = Math.max(peak, segSheets);
-      for (const s of segShots) {
+      let segBoard = boardCount;
+      let room = 9 - segSheets - segBoard;
+      if (room < segShots.length && segBoard) {
+        segBoard = 0;
+        room += 1;
+      }
+      const frameCount = Math.min(segShots.length, Math.max(0, room));
+      peak = Math.max(peak, segBoard + segSheets + frameCount);
+      for (const s of segShots.slice(0, frameCount)) {
         peak = Math.max(peak, boardCount + new Set(activeIndicesInShots([s], false).map(sheetKey)).size);
       }
     } else {

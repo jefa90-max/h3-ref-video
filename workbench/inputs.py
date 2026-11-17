@@ -150,9 +150,10 @@ def validate(payload, root):
             except (SystemExit, ValueError, TypeError, KeyError, OverflowError) as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
         job["film"] = loaded
+        seg_pics = []
         for segment in planned:
             try:
-                film.refs(loaded, segment, job["frames"])
+                seg_pics.append((segment, film.refs(loaded, segment, job["frames"])))
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
         if job["frames"] != "none":
@@ -166,16 +167,17 @@ def validate(payload, root):
                         saved_frames = json.loads(state_cand.read_text(encoding="utf-8")).get("frames") or {}
                     except (OSError, ValueError):
                         saved_frames = {}
-            checked_shots = (
-                [(seg["idx"], j, shot) for seg in planned for j, shot in enumerate(seg["shots"])]
-                if job["frames"] == "shot"
-                else [(seg["idx"], 0, seg["shots"][0]) for seg in planned]
-            )
-            for seg_idx, shot_idx, shot in checked_shots:
-                fkey = f"s{seg_idx + 1}-{shot_idx + 1}"
-                frame_refs = film.frame_reference_paths(loaded, shot, saved_frames.get(fkey, {}))
-                if len(frame_refs) > config.MAX_IMAGES:
-                    raise InputError("too_many_references", count=len(frame_refs), limit=config.MAX_IMAGES)
+            for segment, pics in seg_pics:
+                seg_idx = segment["idx"]
+                for pic in pics:
+                    if pic["kind"] != "frame":
+                        continue
+                    shot_idx = pic["shot"]
+                    shot = segment["shots"][shot_idx]
+                    fkey = f"s{seg_idx + 1}-{shot_idx + 1}"
+                    frame_refs = film.frame_reference_paths(loaded, shot, saved_frames.get(fkey, {}))
+                    if len(frame_refs) > config.MAX_IMAGES:
+                        raise InputError("too_many_references", count=len(frame_refs), limit=config.MAX_IMAGES)
     return job
 
 
