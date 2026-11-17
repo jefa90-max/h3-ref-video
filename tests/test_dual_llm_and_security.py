@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -420,8 +420,9 @@ class WindowsRetryPollingAndLifecycleTest(unittest.TestCase):
             captured["input"] = kwargs.get("input", "")
             return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/win.png"}', stderr="")
 
-        with patch("subprocess.run", side_effect=fake_upload_run), patch.object(http.os, "name", "posix"):
-            http.upload("https://api.example/up", secret, Path(r"C:\Users\temp\frames\s1-1.png"), fields={"apiKey": "@not-a-file;x"})
+        sample_win_path = PureWindowsPath(r"C:\Users\temp\frames\s1-1.png")
+        with patch("subprocess.run", side_effect=fake_upload_run), patch.object(http, "os", SimpleNamespace(name="posix")):
+            http.upload("https://api.example/up", secret, sample_win_path, fields={"apiKey": "@not-a-file;x"})
         self.assertIn("-w", captured["cmd"])
         self.assertIn("--proto", captured["cmd"])
         self.assertIn("form-string =", captured["input"])
@@ -431,8 +432,8 @@ class WindowsRetryPollingAndLifecycleTest(unittest.TestCase):
         def fake_upload_nt(cmd, **kwargs):
             captured_nt["input"] = kwargs.get("input", "")
             return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/win.png"}', stderr="")
-        with patch("subprocess.run", side_effect=fake_upload_nt), patch.object(http.os, "name", "nt"):
-            http.upload("https://api.example/up", secret, Path(r"C:\Users\temp\frames\s1-1.png"), fields={"apiKey": "@not-a-file;x"})
+        with patch("subprocess.run", side_effect=fake_upload_nt), patch.object(http, "os", SimpleNamespace(name="nt")):
+            http.upload("https://api.example/up", secret, sample_win_path, fields={"apiKey": "@not-a-file;x"})
         self.assertIn(r"C:\\Users\\temp\\frames\\s1-1.png", captured_nt["input"])
         self.assertNotIn(r"C:\\\\Users", captured_nt["input"])
 
@@ -621,11 +622,12 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                         fh.__exit__.side_effect = lambda *exc: real_fh.__exit__(*exc)
                         fh.read.side_effect = PermissionError(13, "Permission denied")
                         return fh
-                    with patch.object(instance_mod.os, "name", "nt"), \
+                    nt_lock_dir = root / "nt-lock"
+                    with patch.object(instance_mod, "os", SimpleNamespace(name="nt", SEEK_END=os.SEEK_END)), \
                          patch.dict("sys.modules", {"msvcrt": fake_msvcrt}), \
                          patch.object(Path, "open", mandatory_locked_open):
                         with self.assertRaises(SystemExit):
-                            with single_instance(root / "nt-lock"):
+                            with single_instance(nt_lock_dir):
                                 pass
 
                     # Demo run produces demo-film.json, demo-frames.json, seg1-last.jpg, and report.md
