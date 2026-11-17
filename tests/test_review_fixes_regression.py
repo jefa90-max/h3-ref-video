@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import tempfile
@@ -8,8 +7,9 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from h3ref import film, http, rewrite
-from workbench import segments, storyboard
+from h3ref import film, http, media, rewrite, rh
+from workbench import inputs, segments, storyboard
+from workbench.i18n import InputError
 from workbench.jobs import write_json
 from workbench.server import create_app
 
@@ -44,7 +44,7 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         self.headers = {"X-Workbench": "1", "Accept-Language": "zh-CN"}
         self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "RUNNINGHUB_API_KEY": "rh-test", "persist": False}, headers=self.headers)
 
-    def _setup_two_seg_job(self, job_id):
+    def _setup_two_seg_job(self, job_id, *, frames_mode="none"):
         out = self.root / f"out-{job_id}"
         for folder in ("inputs", "frames", "clips", "prompts"):
             (out / folder).mkdir(parents=True, exist_ok=True)
@@ -59,7 +59,7 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         request = {
             "kind": "film",
             "demo": False,
-            "frames": "none",
+            "frames": frames_mode,
             "optimize_storyboard": False,
             "lang": "zh-CN",
             "output_dir": str(out),
@@ -232,6 +232,601 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         self.assertEqual(card1_failed["prompt"], "新待转化中文草稿")
         self.assertEqual(card1_failed["source_prompt"], "原生效中文词")
         self.assertIn("401 bad key", card1_failed["error"])
+
+    def test_regenerate_after_manual_h3_rewrite_preserves_paired_chinese_source(self):
+        out, _, _ = self._setup_two_seg_job("pair-keep-job")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="初始中文词", h3=_valid_h3("init", 1), h3_source="初始中文词", file=str(out / "clips/seg1.mp4"), cny=0.1)
+        self.jobs.records["pair-keep-job"].update(status="succeeded", error=None)
+
+        # User edits Chinese source prompt and converts to English H3
+        snap0 = self.client.get("/api/jobs/pair-keep-job").json
+        with patch.object(self.jobs, "launch"):
+            r_rw = self.client.post(
+                "/api/jobs/pair-keep-job/segments/1/rewrite",
+                json={"prompt": "女王轻推婚书望向唐僧", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_rw.status_code, 200, r_rw.json)
+        converted_h3 = _valid_h3("converted-queen", 1)
+        with patch.object(rewrite, "rewrite", return_value=converted_h3):
+            segments.rewrite_segment(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["pair-keep-job"].update(status="succeeded", error=None, operation="rewrite_segment")
+
+        # UI switches to H3 preview; even if client posts prompt_format="h3" with the unmodified paired H3,
+        # backend must preserve the paired Chinese source prompt on disk instead of wiping zh to ""!
+        snap1 = self.client.get("/api/jobs/pair-keep-job").json
+        card1 = snap1["segments"][0]
+        with patch("workbench.segments.shutil.which", return_value="/fake/ffmpeg"), patch.object(self.jobs, "launch"):
+            r_regen = self.client.post(
+                "/api/jobs/pair-keep-job/segments/1/regenerate",
+                json={
+                    "version": card1["version"],
+                    "prompt_version": card1["prompt_version"],
+                    "prompt": converted_h3,
+                    "prompt_format": "h3",
+                },
+                headers=self.headers,
+            )
+        self.assertEqual(r_regen.status_code, 200, r_regen.json)
+        req_seg = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+
+        def fake_gen(staged_job, f_dict, seg, pics, *, reference_paths=None):
+            cand = staged_job.dir / "clips" / "seg1.mp4"
+            cand.write_bytes(b"NEW_MP4")
+            (staged_job.dir / "clips" / "seg1-last.jpg").write_bytes(b"NEW_TAIL")
+            staged_job.put("segs", "0", file=str(cand), cny=0.2, task="rh-ok", error=None)
+            return staged_job.state["segs"]["0"]
+
+        with patch.object(film, "gen_segment", side_effect=fake_gen), \
+             patch("h3ref.media.duration", return_value=8.0):
+            segments.regenerate(req_seg)
+        self.jobs.records["pair-keep-job"].update(status="succeeded", error=None, operation="segment")
+
+        saved_seg = film.Job(out).state["segs"]["0"]
+        self.assertEqual(saved_seg["zh"], "女王轻推婚书望向唐僧")
+        self.assertEqual((out / "prompts/seg1.zh.txt").read_text(encoding="utf-8"), "女王轻推婚书望向唐僧")
+        self.assertEqual((saved_seg.get("prompt_override") or {}).get("format"), "source")
+        snap_after = self.client.get("/api/jobs/pair-keep-job").json
+        self.assertEqual(snap_after["segments"][0]["source_prompt"], "女王轻推婚书望向唐僧")
+        self.assertFalse(snap_after["segments"][0]["source_rewrite_required"])
+
+    def test_succeeded_regeneration_and_sibling_rewrite_reconcile_prompt_rewrite_and_terminal_state(self):
+        # 1. Failed single-segment prompt rewrite must be cleared/superseded when subsequent video regeneration succeeds,
+        #    and overwriting a failed single-segment rewrite via another segment's rewrite archives its draft to unapplied_edit.
+        out, _, _ = self._setup_two_seg_job("supersede-rw-job")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        (out / "clips/seg2.mp4").write_bytes(b"C2")
+        (out / "clips/seg2-last.jpg").write_bytes(b"T2")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="一段原词", h3=_valid_h3("s1", 1), h3_source="一段原词", file=str(out / "clips/seg1.mp4"), cny=0.1)
+        fjob.put("segs", "1", zh="二段原词", h3=_valid_h3("s2", 2), h3_source="二段原词", file=str(out / "clips/seg2.mp4"), cny=0.1)
+        self.jobs.records["supersede-rw-job"].update(status="succeeded", error=None)
+
+        snap0 = self.client.get("/api/jobs/supersede-rw-job").json
+        with patch.object(self.jobs, "launch"):
+            self.client.post(
+                "/api/jobs/supersede-rw-job/segments/1/rewrite",
+                json={"prompt": "一段失败草稿", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        req_rw = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("401 bad key")):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                segments.rewrite_segment(req_rw)
+        self.jobs.records["supersede-rw-job"].update(status="failed", error="401 bad key", operation="rewrite_segment")
+
+        # Rewriting segment 2 archives segment 1's failed draft into unapplied_edit instead of losing it
+        snap_fail1 = self.client.get("/api/jobs/supersede-rw-job").json
+        with patch.object(self.jobs, "launch"):
+            self.client.post(
+                "/api/jobs/supersede-rw-job/segments/2/rewrite",
+                json={"prompt": "二段新草稿", "prompt_format": "source", "prompt_version": snap_fail1["segments"][1]["prompt_version"]},
+                headers=self.headers,
+            )
+        snap_after_s2_prep = self.client.get("/api/jobs/supersede-rw-job").json
+        self.assertEqual(snap_after_s2_prep["segments"][0]["prompt"], "一段失败草稿")
+
+        # Now fail segment 2 rewrite too, then regenerate segment 2 directly with H3 -> must NOT reactivate stale error/draft!
+        req_rw2 = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("401 bad key s2")):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                segments.rewrite_segment(req_rw2)
+        self.jobs.records["supersede-rw-job"].update(status="failed", error="401 bad key s2", operation="rewrite_segment")
+
+        snap_fail2 = self.client.get("/api/jobs/supersede-rw-job").json
+        direct_h3_s2 = _valid_h3("direct-s2", 2)
+        with patch("workbench.segments.shutil.which", return_value="/fake/ffmpeg"), patch.object(self.jobs, "launch"):
+            r_reg = self.client.post(
+                "/api/jobs/supersede-rw-job/segments/2/regenerate",
+                json={
+                    "version": snap_fail2["segments"][1]["version"],
+                    "prompt_version": snap_fail2["segments"][1]["prompt_version"],
+                    "prompt": direct_h3_s2,
+                    "prompt_format": "h3",
+                },
+                headers=self.headers,
+            )
+        self.assertEqual(r_reg.status_code, 200, r_reg.json)
+        req_seg2 = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+
+        def fake_gen2(staged_job, f_dict, seg, pics, *, reference_paths=None):
+            cand = staged_job.dir / "clips" / "seg2.mp4"
+            cand.write_bytes(b"NEW_C2")
+            (staged_job.dir / "clips" / "seg2-last.jpg").write_bytes(b"NEW_T2")
+            staged_job.put("segs", "1", file=str(cand), cny=0.2, task="rh-s2-ok", error=None)
+            return staged_job.state["segs"]["1"]
+
+        with patch.object(film, "gen_segment", side_effect=fake_gen2), \
+             patch("h3ref.media.duration", return_value=8.0):
+            segments.regenerate(req_seg2)
+        self.jobs.records["supersede-rw-job"].update(status="succeeded", error=None, operation="segment")
+
+        snap_clean2 = self.client.get("/api/jobs/supersede-rw-job").json
+        card2_clean = snap_clean2["segments"][1]
+        self.assertIsNone(card2_clean["error"])
+        self.assertEqual(card2_clean["prompt_format"], "h3")
+        self.assertEqual(card2_clean["prompt"], direct_h3_s2)
+
+        # 2. Mismatched or missing prompt-rewrite.json revision is rejected instead of silently exiting 0
+        with self.assertRaises(segments.InputError):
+            segments.rewrite_segment({**req_rw2, "segment_revision": "wrong-revision"})
+
+        # 3. Clipless staged terminal_failed in segment-edit.json is preserved across rewrite_prompts (anti-double-charge)
+        #    AND sibling unapplied segment-edit.json is reconciled so unfinished pipeline stays resumable!
+        out_t, _, _ = self._setup_two_seg_job("term-rw-job")
+        fjob_t = film.Job(out_t)
+        fjob_t.put("segs", "0", zh="一段无视频", error="RewriteError")
+        fjob_t.put("segs", "1", zh="二段待生成")
+        staged_t = film.Job(out_t / "inputs" / "segment-revdead")
+        staged_t.put("segs", "0", zh="一段无视频", h3=_valid_h3("dead", 1), h3_source="一段无视频", task="rh-dead-1", terminal_failed=True, error="Remote OOM")
+        write_json(out_t / "inputs/segment-edit.json", {
+            "number": 1, "revision": "revdead", "version": None, "prompt": "一段用户改后词",
+            "prompt_format": "source", "explicit_prompt": True, "previous": {"zh": "一段无视频", "error": "RewriteError"},
+            "applied": False, "error": "failed",
+        })
+        self.jobs.records["term-rw-job"].update(status="failed", operation="segment")
+
+        with patch.object(self.jobs, "launch"):
+            r_batch = self.client.post("/api/jobs/term-rw-job/segments/rewrite", json={"scope": "all"}, headers=self.headers)
+        self.assertEqual(r_batch.status_code, 200, r_batch.json)
+        req_batch = json.loads((out_t / "inputs/request.json").read_text(encoding="utf-8"))
+        seen_zh = []
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: seen_zh.append(zh) or _valid_h3("b", n)):
+            segments.rewrite_prompts(req_batch)
+        self.jobs.records["term-rw-job"].update(status="succeeded", error=None, operation="rewrite_prompts")
+
+        self.assertIn("一段用户改后词", seen_zh, "Batch rewrite must not discard unapplied source edit")
+        seg1_state = film.Job(out_t).state["segs"]["0"]
+        self.assertEqual(seg1_state["zh"], "一段用户改后词")
+        self.assertTrue(seg1_state.get("terminal_failed"), "Clipless staged terminal_failed must survive batch rewrite")
+        self.assertEqual(seg1_state.get("task"), "rh-dead-1")
+
+    def test_inflight_sibling_task_remains_resumable_after_manual_rewrite_succeeds_or_fails(self):
+        out, script, request = self._setup_two_seg_job("inflight-rw-job")
+        # Add 3rd shot so we have 3 segments: seg 1 terminal_failed (no clip), seg 2 in-flight paid RH task, seg 3 editable
+        script["shots"].append({"start": 16, "end": 24, "action": "阿青起身"})
+        write_json(out / "inputs/film.json", script)
+        write_json(out / "inputs/request.json", request)
+        review = storyboard.review_status(request, [])
+        write_json(out / "inputs/review.json", {"dirty_segments": [], "confirmed_version": review["version"]})
+        (out / "clips/seg3.mp4").write_bytes(b"C3")
+        (out / "clips/seg3-last.jpg").write_bytes(b"T3")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="一段", h3=_valid_h3("s1", 1), h3_source="一段", task="rh-dead-1", terminal_failed=True, error="OOM")
+        fjob.put("segs", "1", zh="二段", h3=_valid_h3("s2", 2), h3_source="二段", task="rh-live-2", submitted=1700000000.0, phase="poll")
+        fjob.put("segs", "2", zh="三段", h3=_valid_h3("s3", 2), h3_source="三段", file=str(out / "clips/seg3.mp4"), cny=0.1)
+        self.jobs.records["inflight-rw-job"].update(status="interrupted", operation="pipeline")
+
+        snap0 = self.client.get("/api/jobs/inflight-rw-job").json
+        with patch.object(self.jobs, "launch"):
+            r_rw = self.client.post(
+                "/api/jobs/inflight-rw-job/segments/3/rewrite",
+                json={"prompt": "三段新词", "prompt_format": "source", "prompt_version": snap0["segments"][2]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_rw.status_code, 200, r_rw.json)
+        req_rw = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+
+        # Case A: rewrite_segment FAILS -> Seg 2's paid in-flight task must STILL be resumable via pipeline without LLM key!
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("402 quota")):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                segments.rewrite_segment(req_rw)
+        self.jobs.records["inflight-rw-job"].update(status="failed", error="402 quota", operation="rewrite_segment")
+        snap_failed_rw = self.client.get("/api/jobs/inflight-rw-job").json
+        self.assertTrue(snap_failed_rw["can_resume_pipeline"])
+        self.assertTrue(snap_failed_rw["can_resume_video"])
+
+        # Case B: rewrite_segment SUCCEEDS -> Seg 2's paid in-flight task must ALSO keep can_resume_video=True!
+        with patch.object(rewrite, "rewrite", return_value=_valid_h3("s3-new", 2)):
+            segments.rewrite_segment(req_rw)
+        self.jobs.records["inflight-rw-job"].update(status="succeeded", error=None, operation="rewrite_segment")
+        snap_ok_rw = self.client.get("/api/jobs/inflight-rw-job").json
+        self.assertTrue(snap_ok_rw["can_resume_pipeline"])
+        self.assertTrue(snap_ok_rw["can_resume_video"], "Succeeded manual rewrite must not disable Resume for in-flight paid sibling task")
+
+        # Case C: submission_unknown on a sibling blocks POST /resume when can_resume_video is False on rewrite_segment
+        fjob = film.Job(out)
+        fjob.put("segs", "1", task=None, submission_unknown=True)
+        self.jobs.records["inflight-rw-job"].update(status="failed", error="interrupted", operation="rewrite_segment")
+        snap_unk = self.client.get("/api/jobs/inflight-rw-job").json
+        self.assertFalse(snap_unk["can_resume_video"])
+        res_blocked = self.client.post("/api/jobs/inflight-rw-job/resume", json={}, headers=self.headers)
+        self.assertEqual(res_blocked.status_code, 400)
+
+    def test_batch_rewrite_and_pipeline_resume_preserve_failed_single_rewrite_drafts(self):
+        # 1. Single-segment rewrite fails (no segment-edit.json) -> missing_h3_count counts the unapplied source draft,
+        #    unedited {} POST /segments/1/rewrite refuses to clobber the pending draft without prompt_version,
+        #    and POST /segments/rewrite {"scope": "missing"} or {"scope": "all"} uses the new draft (not old zh)!
+        out, _, _ = self._setup_two_seg_job("batch-after-single-fail")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        (out / "clips/seg2.mp4").write_bytes(b"C2")
+        (out / "clips/seg2-last.jpg").write_bytes(b"T2")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="一段旧词", h3=_valid_h3("s1", 1), h3_source="一段旧词", file=str(out / "clips/seg1.mp4"), cny=0.1)
+        fjob.put("segs", "1", zh="二段旧词", h3=_valid_h3("s2", 2), h3_source="二段旧词", file=str(out / "clips/seg2.mp4"), cny=0.1)
+        self.jobs.records["batch-after-single-fail"].update(status="succeeded", error=None)
+
+        snap0 = self.client.get("/api/jobs/batch-after-single-fail").json
+        with patch.object(self.jobs, "launch"):
+            r_rw = self.client.post(
+                "/api/jobs/batch-after-single-fail/segments/1/rewrite",
+                json={"prompt": "一段待转新草稿", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_rw.status_code, 200, r_rw.json)
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("401 bad key")):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                segments.rewrite_segment(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["batch-after-single-fail"].update(status="failed", error="401 bad key", operation="rewrite_segment")
+
+        snap_after_fail = self.client.get("/api/jobs/batch-after-single-fail").json
+        self.assertEqual(snap_after_fail["missing_h3_count"], 1, "Unconverted single-rewrite source draft must count toward missing_h3_count")
+
+        # Empty-body {} unedited rewrite must NOT overwrite a pending draft without prompt_version
+        clobber_resp = self.client.post("/api/jobs/batch-after-single-fail/segments/1/rewrite", json={}, headers=self.headers)
+        self.assertEqual(clobber_resp.status_code, 400)
+
+        with patch.object(self.jobs, "launch"):
+            r_batch = self.client.post(
+                "/api/jobs/batch-after-single-fail/segments/rewrite",
+                json={"scope": "missing"},
+                headers=self.headers,
+            )
+        self.assertEqual(r_batch.status_code, 200, r_batch.json)
+        batch_plan = json.loads((out / "inputs/prompt-rewrite.json").read_text(encoding="utf-8"))
+        self.assertEqual(batch_plan["targets"], [{"number": 1, "prompt": "一段待转新草稿"}])
+        self.jobs.records["batch-after-single-fail"].update(status="succeeded", error=None)
+
+        # 2. Clipless segment failed single rewrite promoted to zh/prompt_override when superseded -> pipeline resumes,
+        #    so film.stage_prompts rewrites the user's edited prompt!
+        out_c, script_c, _ = self._setup_two_seg_job("clipless-promo-job")
+        (out_c / "clips/seg1.mp4").write_bytes(b"C1")
+        (out_c / "clips/seg1-last.jpg").write_bytes(b"T1")
+        fjob_c = film.Job(out_c)
+        fjob_c.put("segs", "0", zh="一段完成", h3=_valid_h3("s1", 1), h3_source="一段完成", file=str(out_c / "clips/seg1.mp4"), cny=0.1)
+        fjob_c.put("segs", "1", zh="二段旧词")
+        self.jobs.records["clipless-promo-job"].update(status="interrupted", operation="pipeline")
+
+        snap_c0 = self.client.get("/api/jobs/clipless-promo-job").json
+        with patch.object(self.jobs, "launch"):
+            r_c_rw = self.client.post(
+                "/api/jobs/clipless-promo-job/segments/2/rewrite",
+                json={"prompt": "阿青拔剑新词", "prompt_format": "source", "prompt_version": snap_c0["segments"][1]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_c_rw.status_code, 200, r_c_rw.json)
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("502 bad gateway")):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                segments.rewrite_segment(json.loads((out_c / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["clipless-promo-job"].update(status="failed", error="502 bad gateway", operation="rewrite_segment")
+
+        # Sibling Seg 1 rewrite archives clipless Seg 2's draft into zh/prompt_override, then pipeline resume uses it!
+        snap_c1 = self.client.get("/api/jobs/clipless-promo-job").json
+        with patch.object(self.jobs, "launch"):
+            r_s1_rw = self.client.post(
+                "/api/jobs/clipless-promo-job/segments/1/rewrite",
+                json={"prompt": "一段新词", "prompt_format": "source", "prompt_version": snap_c1["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_s1_rw.status_code, 200, r_s1_rw.json)
+        with patch.object(rewrite, "rewrite", return_value=_valid_h3("s1-new", 1)):
+            segments.rewrite_segment(json.loads((out_c / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["clipless-promo-job"].update(status="succeeded", error=None, operation="rewrite_segment")
+
+        self.client.post("/api/config", json={"RUNNINGHUB_API_KEY": "rh-key", "LLM_API_KEY": "sk-key", "persist": False}, headers=self.headers)
+        with patch("shutil.which", return_value="/fake/ffmpeg"), patch.object(self.jobs, "launch"):
+            res_c = self.client.post("/api/jobs/clipless-promo-job/resume", json={}, headers=self.headers)
+        self.assertEqual(res_c.status_code, 200, res_c.json)
+
+        planned_c = film.plan(script_c["shots"])
+        pics_c = {s["idx"]: film.refs(script_c, s, "none") for s in planned_c}
+        seen_c = []
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: seen_c.append(zh) or _valid_h3("s2-ok", n)):
+            film.stage_prompts(film.Job(out_c), script_c, planned_c, pics_c)
+        self.assertEqual(seen_c, ["阿青拔剑新词"])
+        self.assertNotIn("unapplied_edit", film.Job(out_c).state["segs"]["1"])
+
+    def test_failed_rewrite_segment_with_inflight_sibling_drains_without_paid_submission_and_scopes_unknown(self):
+        # Part 1: seg1 task_pending=True, seg2 clip-backed rewrite_segment fails (applied=False), seg3 clipless.
+        # Clicking Resume must drain seg1 without requiring LLM_API_KEY and MUST NOT submit new paid clips for seg3!
+        out, script, request = self._setup_two_seg_job("drain-no-submit")
+        script["shots"].append({"start": 16, "end": 24, "action": "阿青远望"})
+        write_json(out / "inputs/film.json", script)
+        write_json(out / "inputs/request.json", request)
+        review = storyboard.review_status(request, [])
+        write_json(out / "inputs/review.json", {"dirty_segments": [], "confirmed_version": review["version"]})
+        (out / "clips/seg2.mp4").write_bytes(b"C2")
+        (out / "clips/seg2-last.jpg").write_bytes(b"T2")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="一段", h3=_valid_h3("s1", 1), h3_source="一段", task="rh-live-1", submitted=1700000000.0, phase="poll")
+        fjob.put("segs", "1", zh="二段", h3=_valid_h3("s2", 2), h3_source="二段", file=str(out / "clips/seg2.mp4"), cny=0.1)
+        fjob.put("segs", "2", zh="三段")
+        self.jobs.records["drain-no-submit"].update(status="interrupted", operation="pipeline")
+
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-temp", "persist": False}, headers=self.headers)
+        snap0 = self.client.get("/api/jobs/drain-no-submit").json
+        with patch.object(self.jobs, "launch"):
+            r_rw = self.client.post(
+                "/api/jobs/drain-no-submit/segments/2/rewrite",
+                json={"prompt": "二段未完成改写词", "prompt_format": "source", "prompt_version": snap0["segments"][1]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_rw.status_code, 200, r_rw.json)
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteFatalError("402 quota")):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                segments.rewrite_segment(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["drain-no-submit"].update(status="failed", error="402 quota", operation="rewrite_segment")
+
+        # Clear LLM_API_KEY, keep ONLY RUNNINGHUB_API_KEY -> Resume must pass preflight and drain ONLY seg 1!
+        self.client.post("/api/config", json={"LLM_API_KEY": "", "RUNNINGHUB_API_KEY": "rh-only", "persist": False}, headers=self.headers)
+        with patch("shutil.which", return_value="/fake/ffmpeg"), patch.object(self.jobs, "launch"):
+            res_drain = self.client.post("/api/jobs/drain-no-submit/resume", json={}, headers=self.headers)
+        self.assertEqual(res_drain.status_code, 200, res_drain.json)
+
+        def fake_download(url, dest):
+            Path(dest).write_bytes(b"SEG1-MP4")
+
+        with patch.object(rh, "poll", return_value={"state": "done", "url": "https://example.com/seg1.mp4", "cny": 0.1, "coins": 10, "run_seconds": 5.0}), \
+             patch.object(http, "download", side_effect=fake_download), \
+             patch.object(media, "last_frame", side_effect=lambda src, dst: Path(dst).write_bytes(b"T1")), \
+             patch.object(rh, "submit_with_retry", side_effect=AssertionError("must not submit new paid clip for seg 3")), \
+             patch.object(rewrite, "rewrite", side_effect=AssertionError("must not call rewrite while draining")):
+            with self.assertRaises(RuntimeError):
+                film.run(out, out / "inputs/film.json", mode="none", optimize_storyboard=False)
+        self.assertTrue((out / "clips/seg1.mp4").is_file(), "In-flight seg 1 must finish draining")
+        self.jobs.records["drain-no-submit"].update(status="succeeded", error=None)
+
+        # Part 2: seg1 submission_unknown=True in state.json; seg2 rewrite_segment fails (applied=False) -> can_resume_video=True!
+        out_u, _, _ = self._setup_two_seg_job("unk-sibling-rw")
+        (out_u / "clips/seg2.mp4").write_bytes(b"C2")
+        (out_u / "clips/seg2-last.jpg").write_bytes(b"T2")
+        fjob_u = film.Job(out_u)
+        fjob_u.put("segs", "0", zh="一段", h3=_valid_h3("s1", 1), h3_source="一段", task=None, submission_unknown=True)
+        fjob_u.put("segs", "1", zh="二段", h3=_valid_h3("s2", 2), h3_source="二段", file=str(out_u / "clips/seg2.mp4"), cny=0.1)
+        self.jobs.records["unk-sibling-rw"].update(status="failed", error="submission_unknown", operation="pipeline")
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-ok", "persist": False}, headers=self.headers)
+        snap_u0 = self.client.get("/api/jobs/unk-sibling-rw").json
+        with patch.object(self.jobs, "launch"):
+            r_u_rw = self.client.post(
+                "/api/jobs/unk-sibling-rw/segments/2/rewrite",
+                json={"prompt": "二段独立改写词", "prompt_format": "source", "prompt_version": snap_u0["segments"][1]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_u_rw.status_code, 200, r_u_rw.json)
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteError("502 gateway")):
+            with self.assertRaises(rewrite.RewriteError):
+                segments.rewrite_segment(json.loads((out_u / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["unk-sibling-rw"].update(status="failed", error="502 gateway", operation="rewrite_segment")
+
+        snap_u_fail = self.client.get("/api/jobs/unk-sibling-rw").json
+        self.assertTrue(snap_u_fail["can_resume_video"], "Unapplied rewrite_segment on seg 2 must stay resumable despite seg 1 submission_unknown")
+        with patch.object(self.jobs, "launch"):
+            res_u = self.client.post("/api/jobs/unk-sibling-rw/resume", json={}, headers=self.headers)
+        self.assertEqual(res_u.status_code, 200, res_u.json)
+        self.assertEqual(json.loads((out_u / "inputs/request.json").read_text(encoding="utf-8"))["operation"], "rewrite_segment")
+        self.jobs.records["unk-sibling-rw"].update(status="succeeded", error=None)
+
+    def test_archived_single_rewrite_survives_applied_segment_edit_and_same_segment_unapplied_edit(self):
+        # Part 1: Previously regenerated segment has segment-edit.json with applied=True, publishing=False, revision='R1'.
+        # A subsequent failed single rewrite archived into state.json[idx].unapplied_edit must NOT be clobbered by read_context!
+        out, _, _ = self._setup_two_seg_job("applied-seg-clobber")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        (out / "clips/seg2.mp4").write_bytes(b"C2")
+        (out / "clips/seg2-last.jpg").write_bytes(b"T2")
+        active_seg0 = {
+            "zh": "一段旧生效词",
+            "h3": _valid_h3("s1", 1),
+            "h3_source": "一段旧生效词",
+            "file": str(out / "clips/seg1.mp4"),
+            "cny": 0.1,
+            "revision": "rev-applied-1",
+        }
+        fjob = film.Job(out)
+        fjob.state["segs"]["0"] = dict(active_seg0)
+        fjob.state["segs"]["1"] = {"zh": "二段词", "h3": _valid_h3("s2", 2), "h3_source": "二段词", "file": str(out / "clips/seg2.mp4"), "cny": 0.1}
+        fjob.save()
+        write_json(out / "inputs/segment-edit.json", {
+            "number": 1,
+            "revision": "rev-applied-1",
+            "applied": True,
+            "publishing": False,
+            "active": dict(active_seg0),
+        })
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "persist": False}, headers=self.headers)
+        snap0 = self.client.get("/api/jobs/applied-seg-clobber").json
+        with patch.object(self.jobs, "launch"):
+            r1 = self.client.post(
+                "/api/jobs/applied-seg-clobber/segments/1/rewrite",
+                json={"prompt": "一段归档新草稿", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r1.status_code, 200, r1.json)
+        with patch.object(rewrite, "rewrite", side_effect=rewrite.RewriteError("502")):
+            with self.assertRaises(rewrite.RewriteError):
+                segments.rewrite_segment(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["applied-seg-clobber"].update(status="failed", error="502", operation="rewrite_segment")
+
+        # Trigger Seg 2 rewrite -> archives Seg 1's failed rewrite into state.json["segs"]["0"]["unapplied_edit"]
+        snap1 = self.client.get("/api/jobs/applied-seg-clobber").json
+        with patch.object(self.jobs, "launch"):
+            r2 = self.client.post(
+                "/api/jobs/applied-seg-clobber/segments/2/rewrite",
+                json={"prompt": "二段新词", "prompt_format": "source", "prompt_version": snap1["segments"][1]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r2.status_code, 200, r2.json)
+        self.jobs.records["applied-seg-clobber"].update(status="succeeded", error=None)
+        snap2 = self.client.get("/api/jobs/applied-seg-clobber").json
+        self.assertEqual(snap2["segments"][0]["prompt"], "一段归档新草稿", "Archived unapplied_edit must not be overwritten by applied segment-edit.json")
+
+        # Part 2: Same-segment unapplied segment-edit.json superseded by single rewrite -> clear_all must NOT resurrect stale segment-edit prompt!
+        write_json(out / "inputs/segment-edit.json", {
+            "number": 1,
+            "revision": "rev-unapplied-old",
+            "applied": False,
+            "prompt": "过期的重生成草稿",
+            "prompt_format": "source",
+            "previous": dict(fjob.Job(out).state["segs"]["0"]) if hasattr(fjob, "Job") else dict(film.Job(out).state["segs"]["0"]),
+        })
+        snap_p2 = self.client.get("/api/jobs/applied-seg-clobber").json
+        with patch.object(self.jobs, "launch"):
+            r_p2 = self.client.post(
+                "/api/jobs/applied-seg-clobber/segments/1/rewrite",
+                json={"prompt": "更新后的单段改写草稿", "prompt_format": "source", "prompt_version": snap_p2["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_p2.status_code, 200, r_p2.json)
+        req_p2 = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        segments.reconcile_pending_prompt_rewrite(out, req_p2, archive_single_except=0, clear_all=True)
+        self.jobs.records["applied-seg-clobber"].update(status="succeeded", error=None)
+        snap_p2_after = self.client.get("/api/jobs/applied-seg-clobber").json
+        self.assertEqual(snap_p2_after["segments"][0]["prompt"], "更新后的单段改写草稿")
+
+    def test_edit_frame_then_continue_film_promotes_archived_unapplied_source_edit_on_redo_segments(self):
+        out, script, _ = self._setup_two_seg_job("frame-edit-promo", frames_mode="shot")
+        Image.new("RGB", (8, 8), "green").save(out / "frames/s1-1.png")
+        Image.new("RGB", (8, 8), "green").save(out / "frames/s2-1.png")
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        (out / "clips/seg2.mp4").write_bytes(b"C2")
+        (out / "clips/seg2-last.jpg").write_bytes(b"T2")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="一段原词", h3=_valid_h3("s1", 2), h3_source="一段原词", file=str(out / "clips/seg1.mp4"), cny=0.1)
+        fjob.put("segs", "1", zh="二段原词", h3=_valid_h3("s2", 2), h3_source="二段原词", file=str(out / "clips/seg2.mp4"), cny=0.1)
+        req_cur = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        st_cards = storyboard.view(req_cur, self.jobs.artifacts({"id": "frame-edit-promo", "output_dir": str(out)}), True, "frame-edit-promo")
+        rev = storyboard.review_status(req_cur, st_cards)
+        write_json(out / "inputs/review.json", {"dirty_segments": [], "confirmed_version": rev["version"]})
+
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "APIMART_API_KEY": "api-test", "RUNNINGHUB_API_KEY": "rh-test", "persist": False}, headers=self.headers)
+        snap0 = self.client.get("/api/jobs/frame-edit-promo").json
+        with patch.object(self.jobs, "launch"):
+            r_rw = self.client.post(
+                "/api/jobs/frame-edit-promo/segments/1/rewrite",
+                json={"prompt": "修帧前手改的一段源词", "prompt_format": "source", "prompt_version": snap0["segments"][0]["prompt_version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_rw.status_code, 200, r_rw.json)
+        self.jobs.records["frame-edit-promo"].update(status="failed", error="502", operation="rewrite_segment")
+
+        # Edit frame s1-1 -> archives Seg 1's failed rewrite into unapplied_edit and marks Seg 1 dirty
+        with patch.object(self.jobs, "launch"):
+            r_fe = self.client.post(
+                "/api/jobs/frame-edit-promo/frames/s1-1",
+                json={"prompt": "新分镜画面词"},
+                headers=self.headers,
+            )
+        self.assertEqual(r_fe.status_code, 200, r_fe.json)
+        fe_data = json.loads((out / "inputs/frame-edit.json").read_text(encoding="utf-8"))
+        fe_data["applied"] = True
+        write_json(out / "inputs/frame-edit.json", fe_data)
+        write_json(out / "inputs/review.json", {"dirty_segments": [1], "confirmed_version": None})
+        self.jobs.records["frame-edit-promo"].update(status="succeeded", error=None, operation="frame")
+
+        snap_review = self.client.get("/api/jobs/frame-edit-promo").json
+        with patch("shutil.which", return_value="/fake/ffmpeg"), patch.object(self.jobs, "launch"):
+            r_cont = self.client.post(
+                "/api/jobs/frame-edit-promo/continue",
+                json={"approved": True, "review_version": snap_review["review"]["version"]},
+                headers=self.headers,
+            )
+        self.assertEqual(r_cont.status_code, 200, r_cont.json)
+
+        cont_req = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        run_job = film.Job(out)
+        film.invalidate_segments(run_job, cont_req["frames"], cont_req["redo"])
+        planned = film.plan(script["shots"])
+        pics = {s["idx"]: film.refs(script, s, "shot") for s in planned}
+        rewritten = []
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: rewritten.append(zh) or _valid_h3("s1-cont", n)):
+            film.stage_prompts(run_job, script, planned, pics)
+        self.assertEqual(rewritten, ["修帧前手改的一段源词"])
+
+    def test_batch_rewrite_uses_updated_automatic_source_without_fabricating_override_and_preflight_guards_h3(self):
+        # Part 1: Clipless/invalidated un-overridden segment with stale compiler rec['zh'] uses current automatic['source'] without fake override
+        out, script, req = self._setup_two_seg_job("stale-auto-zh")
+        (out / "clips/seg2.mp4").write_bytes(b"C2")
+        (out / "clips/seg2-last.jpg").write_bytes(b"T2")
+        fjob = film.Job(out)
+        fjob.put("segs", "0", zh="旧版自动编译词", h3=_valid_h3("old1", 1), h3_source="旧版自动编译词")
+        planned = film.plan(script["shots"])
+        auto2 = film.compile_prompt(script, planned[1], film.refs(script, planned[1], "none"), len(planned))
+        fjob.put("segs", "1", zh=auto2, h3=_valid_h3("ok2", 2), h3_source=auto2, file=str(out / "clips/seg2.mp4"), cny=0.1)
+        (out / "prompts/seg1.zh.txt").write_text("旧版自动编译词", encoding="utf-8")
+        (out / "prompts/seg1.h3.txt").write_text(_valid_h3("old1", 1), encoding="utf-8")
+        (out / "prompts/seg2.zh.txt").write_text(auto2, encoding="utf-8")
+        (out / "prompts/seg2.h3.txt").write_text(_valid_h3("ok2", 2), encoding="utf-8")
+
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "persist": False}, headers=self.headers)
+        snap = self.client.get("/api/jobs/stale-auto-zh").json
+        self.assertEqual(snap["missing_h3_count"], 1, "Un-overridden clipless segment whose zh lags automatic_source_prompt must count as missing_h3")
+        with patch.object(self.jobs, "launch"):
+            r_batch = self.client.post("/api/jobs/stale-auto-zh/segments/rewrite", json={"scope": "missing"}, headers=self.headers)
+        self.assertEqual(r_batch.status_code, 200, r_batch.json)
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: _valid_h3("fresh", n)):
+            segments.rewrite_prompts(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")))
+        self.jobs.records["stale-auto-zh"].update(status="succeeded", error=None)
+        seg0_after = film.Job(out).state["segs"]["0"]
+        self.assertNotIn("prompt_override", seg0_after, "Batch rewrite of un-overridden segment must not fabricate prompt_override")
+        self.assertEqual(seg0_after["zh"], snap["segments"][0]["automatic_source_prompt"])
+
+        # Part 2: preserve_paired_source is False in h3 mode when reference_version changed
+        (out / "clips/seg1.mp4").write_bytes(b"C1")
+        (out / "clips/seg1-last.jpg").write_bytes(b"T1")
+        fjob2 = film.Job(out)
+        fjob2.state["segs"]["0"]["file"] = str(out / "clips/seg1.mp4")
+        fjob2.state["segs"]["0"]["cny"] = 0.1
+        fjob2.state["segs"]["0"]["manual_rewrite"] = True
+        fjob2.state["segs"]["0"]["h3_reference_version"] = "stale-ref-ver"
+        fjob2.save()
+        snap_ref = self.client.get("/api/jobs/stale-auto-zh").json
+        card0 = snap_ref["segments"][0]
+        plan_h3 = segments.regeneration_plan(
+            req,
+            1,
+            card0["version"],
+            prompt=card0["h3_prompt"],
+            prompt_format="h3",
+            prompt_version=card0["prompt_version"],
+        )
+        self.assertFalse(plan_h3["preserve_paired_source"], "Stale reference_version must disable preserve_paired_source in h3 format")
+
+        # Part 3: inputs.preflight rejects malformed cached paired H3 when LLM_API_KEY is missing
+        out_pf, script_pf, req_pf = self._setup_two_seg_job("pf-malformed-h3")
+        planned_pf = film.plan(script_pf["shots"])
+        zh_pf = film.compile_prompt(script_pf, planned_pf[0], film.refs(script_pf, planned_pf[0], "none"), len(planned_pf))
+        bad_h3 = _valid_h3("bad-pic", 1).replace("<Picture 1>", "<Picture 9>")
+        film.Job(out_pf).put("segs", "0", zh=zh_pf, h3=bad_h3, h3_source=zh_pf)
+        with patch("shutil.which", return_value="/fake/ffmpeg"):
+            with self.assertRaises(InputError) as pf_err:
+                inputs.preflight({**req_pf, "operation": "pipeline"}, {"RUNNINGHUB_API_KEY": "rh-only"})
+        self.assertEqual(pf_err.exception.key, "keys")
 
 
 if __name__ == "__main__":

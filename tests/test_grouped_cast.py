@@ -1,4 +1,3 @@
-import copy
 import io
 import json
 import os
@@ -9,8 +8,8 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from h3ref import config, film, frames, rewrite
-from workbench import demo, inputs, references, segments, storyboard
+from h3ref import film, frames, rewrite
+from workbench import demo, inputs, references, storyboard
 from workbench.i18n import InputError
 from workbench.server import create_app
 
@@ -279,8 +278,86 @@ class GroupedCastTest(unittest.TestCase):
             )
             self.assertEqual(over_resp.status_code, 400)
             self.assertIn("9", over_resp.json["error"])
+
+            # 4. Unhashable reference_bindings value alongside reference_groups returns 400 InputError (not HTTP 500 TypeError)
+            bad_group_resp = client.post(
+                "/api/jobs",
+                json={
+                    "kind": "film",
+                    "demo": True,
+                    "frames": "shot",
+                    "film": {"aspect": "9:16", "cast": [{"name": "A"}, {"name": "B"}], "shots": [{"action": "A talks"}]},
+                    "reference_bindings": {"cast:0": ["unhashable-list"]},
+                    "reference_groups": [["cast:0", "cast:1"]],
+                },
+                headers=headers,
+            )
+            self.assertEqual(bad_group_resp.status_code, 400)
+
+            # 5. Null/empty edit fields on POST /segments/1/rewrite return 400 instead of silently falling back to unedited
+            review = storyboard.review_status(
+                json.loads((out / "inputs/request.json").read_text(encoding="utf-8")),
+                storyboard.view(json.loads((out / "inputs/request.json").read_text(encoding="utf-8")), jobs.artifacts(jobs.find(jid)), False),
+            )
+            from workbench.jobs import write_json
+            write_json(out / "inputs/review.json", {"dirty_segments": [], "confirmed_version": review["version"]})
+            client.post("/api/config", json={"LLM_API_KEY": "sk-test", "persist": False}, headers=headers)
+            null_rw = client.post(
+                f"/api/jobs/{jid}/segments/1/rewrite",
+                json={"prompt": None, "prompt_format": None, "prompt_version": None},
+                headers=headers,
+            )
+            self.assertEqual(null_rw.status_code, 400)
+            empty_fmt_rw = client.post(
+                f"/api/jobs/{jid}/segments/1/rewrite",
+                json={"prompt": "新词", "prompt_format": "", "prompt_version": "v"},
+                headers=headers,
+            )
+            self.assertEqual(empty_fmt_rw.status_code, 400)
         finally:
             jobs.close()
+
+        # 6. Jobs.resume() on an interrupted pipeline job respects saved state.json frame character_reference_paths
+        #    (a legacy/repaired job whose shot had 9 cast + board in film.json but was trimmed in state.json['frames'] must resume!)
+        app2 = create_app(self.root / "storage2", self.root / ".env2")
+        jobs2 = app2.extensions["jobs"]
+        client2 = app2.test_client()
+        try:
+            client2.post("/api/config", json={"RUNNINGHUB_API_KEY": "rh-test", "LLM_API_KEY": "sk-test", "persist": False}, headers=headers)
+            out_r = self.root / "resume-repaired-job"
+            for d in ("inputs", "frames", "clips", "prompts"):
+                (out_r / d).mkdir(parents=True, exist_ok=True)
+            nine_roles = [{"name": f"角{i}", "picture": str(ten_paths[i])} for i in range(9)]
+            script_r = {
+                "aspect": "9:16",
+                "board": str(board_path),
+                "cast": nine_roles,
+                "shots": [{"start": 0, "end": 5, "action": "众人站立"}],
+            }
+            Image.new("RGB", (8, 8), "gray").save(out_r / "frames/s1-1.png")
+            fjob_r = film.Job(out_r)
+            fjob_r.put("frames", "s1-1", prompt="p", file=str(out_r / "frames/s1-1.png"), character_reference_paths=[str(ten_paths[0])])
+            fjob_r.put("segs", "0", zh="词", h3="subject_definitions:\nA\n\nsummary:\nB\n\nretention_analysis:\nC\n\ndetailed_description:\n[Shot 1] D\n\noverall_soundscape:\nE\n\nnon_diegetic_music:\nN/A", h3_source="词", task="rh-inflight-legacy", submitted=1700000000.0, phase="poll")
+            req_r = {
+                "kind": "film", "demo": False, "frames": "shot", "optimize_storyboard": False,
+                "lang": "zh-CN", "output_dir": str(out_r), "film": script_r, "operation": "pipeline",
+            }
+            from workbench.jobs import write_json
+            write_json(out_r / "inputs/film.json", script_r)
+            write_json(out_r / "inputs/request.json", req_r)
+            desc_r = storyboard.view(req_r, jobs2.artifacts({"id": "leg-r", "output_dir": str(out_r)}), False)
+            rev_r = storyboard.review_status(req_r, desc_r)
+            write_json(out_r / "inputs/review.json", {"dirty_segments": [], "confirmed_version": rev_r["version"]})
+            jobs2.records["leg-r"] = {
+                "id": "leg-r", "kind": "film", "demo": False, "status": "interrupted", "operation": "pipeline",
+                "output_dir": str(out_r), "lang": "zh-CN", "created_at": "2026-11-16T00:00:00+0000", "error": "interrupted",
+            }
+            jobs2.save(jobs2.records["leg-r"])
+            with patch("shutil.which", return_value="/fake/ffmpeg"), patch.object(jobs2, "launch"):
+                res_r = client2.post("/api/jobs/leg-r/resume", json={}, headers=headers)
+            self.assertEqual(res_r.status_code, 200, res_r.json)
+        finally:
+            jobs2.close()
 
 
 if __name__ == "__main__":

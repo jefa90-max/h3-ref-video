@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from h3ref import config, film, frames, http, rewrite, staging
+from h3ref import film, frames, http, rewrite, staging
 
 
 def _sample_v3():
@@ -378,6 +378,100 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
                 with self.assertRaises(rewrite.RewriteFatalError):
                     rewrite.rewrite("中文提示词", 1, 8, "9:16")
                 self.assertEqual(fatal_req.call_count, 1)
+
+    def test_empty_composition_reply_keeps_alternating_roles_and_error_envelopes_abort(self):
+        # Empty reply on attempt 1 MUST still insert an assistant turn before the retry user message (no consecutive user turns!)
+        responses = [
+            {"choices": [{"message": {"content": ""}}]},
+            {"choices": [{"message": {"content": json.dumps(_sample_v3(), ensure_ascii=False)}}]},
+        ]
+        with patch.object(frames.http, "request", side_effect=responses) as req, \
+             patch.object(frames.config, "llm_key", return_value="sk-test"):
+            frames.describe_composition(self.script, self.script["shots"][0])
+        second_messages = req.call_args_list[1].args[2]["messages"]
+        roles = [m["role"] for m in second_messages]
+        self.assertEqual(roles, ["system", "user", "assistant", "user"])
+        self.assertTrue(second_messages[2]["content"].strip())
+
+        # HTTP-200 JSON error envelopes without choices abort immediately on attempt 1
+        for err_code, expected_status in (("insufficient_quota", 402), ("model_not_found", 404), ("rate_limit_exceeded", 429)):
+            with patch.object(frames.http, "request", return_value={"error": {"code": err_code, "message": err_code}}) as env_req, \
+                 patch.object(frames.config, "llm_key", return_value="sk-test"):
+                with self.assertRaises(http.HTTPResponseError) as ctx:
+                    frames.describe_composition(self.script, self.script["shots"][0])
+            self.assertEqual(ctx.exception.status_code, expected_status)
+            self.assertEqual(env_req.call_count, 1)
+
+    def test_rewrite_treats_claude_errors_and_405_413_422_as_fatal(self):
+        # HTTP 405, 413, 422 on _llm abort immediately via RewriteFatalError
+        for code in (405, 413, 422):
+            with patch.object(rewrite, "backend", return_value="llm"), \
+                 patch.object(rewrite.http, "request", side_effect=http.HTTPResponseError(code, f"HTTP {code}")) as fatal_req, \
+                 patch.object(rewrite.config, "llm_key", return_value="sk-test"), \
+                 patch.object(rewrite, "guide", return_value="guide"):
+                with self.assertRaises(rewrite.RewriteFatalError):
+                    rewrite.rewrite("中文提示词", 1, 8, "9:16")
+                self.assertEqual(fatal_req.call_count, 1)
+
+        # _claude CLI is_error / process failure raises RewriteFatalError on attempt 1 instead of spawning 7 subprocesses
+        class FakeProc:
+            returncode = 1
+            stdout = json.dumps({"is_error": True, "result": "Not logged in · Please run /login"})
+            stderr = ""
+
+        with patch.object(rewrite, "backend", return_value="claude"), \
+             patch.object(rewrite, "claude_bin", return_value="/usr/bin/claude"), \
+             patch.object(rewrite.subprocess, "run", return_value=FakeProc()) as proc_mock, \
+             patch.object(rewrite, "guide", return_value="guide"):
+            with self.assertRaises(rewrite.RewriteFatalError):
+                rewrite.rewrite("中文提示词", 1, 8, "9:16")
+            self.assertEqual(proc_mock.call_count, 1)
+
+    def test_render_v3_character_only_replaces_subject_position_not_object_nouns(self):
+        # Character name appearing inside an object / another person's name must NOT splice look into the object!
+        comp = {
+            "version": 3,
+            "camera": "中景平视",
+            "scene": "客厅内",
+            "characters": [
+                {
+                    "name": "小明",
+                    "locked_look": "短发，蓝色校服",
+                    "placement_and_pose": "画面左侧站着，侧身望向小明妈妈",
+                },
+                {
+                    "name": "女王",
+                    "locked_look": "九凤金冠，大红凤袍",
+                    "placement_and_pose": "画面右侧站着，右手轻扶女王宝座",
+                },
+            ],
+        }
+        rendered = staging.render_opening(comp)
+        self.assertIn("画面左侧站着小明（短发，蓝色校服），侧身望向小明妈妈。", rendered)
+        self.assertNotIn("小明（短发，蓝色校服）妈妈", rendered)
+        self.assertIn("画面右侧站着女王（九凤金冠，大红凤袍），右手轻扶女王宝座。", rendered)
+        self.assertNotIn("女王（九凤金冠，大红凤袍）宝座", rendered)
+
+    def test_rewrite_ignores_out_of_bounds_picture_inside_think_block(self):
+        # Reasoning models (e.g. deepseek-v4-pro) emit <think>...</think> blocks that may mention
+        # out-of-range <Picture 4> or draft section headers while fixing a prior validation failure.
+        think_wrapped = (
+            "<think>\n"
+            "Fix out-of-bounds <Picture 4> -> <Picture 1>.\n"
+            "subject_definitions:\n"
+            "Draft thinking header.\n"
+            "</think>\n"
+            "```text\n"
+            + _valid_h3()
+            + "\n```"
+        )
+        with patch.object(rewrite, "backend", return_value="llm"), \
+             patch.object(rewrite, "_llm", return_value=think_wrapped) as llm_mock, \
+             patch.object(rewrite, "guide", return_value="guide"):
+            result = rewrite.rewrite("中文提示词", 1, 8, "9:16")
+        self.assertEqual(llm_mock.call_count, 1)
+        self.assertIn("subject_definitions:", result)
+        self.assertEqual(rewrite.problems(think_wrapped, 1), [])
 
 
 if __name__ == "__main__":

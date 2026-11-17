@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from h3ref import film, media, rewrite, rh
+from h3ref import film, rewrite, rh
 from workbench import segments, storyboard
 from workbench.jobs import write_json
 from workbench.server import create_app
@@ -279,6 +279,41 @@ class ManualH3RewriteTest(unittest.TestCase):
         for idx, card in enumerate(snap["segments"]):
             self.assertTrue(card["h3_prompt"])
             self.assertEqual(rewrite.problems(card["h3_prompt"], len(card["reference_images"])), [], f"seg {idx + 1}")
+
+    def test_partial_batch_rewrite_failure_resumes_only_uncompleted_segments(self):
+        out, _ = self._create_historical_film_job("batch-resume", with_clips=(1, 2, 3))
+        self.client.post("/api/config", json={"LLM_API_KEY": "sk-test", "persist": False}, headers=self.headers)
+        with patch.object(self.jobs, "launch"):
+            r_start = self.client.post("/api/jobs/batch-resume/segments/rewrite", json={"scope": "all"}, headers=self.headers)
+        self.assertEqual(r_start.status_code, 200, r_start.json)
+        req = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+
+        def flaky_rewrite(zh_text, n_images, seconds, aspect):
+            if "喝茶" in zh_text:
+                raise rewrite.RewriteError("transient 502 on seg 2")
+            return _make_h3("ok-first-pass", n_images)
+
+        with patch.object(rewrite, "rewrite", side_effect=flaky_rewrite):
+            with self.assertRaises(rewrite.RewriteError):
+                segments.rewrite_prompts(req)
+        self.jobs.records["batch-resume"].update(status="failed", error="transient 502 on seg 2", operation="rewrite_prompts")
+
+        saved_plan = json.loads((out / "inputs/prompt-rewrite.json").read_text(encoding="utf-8"))
+        self.assertIn("2", saved_plan["errors"])
+        already_done = set(saved_plan["completed"])
+        self.assertGreaterEqual(len(already_done), 1)
+
+        with patch.object(self.jobs, "launch"):
+            res = self.client.post("/api/jobs/batch-resume/resume", json={}, headers=self.headers)
+        self.assertEqual(res.status_code, 200, res.json)
+        resumed_req = json.loads((out / "inputs/request.json").read_text(encoding="utf-8"))
+        self.assertEqual(resumed_req["operation"], "rewrite_prompts")
+
+        retried = []
+        with patch.object(rewrite, "rewrite", side_effect=lambda zh, n, *a: retried.append(zh) or _make_h3("ok-resumed", n)):
+            segments.rewrite_prompts(resumed_req)
+        self.assertEqual(len(retried), 3 - len(already_done))
+        self.assertTrue(json.loads((out / "inputs/prompt-rewrite.json").read_text(encoding="utf-8"))["applied"])
 
 
 if __name__ == "__main__":

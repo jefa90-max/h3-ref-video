@@ -664,5 +664,12 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
   await context.refreshFilmReferences();
   assert.equal(context.state.filmGroups.length, 0);
   assert.equal(context.state.filmBindings.has("cast:0"), false, "Dissolved 2-role group sheet must not stay bound to the surviving solo role");
+
+  // Toggling a cast merge checkbox updates merge button in place without destroying/recreating card DOM
+  tree = allDescendants($("film-reference-list"));
+  const firstCheck = tree.find((n) => n.className.includes("film-cast-select"));
+  firstCheck.checked = true;
+  firstCheck.events.change();
+  assert.equal(allDescendants($("film-reference-list")).includes(firstCheck), true, "Checkbox toggle must not tear down card DOM");
 });
 
