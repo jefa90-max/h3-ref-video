@@ -420,12 +420,21 @@ class WindowsRetryPollingAndLifecycleTest(unittest.TestCase):
             captured["input"] = kwargs.get("input", "")
             return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/win.png"}', stderr="")
 
-        with patch("subprocess.run", side_effect=fake_upload_run):
+        with patch("subprocess.run", side_effect=fake_upload_run), patch.object(http.os, "name", "posix"):
             http.upload("https://api.example/up", secret, Path(r"C:\Users\temp\frames\s1-1.png"), fields={"apiKey": "@not-a-file;x"})
         self.assertIn("-w", captured["cmd"])
         self.assertIn("--proto", captured["cmd"])
         self.assertIn("form-string =", captured["input"])
         self.assertIn(r"C:\\\\Users\\\\temp\\\\frames\\\\s1-1.png", captured["input"])
+
+        captured_nt = {}
+        def fake_upload_nt(cmd, **kwargs):
+            captured_nt["input"] = kwargs.get("input", "")
+            return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/win.png"}', stderr="")
+        with patch("subprocess.run", side_effect=fake_upload_nt), patch.object(http.os, "name", "nt"):
+            http.upload("https://api.example/up", secret, Path(r"C:\Users\temp\frames\s1-1.png"), fields={"apiKey": "@not-a-file;x"})
+        self.assertIn(r"C:\\Users\\temp\\frames\\s1-1.png", captured_nt["input"])
+        self.assertNotIn(r"C:\\\\Users", captured_nt["input"])
 
         # Reference endpoints reject tampered non-image / non-cast paths (e.g. .env)
         with tempfile.TemporaryDirectory() as tmp:
@@ -592,12 +601,31 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                         with patch("urllib.request.urlopen", return_value=resp_ok):
                             self.assertEqual(rewrite.guide(), "OFFICIAL GUIDE TEXT")
 
-                    # Single-instance lock rejects concurrent second lock
+                    # Single-instance lock rejects concurrent second lock (including Windows mandatory byte-lock read denial)
+                    from workbench import instance as instance_mod
                     from workbench.instance import single_instance
                     lock_dir = root / "lock-st"
                     with single_instance(lock_dir):
                         with self.assertRaises(SystemExit):
                             with single_instance(lock_dir):
+                                pass
+
+                    fake_msvcrt = SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=MagicMock(side_effect=PermissionError(13, "Permission denied")))
+                    orig_open = Path.open
+                    def mandatory_locked_open(p, mode="r", *a, **kw):
+                        real_fh = orig_open(p, mode, *a, **kw)
+                        if p.name != "server.lock":
+                            return real_fh
+                        fh = MagicMock(wraps=real_fh)
+                        fh.__enter__.return_value = fh
+                        fh.__exit__.side_effect = lambda *exc: real_fh.__exit__(*exc)
+                        fh.read.side_effect = PermissionError(13, "Permission denied")
+                        return fh
+                    with patch.object(instance_mod.os, "name", "nt"), \
+                         patch.dict("sys.modules", {"msvcrt": fake_msvcrt}), \
+                         patch.object(Path, "open", mandatory_locked_open):
+                        with self.assertRaises(SystemExit):
+                            with single_instance(root / "nt-lock"):
                                 pass
 
                     # Demo run produces demo-film.json, demo-frames.json, seg1-last.jpg, and report.md
