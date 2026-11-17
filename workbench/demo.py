@@ -116,6 +116,17 @@ def run(request):
             clips.append(clip)
             log("demo_clip", name=name)
         final = out / ("film.mp4" if request["kind"] == "film" else "clip.mp4")
+        if request["kind"] == "film" and (out / "state.json").is_file():
+            fjob = film.Job(out)
+            changed_demo = False
+            for segment in segments:
+                srec = fjob.state.get("segs", {}).get(str(segment["idx"]))
+                if isinstance(srec, dict) and ("manual_rewrite" in srec or "clip_prompts" in srec):
+                    srec.pop("manual_rewrite", None)
+                    srec.pop("clip_prompts", None)
+                    changed_demo = True
+            if changed_demo:
+                fjob.save()
         if len(clips) == 1:
             shutil.copyfile(clips[0], final)
         else:

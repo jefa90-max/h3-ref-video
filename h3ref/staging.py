@@ -18,14 +18,17 @@ _V3_LOC_PREFIX = (
     r'(?:偏左方|偏右方|偏前方|偏后方|偏左|偏右|偏前|偏后|处)?'
 )
 _V3_PLACEMENT_VERB = re.compile(
-    r'^(' + _V3_LOC_PREFIX + r'\s*(?:(?:正|半|侧身|微微)?(?:站着|坐着|跪着|蹲着|躺着|趴着|靠着|倚着|立着))?)'
+    r'^(' + _V3_LOC_PREFIX + r'(?:\s*(?:正|半|侧身|微微)?(?:站着|坐着|跪着|蹲着|躺着|趴着|靠着|倚着|立着))?)'
     r'\s*(?:[，,]\s*(.*)|$)'
 )
-_V3_LOCATION_ONLY = re.compile(r'^(' + _V3_LOC_PREFIX + r')\s*[，,]\s*(.+)$')
 
 
 def is_structured(composition: object) -> bool:
     return isinstance(composition, dict) and composition.get('version') in (2, 3)
+
+
+def _canonical_path_key(raw: str) -> str:
+    return str(Path(raw).expanduser().resolve()) if raw else ''
 
 
 def deduplicate_paths(paths) -> list[str]:
@@ -33,7 +36,7 @@ def deduplicate_paths(paths) -> list[str]:
     out = []
     for item in paths:
         raw = str(item)
-        key = str(Path(raw)) if raw else ''
+        key = _canonical_path_key(raw)
         if key not in seen:
             seen.add(key)
             out.append(raw)
@@ -46,7 +49,7 @@ def group_cast_by_picture(active_cast: list[dict], all_cast: list[dict] | None =
 
     def key_of(person: dict, fallback_idx: int) -> str:
         pic = person.get('picture')
-        return str(Path(str(pic))) if pic else f'__unpictured_{fallback_idx}_{person.get("name", "")}'
+        return _canonical_path_key(str(pic)) if pic else f'__unpictured_{fallback_idx}_{person.get("name", "")}'
 
     ordered_keys = []
     active_by_key: dict[str, list[dict]] = {}
@@ -186,13 +189,15 @@ def _render_v3_character(character: dict, other_names: set[str] | None = None) -
     pose = character['placement_and_pose'].strip().rstrip('。；; ')
     tagged = f'{name}（{look}）'
     subject_re = re.compile(
-        r'^((?:' + _V3_LOC_PREFIX + r'\s*(?:(?:(?:正|半|侧身|微微)?(?:站着|坐着|跪着|蹲着|躺着|趴着|靠着|倚着|立着))\s*|[，,]\s*))?)'
+        r'^((?:(?:(?:站在|坐在|跪在|位于|立于|处于)\s*)?' + _V3_LOC_PREFIX
+        + r'(?:\s*(?:(?:正|半|侧身|微微)?(?:站着|坐着|跪着|蹲着|躺着|趴着|靠着|倚着|立着))\s*|\s*[，,]\s*)?)?'
+        + r'(?:[^，,。；;（）()]*的)?)'
         + re.escape(name)
         + r'(\s*(?:（[^）]*）|\([^)]*\))?)'
     )
     subj_matched = subject_re.match(pose)
     from_name = pose[len(subj_matched.group(1)):] if subj_matched else ''
-    longer_cast_match = bool(other_names and any(other != name and from_name.startswith(other) for other in other_names))
+    longer_cast_match = bool(other_names and any(len(other) > len(name) and from_name.startswith(other) for other in other_names))
     if subj_matched and not longer_cast_match:
         note = (subj_matched.group(2) or '').strip()
         kept_note = note if (note and look not in note) else ''
@@ -204,11 +209,7 @@ def _render_v3_character(character: dict, other_names: set[str] | None = None) -
             rest = (matched.group(2) or '').strip()
             sentence = f'{head}{tagged}，{rest}' if rest else f'{head}{tagged}'
         else:
-            loc_matched = _V3_LOCATION_ONLY.match(pose)
-            if loc_matched:
-                sentence = f'{loc_matched.group(1).strip()}{tagged}{loc_matched.group(2).strip()}'
-            else:
-                sentence = f'{tagged}{pose}'
+            sentence = f'{tagged}{pose}'
     return sentence.rstrip('。；; ') + '。'
 
 

@@ -47,7 +47,13 @@ def cmd_one(a):
     t0 = time.time()
     if not st.get("h3"):
         text = Path(a.prompt).read_text(encoding="utf-8")
-        st["h3"] = text if rewrite.is_rewritten(text) else rewrite.rewrite(text, len(images), a.seconds, a.aspect)
+        if rewrite.is_rewritten(text):
+            issues = rewrite.cached_problems(text, len(images))
+            if issues:
+                raise rewrite.RewriteError("; ".join(issues))
+            st["h3"] = rewrite.strip_h3_wrappers(text)
+        else:
+            st["h3"] = rewrite.rewrite(text, len(images), a.seconds, a.aspect)
         (out / "prompt.h3.txt").write_text(st["h3"], encoding="utf-8")
         save()
         print("改写好了：", out / "prompt.h3.txt")

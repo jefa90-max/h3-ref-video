@@ -165,6 +165,70 @@ async function refreshFilmReferences({ reset = false, format = false } = {}) {
   }
 }
 
+const FILM_GROUP_WORDS = ["两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both"];
+
+function peakFilmReferences(castSlots, groupBySlot, boardCount) {
+  const rawShots = (state.film?.shots || []).filter((s) => String(s?.action || "").trim());
+  const cast = state.film?.cast || [];
+  const framesMode = $("frames")?.value || "shot";
+  const sheetKey = (idx) => {
+    const slotId = `cast:${idx}`;
+    const grp = groupBySlot.get(slotId);
+    if (grp) return `group:${grp.slotIds[0]}`;
+    const bound = state.filmBindings.get(slotId);
+    return bound ? `file:${bound.file.id}` : `solo:${idx}`;
+  };
+  if (!rawShots.length) {
+    return new Set(castSlots.map((_, i) => sheetKey(i))).size + boardCount;
+  }
+  let curT = 0;
+  const shots = rawShots.map((s) => {
+    const hasTimes = s.start != null && s.end != null && Number.isFinite(Number(s.start)) && Number.isFinite(Number(s.end));
+    const len = hasTimes ? Number(s.end) - Number(s.start) : 2.0;
+    const start = Math.round(curT * 100) / 100;
+    const end = Math.round((curT + Math.max(0.5, len)) * 100) / 100;
+    curT = end;
+    return { ...s, start, end };
+  });
+  const totalDur = shots.at(-1).end;
+  const segCountTarget = Math.max(1, Math.ceil(totalDur / 15));
+  const targetLen = totalDur / segCountTarget;
+  const segments = [[]];
+  for (const s of shots) {
+    const cur = segments.at(-1);
+    if (cur.length) {
+      const segStart = cur[0].start;
+      if (s.end - segStart > 15 || (s.start - segStart >= targetLen - 0.01 && segments.length < segCountTarget)) {
+        segments.push([]);
+      }
+    }
+    segments.at(-1).push(s);
+  }
+  const activeIndicesInShots = (shotList, fallbackAll = false) => {
+    const text = shotList.map((s) => `${s.action || ""} ${s.line || ""}`).join(" ");
+    if (FILM_GROUP_WORDS.some((w) => text.includes(w))) return cast.map((_, i) => i);
+    const matched = cast.map((c, i) => ([c.name, ...(c.aliases || [])].some((n) => n && text.includes(n)) ? i : -1)).filter((i) => i >= 0);
+    return matched.length ? matched : (fallbackAll ? cast.map((_, i) => i) : []);
+  };
+  let peak = 0;
+  segments.forEach((segShots, segIdx) => {
+    const segSheets = new Set(activeIndicesInShots(segShots, true).map(sheetKey)).size;
+    if (framesMode === "shot") {
+      peak = Math.max(peak, segSheets);
+      for (const s of segShots) {
+        peak = Math.max(peak, boardCount + new Set(activeIndicesInShots([s], false).map(sheetKey)).size);
+      }
+    } else {
+      const tailCount = (framesMode === "first" ? 1 : 0) + (segIdx > 0 ? 1 : 0);
+      peak = Math.max(peak, boardCount + segSheets + tailCount);
+      if (framesMode === "first" && segShots[0]) {
+        peak = Math.max(peak, boardCount + new Set(activeIndicesInShots([segShots[0]], false).map(sheetKey)).size);
+      }
+    }
+  });
+  return peak;
+}
+
 function renderFilmReferences() {
   $("film-parse-status").textContent = state.filmImporting ? t("filmImporting") : state.filmParsing ? t("filmParsing") : state.filmError || "";
   $("film-parse-status").classList.toggle("field-error", Boolean(state.filmError));
@@ -177,40 +241,45 @@ function renderFilmReferences() {
     for (const id of group.slotIds) groupBySlot.set(id, group);
   }
   const castSlots = state.filmSlots.filter((s) => s.kind === "cast");
+  const groupedMemberCount = state.filmGroups.reduce((sum, g) => sum + g.slotIds.length, 0);
+  const ungroupedCastCount = castSlots.length - groupedMemberCount;
+  if (ungroupedCastCount < 2) state.selectedCastSlots.clear();
   const controlsLocked = state.uploading || state.filmImporting || state.submitting || state.filmParsing || !state.film;
   let mergeBtn = null;
   if (castSlots.length >= 2) {
-    const groupedMemberCount = state.filmGroups.reduce((sum, g) => sum + g.slotIds.length, 0);
-    const castSheetCount = (castSlots.length - groupedMemberCount) + state.filmGroups.length;
+    const castSheetCount = ungroupedCastCount + state.filmGroups.length;
     const boardCount = state.filmSlots.some((s) => s.kind === "board" && (s.required || state.filmBindings.has(s.id))) ? 1 : 0;
-    const totalRefs = castSheetCount + boardCount;
+    const totalRefs = peakFilmReferences(castSlots, groupBySlot, boardCount);
     const toolbar = element("div", "film-cast-group-toolbar");
     const info = element("div", "film-cast-group-info");
     info.append(element("p", "hint", t("filmCastGroupSummary", { roles: castSlots.length, sheets: castSheetCount, max: 9 })));
     if (totalRefs > 9) {
       info.append(element("p", "hint field-error", t("filmCastOverLimitHint", { total: totalRefs, max: 9 })));
     }
-    mergeBtn = element("button", "button secondary merge-cast-button", t("mergeSelectedCast", { count: state.selectedCastSlots.size }));
-    mergeBtn.type = "button";
-    mergeBtn.disabled = controlsLocked || state.selectedCastSlots.size < 2;
-    mergeBtn.addEventListener("click", () => {
-      if (mergeBtn.disabled) return;
-      const ordered = castSlots.filter((s) => state.selectedCastSlots.has(s.id));
-      if (ordered.length < 2) return;
-      const existing = ordered.map((s) => state.filmBindings.get(s.id)).filter(Boolean);
-      const uniqueFiles = new Map(existing.map((b) => [b.file.id, b.file]));
-      if (existing.length === ordered.length && uniqueFiles.size === 1) {
-        const sharedFile = [...uniqueFiles.values()][0];
-        for (const s of ordered) state.filmBindings.set(s.id, { name: s.name, file: sharedFile });
-      } else {
-        for (const s of ordered) state.filmBindings.delete(s.id);
-      }
-      state.filmGroups.push({ slotIds: ordered.map((s) => s.id), names: ordered.map((s) => s.name) });
-      state.selectedCastSlots.clear();
-      renderFilmReferences();
-      showMessage(t("castMerged", { names: ordered.map((s) => s.name).join(" / ") }));
-    });
-    toolbar.append(info, mergeBtn);
+    toolbar.append(info);
+    if (ungroupedCastCount >= 2) {
+      mergeBtn = element("button", "button secondary merge-cast-button", t("mergeSelectedCast", { count: state.selectedCastSlots.size }));
+      mergeBtn.type = "button";
+      mergeBtn.disabled = controlsLocked || state.selectedCastSlots.size < 2;
+      mergeBtn.addEventListener("click", () => {
+        if (mergeBtn.disabled) return;
+        const ordered = castSlots.filter((s) => state.selectedCastSlots.has(s.id));
+        if (ordered.length < 2) return;
+        const existing = ordered.map((s) => state.filmBindings.get(s.id)).filter(Boolean);
+        const uniqueFiles = new Map(existing.map((b) => [b.file.id, b.file]));
+        if (existing.length === ordered.length && uniqueFiles.size === 1) {
+          const sharedFile = [...uniqueFiles.values()][0];
+          for (const s of ordered) state.filmBindings.set(s.id, { name: s.name, file: sharedFile });
+        } else {
+          for (const s of ordered) state.filmBindings.delete(s.id);
+        }
+        state.filmGroups.push({ slotIds: ordered.map((s) => s.id), names: ordered.map((s) => s.name) });
+        state.selectedCastSlots.clear();
+        renderFilmReferences();
+        showMessage(t("castMerged", { names: ordered.map((s) => s.name).join(" / ") }));
+      });
+      toolbar.append(mergeBtn);
+    }
     list.append(toolbar);
   }
   for (const slot of state.filmSlots) {
@@ -286,7 +355,7 @@ function renderFilmReferences() {
     const name = filmSlotName(slot);
     const card = element("article", "film-reference-card");
     const heading = element("div", "label-heading");
-    if (slot.kind === "cast" && castSlots.length >= 2) {
+    if (slot.kind === "cast" && ungroupedCastCount >= 2) {
       const checkWrap = element("label", "checkbox-field cast-merge-check");
       const checkbox = element("input", "film-cast-select");
       checkbox.type = "checkbox";
@@ -422,7 +491,7 @@ for (const kind of ["one", "film"]) {
 
 $("mode-demo").addEventListener("click", () => { state.demo = true; renderMode(); });
 $("mode-live").addEventListener("click", () => { state.demo = false; renderMode(); });
-$("frames").addEventListener("change", updateFrameHint);
+$("frames").addEventListener("change", () => { updateFrameHint(); renderFilmReferences(); });
 $("optimize-storyboard").addEventListener("change", () => {
   state.optimizeStoryboard = Boolean($("optimize-storyboard").checked);
   renderMode();

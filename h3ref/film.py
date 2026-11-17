@@ -48,12 +48,12 @@ def load(path: Path, check_images: bool = True) -> dict:
     film.setdefault("aspect", "9:16")
     for c in film.get("cast") or []:
         p = Path(c["picture"]).expanduser()
-        c["picture"] = str(p if p.is_absolute() else (base / p).resolve())
+        c["picture"] = str((p if p.is_absolute() else (base / p)).resolve())
         if check_images and not Path(c["picture"]).is_file():
             raise SystemExit(f"找不到 {c['name']} 的参考图：{c['picture']}")
     if film.get("board"):
         p = Path(film["board"]).expanduser()
-        film["board"] = str(p if p.is_absolute() else (base / p).resolve())
+        film["board"] = str((p if p.is_absolute() else (base / p)).resolve())
     shots = [s for s in film.get("shots") or [] if (s.get("action") or "").strip()]
     if not shots:
         raise SystemExit("film.json 里没有镜头（shots）")
@@ -360,7 +360,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                                 job.put('frames', key, composition=None, prompt=text, reference_paths=references)
                         futures.append(pool.submit(draw, key, text, references, rec.get('task')))
                     except Exception as exc:
-                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 402, 403, 404, 429) and not rec.get('task') and not rec.get('submission_unknown'):
+                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in frames.FATAL_COMPOSITION_STATUSES and not rec.get('task') and not rec.get('submission_unknown'):
                             for future in futures:
                                 future.result()
                             raise
@@ -440,6 +440,7 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
             h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
         except Exception as exc:
             (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+            (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').unlink(missing_ok=True)
             job.put('segs', str(i), zh=zh, h3=None, h3_source=None, error=f"{type(exc).__name__}: {exc}")
             raise
         (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
@@ -535,8 +536,13 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
     http.download(st["url"], out)
     job.put("segs", str(i), phase="tail")
     media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
-    job.put("segs", str(i), file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
-            wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
+    with job.lock:
+        cur = job.state["segs"].setdefault(str(i), {})
+        cur.pop("clip_prompts", None)
+        cur.pop("manual_rewrite", None)
+        cur.update(file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
+                   wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
+        job.save()
     job.log("done", f"seg{i + 1}", f"¥{st['cny']:.3f}", f"{st.get('run_seconds')} s on the GPU")
     return job.state["segs"][str(i)]
 

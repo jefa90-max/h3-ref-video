@@ -47,7 +47,7 @@
   "staging_axis_side": "Axis side",
   "staging_invalid": "Staging field {path}={value}; expected {expected}.",
   "staging_known_layout": "exact known layout of scene {scene_id}",
-  "staging_plan_failed": "STAGING_INVALID {frame_key} schema=3 model={model}, record {path}: {detail}. This text request may have been charged. Edit this frame prompt and regenerate only its image; do not automatically replan.",
+  "staging_plan_failed": "STAGING_PLAN_FAILED {frame_key} model={model}, record {path}: {detail}. This text request may have been charged. Edit this frame prompt and regenerate only its image; do not automatically replan.",
   "frame_composition_fallback": "Frame {frame_key} composition optimization failed after retries; falling back to the raw storyboard prompt: {detail}",
   "optimize_storyboard_help": "Skip LLM storyboard prompt optimization and draw frames directly from raw shot descriptions",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}; record {path}. Other shots were processed. Manually repair failed frames in the workbench before continuing.",

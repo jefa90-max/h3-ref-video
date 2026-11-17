@@ -40,6 +40,36 @@ class CompositionFormatError(RuntimeError):
     """The composition LLM returned empty, non-JSON, or schema-invalid output across all bounded retries."""
 
 
+def _extract_composition_json_text(raw_reply: str) -> str:
+    lower = raw_reply.lower()
+    pos = 0
+    chunks = []
+    while True:
+        start = lower.find("<think>", pos)
+        if start == -1:
+            chunks.append(raw_reply[pos:])
+            break
+        chunks.append(raw_reply[pos:start])
+        end = lower.find("</think>", start + 7)
+        if end == -1:
+            raise ValueError(message("frame_composition_invalid", detail=raw_reply[:300]))
+        pos = end + 8
+    cleaned = "".join(chunks).strip()
+    low_rem = cleaned.lower()
+    if "<think" in low_rem or "</think" in low_rem:
+        raise ValueError(message("frame_composition_invalid", detail=raw_reply[:300]))
+    fence_open = cleaned.find("```")
+    if fence_open != -1:
+        fence_close = cleaned.find("```", fence_open + 3)
+        if fence_close == -1:
+            raise ValueError(message("frame_composition_invalid", detail=cleaned[:300]))
+        inner = cleaned[fence_open + 3:fence_close]
+        if inner[:4].lower() == "json" and (len(inner) == 4 or inner[4].isspace()):
+            inner = inner[4:]
+        return inner.strip()
+    return cleaned
+
+
 NON_RETRYABLE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
 FATAL_COMPOSITION_STATUSES = {401, 402, 403, 404, 429}
 MAX_POLL_ATTEMPTS = 600
@@ -131,9 +161,7 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
             if not isinstance(raw_content, str) or not raw_content.strip():
                 raise ValueError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300]))
             raw_reply = raw_content.strip()
-            cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_reply, flags=re.IGNORECASE).strip()
-            fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
-            cleaned = fenced.group(1).strip() if fenced else re.sub(r"^```\w*\s*|\s*```$", "", cleaned).strip()
+            cleaned = _extract_composition_json_text(raw_reply)
             composition = json.loads(cleaned)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             last_error = str(exc) if isinstance(exc, ValueError) else message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])

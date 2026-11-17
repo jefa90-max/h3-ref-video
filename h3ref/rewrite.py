@@ -112,14 +112,50 @@ def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback
         "Write the rewrite now: the six sections only."]).strip()
 
 
+def _strip_think_blocks_linear(raw: str) -> str:
+    lower = raw.lower()
+    pos = 0
+    chunks = []
+    while True:
+        start = lower.find("<think>", pos)
+        if start == -1:
+            chunks.append(raw[pos:])
+            break
+        chunks.append(raw[pos:start])
+        end = lower.find("</think>", start + 7)
+        if end == -1:
+            raise RewriteError(message("rewrite_empty"))
+        pos = end + 8
+    rem = "".join(chunks)
+    low_rem = rem.lower()
+    if "<think" in low_rem or "</think" in low_rem:
+        raise RewriteError(message("rewrite_empty"))
+    return rem.strip()
+
+
 def _strip_reasoning_and_fences(raw: str) -> str:
     if not isinstance(raw, str):
         return ""
-    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
-    fenced = re.search(r"```(?:\w+)?\s*([\s\S]*?)```", cleaned)
-    if fenced:
-        return fenced.group(1).strip()
-    return re.sub(r"^```\w*\s*\n?|\n?\s*```$", "", cleaned).strip()
+    cleaned = _strip_think_blocks_linear(raw)
+    if not cleaned:
+        return ""
+    if cleaned.startswith("```"):
+        nl = cleaned.find("\n")
+        close_idx = cleaned.find("```", 3)
+        if nl == -1 or close_idx == -1 or close_idx != len(cleaned) - 3:
+            raise RewriteError("代码围栏未闭合或包含围栏外多余内容")
+        header = cleaned[3:nl].strip()
+        if header and not header.isalnum():
+            raise RewriteError("代码围栏标记无效")
+        cleaned = cleaned[nl + 1:close_idx].strip()
+    if "```" in cleaned:
+        raise RewriteError("提示词包含多余代码围栏")
+    return cleaned
+
+
+def strip_h3_wrappers(raw: str) -> str:
+    """Validate and remove <think>...</think> and outer code fences in O(N) time."""
+    return _strip_reasoning_and_fences(raw)
 
 
 def sections(text: str) -> dict:
@@ -129,7 +165,7 @@ def sections(text: str) -> dict:
         raise RewriteError(message("rewrite_empty"))
     found = [(m.start(), m.group(1)) for m in re.finditer(r"^\s*(" + "|".join(SECTIONS) + r")\s*:", text, re.M)]
     names = [n for _, n in found]
-    if names != SECTIONS:
+    if names != SECTIONS or found[0][0] != 0:
         raise RewriteError("六块不全或顺序不对：" + "、".join(names))
     out = {}
     for k, (pos, name) in enumerate(found):
@@ -141,12 +177,7 @@ def sections(text: str) -> dict:
     return out
 
 
-def cached_problems(text: str, n_images: int) -> list[str]:
-    """Structural and <Picture N> bound checks for cached paired H3 prompts."""
-    try:
-        parts = sections(text)
-    except RewriteError as exc:
-        return [str(exc)]
+def _picture_problems(parts: dict, n_images: int) -> list[str]:
     out = []
     section_body = "\n".join(parts.values())
     for token in re.findall(r"<Picture([^>]*)>", section_body):
@@ -159,17 +190,25 @@ def cached_problems(text: str, n_images: int) -> list[str]:
     return out
 
 
-def problems(text: str, n_images: int) -> list[str]:
-    issues = cached_problems(text, n_images)
+def cached_problems(text: str, n_images: int) -> list[str]:
+    """Structural and <Picture N> bound checks for cached paired H3 prompts."""
     try:
         parts = sections(text)
-    except RewriteError:
-        return issues
+    except RewriteError as exc:
+        return [str(exc)]
+    return _picture_problems(parts, n_images)
+
+
+def problems(text: str, n_images: int) -> list[str]:
+    try:
+        parts = sections(text)
+    except RewriteError as exc:
+        return [str(exc)]
     out = []
     for name in ("detailed_description", "overall_soundscape"):
         for m in NEGATIVE.finditer(parts[name]):
             out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
-    out.extend(issues)
+    out.extend(_picture_problems(parts, n_images))
     if "[Shot 1]" not in parts["detailed_description"]:
         out.append("detailed_description has no [Shot 1]")
     return out
@@ -270,10 +309,14 @@ def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str, *, max_r
         except RewriteError as exc:
             issues = [str(exc)]
         else:
-            cleaned = _strip_reasoning_and_fences(raw or "")
-            issues = [message("rewrite_empty")] if not cleaned else problems(cleaned, n_images)
-            if not issues:
-                return assemble(sections(cleaned))
+            try:
+                cleaned = _strip_reasoning_and_fences(raw or "")
+            except RewriteError as exc:
+                issues = [str(exc)]
+            else:
+                issues = [message("rewrite_empty")] if not cleaned else problems(cleaned, n_images)
+                if not issues:
+                    return assemble(sections(cleaned))
         feedback = "\n".join(f"- {x}" for x in issues)
     raise RewriteError(message("rewrite_exhausted", attempts=attempts, detail=feedback.replace("\n", " ")[:300]))
 

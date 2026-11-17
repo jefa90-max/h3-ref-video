@@ -70,7 +70,7 @@ def character_references(request, identifier):
     references = []
     groups = film.group_cast_by_picture(script.get("cast") or [], script.get("cast") or [])
     for index, group in enumerate(groups):
-        path = Path(group["path"])
+        path = Path(group["path"]).expanduser().resolve()
         url = f"/api/jobs/{identifier}/characters/{index}?v={path.stat().st_mtime_ns}" if path.is_file() else None
         references.append({"kind": "character", "path": str(path), "name": group["name"], "url": url})
     return references

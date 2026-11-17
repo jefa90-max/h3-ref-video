@@ -187,7 +187,7 @@ def preflight(job, env):
     if job["demo"]:
         return
     import shutil
-    from h3ref.rewrite import is_rewritten
+    from h3ref.rewrite import is_rewritten, strip_h3_wrappers
     required = []
     out = Path(job["output_dir"]) if job.get("output_dir") else None
     state_file = out / "state.json" if out else None
@@ -196,7 +196,7 @@ def preflight(job, env):
     needs_rh, needs_rewrite, needs_frames, needs_vision, needs_composition = False, False, False, False, False
     if job["kind"] == "one":
         needs_rh = True
-        h3 = state.get("h3") or (job["prompt"] if is_rewritten(job["prompt"]) else "")
+        h3 = state.get("h3") or (strip_h3_wrappers(job["prompt"]) if is_rewritten(job["prompt"]) else "")
         needs_rewrite = not h3
         needs_vision = config.SUBTITLE_CHECKS_ENABLED and (job.get("check", False) or any(ord(ch) > 0x2E80 for ch in h3))
     else:

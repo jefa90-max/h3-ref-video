@@ -270,7 +270,8 @@ function renderJob(job) {
   $("job-created").textContent = dateLabel(job.created_at);
   const failed = ["failed", "interrupted"].includes(job.status);
   const activeStage = { pipeline: "stageGeneratingVideo", segment: "stageRegeneratingSegment", assemble: "stageAssembling", rewrite_segment: "stageRewritingPrompts", rewrite_prompts: "stageRewritingPrompts" }[job.operation] || "stageGeneratingFrames";
-  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.frame_failures ? "stageFramesIncomplete" : job.review_needed ? "stageReview" : job.pending_assembly ? "stageAwaitingAssembly" : "stageFinished";
+  const unfinishedClips = Boolean(job.can_resume_pipeline || (job.kind === "film" && (job.segments || []).length > 0 && (job.segments || []).some((segment) => !segment.url)));
+  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.frame_failures ? "stageFramesIncomplete" : job.review_needed ? "stageReview" : (job.pending_assembly && job.assembly?.ready !== false) ? "stageAwaitingAssembly" : unfinishedClips ? "stagePromptsReady" : "stageFinished";
   $("stage-title").textContent = t(stage);
   $("stage-hint").textContent = t(stage === "stageReview" && review.kind === "script" ? "stageScriptReviewHint" : `${stage}Hint`);
   $("job-error").hidden = !job.error;

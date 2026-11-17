@@ -125,9 +125,14 @@ function refreshSegmentControls(card, job, syncText = false) {
     card.draftNote.hidden = !draft;
     card.otherDraft.textContent = t("segmentOtherFormatDraft");
     card.otherDraft.hidden = !state.segmentDrafts.get(segment.number)?.drafts[format === "source" ? "h3" : "source"];
-    card.activeLabel.textContent = t(segment.url ? "segmentActivePrompts" : "segmentSavedPrompts");
-    card.activeSource.textContent = segment.source_prompt || t("segmentNoActiveSource");
-    card.activeH3.textContent = segment.h3_prompt || t("segmentNoActiveH3");
+    const hasClipSnapshot = Boolean(segment.url && segment.prompts_unapplied_to_clip && (segment.clip_source_prompt != null || segment.clip_h3_prompt != null));
+    const shownSource = hasClipSnapshot ? segment.clip_source_prompt : segment.source_prompt;
+    const shownH3 = hasClipSnapshot ? segment.clip_h3_prompt : segment.h3_prompt;
+    card.activeLabel.textContent = t(
+      !segment.url ? "segmentSavedPrompts" : (segment.prompts_unapplied_to_clip && !hasClipSnapshot) ? "segmentSavedPromptsPendingVideo" : "segmentActivePrompts",
+    );
+    card.activeSource.textContent = shownSource || t("segmentNoActiveSource");
+    card.activeH3.textContent = shownH3 || t("segmentNoActiveH3");
   }
   const baseline = draft || (card.editorFormat === format && card.editorBaseline) || { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
   const conflict = baseline.basePromptVersion !== segment.prompt_version || baseline.baseClipVersion !== segment.version;
@@ -202,11 +207,9 @@ function expandSegmentEditor(card) {
   card.rewriteH3.addEventListener("click", async () => {
     if (card.rewriteH3.disabled) return;
     state.segmentRewrites ??= new Map();
-    const current = card.segment, format = segmentFormat(current);
+    const current = card.segment;
     const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
-    const sourceText = format === "source"
-      ? (sourceDraft?.text ?? segmentSavedText(current, "source"))
-      : (sourceDraft?.text ?? segmentSavedText(current, "source"));
+    const sourceText = sourceDraft?.text ?? segmentSavedText(current, "source");
     const trimmedSource = sourceText.trim();
     if (!trimmedSource) return;
     const baseline = sourceDraft || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
@@ -330,7 +333,7 @@ function renderVideoSegments(job) {
     card.description.textContent = t("segmentDetails", { start: segment.start, end: segment.end, seconds: segment.seconds, count: segment.shots });
     card.status.textContent = t(segment.url ? "segmentReady" : "segmentWaiting");
     card.summary.textContent = t("segmentEditPrompt");
-    const note = segment.submission_unknown ? "segmentSubmissionUnknown" : segment.task_pending ? "segmentTaskPending" : segment.terminal_failed ? "segmentTerminalFailed" : segment.error ? "segmentFailedAttempt" : "";
+    const note = segment.submission_unknown ? "segmentSubmissionUnknown" : segment.task_pending ? "segmentTaskPending" : segment.terminal_failed ? "segmentTerminalFailed" : segment.error ? "segmentFailedAttempt" : (segment.url && segment.prompts_unapplied_to_clip) ? "segmentPromptsSavedNotInVideo" : "";
     const text = note ? t(note) : ""; if (card.attemptNote.textContent !== text) card.attemptNote.textContent = text;
     card.attemptNote.hidden = !text; card.error.textContent = segment.error || ""; card.error.hidden = !segment.error;
     card.sourceWarning.textContent = t("segmentSourceChanged"); card.sourceWarning.hidden = !segment.source_changed;
