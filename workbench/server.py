@@ -115,7 +115,7 @@ def create_app(storage=None, env_path=None):
     @app.errorhandler(InputError)
     def input_error(exc):
         status = 404 if exc.key == 'not_found' else 400
-        if request.endpoint == 'regenerate_segment':
+        if request.endpoint in ('regenerate_segment', 'rewrite_segment', 'rewrite_prompts'):
             field = exc.values.get('field') or {'segment_changed': 'version', 'segment_number': 'number'}.get(exc.key)
             return segment_problem(exc.key, exc.localized(language()), status, field=field)
         return jsonify(error=jobs.redact(exc.localized(language()))), status
@@ -126,7 +126,7 @@ def create_app(storage=None, env_path=None):
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
-        if request.endpoint in ('regenerate_segment', 'get_job'):
+        if request.endpoint in ('regenerate_segment', 'rewrite_segment', 'rewrite_prompts', 'get_job'):
             import traceback
             instance = uuid.uuid4().hex
             number = (request.view_args or {}).get('number', '?')
@@ -364,6 +364,26 @@ def create_app(storage=None, env_path=None):
             return jsonify(jobs.start_video_operation(identifier, 'segment', dict(env), values.get('version'), number,
                 prompt=values.get('prompt'), prompt_format=values.get('prompt_format', '') if edited else None,
                 prompt_version=values.get('prompt_version', '') if edited else None))
+
+    @app.post("/api/jobs/<identifier>/segments/<int:number>/rewrite")
+    def rewrite_segment(identifier, number):
+        values = request.get_json()
+        if not isinstance(values, dict):
+            invalid("segment", values, "object")
+        with jobs.lock:
+            edited = any(key in values for key in ('prompt', 'prompt_format', 'prompt_version'))
+            return jsonify(jobs.start_video_operation(identifier, 'rewrite_segment', dict(env), None, number,
+                prompt=values.get('prompt'), prompt_format=values.get('prompt_format', 'source') if edited else None,
+                prompt_version=values.get('prompt_version', '') if edited else None))
+
+    @app.post("/api/jobs/<identifier>/segments/rewrite")
+    def rewrite_prompts(identifier):
+        values = request.get_json()
+        if not isinstance(values, dict):
+            invalid("segment", values, "object")
+        with jobs.lock:
+            return jsonify(jobs.start_video_operation(identifier, 'rewrite_prompts', dict(env), None,
+                scope=values.get('scope', 'missing')))
 
     @app.post("/api/jobs/<identifier>/assemble")
     def assemble_film(identifier):

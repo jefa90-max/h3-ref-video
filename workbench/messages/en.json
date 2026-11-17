@@ -89,5 +89,9 @@
   "segment_expected_prompt": "nonempty string",
   "segment_expected_prompt_format": "source or h3",
   "segment_expected_prompt_version": "current prompt version",
+  "segment_expected_scope": "missing or all",
+  "segment_rewrite_done": "Segment {number} English prompt updated and saved; existing video was preserved without calling the video API.",
+  "segments_rewrite_done": "Converted English prompts for {count} segment(s); no video generation was triggered.",
+  "segments_rewrite_none": "All segments already have up-to-date English prompts; nothing to rewrite.",
   "segment_snapshot_changed": "Clip versions are changing. Refresh the results; your draft is preserved."
 }

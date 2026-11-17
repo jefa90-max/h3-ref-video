@@ -30,7 +30,7 @@ def write_json(path, value):
 
 def command(request, root):
     out = Path(request["output_dir"])
-    if request.get("operation") in ("segment", "assemble"):
+    if request.get("operation") in ("segment", "assemble", "rewrite_segment", "rewrite_prompts"):
         return [sys.executable, "-u", "-m", "workbench.segments", str(out / "inputs" / "request.json")]
     if request.get("operation", "pipeline") != "pipeline" or request.get("redo"):
         return [sys.executable, "-u", "-m", "workbench.storyboard", str(out / "inputs" / "request.json")]
@@ -244,7 +244,7 @@ class Jobs:
         if record["kind"] == "one" and any(a["name"] == "clip.mp4" for a in artifacts):
             result["progress"]["clips"] = 1
         result.update(storyboard=[], character_references=[], pending_video=False, can_continue=False, review=None, review_needed=False,
-                      segments=[], assembly=None, pending_assembly=False, can_assemble=False)
+                      segments=[], assembly=None, pending_assembly=False, can_assemble=False, can_rewrite_prompts=False, missing_h3_count=0)
         if record["kind"] == "one":
             one_state = context["state"]
             result["can_resume_video"] = not bool(
@@ -290,7 +290,7 @@ class Jobs:
             for card in result["segments"]:
                 if card.get("error"):
                     card["error"] = self.redact(str(card["error"]))
-            result["segment_number"] = saved.get("segment") if saved.get("operation") == "segment" else None
+            result["segment_number"] = saved.get("segment") if saved.get("operation") in ("segment", "rewrite_segment") else None
             unfinished = [card for card in result['segments'] if not card['url'] or card['task_pending']]
             raw_pending_seg = context['pending']
             pending_seg, pending_staged = segments.attempt_record(saved, context, raw_pending_seg.get('number', 0)) if raw_pending_seg else ({}, {})
@@ -334,13 +334,20 @@ class Jobs:
                         and (pending_seg.get('error') or pending_staged.get('error')) and has_inflight_sibling)
                 )
             )
-            result['can_resume_pipeline'] = bool(saved.get('operation') == 'segment'
-                    and (raw_pending_seg.get('applied') or can_resume_superseded or pending_settled_dead)
-                    and unfinished and result['review']['complete'] and not result['pending_video'])
+            pending_clear = not raw_pending_seg or bool(raw_pending_seg.get('applied') or can_resume_superseded or pending_settled_dead)
+            result['can_resume_pipeline'] = bool(
+                (
+                    (saved.get('operation') == 'segment' and (raw_pending_seg.get('applied') or can_resume_superseded or pending_settled_dead))
+                    or (saved.get('operation') in ('rewrite_segment', 'rewrite_prompts') and record['status'] == 'succeeded' and pending_clear)
+                )
+                and unfinished and result['review']['complete'] and not result['pending_video']
+            )
             if result['can_resume_pipeline']:
                 result['segment_number'] = None
-            if saved.get("operation") in ("frames", "frame", "assemble") and not result["can_resume_pipeline"]:
-                if result["can_resume_frames"]:
+            if saved.get("operation") in ("frames", "frame", "assemble", "rewrite_segment", "rewrite_prompts") and not result["can_resume_pipeline"]:
+                if saved.get("operation") in ("rewrite_segment", "rewrite_prompts"):
+                    result["can_resume_video"] = not any(card["submission_unknown"] for card in result["segments"])
+                elif result["can_resume_frames"]:
                     result["can_resume_video"] = not any(frame.get("submission_unknown") for frame in result["storyboard"])
                 else:
                     result["can_resume_video"] = not bool(
@@ -369,6 +376,11 @@ class Jobs:
                 for card in result["segments"]
             )
             result["can_assemble"] = editable and result["assembly"]["ready"] and not has_locked_segment
+            result["can_rewrite_prompts"] = bool(editable and not has_locked_segment)
+            result["missing_h3_count"] = sum(
+                1 for card in result["segments"]
+                if not card["h3_prompt"] or card["source_rewrite_required"]
+            )
         out = Path(record['output_dir'])
         if segments.clip_version(out / 'inputs' / 'segment-edit.json', out) != context['pending_stamp']:
             return None
@@ -401,7 +413,7 @@ class Jobs:
         request = validate(payload, self.root)
         if request["operation"] == "frame":
             raise InputError("frame_operation")
-        if request["operation"] in ("segment", "assemble"):
+        if request["operation"] in ("segment", "assemble", "rewrite_segment", "rewrite_prompts"):
             raise InputError("segment_operation")
         if request["kind"] == "film":
             # Creation always stops after frames. Only the reviewed continuation can generate a film.
@@ -615,7 +627,7 @@ class Jobs:
         self.launch(record, request, env)
         return self.snapshot(record["id"])
 
-    def start_video_operation(self, identifier, operation, env, version, number=None, *, prompt=None, prompt_format=None, prompt_version=None):
+    def start_video_operation(self, identifier, operation, env, version=None, number=None, *, prompt=None, prompt_format=None, prompt_version=None, scope=None):
         from . import segments
         with self.lock:
             self.available()
@@ -629,9 +641,9 @@ class Jobs:
             affected_dirty = _dirty_affected_segments(request, out, total_segs) if snapshot["pending_video"] else set()
             if not snapshot["review"]["complete"]:
                 raise InputError("review_required")
-            if snapshot["pending_video"] and (operation != "segment" or number in affected_dirty):
+            if snapshot["pending_video"] and (operation not in ("segment", "rewrite_segment") or number in affected_dirty):
                 raise InputError("review_required")
-            if operation == "assemble":
+            if operation in ("assemble", "rewrite_prompts"):
                 publishing_card = next((c for c in snapshot["segments"] if c["publishing"]), None)
                 if publishing_card:
                     raise InputError("segment_publishing", number=publishing_card["number"])
@@ -639,15 +651,24 @@ class Jobs:
                 if locked_card:
                     raise InputError("segment_locked", number=locked_card["number"])
             request.update(operation=operation)
-            for key in ("redo", "reset_applied", "segment_revision"):
+            for key in ("redo", "reset_applied", "segment_revision", "rewrite_scope"):
                 request.pop(key, None)
             if operation == "segment":
                 request["segment"] = number
                 request["_segment_preparation"] = segments.regeneration_plan(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
+            elif operation == "rewrite_segment":
+                request["segment"] = number
+            elif operation == "rewrite_prompts":
+                request.pop("segment", None)
+                request["rewrite_scope"] = scope
             preflight(request, env)
             request.pop("_segment_preparation", None)
             if operation == "segment":
                 request["segment_revision"] = segments.prepare_regeneration(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
+            elif operation == "rewrite_segment":
+                request["segment_revision"] = segments.prepare_rewrite_segment(request, number, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
+            elif operation == "rewrite_prompts":
+                request["segment_revision"] = segments.prepare_rewrite_prompts(request, scope=scope)
             else:
                 segments.prepare_assembly(request, version)
             return self.restart(record, request, env)
@@ -665,17 +686,17 @@ class Jobs:
             request = json.loads((out_dir / "inputs" / "request.json").read_text(encoding="utf-8"))
             if remaining_pipeline:
                 request['operation'] = 'pipeline'
-                for key in ('segment', 'segment_revision', 'redo', 'reset_applied'):
+                for key in ('segment', 'segment_revision', 'rewrite_scope', 'redo', 'reset_applied'):
                     request.pop(key, None)
             elif remaining_frames:
                 request["operation"] = "frames"
-            if request.get("operation") in ("segment", "assemble") or remaining_pipeline:
+            if request.get("operation") in ("segment", "assemble", "rewrite_segment", "rewrite_prompts") or remaining_pipeline:
                 total_segs = len(snapshot["review"]["plan"]["segments"])
                 affected_dirty = _dirty_affected_segments(request, out_dir, total_segs) if snapshot["pending_video"] else set()
                 if not snapshot["review"]["complete"]:
                     raise InputError("review_required")
                 if snapshot["pending_video"] and (
-                    request.get("operation") != "segment"
+                    request.get("operation") not in ("segment", "rewrite_segment")
                     or remaining_pipeline
                     or request.get("segment") in affected_dirty
                 ):

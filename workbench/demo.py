@@ -8,8 +8,25 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from h3ref import film, media
+from h3ref import film, media, rewrite
 from .i18n import message
+
+
+def demo_h3_prompt(n_images: int, seconds: float, aspect: str, number: int) -> str:
+    refs_desc = ", ".join(f"<Subject {i}> from <Picture {i}>" for i in range(1, n_images + 1)) or "<Subject 1> Demo character"
+    retention = "; ".join(f"<Subject {i}>: fully_preserved" for i in range(1, max(1, n_images) + 1)) + "."
+    parts = {
+        "subject_definitions": f"{refs_desc} (DEMO offline preview for segment {number}).",
+        "summary": f"[reference generation] Offline demo H3 preview for segment {number} ({seconds:g}s, {aspect}).",
+        "retention_analysis": retention,
+        "detailed_description": (
+            f"Demo offline {aspect} clip ({seconds:g}s).\n"
+            f"[Shot 1] Offline preview of segment {number}; configure API keys and disable demo mode for real LLM rewriting."
+        ),
+        "overall_soundscape": "Natural ambient room tone and subtle movement foley.",
+        "non_diegetic_music": "N/A",
+    }
+    return "\n\n".join(f"{name}:\n{parts[name]}" for name in rewrite.SECTIONS)
 
 
 def placeholder(path, label, aspect):
