@@ -377,10 +377,7 @@ class Jobs:
             )
             result["can_assemble"] = editable and result["assembly"]["ready"] and not has_locked_segment
             result["can_rewrite_prompts"] = bool(editable and not has_locked_segment)
-            result["missing_h3_count"] = sum(
-                1 for card in result["segments"]
-                if not card["h3_prompt"] or card["source_rewrite_required"]
-            )
+            result["missing_h3_count"] = sum(1 for card in result["segments"] if card.get("h3_missing"))
         out = Path(record['output_dir'])
         if segments.clip_version(out / 'inputs' / 'segment-edit.json', out) != context['pending_stamp']:
             return None

@@ -82,19 +82,23 @@ function reconcileSegmentSubmissions(job) {
       }
     }
     const rewritePending = state.segmentRewrites.get(segment.number);
-    if (rewritePending && job.status === "succeeded" && segment.h3_prompt && segment.source_prompt === rewritePending.prompt) {
-      const entry = segmentDraftEntry(segment);
-      if (entry.drafts.source?.text === rewritePending.prompt) {
-        delete entry.drafts.source;
+    if (rewritePending) {
+      if (["failed", "interrupted"].includes(job.status)) {
+        state.segmentRewrites.delete(segment.number);
+      } else if (job.status === "succeeded" && segment.h3_prompt && segment.source_prompt === rewritePending.prompt) {
+        const entry = segmentDraftEntry(segment);
+        if (entry.drafts.source?.text?.trim() === rewritePending.prompt) {
+          delete entry.drafts.source;
+        }
+        delete entry.drafts.h3;
+        entry.selectedFormat = "h3";
+        const card = state.segmentCards.get(segment.number);
+        if (card) {
+          card.editorFormat = null;
+          card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+        }
+        state.segmentRewrites.delete(segment.number);
       }
-      delete entry.drafts.h3;
-      entry.selectedFormat = "h3";
-      const card = state.segmentCards.get(segment.number);
-      if (card) {
-        card.editorFormat = null;
-        card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
-      }
-      state.segmentRewrites.delete(segment.number);
     }
   }
 }
@@ -199,16 +203,19 @@ function expandSegmentEditor(card) {
     const current = card.segment, format = segmentFormat(current);
     const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
     const sourceText = format === "source"
-      ? (state.segmentDrafts.get(current.number)?.drafts.source?.text ?? segmentSavedText(current, "source"))
+      ? (sourceDraft?.text ?? segmentSavedText(current, "source"))
       : (sourceDraft?.text ?? (current.source_prompt || current.automatic_source_prompt || ""));
-    const baseline = (format === "source" ? sourceDraft : sourceDraft) || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
-    const payload = { prompt: sourceText, prompt_format: "source", prompt_version: baseline.basePromptVersion };
-    state.segmentRewrites.set(current.number, { prompt: sourceText, revision: null });
+    const trimmedSource = sourceText.trim();
+    if (!trimmedSource) return;
+    const baseline = sourceDraft || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    const payload = { prompt: trimmedSource, prompt_format: "source", prompt_version: baseline.basePromptVersion };
     const accepted = await runJobAction(`/api/jobs/${encodeURIComponent(state.selectedJob.id)}/segments/${current.number}/rewrite`, payload);
     if (accepted) {
       const updated = accepted.segments?.find(item => item.number === current.number);
-      const tracked = state.segmentRewrites.get(current.number);
-      if (tracked) tracked.revision = updated?.attempt_revision || updated?.applied_revision || null;
+      state.segmentRewrites.set(current.number, {
+        prompt: trimmedSource,
+        revision: updated?.attempt_revision || updated?.applied_revision || null,
+      });
       renderVideoSegments(accepted);
     }
   });

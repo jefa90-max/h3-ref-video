@@ -139,7 +139,11 @@ async function refreshFilmReferences({ reset = false, format = false } = {}) {
           const s = slotById.get(id);
           if (s && s.kind === "cast" && s.name === g.names[idx]) kept.push(id);
         });
-        return kept.length >= 2 ? { slotIds: kept, names: kept.map((id) => slotById.get(id).name) } : null;
+        if (kept.length >= 2) {
+          return { slotIds: kept, names: kept.map((id) => slotById.get(id).name) };
+        }
+        for (const id of kept) state.filmBindings.delete(id);
+        return null;
       })
       .filter(Boolean);
     const groupedIds = new Set(state.filmGroups.flatMap((g) => g.slotIds));
@@ -194,7 +198,7 @@ function renderFilmReferences() {
       if (ordered.length < 2) return;
       const existing = ordered.map((s) => state.filmBindings.get(s.id)).filter(Boolean);
       const uniqueFiles = new Map(existing.map((b) => [b.file.id, b.file]));
-      if (uniqueFiles.size === 1) {
+      if (existing.length === ordered.length && uniqueFiles.size === 1) {
         const sharedFile = [...uniqueFiles.values()][0];
         for (const s of ordered) state.filmBindings.set(s.id, { name: s.name, file: sharedFile });
       } else {

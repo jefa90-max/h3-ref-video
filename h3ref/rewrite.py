@@ -68,7 +68,7 @@ class RewriteFatalError(RewriteError):
     pass
 
 
-FATAL_REWRITE_STATUSES = {401, 402, 403, 404}
+FATAL_REWRITE_STATUSES = {400, 401, 402, 403, 404, 429}
 
 
 def guide() -> str:
@@ -203,28 +203,16 @@ def _llm(prompt: str) -> str:
         err_cls = RewriteFatalError if exc.status_code in FATAL_REWRITE_STATUSES else RewriteError
         raise err_cls("改写模型请求失败：" + str(exc)[:300]) from None
     if not isinstance(out, dict):
-        raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+        raise RewriteError(message("rewrite_empty"))
     if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
-        err_obj = out.get("error")
         detail = json.dumps(out, ensure_ascii=False)
-        low = detail.lower()
-        http_status = out.get("_http_status")
-        raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
-        is_fatal = (
-            http_status in FATAL_REWRITE_STATUSES
-            or raw_code in (*FATAL_REWRITE_STATUSES, "invalid_api_key", "api_key_invalid", "unauthorized",
-                            "authentication_error", "insufficient_quota", "billing_hard_limit_reached", "model_not_found")
-            or any(tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid",
-                                          "incorrect api key", "unauthorized", "forbidden", "insufficient_quota", "model_not_found"))
-        )
-        err_cls = RewriteFatalError if is_fatal else RewriteError
-        raise err_cls("改写模型请求失败：" + detail[:300])
+        raise RewriteFatalError("改写模型请求失败：" + detail[:300])
     choices = out.get("choices")
     first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
     msg = first.get("message") if isinstance(first.get("message"), dict) else {}
     text = msg.get("content")
     if not isinstance(text, str) or not text.strip():
-        raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+        raise RewriteError(message("rewrite_empty"))
     return text
 
 
