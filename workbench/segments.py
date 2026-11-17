@@ -1086,9 +1086,9 @@ def prepare_rewrite_segment(request, number, *, prompt=None, prompt_format=None,
                 ('prompt_format', prompt_format, prompt_format == 'source'),
                 ('prompt_version', prompt_version, isinstance(prompt_version, str) and bool(prompt_version))):
             if not valid:
-                expected_key = 'segment_expected_prompt' if field == 'prompt' else ('segment_expected_prompt_version' if field == 'prompt_version' else 'segment_expected_prompt_format')
+                expected_msg_id = 'segment_expected_prompt' if field == 'prompt' else ('segment_expected_prompt_version' if field == 'prompt_version' else 'segment_expected_prompt_format')
                 raise InputError('segment_value', field=field, value=json.dumps(value, ensure_ascii=False)[:100],
-                                 expected='source' if field == 'prompt_format' else message(expected_key, request['lang']))
+                                 expected='source' if field == 'prompt_format' else message(expected_msg_id, request['lang']))
         if prompt_version != segment_prompt_version(previous_with_pair, current, pending, reference_version=automatic['reference_version'], rewrite_pending=rw_pending):
             raise InputError('segment_prompt_changed', field='prompt_version', number=number)
         source_text = prompt.strip()
