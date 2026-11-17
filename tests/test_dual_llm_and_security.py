@@ -1038,21 +1038,25 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                     self.assertEqual(verify_calls["count"], 1, "Unchanged verified reference image must be verified once and cached")
 
                     # 5. storyboard.view caches shared reference stat() calls across 20 shots without double-statting regular files
-                    orig_os_stat = os.stat
+                    orig_stat = Path.stat
+                    orig_is_file = Path.is_file
                     actor_resolved = actor.resolve()
-                    actor_targets = {str(actor), str(actor_resolved)}
-                    direct_os_stats = {"count": 0}
-                    def counted_os_stat(target, *a, **kw):
-                        if str(target) in actor_targets:
-                            direct_os_stats["count"] += 1
-                        return orig_os_stat(target, *a, **kw)
+                    helper_stats = {"stat": 0, "is_file": 0}
+                    def counted_helper_stat(p, *a, **kw):
+                        if (p == actor or p == actor_resolved) and kw.get("follow_symlinks", True):
+                            helper_stats["stat"] += 1
+                        return orig_stat(p, *a, **kw)
+                    def counted_helper_is_file(p, *a, **kw):
+                        if p == actor or p == actor_resolved:
+                            helper_stats["is_file"] += 1
+                        return orig_is_file(p, *a, **kw)
                     meta = {}
-                    with patch("os.stat", side_effect=counted_os_stat):
+                    with patch.object(Path, "stat", counted_helper_stat), patch.object(Path, "is_file", counted_helper_is_file):
                         mtime_ns = sb_mod._cached_mtime_ns(str(actor), {})
                         film.reference_version([str(actor)], metadata=meta)
                     self.assertIsNotNone(mtime_ns)
                     self.assertIsNotNone(meta[str(actor)][1])
-                    self.assertEqual(direct_os_stats["count"], 2, f"Expected single stat per helper without is_file() re-stat, got {direct_os_stats['count']}")
+                    self.assertEqual(helper_stats, {"stat": 2, "is_file": 0})
                     self.assertIsNone(sb_mod._cached_mtime_ns(str(root), {}))
                     self.assertIsNone(sb_mod._cached_mtime_ns(str(root / "missing-ref.png"), {}))
                     dir_and_missing_meta = {}
@@ -1060,7 +1064,6 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                     self.assertIsNone(dir_and_missing_meta[str(root)][1])
                     self.assertIsNone(dir_and_missing_meta[str(root / "missing-ref.png")][1])
 
-                    orig_stat = Path.stat
                     actor_stats = {"count": 0}
                     def counted_stat(p, *a, **kw):
                         if p == actor or p == actor_resolved:
