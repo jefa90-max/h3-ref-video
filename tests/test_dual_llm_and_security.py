@@ -1060,6 +1060,27 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
         with patch.object(frames.config, "apimart_key", return_value="k"), \
              patch.object(frames.http, "request", return_value={"error": {"code": 404, "message": "not found"}}):
             self.assertEqual(frames.poll("missing-404-task")["state"], "failed")
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", return_value={"_http_status": 429, "status": "error", "message": "Too Many Requests"}):
+            with self.assertRaises(RuntimeError):
+                frames.poll("paid-429-status-task")
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", return_value={"status": "error", "message": "Upstream gateway timeout"}):
+            with self.assertRaises(RuntimeError):
+                frames.poll("paid-200-gateway-error-task")
+        with patch.object(frames.config, "apimart_key", return_value="k"), \
+             patch.object(frames.http, "request", return_value={"_http_status": 400, "status": 400, "error": "content_policy_violation"}):
+            with self.assertRaises(frames.ContentPolicyError):
+                frames.poll("rfc7807-moderation-task")
+        with tempfile.TemporaryDirectory() as asm_tmp:
+            asm_out = Path(asm_tmp)
+            (asm_out / "clips").mkdir(parents=True)
+            (asm_out / "clips" / "seg1.mp4").write_bytes(b"seg1")
+            (asm_out / "film.mp4").write_bytes(b"final")
+            asm_req = {"output_dir": str(asm_out), "film": {"shots": [{"start": 0, "end": 8, "action": "a"}, {"start": 8, "end": 16, "action": "b"}]}}
+            asm_st = segments.assembly_status(asm_req)
+            self.assertFalse(asm_st["ready"])
+            self.assertTrue(asm_st["pending"])
         with patch.object(rh, "_post", side_effect=http.HTTPResponseError(404, "404 Not Found")):
             with self.assertRaises(http.HTTPResponseError):
                 rh.poll("proxy-404-video-task")
