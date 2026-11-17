@@ -89,6 +89,18 @@ def pending_superseded(active, pending, staged):
     active_source = '' if (active.get('prompt_override') or {}).get('format') == 'h3' else active.get('zh')
     if active_source and 'zh' in prev and active_source != prev.get('zh') and not (reconciled_terminal and active_source == expected_zh):
         return True
+    expected_h3 = (
+        staged['h3'] if 'h3' in staged
+        else (pending.get('prompt', '') if pending.get('prompt_format') == 'h3'
+              else (None if not pending.get('reuse_h3') and pending.get('prompt', '') != prev.get('zh') else prev.get('h3')))
+        if ('prompt_override' not in staged and pending.get('explicit_prompt') and pending.get('prompt_format') in ('source', 'h3'))
+        else prev.get('h3')
+    )
+    active_h3 = active.get('h3')
+    if active_h3 and 'h3' in prev and active_h3 != prev.get('h3') and not (reconciled_terminal and active_h3 == expected_h3):
+        return True
+    if 'zh' in prev and active.get('prompt_override') != prev.get('prompt_override') and not reconciled_terminal:
+        return True
     return False
 
 
