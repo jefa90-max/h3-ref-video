@@ -15,6 +15,7 @@ import json
 import math
 import os
 import random
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -221,8 +222,12 @@ def reference_version(paths, *, metadata=None) -> str:
         key = str(source)
         if key not in metadata:
             path = Path(source)
-            stat = path.stat() if path.is_file() else None
-            metadata[key] = (str(path.resolve()), (stat.st_mtime_ns, stat.st_size) if stat else None)
+            try:
+                st = path.stat()
+            except OSError:
+                st = None
+            regular = st if st is not None and stat.S_ISREG(st.st_mode) else None
+            metadata[key] = (str(path.resolve()), (regular.st_mtime_ns, regular.st_size) if regular else None)
         sources.append(metadata[key])
     return hashlib.sha256(json.dumps(sources, ensure_ascii=False).encode()).hexdigest()
 

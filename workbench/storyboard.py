@@ -2,6 +2,7 @@
 import json
 import hashlib
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -90,7 +91,7 @@ def _cached_mtime_ns(path_str, cache):
         path = Path(path_str)
         try:
             st = path.stat()
-            cache[path_str] = st.st_mtime_ns if path.is_file() else None
+            cache[path_str] = st.st_mtime_ns if stat.S_ISREG(st.st_mode) else None
         except OSError:
             cache[path_str] = None
     return cache[path_str]
