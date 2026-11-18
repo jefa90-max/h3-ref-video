@@ -23,7 +23,8 @@ def _make_png_bytes(color="blue"):
 
 class GroupedCastTest(unittest.TestCase):
     def setUp(self):
-        env_patch = patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True)
+        base_env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "SystemRoot") if k in os.environ}
+        env_patch = patch.dict(os.environ, base_env, clear=True)
         env_patch.start()
         self.addCleanup(env_patch.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -492,7 +493,13 @@ class GroupedCastTest(unittest.TestCase):
         proc = subprocess.run(
             jobs_mod.command(demo_req, config.ROOT),
             cwd=config.ROOT,
-            env={**os.environ, "H3_SKIP_DOTENV": "1"},
+            env={
+                **os.environ,
+                "HOME": str(self.root),
+                "USERPROFILE": str(self.root),
+                "H3REF_CACHE": str(self.root / "cache"),
+                "H3_SKIP_DOTENV": "1",
+            },
             capture_output=True,
             text=True,
             timeout=30,
