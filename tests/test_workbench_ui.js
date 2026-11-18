@@ -1033,3 +1033,101 @@ test("common.js renders ComfyUI/Colab runtime card states, Drive auth ack, and t
   assert.deepEqual(stopCalls.map((c) => c.body.force), [false, true]);
 });
 
+test("common.js refreshes runtime card when video submission triggers auto-start HTTP 400 and submits cleared COMFYUI_URL", async () => {
+  const { $, ids } = makeDom();
+  $("persist-config").checked = true;
+  let postedConfig = null;
+  let runtimePhase = "offline";
+
+  class FakeFormData {
+    constructor() {
+      const entries = [];
+      for (const id of ["video-provider", "comfy-url", "comfy-preset", "colab-auto-start", "llm-provider", "llm-composition-model", "llm-rewrite-model", "llm-base"]) {
+        const el = ids.get(id);
+        if (el && !el.disabled && el.name) entries.push([el.name, el.value]);
+      }
+      this._entries = entries;
+    }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  $("video-provider").name = "VIDEO_PROVIDER";
+  $("comfy-url").name = "COMFYUI_URL";
+  $("comfy-preset").name = "COMFYUI_PRESET";
+  $("colab-auto-start").name = "COLAB_AUTO_START";
+  $("llm-provider").name = "LLM_PROVIDER";
+  $("llm-composition-model").name = "LLM_COMPOSITION_MODEL";
+  $("llm-rewrite-model").name = "LLM_REWRITE_MODEL";
+  $("llm-base").name = "LLM_BASE_URL";
+
+  const comfyConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: true, APIMART_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_PRESET: "4step",
+    COLAB_AUTO_START: "1",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: FakeFormData,
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") {
+        if (runtimePhase === "awaiting_drive_auth") {
+          return {
+            ok: true,
+            json: async () => ({
+              state: "awaiting_drive_auth",
+              cli_available: true,
+              auth_url: "https://accounts.google.com/o/oauth2/auth?auto=1",
+              comfyui_url: "https://demo.ngrok-free.dev",
+              logs: [],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({ state: "offline", cli_available: true, comfyui_url: "https://demo.ngrok-free.dev", logs: [] }) };
+      }
+      if (url === "/api/jobs") {
+        runtimePhase = "awaiting_drive_auth";
+        return { ok: false, status: 400, json: async () => ({ error: "Colab A100 startup triggered" }) };
+      }
+      if (url === "/api/config") {
+        postedConfig = JSON.parse(opts.body);
+        return { ok: true, json: async () => ({ ...comfyConfig, COMFYUI_URL: postedConfig.COMFYUI_URL ?? comfyConfig.COMFYUI_URL }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  const freshMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(freshMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+  assert.equal($("runtime-drive-box").hidden, true);
+
+  // Trigger POST /api/jobs returning 400 -> runtime card must auto-refresh and reveal Drive OAuth box
+  await assert.rejects(() => context.post("/api/jobs", { kind: "one" }));
+  await new Promise((r) => setImmediate(r));
+  assert.equal($("runtime-drive-box").hidden, false);
+  assert.equal($("runtime-drive-link").href, "https://accounts.google.com/o/oauth2/auth?auto=1");
+
+  // Clearing #comfy-url and saving submits COMFYUI_URL: ""
+  $("comfy-url").value = "";
+  await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
+  assert.equal(postedConfig.COMFYUI_URL, "");
+});
+
