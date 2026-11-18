@@ -1052,6 +1052,26 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         self.assertEqual(reconciled_u2["1"]["h3"], expected_u2_h3, "Paid staged H3 prompt must survive clipless reconciliation")
         self.assertEqual(reconciled_u2["1"]["h3_source"], untouched_card2["prompt"])
 
+        # 5. voices/adversarial-native#2: reconcile_pending_segment on clipless segment and stage_prompts cache hit
+        # must both materialize out/prompts/seg{N}.{zh,h3}.txt on disk!
+        (out / "prompts" / "seg2.zh.txt").unlink(missing_ok=True)
+        (out / "prompts" / "seg2.h3.txt").unlink(missing_ok=True)
+        segments.reconcile_pending_segment(out, keep_pending=False, supersede=False)
+        self.assertEqual((out / "prompts" / "seg2.zh.txt").read_text(encoding="utf-8"), untouched_card2["prompt"])
+        self.assertEqual((out / "prompts" / "seg2.h3.txt").read_text(encoding="utf-8"), expected_u2_h3)
+
+        (out / "prompts" / "seg1.zh.txt").unlink(missing_ok=True)
+        (out / "prompts" / "seg1.h3.txt").unlink(missing_ok=True)
+        (out / "prompts" / "seg2.zh.txt").unlink(missing_ok=True)
+        (out / "prompts" / "seg2.h3.txt").unlink(missing_ok=True)
+        pics_map = {s["idx"]: film.refs(script, s, "none") for s in planned}
+        with patch.object(film.rewrite, "rewrite", side_effect=AssertionError("stage_prompts must hit cache")):
+            film.stage_prompts(film.Job(out), script, planned, pics_map)
+        self.assertEqual((out / "prompts" / "seg1.zh.txt").read_text(encoding="utf-8"), zh0)
+        self.assertEqual((out / "prompts" / "seg1.h3.txt").read_text(encoding="utf-8"), h3_0)
+        self.assertEqual((out / "prompts" / "seg2.zh.txt").read_text(encoding="utf-8"), untouched_card2["prompt"])
+        self.assertEqual((out / "prompts" / "seg2.h3.txt").read_text(encoding="utf-8"), expected_u2_h3)
+
 
 if __name__ == "__main__":
     unittest.main()
