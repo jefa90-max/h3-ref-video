@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from h3ref import check, config, film, http, media, rewrite, rh  # noqa: E402
+from h3ref import check, comfy, config, film, http, media, rewrite, rh  # noqa: E402
 from h3ref.i18n import message  # noqa: E402
 
 
@@ -57,32 +57,49 @@ def cmd_one(a):
         (out / "prompt.h3.txt").write_text(st["h3"], encoding="utf-8")
         save()
         print("改写好了：", out / "prompt.h3.txt")
+    provider_name = (
+        str(st.get("provider") or "runninghub").strip().lower()
+        if (st.get("task") or st.get("submission_unknown"))
+        else config.video_settings()["provider"]
+    )
+    backend = comfy if provider_name == "comfyui" else rh
     if not st.get("task"):
         if st.get("submission_unknown"):
-            raise RuntimeError(message("submission_unknown", number=1, path=state_file))
-        names = [rh.upload(p) for p in images]
+            unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
+            raise RuntimeError(message(unknown_key, number=1, path=state_file))
+        names = [backend.upload(p) for p in images]
         st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
-        g = rh.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
+        g = backend.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
         def record_submission(unknown):
+            if provider_name == "comfyui":
+                st["provider"] = "comfyui"
             st["submission_unknown"] = unknown
             save()
-        st["task"] = rh.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
-                                           record_submission=record_submission)
+        st["task"] = backend.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
+                                               record_submission=record_submission)
+        if provider_name == "comfyui":
+            st["provider"] = "comfyui"
         st["submission_unknown"] = False
         save()
-        print(f"已提交，预计 ¥{rh.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
+        print(f"已提交，预计 ¥{backend.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
+    provider_name = str(st.get("provider") or "runninghub").strip().lower()
+    backend = comfy if provider_name == "comfyui" else rh
     for _ in range(360):
-        res = rh.poll(st["task"])
+        res = backend.poll(st["task"])
         if res["state"] != "running":
             break
         time.sleep(20)
     else:
-        raise RuntimeError(f"RunningHub 轮询超时：{st['task']}")
+        label = "ComfyUI" if provider_name == "comfyui" else "RunningHub"
+        raise RuntimeError(f"{label} 轮询超时：{st['task']}")
     if res["state"] == "failed":
         st.update(terminal_failed=True, error=res.get("error"))
         save()
         raise RuntimeError(message("one_terminal_failed", path=state_file))
-    http.download(res["url"], clip)
+    if provider_name == "comfyui":
+        comfy.download(res["url"], clip)
+    else:
+        http.download(res["url"], clip)
     st.update(cny=res["cny"], run_s=res.get("run_seconds"), wall_s=round(time.time() - t0))
     if config.SUBTITLE_CHECKS_ENABLED and (any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check):
         st["subtitles"] = check.subtitles(clip)
@@ -131,8 +148,11 @@ def main():
     elif a.cmd == "rewrite":
         print(rewrite.rewrite(Path(a.prompt).read_text(encoding="utf-8"), a.images, a.seconds, a.aspect))
     else:
-        acc = rh.account()
-        print({k: acc.get(k) for k in ("remainCoins", "remainMoney", "currentTaskCounts") if k in acc})
+        if config.video_settings()["provider"] == "comfyui":
+            print(comfy.account())
+        else:
+            acc = rh.account()
+            print({k: acc.get(k) for k in ("remainCoins", "remainMoney", "currentTaskCounts") if k in acc})
 
 
 if __name__ == "__main__":

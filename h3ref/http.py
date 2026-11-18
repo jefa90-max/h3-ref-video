@@ -59,7 +59,11 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
             extra_headers: dict | None = None) -> dict:
     """POST (with body) or GET; network errors and 5xx retry, 4xx answers come back as they are."""
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": config.UA, **(extra_headers or {})}
+    headers = {"Content-Type": "application/json", "User-Agent": config.UA}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    if extra_headers:
+        headers.update(extra_headers)
     last = None
     for attempt in range(tries):
         req = urllib.request.Request(url, data=data, method=method or ("POST" if data else "GET"), headers=headers)
@@ -93,7 +97,8 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
 _NON_RETRYABLE_UPLOAD_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422}
 
 
-def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: int = 300) -> dict:
+def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: int = 300, *,
+           file_field_name: str = "file", filename: str | None = None, extra_headers: dict | None = None) -> dict:
     """Multipart upload with curl via stdin config so keys never enter argv and paths with commas/semicolons stay intact."""
     if urlsplit(url).scheme not in ("http", "https"):
         raise RuntimeError(f"upload rejected unsafe url: {url[:120]}")
@@ -101,13 +106,19 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
     if os.name != "nt":
         raw_path = raw_path.replace("\\", "\\\\")
     form_path = raw_path.replace('"', '\\"')
-    file_field = 'file=@"' + form_path + '"'
+    file_field = f'{file_field_name}=@"{form_path}"'
+    if filename:
+        safe_filename = filename.replace("\\", "").replace('"', "")
+        file_field += f';filename="{safe_filename}"'
     lines = [
         f'url = "{_curl_escape(url)}"',
         'request = "POST"',
-        f'header = "{_curl_escape("Authorization: Bearer " + key)}"',
-        f'form = "{_curl_escape(file_field)}"',
     ]
+    if key:
+        lines.append(f'header = "{_curl_escape("Authorization: Bearer " + key)}"')
+    for hk, hv in (extra_headers or {}).items():
+        lines.append(f'header = "{_curl_escape(f"{hk}: {hv}")}"')
+    lines.append(f'form = "{_curl_escape(file_field)}"')
     for k, v in (fields or {}).items():
         field_pair = f"{k}={v}"
         lines.append(f'form-string = "{_curl_escape(field_pair)}"')
@@ -153,17 +164,30 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
     raise RuntimeError(f"upload {path.name} failed: {last}")
 
 
-def download(url: str, out: Path) -> Path:
+def download(url: str, out: Path, *, key: str = "", extra_headers: dict | None = None) -> Path:
     if urlsplit(url).scheme not in ("http", "https"):
         raise RuntimeError(f"download rejected unsafe url: {url[:120]}")
     tmp = out.with_suffix(out.suffix + ".part")
-    ok = subprocess.run(
-        ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", "=http,https",
-         "--retry", "6", "--retry-all-errors", "--retry-delay", "5", "-o", str(tmp), "--", url],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
-    ).returncode == 0
+    if key or extra_headers:
+        cfg_lines = []
+        if key:
+            cfg_lines.append(f'header = "{_curl_escape("Authorization: Bearer " + key)}"')
+        for hk, hv in (extra_headers or {}).items():
+            cfg_lines.append(f'header = "{_curl_escape(f"{hk}: {hv}")}"')
+        cfg = "\n".join(cfg_lines) + "\n"
+        ok = subprocess.run(
+            ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", "=http,https",
+             "--retry", "6", "--retry-all-errors", "--retry-delay", "5", "--config", "-", "-o", str(tmp), "--", url],
+            input=cfg, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
+        ).returncode == 0
+    else:
+        ok = subprocess.run(
+            ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", "=http,https",
+             "--retry", "6", "--retry-all-errors", "--retry-delay", "5", "-o", str(tmp), "--", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
+        ).returncode == 0
     if not ok or not tmp.exists() or tmp.stat().st_size < 1000:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"download failed: {url[:120]}")
+        raise RuntimeError(f"download failed: {_scrub(url, key)[:120]}")
     config.atomic_replace(tmp, out)
     return out

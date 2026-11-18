@@ -59,5 +59,9 @@
   "rewrite_picture_bound": "Image reference <Picture {number}> is outside the actual range 1..{count}.",
   "rewrite_empty": "Rewrite output is empty; all six sections must be present and non-empty.",
   "rewrite_empty_sections": "The following sections are empty: {names}.",
-  "rewrite_exhausted": "H3 rewrite failed validation across all {attempts} attempts: {detail}"
+  "rewrite_exhausted": "H3 rewrite failed validation across all {attempts} attempts: {detail}",
+  "comfy_submission_rejected": "ComfyUI rejected the task: {reason}",
+  "comfy_submission_failed": "ComfyUI submission failed: {reason}",
+  "comfy_submission_unknown": "The previous ComfyUI submission result for segment {number} is unknown. Automatic resubmission is blocked. Check the remote queue/history before restoring the local record: {path}",
+  "comfy_prompt_lost": "Task {task} is missing from both ComfyUI queue and history (the remote runtime may have restarted or unassigned); start a new generation explicitly."
 }

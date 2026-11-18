@@ -59,5 +59,9 @@
   "rewrite_picture_bound": "图片引用 <Picture {number}> 超出实际范围 1..{count}。",
   "rewrite_empty": "改写输出为空，必须按顺序输出完整的六个非空段落。",
   "rewrite_empty_sections": "以下段落内容为空：{names}。",
-  "rewrite_exhausted": "改写成 H3 格式连续 {attempts} 次都没过检查：{detail}"
+  "rewrite_exhausted": "改写成 H3 格式连续 {attempts} 次都没过检查：{detail}",
+  "comfy_submission_rejected": "ComfyUI 拒绝了生成任务：{reason}",
+  "comfy_submission_failed": "ComfyUI 提交失败：{reason}",
+  "comfy_submission_unknown": "第 {number} 段上次向 ComfyUI 提交的结果未知，已停止自动重提。请核对远端队列或历史记录后再恢复：{path}",
+  "comfy_prompt_lost": "远端 ComfyUI 队列与历史中均找不到任务 {task}（实例可能已重启或释放），请从卡片明确重新生成。"
 }

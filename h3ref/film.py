@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import check, config, frames, http, media, rewrite, rh, staging
+from . import check, comfy, config, frames, http, media, rewrite, rh, staging
 from .i18n import message
 from .staging import deduplicate_paths, group_cast_by_picture
 
@@ -501,6 +501,12 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
         raise
 
 
+def _video_provider_name(rec: dict | None = None) -> str:
+    if rec and (rec.get("task") or rec.get("submission_unknown")):
+        return str(rec.get("provider") or "runninghub").strip().lower()
+    return config.video_settings()["provider"]
+
+
 def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
@@ -509,36 +515,50 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
         return rec
     if rec.get("terminal_failed"):
         raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
+    provider_name = _video_provider_name(rec)
+    backend = comfy if provider_name == "comfyui" else rh
+    extra_provider = {"provider": "comfyui"} if provider_name == "comfyui" else {}
     if not rec.get("task"):
         if rec.get("submission_unknown"):
-            raise RuntimeError(message("submission_unknown", number=i + 1, path=str(job.file)))
+            unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
+            raise RuntimeError(message(unknown_key, number=i + 1, path=str(job.file)))
         paths = _picture_paths(job, seg, pics) if reference_paths is None else reference_paths
         missing = [str(p) for p in paths if not p.exists()]
         if missing:
             raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
         job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
-        names = [rh.upload(p) for p in paths]
+        names = [backend.upload(p) for p in paths]
         seed = int(rec["seed"] if rec.get("seed") is not None else random.randrange(10 ** 14, 10 ** 15))
-        g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
+        g = backend.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
         job.put("segs", str(i), phase="submit")
-        task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail),
-                                    record_submission=lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed))
-        job.put("segs", str(i), task=task, seed=seed, submitted=time.time(), submission_unknown=False)
-        job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
+        task = backend.submit_with_retry(
+            g,
+            log=lambda detail: job.log(f"seg{i + 1}", detail),
+            record_submission=lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed, **extra_provider),
+        )
+        job.put("segs", str(i), task=task, seed=seed, submitted=time.time(), submission_unknown=False, **extra_provider)
+        job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{backend.estimate_cny(seg['seconds'])}")
         rec = job.state["segs"][str(i)]
+    provider_name = _video_provider_name(rec)
+    backend = comfy if provider_name == "comfyui" else rh
+    extra_provider = {"provider": "comfyui"} if provider_name == "comfyui" else {}
     job.put("segs", str(i), phase="poll")
     for _ in range(360):
-        st = rh.poll(rec["task"])
+        st = backend.poll(rec["task"])
         if st["state"] != "running":
             break
         time.sleep(20)
     else:
-        raise RuntimeError(f"RunningHub poll timed out for seg{i + 1} task {rec['task']}")
+        label = "ComfyUI" if provider_name == "comfyui" else "RunningHub"
+        raise RuntimeError(f"{label} poll timed out for seg{i + 1} task {rec['task']}")
     if st["state"] == "failed":
-        job.put("segs", str(i), terminal_failed=True, error=st.get("error"))
+        job.put("segs", str(i), terminal_failed=True, error=st.get("error"), **extra_provider)
         raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
     job.put("segs", str(i), phase="download")
-    http.download(st["url"], out)
+    if provider_name == "comfyui":
+        comfy.download(st["url"], out)
+    else:
+        http.download(st["url"], out)
     job.put("segs", str(i), phase="tail")
     media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
     with job.lock:
@@ -546,7 +566,7 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
         cur.pop("clip_prompts", None)
         cur.pop("manual_rewrite", None)
         cur.update(file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
-                   wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
+                   wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None, **extra_provider)
         job.save()
     job.log("done", f"seg{i + 1}", f"¥{st['cny']:.3f}", f"{st.get('run_seconds')} s on the GPU")
     return job.state["segs"][str(i)]
@@ -584,7 +604,7 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                     if first_error is None:
                         first_error = exc
         elif inflight_segs:
-            pool = ThreadPoolExecutor(max(1, config.RH_CONCURRENCY))
+            pool = ThreadPoolExecutor(max(1, config.video_settings()["concurrency"]))
             try:
                 futures = [pool.submit(gen_segment, job, film, s, pics[s["idx"]]) for s in inflight_segs]
                 for future in futures:
@@ -627,7 +647,7 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
             except BaseException:
                 abort.set()
                 raise
-        pool = ThreadPoolExecutor(max(1, config.RH_CONCURRENCY))
+        pool = ThreadPoolExecutor(max(1, config.video_settings()["concurrency"]))
         first_error = None
         try:
             inflight_futures = [pool.submit(gen_segment, job, film, s, pics[s["idx"]]) for s in inflight_segs]

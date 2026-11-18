@@ -181,9 +181,11 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 rec.pop('attempt_blocked', None)
                 rec.update(terminal_failed=True, task=staged.get('task'),
                            error=staged.get('error') or pending.get('error'), file=None, cny=None)
+                if 'provider' in staged:
+                    rec['provider'] = staged['provider']
                 changed = True
             elif not staged.get('task') and not staged.get('submission_unknown'):
-                for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
+                for stale_key in ('task', 'provider', 'terminal_failed', 'submission_unknown', 'submitted',
                                   'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                                   'error_code', 'attempt_blocked'):
                     if rec.pop(stale_key, None) is not None:
@@ -1278,7 +1280,7 @@ def _execute_rewrite_targets(request):
                         rec.update(terminal_failed=True, task=staged_rec.get('task'),
                                    error=staged_rec.get('error') or existing_seg_edit.get('error'))
                     elif not staged_rec.get('task') and not staged_rec.get('submission_unknown'):
-                        for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
+                        for stale_key in ('task', 'provider', 'terminal_failed', 'submission_unknown', 'submitted',
                                           'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                                           'error_code', 'attempt_blocked'):
                             rec.pop(stale_key, None)
