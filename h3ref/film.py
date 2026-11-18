@@ -102,12 +102,12 @@ def in_shots(c: dict, shots: list[dict]) -> bool:
     return any(n and n in text for n in [c["name"], *(c.get("aliases") or [])])
 
 
-def refs(film: dict, seg: dict, mode: str) -> list[dict]:
+def refs(film: dict, seg: dict, mode: str, *, resolve_cache: dict[str, str] | None = None) -> list[dict]:
     """The segment's pictures in <Picture N> order: board, each character sheet in it, then the frames or the previous last frame.
     Nine at most: when they run short the board goes first, then the later shots' frames."""
     all_cast = list(film.get("cast") or [])
     active_cast = [c for c in all_cast if in_shots(c, seg["shots"])] or all_cast
-    groups = group_cast_by_picture(active_cast, all_cast)
+    groups = group_cast_by_picture(active_cast, all_cast, resolve_cache=resolve_cache)
     board = [{"kind": "board", "path": film["board"]}] if film.get("board") else []
     people = [{"kind": "cast", "path": g["path"], "cast": {**g["active"][0], "name": g["name"]},
                "active_cast": g["active"], "absent_cast": g["absent"], "all_cast": g["all"]}
@@ -241,12 +241,12 @@ def _frame_key(i: int, j: int) -> str:
     return f"s{i + 1}-{j + 1}"
 
 
-def frame_reference_paths(film: dict, shot: dict, record: dict) -> list[str]:
+def frame_reference_paths(film: dict, shot: dict, record: dict, *, resolve_cache: dict[str, str] | None = None) -> list[str]:
     if "character_reference_paths" in record:
-        characters = deduplicate_paths(record["character_reference_paths"])
+        characters = deduplicate_paths(record["character_reference_paths"], resolve_cache=resolve_cache)
     else:
         active = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
-        characters = [g["path"] for g in group_cast_by_picture(active, film.get("cast") or [])]
+        characters = [g["path"] for g in group_cast_by_picture(active, film.get("cast") or [], resolve_cache=resolve_cache)]
     return ([film["board"]] if film.get("board") else []) + characters
 
 
@@ -267,9 +267,10 @@ def reference_version(paths, *, metadata=None) -> str:
     return hashlib.sha256(json.dumps(sources, ensure_ascii=False).encode()).hexdigest()
 
 
-def frame_reference_versions(film: dict, segs: list[dict], records: dict) -> dict[str, str]:
+def frame_reference_versions(film: dict, segs: list[dict], records: dict, *, resolve_cache: dict[str, str] | None = None) -> dict[str, str]:
     metadata = {}
-    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {})), metadata=metadata)
+    cache = {} if resolve_cache is None else resolve_cache
+    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {}), resolve_cache=cache), metadata=metadata)
             for s in segs for j, shot in enumerate(s['shots'])}
 
 

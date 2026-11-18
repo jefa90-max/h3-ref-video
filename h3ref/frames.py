@@ -171,7 +171,8 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
     raise CompositionFormatError(last_error)
 
 
-def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None) -> str:
+def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None, *,
+           resolve_cache: dict[str, str] | None = None) -> str:
     """Chinese prompt for one frame. Pictures in order: board (optional), each character in it."""
     aspect = film["aspect"]
     lines = [f"一张{ORIENT.get(aspect, '竖屏')}电影剧照，画幅 {aspect}，它是一段视频里一个镜头的第一帧。画风：{(film.get('look') or '').strip()}"]
@@ -196,7 +197,7 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
         for ch in composition.get("characters") or []:
             if ch.get("name"):
                 comp_looks[ch["name"]] = (ch.get("locked_look") or ch.get("appearance") or "").strip().rstrip("。；; ")
-    groups = staging.group_cast_by_picture(who, film.get("cast") or who)
+    groups = staging.group_cast_by_picture(who, film.get("cast") or who, resolve_cache=resolve_cache)
     for g in groups:
         if len(g["all"]) <= 1 and len(g["active"]) == 1 and not g["absent"]:
             c = g["active"][0]

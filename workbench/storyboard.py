@@ -24,33 +24,37 @@ def plan(request, check_images=True, *, records=None):
     source = out / "inputs" / ("demo-film.json" if request["demo"] else "film.json")
     script = film.load(source, check_images=check_images)
     segments = film.plan(script["shots"])
-    pictures = {s["idx"]: film.refs(script, s, request["frames"]) for s in segments}
+    resolve_cache: dict[str, str] = {}
+    pictures = {s["idx"]: film.refs(script, s, request["frames"], resolve_cache=resolve_cache) for s in segments}
     wanted = [(s["idx"], p["shot"]) for s in segments for p in pictures[s["idx"]] if p["kind"] == "frame"]
     descriptions = []
     records = frame_records(request) if records is None else records
     pending = read_json(out / "inputs" / "frame-edit.json", {})
     active_pending = pending if pending and not pending.get("applied") else {}
-    compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records))
-    all_groups = film.group_cast_by_picture(script.get("cast") or [], script.get("cast") or [])
+    compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records, resolve_cache=resolve_cache))
+    all_cast = script.get("cast") or []
+    all_groups = film.group_cast_by_picture(all_cast, all_cast, resolve_cache=resolve_cache)
     character_names = {}
     for g in all_groups:
         character_names[g["path"]] = g["name"]
         if g["path"]:
-            character_names[str(Path(g["path"]).resolve())] = g["name"]
+            character_names[staging.canonical_path_key(g["path"], resolve_cache)] = g["name"]
     for segment, shot in wanted:
         key = f"s{segment + 1}-{shot + 1}"
         pending_for_key = active_pending if active_pending.get("key") == key else {}
-        who = [c for c in script.get("cast") or [] if film.in_shots(c, [segments[segment]["shots"][shot]])]
-        default_char_paths = [g["path"] for g in film.group_cast_by_picture(who, script.get("cast") or [])]
+        who = [c for c in all_cast if film.in_shots(c, [segments[segment]["shots"][shot]])]
+        default_char_paths = [g["path"] for g in film.group_cast_by_picture(who, all_cast, resolve_cache=resolve_cache)]
         raw_characters = pending_for_key.get("character_reference_paths",
                                              records.get(key, {}).get("character_reference_paths", default_char_paths))
-        characters = film.deduplicate_paths(raw_characters)
+        characters = film.deduplicate_paths(raw_characters, resolve_cache=resolve_cache)
         references = ([{"kind": "board", "path": script["board"], "name": ""}] if script.get("board") else [])
-        references += [{"kind": "character", "path": p, "name": character_names.get(p) or character_names.get(str(Path(p).resolve()), "")} for p in characters]
+        references += [{"kind": "character", "path": p, "name": character_names.get(p) or character_names.get(staging.canonical_path_key(p, resolve_cache), "")} for p in characters]
         cached = records.get(key, {})
         composition = compositions.get(key) or (cached.get("composition") if not staging.is_structured(cached.get("composition")) else None)
         with use_lang(request.get("lang")):
-            prompt = pending_for_key.get("prompt") or cached.get("prompt") or frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition)
+            prompt = pending_for_key.get("prompt") or cached.get("prompt") or frames.prompt(
+                script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition, resolve_cache=resolve_cache,
+            )
         descriptions.append({"key": key, "segment": segment + 1, "shot": shot + 1, "prompt": prompt,
                              "references": references, "reference_paths": [r["path"] for r in references],
                              "path": str(out / "frames" / f"{key}.png")})

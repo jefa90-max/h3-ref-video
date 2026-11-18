@@ -1,8 +1,8 @@
 """Pure v2/v3 staging validation and text rendering; expected ends are plans, never images."""
 import copy
 import json
+import os
 import re
-from pathlib import Path
 
 from .i18n import message
 
@@ -27,29 +27,39 @@ def is_structured(composition: object) -> bool:
     return isinstance(composition, dict) and composition.get('version') in (2, 3)
 
 
-def _canonical_path_key(raw: str) -> str:
-    return str(Path(raw).expanduser().resolve()) if raw else ''
+def canonical_path_key(raw: str, resolve_cache: dict[str, str] | None = None) -> str:
+    if not raw:
+        return ''
+    if resolve_cache is not None and raw in resolve_cache:
+        return resolve_cache[raw]
+    resolved = os.path.normcase(os.path.realpath(os.path.expanduser(raw)))
+    if resolve_cache is not None:
+        resolve_cache[raw] = resolved
+    return resolved
 
 
-def deduplicate_paths(paths) -> list[str]:
+def deduplicate_paths(paths, *, resolve_cache: dict[str, str] | None = None) -> list[str]:
+    cache = {} if resolve_cache is None else resolve_cache
     seen = set()
     out = []
     for item in paths:
         raw = str(item)
-        key = _canonical_path_key(raw)
+        key = canonical_path_key(raw, cache)
         if key not in seen:
             seen.add(key)
             out.append(raw)
     return out
 
 
-def group_cast_by_picture(active_cast: list[dict], all_cast: list[dict] | None = None) -> list[dict]:
+def group_cast_by_picture(active_cast: list[dict], all_cast: list[dict] | None = None, *,
+                          resolve_cache: dict[str, str] | None = None) -> list[dict]:
     """Group active characters by shared picture path in first-appearance order, tracking absent sheet-mates."""
+    cache = {} if resolve_cache is None else resolve_cache
     full_cast = list(active_cast if all_cast is None else all_cast)
 
     def key_of(person: dict, fallback_idx: int) -> str:
         pic = person.get('picture')
-        return _canonical_path_key(str(pic)) if pic else f'__unpictured_{fallback_idx}_{person.get("name", "")}'
+        return canonical_path_key(str(pic), cache) if pic else f'__unpictured_{fallback_idx}_{person.get("name", "")}'
 
     ordered_keys = []
     active_by_key: dict[str, list[dict]] = {}
