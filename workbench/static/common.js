@@ -49,6 +49,9 @@ async function request(url, options = {}) {
   }
   const body = await response.json();
   if (!response.ok) {
+    if ((state.config?.VIDEO_PROVIDER || "runninghub") === "comfyui" && !String(url).startsWith("/api/runtime/")) {
+      refreshRuntimeStatus().catch(() => {});
+    }
     const error = new Error(body.error || t("httpError", { status: response.status }));
     error.status = response.status;
     throw error;
@@ -398,6 +401,9 @@ $("config-form").addEventListener("submit", async (event) => {
   clearNotices();
   try {
     const payload = Object.fromEntries([...new FormData(event.target)].filter(([, value]) => value.trim()).map(([key, value]) => [key, value.trim()]));
+    if (!$("comfy-url").disabled && !$("comfy-url").value.trim()) {
+      payload.COMFYUI_URL = "";
+    }
     payload.persist = $("persist-config").checked;
     state.config = await post("/api/config", payload);
     for (const id of ["rh-key", "comfy-key", "apimart-key", "llm-key", "gemini-key"]) $(id).value = "";

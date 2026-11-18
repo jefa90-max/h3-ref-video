@@ -35,6 +35,7 @@ COMFY_PORT = 8188
 GATEWAY_PORT = 8189
 SUPERVISOR_PID_FILE = Path("/tmp/comfy_supervisor.pid")
 SUPERVISOR_LOG_FILE = Path("/tmp/comfy_supervisor.log")
+NGROK_LOG_FILE = Path("/tmp/ngrok.log")
 COMFY_LOG_FILE = Path("/tmp/comfyui.log")
 
 MODEL_FILES = [
@@ -128,23 +129,30 @@ def _queue_busy() -> bool:
         return False
 
 
-def _unassign_colab_runtime(log) -> None:
+def _unassign_colab_runtime(log) -> bool:
     runtime_addr = os.environ.get("TBE_RUNTIME_ADDR", "").strip()
     if runtime_addr:
-        req = urllib.request.Request(f"http://{runtime_addr}/unassign", data=b"", method="POST")
+        req = urllib.request.Request(
+            f"http://{runtime_addr}/unassign",
+            data=b"",
+            headers={"X-Colab-Tunnel": "Google"},
+            method="POST",
+        )
         try:
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 log(f"[watchdog] POST /unassign status={resp.status}")
                 if resp.status == 200:
-                    return
+                    return True
         except Exception as exc:
             log(f"[watchdog] Direct /unassign failed: {type(exc).__name__}: {exc}")
     try:
         from google.colab import runtime  # type: ignore
         runtime.unassign()
         log("[watchdog] google.colab.runtime.unassign() invoked")
+        return True
     except Exception as exc:
         log(f"[watchdog] runtime.unassign() fallback failed: {type(exc).__name__}: {exc}")
+    return False
 
 
 def run_supervisor(*, skip_comfy_check: bool = False) -> None:
@@ -280,12 +288,13 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
 
     def spawn_ngrok() -> subprocess.Popen:
         child_env = {**os.environ, "NGROK_AUTHTOKEN": ngrok_token}
-        return subprocess.Popen(
-            [ngrok_bin, "http", f"{COMFY_HOST}:{GATEWAY_PORT}", f"--url={public_url}", "--authtoken-from-env", "--log=stdout"],
-            env=child_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-        )
+        with NGROK_LOG_FILE.open("a", encoding="utf-8") as ngrok_log:
+            return subprocess.Popen(
+                [ngrok_bin, "http", f"{COMFY_HOST}:{GATEWAY_PORT}", f"--url={public_url}", "--log=stdout"],
+                env=child_env,
+                stdout=ngrok_log,
+                stderr=subprocess.STDOUT,
+            )
 
     ngrok_proc = spawn_ngrok()
     log(f"[supervisor] Spawned ngrok pid={ngrok_proc.pid} for {public_url} (idle_timeout={idle_minutes:g}m)")
@@ -314,9 +323,10 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
                 touch_activity()
                 continue
             log(f"[watchdog] Idle for >= {idle_minutes:g} min with empty queue. Unassigning runtime...")
-            ngrok_proc.terminate()
-            _unassign_colab_runtime(log)
-            break
+            if _unassign_colab_runtime(log):
+                ngrok_proc.terminate()
+                break
+            log("[watchdog] Unassign did not succeed yet; keeping supervisor alive to retry.")
 
 
 def ensure_comfyui_code() -> None:
@@ -402,7 +412,7 @@ def start_comfyui() -> None:
 
 def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
-    _read_secret(".ngrok_token", "NGROK_AUTHTOKEN")
+    ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN")
     public_url = _normalize_public_url(_read_secret(".ngrok_domain", "NGROK_URL"))
     auth_headers = {
         "Authorization": f"Bearer {api_key}",
@@ -449,8 +459,13 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
             print(f"[start_colab] TUNNEL READY (AUTH PROTECTED): {public_url}", flush=True)
             return public_url
         time.sleep(2)
-    tail = SUPERVISOR_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-2000:] if SUPERVISOR_LOG_FILE.exists() else ""
-    raise RuntimeError(f"Authenticated ngrok tunnel failed readiness check:\n{tail}")
+    sup_tail = SUPERVISOR_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1200:] if SUPERVISOR_LOG_FILE.exists() else ""
+    ng_tail = NGROK_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1200:] if NGROK_LOG_FILE.exists() else ""
+    combined = f"{sup_tail}\n{ng_tail}".strip()
+    for secret in (ngrok_token, api_key):
+        if secret:
+            combined = combined.replace(secret, "[REDACTED]")
+    raise RuntimeError(f"Authenticated ngrok tunnel failed readiness check:\n{combined}")
 
 
 def main() -> None:

@@ -71,5 +71,6 @@
   "colab_auth_rejected": "远端隧道拒绝了访问密钥（HTTP {code}），请核对 COMFYUI_API_KEY 与 Google Drive 上的 .comfyui_api_key 是否一致。",
   "colab_orphan_blocked": "检测到云端已有未关联本机的孤立 Colab 会话（{sessions}），已阻止重复新开 A100 以免双倍扣费。请先在 Colab 网页核对或释放旧实例。",
   "colab_drive_timeout": "等待 Google Drive 授权确认超时（{seconds} 秒），已终止本次挂载；请重新点击启动并完成浏览器授权。",
-  "colab_start_failed": "Colab ComfyUI 启动失败：{reason}"
+  "colab_start_failed": "Colab ComfyUI 启动失败：{reason}",
+  "colab_tunnel_unready": "远端启动脚本已执行，但 /system_stats 未在预期时间内返回 HTTP 200。"
 }

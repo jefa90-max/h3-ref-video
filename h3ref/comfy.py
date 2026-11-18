@@ -43,6 +43,7 @@ _ASCII_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 _VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv")
 _MISSING_LOCK = threading.Lock()
 _MISSING_COUNTS: dict[tuple[str, str], int] = {}
+_TRANSIENT_COUNTS: dict[tuple[str, str], int] = {}
 
 
 def _headers() -> dict[str, str]:
@@ -107,9 +108,14 @@ def graph(prompt: str, image_names: list[str], seconds: float, aspect: str, seed
     g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = config.COMFY_SIZES[aspect]
     g[SEED]["inputs"]["noise_seed"] = int(seed)
     g[ENABLE_LORA]["inputs"]["value"] = bool(preset_cfg["enable_lora"])
-    g[LORA]["inputs"]["lora_name"] = preset_cfg["lora_name"]
     g[TURBO_STEPS]["inputs"]["value"] = int(preset_cfg["steps"])
     g[FULL_STEPS]["inputs"]["value"] = 20
+    if preset_cfg["enable_lora"]:
+        g[LORA]["inputs"]["lora_name"] = preset_cfg["lora_name"]
+    else:
+        g["126"]["inputs"]["model"] = ["127", 0]
+        g[SWITCH_MODEL]["inputs"]["on_true"] = ["127", 0]
+        g.pop(LORA, None)
 
     for idx, node_id in enumerate(IMAGES):
         ref_key = f"ref_images.ref_image_{idx}"
@@ -236,17 +242,34 @@ def _task_in_queue_list(items, task: str) -> bool:
     return False
 
 
+def _is_transient_tunnel_error(exc: http.HTTPResponseError) -> bool:
+    return exc.status_code in (502, 503, 504) or "ERR_NGROK_" in str(exc)
+
+
 def poll(task: str) -> dict:
     """{state: running|done|failed, url, cny: 0.0, run_seconds, error}"""
     base = config.comfy_url()
     key = config.comfy_key()
     hdrs = _headers()
-    hist = http.request(f"{base}/history/{quote(task, safe='')}", key, extra_headers=hdrs)
+    try:
+        hist = http.request(f"{base}/history/{quote(task, safe='')}", key, extra_headers=hdrs)
+    except http.HTTPResponseError as exc:
+        if _is_transient_tunnel_error(exc):
+            with _MISSING_LOCK:
+                blips = _TRANSIENT_COUNTS.get((base, task), 0) + 1
+                if blips <= 3:
+                    _TRANSIENT_COUNTS[(base, task)] = blips
+                    return {"state": "running", "queued": False}
+                _TRANSIENT_COUNTS.pop((base, task), None)
+        raise
     if not isinstance(hist, dict):
         raise RuntimeError(f"ComfyUI /history returned invalid payload: {str(hist)[:200]}")
     http_status = hist.get("_http_status")
     if isinstance(http_status, int) and http_status >= 400 and http_status != 404:
         raise RuntimeError(f"ComfyUI poll HTTP {http_status}: {json.dumps(hist, ensure_ascii=False)[:240]}")
+
+    with _MISSING_LOCK:
+        _TRANSIENT_COUNTS.pop((base, task), None)
 
     entry = hist.get(task)
     if isinstance(entry, dict):
@@ -274,7 +297,17 @@ def poll(task: str) -> dict:
             "run_seconds": _extract_run_seconds(status_obj),
         }
 
-    q = http.request(f"{base}/queue", key, extra_headers=hdrs)
+    try:
+        q = http.request(f"{base}/queue", key, extra_headers=hdrs)
+    except http.HTTPResponseError as exc:
+        if _is_transient_tunnel_error(exc):
+            with _MISSING_LOCK:
+                blips = _TRANSIENT_COUNTS.get((base, task), 0) + 1
+                if blips <= 3:
+                    _TRANSIENT_COUNTS[(base, task)] = blips
+                    return {"state": "running", "queued": False}
+                _TRANSIENT_COUNTS.pop((base, task), None)
+        raise
     if not isinstance(q, dict):
         raise RuntimeError(f"ComfyUI /queue returned invalid payload: {str(q)[:200]}")
     q_status = q.get("_http_status")

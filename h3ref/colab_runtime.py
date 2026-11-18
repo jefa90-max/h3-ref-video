@@ -19,14 +19,24 @@ import urllib.request
 from pathlib import Path
 
 from . import config, http
-from .i18n import message
+from .i18n import message, use_lang
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 DRIVE_AUTH_TIMEOUT_SEC = 600.0
 SESSION_CACHE_TTL_SEC = 5.0
 REMOTE_START_CODE = (
     "import subprocess, sys\n"
-    "subprocess.run([sys.executable, '/content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py'], check=True)\n"
+    "p = subprocess.Popen(\n"
+    "    [sys.executable, '-u', '/content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py'],\n"
+    "    stdout=subprocess.PIPE,\n"
+    "    stderr=subprocess.STDOUT,\n"
+    "    text=True,\n"
+    ")\n"
+    "for line in p.stdout:\n"
+    "    print(line, end='', flush=True)\n"
+    "rc = p.wait()\n"
+    "if rc != 0:\n"
+    "    raise SystemExit(f'start_colab.py exited with {rc}')\n"
 )
 
 _STRIPPED_PROJECT_SECRETS = (
@@ -36,6 +46,8 @@ _STRIPPED_PROJECT_SECRETS = (
     "LLM_API_KEY",
     "GEMINI_API_KEY",
     "VISION_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "NGROK_AUTHTOKEN",
 )
 _URL_RE = re.compile(r"(https://accounts\.google\.com/\S+)")
 _SESSION_LINE_RE = re.compile(r"^\[(?P<name>[^\]]+)\]\s+(?P<endpoint>\S+)\s+\|\s+Hardware:\s*(?P<hardware>[^|]+)")
@@ -242,8 +254,15 @@ class ColabRuntimeManager:
         self._last_error: str | None = None
         self._logs: list[str] = []
         self._drive_ack_event = threading.Event()
+        self._cancel_event = threading.Event()
         self._drive_proc = None
+        self._active_proc = None
+        self._worker_thread: threading.Thread | None = None
         self._sessions_cache: tuple[float, dict] | None = None
+
+    def _logs_tail(self) -> list[str]:
+        with self._lock:
+            return list(self._logs[-15:])
 
     def _append_log(self, line: str) -> None:
         cleaned = line.rstrip("\r\n")
@@ -265,6 +284,8 @@ class ColabRuntimeManager:
             stderr=subprocess.STDOUT,
             **kwargs,
         )
+        with self._lock:
+            self._active_proc = proc
         if stdin_text is not None and proc.stdin is not None:
             try:
                 proc.stdin.write(stdin_text)
@@ -290,6 +311,9 @@ class ColabRuntimeManager:
             _kill_process_tree(proc)
             rc = -9
         finally:
+            with self._lock:
+                if self._active_proc is proc:
+                    self._active_proc = None
             t.join(timeout=2.0)
             if proc.stdout is not None:
                 try:
@@ -328,7 +352,7 @@ class ColabRuntimeManager:
                 "auth_url": None,
                 "error": None,
                 "orphan_sessions": [],
-                "logs": list(self._logs[-15:]),
+                "logs": self._logs_tail(),
             }
         if probe.get("auth_failed"):
             err_msg = message("colab_auth_rejected", code=probe.get("status_code", 401))
@@ -342,7 +366,7 @@ class ColabRuntimeManager:
                 "auth_url": None,
                 "error": err_msg,
                 "orphan_sessions": [],
-                "logs": list(self._logs[-15:]),
+                "logs": self._logs_tail(),
             }
 
         with self._lock:
@@ -450,6 +474,7 @@ class ColabRuntimeManager:
         )
         with self._lock:
             self._drive_proc = proc
+            self._active_proc = proc
             self._drive_ack_event.clear()
 
         lines: list[str] = []
@@ -488,13 +513,20 @@ class ColabRuntimeManager:
         reader.start()
         timed_out_auth = False
         try:
-            deadline = time.monotonic() + max(self.drive_auth_timeout + 60.0, 180.0)
+            deadline = time.monotonic() + 180.0
             while proc.poll() is None:
+                if self._cancel_event.is_set():
+                    _kill_process_tree(proc)
+                    break
                 if prompted.is_set() and not self._drive_ack_event.is_set():
                     if not self._drive_ack_event.wait(timeout=self.drive_auth_timeout):
                         timed_out_auth = True
                         _kill_process_tree(proc)
                         break
+                    if self._cancel_event.is_set():
+                        _kill_process_tree(proc)
+                        break
+                    deadline = time.monotonic() + 180.0
                 if time.monotonic() >= deadline:
                     _kill_process_tree(proc)
                     break
@@ -512,6 +544,8 @@ class ColabRuntimeManager:
                     pass
             with self._lock:
                 self._drive_proc = None
+                if self._active_proc is proc:
+                    self._active_proc = None
                 self._auth_url = None
         return rc, "".join(lines), timed_out_auth
 
@@ -520,66 +554,84 @@ class ColabRuntimeManager:
         session_name = settings["colab_session"]
         auth_mode = settings["colab_auth"]
         try:
-            sessions = self._query_sessions(colab_bin, auth_mode, environ=env_copy, force=True)
-            has_target = any(s["name"] == session_name for s in sessions["named"])
-            if not has_target and sessions["orphans"]:
-                endpoints = ", ".join(s["endpoint"] for s in sessions["orphans"])
-                raise RuntimeError(message("colab_orphan_blocked", sessions=endpoints))
+            with use_lang(env_copy.get("H3_LANG")):
+                sessions = self._query_sessions(colab_bin, auth_mode, environ=env_copy, force=True)
+                if self._cancel_event.is_set():
+                    return
+                has_target = any(s["name"] == session_name for s in sessions["named"])
+                if not has_target and sessions["orphans"]:
+                    endpoints = ", ".join(s["endpoint"] for s in sessions["orphans"])
+                    raise RuntimeError(message("colab_orphan_blocked", sessions=endpoints))
 
-            if not has_target:
+                if not has_target:
+                    with self._lock:
+                        self._active_state = "provisioning"
+                    rc, out = self._run_command(
+                        colab_bin, auth_mode, ["new", "-s", session_name, "--gpu", "A100"],
+                        environ=env_copy, timeout=180.0,
+                    )
+                    if self._cancel_event.is_set():
+                        return
+                    if rc != 0 or "Session READY" not in out:
+                        raise RuntimeError(message("colab_start_failed", reason=out.strip()[-300:] or f"colab new exit {rc}"))
+                    with self._lock:
+                        self._sessions_cache = None
+
                 with self._lock:
-                    self._active_state = "provisioning"
-                rc, out = self._run_command(
-                    colab_bin, auth_mode, ["new", "-s", session_name, "--gpu", "A100"],
-                    environ=env_copy, timeout=180.0,
-                )
-                if rc != 0 or "Session READY" not in out:
-                    raise RuntimeError(message("colab_start_failed", reason=out.strip()[-300:] or f"colab new exit {rc}"))
-                with self._lock:
-                    self._sessions_cache = None
+                    self._active_state = "starting_comfy"
 
-            with self._lock:
-                self._active_state = "starting_comfy"
-
-            rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
-            if timed_out_auth:
-                raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
-            if "Credentials propagated" in mount_out and "mount failed" in mount_out and "Mounted at" not in mount_out:
                 rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
+                if self._cancel_event.is_set():
+                    return
                 if timed_out_auth:
                     raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
-            if rc != 0 or ("Mounted at" not in mount_out and "already mounted" not in mount_out.lower()):
-                raise RuntimeError(message("colab_start_failed", reason=mount_out.strip()[-300:] or f"drivemount exit {rc}"))
+                if "Credentials propagated" in mount_out and "mount failed" in mount_out and "Mounted at" not in mount_out:
+                    rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
+                    if self._cancel_event.is_set():
+                        return
+                    if timed_out_auth:
+                        raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
+                if rc != 0 or ("Mounted at" not in mount_out and "already mounted" not in mount_out.lower()):
+                    raise RuntimeError(message("colab_start_failed", reason=mount_out.strip()[-300:] or f"drivemount exit {rc}"))
 
-            with self._lock:
-                self._active_state = "starting_comfy"
-            rc, exec_out = self._run_command(
-                colab_bin,
-                auth_mode,
-                ["exec", "-s", session_name, "--timeout", "1200"],
-                environ=env_copy,
-                stdin_text=REMOTE_START_CODE,
-                timeout=1260.0,
-            )
-            if rc != 0 or "Traceback (most recent call last)" in exec_out:
-                raise RuntimeError(message("colab_start_failed", reason=exec_out.strip()[-300:] or f"colab exec exit {rc}"))
-
-            for _ in range(10):
-                if probe_comfyui(env_copy)["online"]:
-                    with self._lock:
-                        self._last_error = None
-                        self._active_state = None
-                        self._sessions_cache = None
+                with self._lock:
+                    self._active_state = "starting_comfy"
+                rc, exec_out = self._run_command(
+                    colab_bin,
+                    auth_mode,
+                    ["exec", "-s", session_name, "--timeout", "1200"],
+                    environ=env_copy,
+                    stdin_text=REMOTE_START_CODE,
+                    timeout=1260.0,
+                )
+                if self._cancel_event.is_set():
                     return
-                time.sleep(1.5)
-            raise RuntimeError(message("colab_start_failed", reason="Tunnel started but /system_stats did not respond HTTP 200"))
+                if rc != 0 or "Traceback (most recent call last)" in exec_out:
+                    raise RuntimeError(message("colab_start_failed", reason=exec_out.strip()[-300:] or f"colab exec exit {rc}"))
+
+                for _ in range(10):
+                    if self._cancel_event.is_set():
+                        return
+                    if probe_comfyui(env_copy)["online"]:
+                        with self._lock:
+                            self._last_error = None
+                            self._active_state = None
+                            self._sessions_cache = None
+                        return
+                    time.sleep(1.5)
+                raise RuntimeError(message("colab_start_failed", reason=message("colab_tunnel_unready")))
         except Exception as exc:
             with self._lock:
-                self._last_error = str(exc)
+                if not self._cancel_event.is_set():
+                    self._last_error = str(exc)
                 self._active_state = None
                 self._auth_url = None
                 self._sessions_cache = None
         finally:
+            with self._lock:
+                if self._cancel_event.is_set():
+                    self._active_state = None
+                    self._auth_url = None
             lock_ctx.__exit__(None, None, None)
 
     def start_async(self, environ=None) -> dict:
@@ -607,6 +659,7 @@ class ColabRuntimeManager:
         lock_ctx.__enter__()
         try:
             with self._lock:
+                self._cancel_event.clear()
                 self._last_error = None
                 self._auth_url = None
                 self._logs.clear()
@@ -616,6 +669,8 @@ class ColabRuntimeManager:
                 args=(env_copy, colab_bin, lock_ctx),
                 daemon=True,
             )
+            with self._lock:
+                self._worker_thread = t
             t.start()
         except BaseException:
             lock_ctx.__exit__(None, None, None)
@@ -655,6 +710,17 @@ class ColabRuntimeManager:
                 "status": self.status(env_copy),
             }
 
+        with self._lock:
+            active_worker = self._worker_thread if self._active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy") else None
+            proc_to_cancel = self._active_proc
+            if active_worker is not None:
+                self._cancel_event.set()
+                self._drive_ack_event.set()
+        if proc_to_cancel is not None:
+            _kill_process_tree(proc_to_cancel)
+        if active_worker is not None and active_worker.is_alive():
+            active_worker.join(timeout=5.0)
+
         with runtime_file_lock(self.storage):
             with self._lock:
                 self._active_state = "stopping"
@@ -689,6 +755,6 @@ class ColabRuntimeManager:
                 "auth_url": None,
                 "error": None,
                 "orphan_sessions": [],
-                "logs": list(self._logs[-15:]),
+                "logs": self._logs_tail(),
             },
         }

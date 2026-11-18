@@ -13,6 +13,7 @@ from flask import Flask, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
 
 from h3ref import colab_runtime, config, film
+from h3ref.i18n import use_lang
 from .i18n import InputError, message
 from .inputs import array, invalid, needed_video_providers, text, verify_image
 from .jobs import ARTIFACT_TYPES, Jobs
@@ -60,19 +61,22 @@ def create_app(storage=None, env_path=None):
     def ensure_video_runtime(job_request, job_env):
         if "comfyui" not in needed_video_providers(job_request, job_env):
             return
-        probe = colab_runtime.probe_comfyui(job_env)
-        if probe["online"]:
-            return
-        if probe.get("auth_failed"):
-            raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))
-        vcfg = config.video_settings(job_env)
-        if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(job_env):
-            try:
-                runtime.start_async(job_env)
-            except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError):
-                pass
-            raise InputError("comfy_starting")
-        raise InputError("comfy_offline")
+        lang = job_request.get("lang") or language()
+        env_with_lang = {**job_env, "H3_LANG": lang}
+        with use_lang(lang):
+            probe = colab_runtime.probe_comfyui(env_with_lang)
+            if probe["online"]:
+                return
+            if probe.get("auth_failed"):
+                raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))
+            vcfg = config.video_settings(env_with_lang)
+            if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(env_with_lang):
+                try:
+                    runtime.start_async(env_with_lang)
+                except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError):
+                    pass
+                raise InputError("comfy_starting")
+            raise InputError("comfy_offline")
 
     jobs.before_video_launch = ensure_video_runtime
 
@@ -287,27 +291,33 @@ def create_app(storage=None, env_path=None):
 
     @app.get("/api/runtime/status")
     def runtime_status():
+        lang = language()
         with jobs.lock:
-            current_env = dict(env)
-        return jsonify(redact_runtime_payload(runtime.status(current_env)))
+            current_env = {**env, "H3_LANG": lang}
+        with use_lang(lang):
+            return jsonify(redact_runtime_payload(runtime.status(current_env)))
 
     @app.post("/api/runtime/start")
     def runtime_start():
+        lang = language()
         with jobs.lock:
-            current_env = dict(env)
-        try:
-            st = runtime.start_async(current_env)
-        except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
-            raise InputError("comfy_runtime_action", detail=str(exc)) from exc
-        return jsonify(redact_runtime_payload(st))
+            current_env = {**env, "H3_LANG": lang}
+        with use_lang(lang):
+            try:
+                st = runtime.start_async(current_env)
+            except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
+                raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+            return jsonify(redact_runtime_payload(st))
 
     @app.post("/api/runtime/drive-ack")
     def runtime_drive_ack():
+        lang = language()
         with jobs.lock:
-            current_env = dict(env)
-        ack = runtime.submit_drive_authorized()
-        ack["status"] = runtime.status(current_env)
-        return jsonify(redact_runtime_payload(ack))
+            current_env = {**env, "H3_LANG": lang}
+        with use_lang(lang):
+            ack = runtime.submit_drive_authorized()
+            ack["status"] = runtime.status(current_env)
+            return jsonify(redact_runtime_payload(ack))
 
     @app.post("/api/runtime/stop")
     def runtime_stop():
@@ -319,14 +329,16 @@ def create_app(storage=None, env_path=None):
         force = values.get("force", False)
         if not isinstance(force, bool):
             invalid("force", force, "choice")
+        lang = language()
         with jobs.lock:
-            current_env = dict(env)
+            current_env = {**env, "H3_LANG": lang}
             local_busy = jobs.has_active_video_work()
-        try:
-            res = runtime.stop(environ=current_env, force=force, local_busy=local_busy)
-        except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, RuntimeError) as exc:
-            raise InputError("comfy_runtime_action", detail=str(exc)) from exc
-        return jsonify(redact_runtime_payload(res))
+        with use_lang(lang):
+            try:
+                res = runtime.stop(environ=current_env, force=force, local_busy=local_busy)
+            except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, RuntimeError) as exc:
+                raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+            return jsonify(redact_runtime_payload(res))
 
     @app.post("/api/output-folder/pick")
     def pick_output_folder():

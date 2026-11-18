@@ -232,17 +232,31 @@ def needed_video_providers(job, env):
     if job["kind"] == "one":
         if state.get("task") and not state.get("terminal_failed"):
             return [state.get("provider") or "runninghub"]
+        if state.get("submission_unknown") and not state.get("task"):
+            return [state.get("provider") or default_provider]
         return [default_provider]
     from h3ref.i18n import use_lang
     providers = []
+    inflight_providers = []
     with use_lang(job.get("lang")):
         segments = film.plan(job["film"]["shots"])
-        records = dict(job["_reconciled_segs"]) if "_reconciled_segs" in job else dict(state.get("segs", {}))
+        base_records = dict(job["_reconciled_segs"]) if "_reconciled_segs" in job else dict(state.get("segs", {}))
+        records = dict(base_records)
         invalidated = set()
         if not job.get("reset_applied"):
             invalidated_map = film.invalidated_segment_records(records, job["frames"], job.get("redo"))
             invalidated = {int(idx) for idx in invalidated_map}
             records = {**records, **invalidated_map}
+        has_blocker = any(
+            not (out and s["idx"] not in invalidated and (out / "clips" / f"seg{s['idx'] + 1}.mp4").exists()
+                 and (records.get(str(s["idx"])) or {}).get("cny") is not None)
+            and (
+                (records.get(str(s["idx"])) or {}).get("terminal_failed")
+                or ((records.get(str(s["idx"])) or {}).get("submission_unknown") and not (records.get(str(s["idx"])) or {}).get("task"))
+                or (records.get(str(s["idx"])) or {}).get("attempt_blocked")
+            )
+            for s in segments
+        )
         for segment in segments:
             rec = records.get(str(segment["idx"]), {})
             clip_done = bool(
@@ -251,11 +265,18 @@ def needed_video_providers(job, env):
                 and rec.get("cny") is not None
             )
             if not clip_done:
-                if segment["idx"] not in invalidated and rec.get("task") and not rec.get("terminal_failed"):
-                    providers.append(rec.get("provider") or "runninghub")
-                else:
+                if rec.get("task") and not rec.get("terminal_failed"):
+                    prov = rec.get("provider") or "runninghub"
+                    inflight_providers.append(prov)
+                    providers.append(prov)
+                elif rec.get("terminal_failed") or (rec.get("submission_unknown") and not rec.get("task")):
+                    fallback_prov = rec.get("provider") or ("runninghub" if rec.get("task") else default_provider)
+                    providers.append(fallback_prov)
+                elif not has_blocker:
                     providers.append(default_provider)
-    if job.get("redo") and not job.get("reset_applied"):
+    if has_blocker and inflight_providers:
+        return list(dict.fromkeys(inflight_providers))
+    if job.get("redo") and not job.get("reset_applied") and not has_blocker:
         providers.append(default_provider)
     return list(dict.fromkeys(providers))
 

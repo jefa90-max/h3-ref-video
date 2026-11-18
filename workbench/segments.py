@@ -181,8 +181,10 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 rec.pop('attempt_blocked', None)
                 rec.update(terminal_failed=True, task=staged.get('task'),
                            error=staged.get('error') or pending.get('error'), file=None, cny=None)
-                if 'provider' in staged:
+                if staged.get('provider'):
                     rec['provider'] = staged['provider']
+                else:
+                    rec.pop('provider', None)
                 changed = True
             elif not staged.get('task') and not staged.get('submission_unknown'):
                 for stale_key in ('task', 'provider', 'terminal_failed', 'submission_unknown', 'submitted',
@@ -1134,6 +1136,10 @@ def prepare_rewrite_segment(request, number, *, prompt=None, prompt_format=None,
                     cur_rec.pop('attempt_blocked', None)
                     cur_rec.update(terminal_failed=True, task=staged_rec.get('task'),
                                    error=staged_rec.get('error') or existing_seg.get('error'), file=None, cny=None)
+                    if staged_rec.get('provider'):
+                        cur_rec['provider'] = staged_rec['provider']
+                    else:
+                        cur_rec.pop('provider', None)
                     fjob.state['segs'][idx_str] = cur_rec
                     fjob.save()
             (out / 'inputs' / 'segment-edit.json').unlink(missing_ok=True)
@@ -1288,6 +1294,10 @@ def _execute_rewrite_targets(request):
                     if staged_rec.get('terminal_failed'):
                         rec.update(terminal_failed=True, task=staged_rec.get('task'),
                                    error=staged_rec.get('error') or existing_seg_edit.get('error'))
+                        if staged_rec.get('provider'):
+                            rec['provider'] = staged_rec['provider']
+                        else:
+                            rec.pop('provider', None)
                     elif not staged_rec.get('task') and not staged_rec.get('submission_unknown'):
                         for stale_key in ('task', 'provider', 'terminal_failed', 'submission_unknown', 'submitted',
                                           'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',

@@ -71,5 +71,6 @@
   "colab_auth_rejected": "The remote tunnel rejected COMFYUI_API_KEY (HTTP {code}); verify it matches .comfyui_api_key in Google Drive.",
   "colab_orphan_blocked": "Detected orphaned remote Colab session(s) ({sessions}); blocked allocating another A100 to prevent double billing. Inspect or release them in Colab first.",
   "colab_drive_timeout": "Timed out waiting for Google Drive authorization ({seconds}s); cancelled mount. Click Start again and complete browser consent.",
-  "colab_start_failed": "Failed to start ComfyUI on Colab: {reason}"
+  "colab_start_failed": "Failed to start ComfyUI on Colab: {reason}",
+  "colab_tunnel_unready": "Remote bootstrap finished, but /system_stats did not respond HTTP 200."
 }

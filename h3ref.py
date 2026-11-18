@@ -71,14 +71,12 @@ def cmd_one(a):
         st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
         g = backend.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
         def record_submission(unknown):
-            if provider_name == "comfyui":
-                st["provider"] = "comfyui"
+            st["provider"] = provider_name
             st["submission_unknown"] = unknown
             save()
         st["task"] = backend.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
                                                record_submission=record_submission)
-        if provider_name == "comfyui":
-            st["provider"] = "comfyui"
+        st["provider"] = provider_name
         st["submission_unknown"] = False
         save()
         print(f"已提交，预计 ¥{backend.estimate_cny(a.seconds)}、4–6 分钟", flush=True)

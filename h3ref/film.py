@@ -517,7 +517,7 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
         raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
     provider_name = _video_provider_name(rec)
     backend = comfy if provider_name == "comfyui" else rh
-    extra_provider = {"provider": "comfyui"} if provider_name == "comfyui" else {}
+    extra_provider = {"provider": provider_name}
     if not rec.get("task"):
         if rec.get("submission_unknown"):
             unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
@@ -541,7 +541,7 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
         rec = job.state["segs"][str(i)]
     provider_name = _video_provider_name(rec)
     backend = comfy if provider_name == "comfyui" else rh
-    extra_provider = {"provider": "comfyui"} if provider_name == "comfyui" else {}
+    extra_provider = {"provider": provider_name}
     job.put("segs", str(i), phase="poll")
     for _ in range(360):
         st = backend.poll(rec["task"])
