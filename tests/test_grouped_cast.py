@@ -499,9 +499,12 @@ class GroupedCastTest(unittest.TestCase):
                 "USERPROFILE": str(self.root),
                 "H3REF_CACHE": str(self.root / "cache"),
                 "H3_SKIP_DOTENV": "1",
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
             },
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
