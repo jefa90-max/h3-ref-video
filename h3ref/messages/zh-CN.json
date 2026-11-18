@@ -63,5 +63,13 @@
   "comfy_submission_rejected": "ComfyUI 拒绝了生成任务：{reason}",
   "comfy_submission_failed": "ComfyUI 提交失败：{reason}",
   "comfy_submission_unknown": "第 {number} 段上次向 ComfyUI 提交的结果未知，已停止自动重提。请核对远端队列或历史记录后再恢复：{path}",
-  "comfy_prompt_lost": "远端 ComfyUI 队列与历史中均找不到任务 {task}（实例可能已重启或释放），请从卡片明确重新生成。"
+  "comfy_prompt_lost": "远端 ComfyUI 队列与历史中均找不到任务 {task}（实例可能已重启或释放），请从卡片明确重新生成。",
+  "colab_worker_forbidden": "工作台子进程不允许直接操控 Colab 实例生命周期，请从工作台页面启动云端实例。",
+  "colab_cli_missing": "未检测到 google-colab-cli（colab 命令），无法在本机自动拉起或关停 Colab 实例。",
+  "colab_busy": "Colab 实例正在启停操作中，请勿重复提交。",
+  "colab_url_missing": "请先配置 COMFYUI_URL（远端 ComfyUI 隧道地址）后再启动。",
+  "colab_auth_rejected": "远端隧道拒绝了访问密钥（HTTP {code}），请核对 COMFYUI_API_KEY 与 Google Drive 上的 .comfyui_api_key 是否一致。",
+  "colab_orphan_blocked": "检测到云端已有未关联本机的孤立 Colab 会话（{sessions}），已阻止重复新开 A100 以免双倍扣费。请先在 Colab 网页核对或释放旧实例。",
+  "colab_drive_timeout": "等待 Google Drive 授权确认超时（{seconds} 秒），已终止本次挂载；请重新点击启动并完成浏览器授权。",
+  "colab_start_failed": "Colab ComfyUI 启动失败：{reason}"
 }

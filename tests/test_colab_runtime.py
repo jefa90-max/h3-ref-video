@@ -1,0 +1,325 @@
+"""Stage 3 tests: cross-platform Colab runtime controller (h3ref/colab_runtime.py)."""
+import io
+import os
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from h3ref import colab_runtime
+
+
+class ColabRuntimeTest(unittest.TestCase):
+    def _make_pipe_proc(self, before_lines, after_lines=(), *, wait_for_stdin=False, returncode=0):
+        stdin_event = threading.Event()
+        killed_event = threading.Event()
+        stdin_writes = []
+        r_fd, w_fd = os.pipe()
+        stdout_file = os.fdopen(r_fd, "r", encoding="utf-8", errors="replace")
+        writer_file = os.fdopen(w_fd, "w", encoding="utf-8")
+
+        class FakeStdin:
+            def write(self, data):
+                stdin_writes.append(data)
+                stdin_event.set()
+
+            def flush(self):
+                pass
+
+            def close(self):
+                stdin_event.set()
+
+        proc = MagicMock()
+        proc.pid = 54321
+        proc.stdout = stdout_file
+        proc.stdin = FakeStdin()
+        proc.stdin_writes = stdin_writes
+        proc.killed_event = killed_event
+        state = {"rc": None}
+
+        def feed():
+            try:
+                for line in before_lines:
+                    writer_file.write(line)
+                    writer_file.flush()
+                if wait_for_stdin:
+                    while not stdin_event.is_set() and not killed_event.is_set():
+                        time.sleep(0.01)
+                if not killed_event.is_set():
+                    for line in after_lines:
+                        writer_file.write(line)
+                        writer_file.flush()
+                    state["rc"] = returncode
+                else:
+                    state["rc"] = -9
+            finally:
+                try:
+                    writer_file.close()
+                except OSError:
+                    pass
+
+        def poll():
+            return state["rc"]
+
+        def wait(timeout=None):
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while state["rc"] is None:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("colab", timeout)
+                time.sleep(0.01)
+            return state["rc"]
+
+        def kill():
+            killed_event.set()
+            state["rc"] = -9
+
+        proc.poll.side_effect = poll
+        proc.wait.side_effect = wait
+        proc.terminate.side_effect = kill
+        proc.kill.side_effect = kill
+        threading.Thread(target=feed, daemon=True).start()
+        return proc
+
+    def test_online_short_circuits_without_invoking_colab_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = colab_runtime.ColabRuntimeManager(Path(tmp))
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": "h3c_ok",
+            }
+            with patch.object(colab_runtime, "find_colab_bin", return_value=None), \
+                 patch.object(colab_runtime, "probe_comfyui", return_value={"online": True, "devices": [{"name": "A100"}]}) as probe, \
+                 patch("subprocess.Popen", side_effect=AssertionError("CLI must not run when already online!")):
+                st = mgr.status(env)
+                self.assertEqual(st["state"], "online")
+                self.assertFalse(st["cli_available"])
+                started = mgr.start_async(env)
+                self.assertEqual(started["state"], "online")
+                self.assertGreaterEqual(probe.call_count, 1)
+
+    def test_cli_unavailable_degrades_gracefully_and_windows_paths_are_probed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mgr = colab_runtime.ColabRuntimeManager(root / ".workbench")
+            env = {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://demo.ngrok-free.dev"}
+            with patch.object(colab_runtime, "find_colab_bin", return_value=None), \
+                 patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}):
+                st = mgr.status(env)
+            self.assertEqual(st["state"], "cli_unavailable")
+            self.assertFalse(st["cli_available"])
+
+            # Verify Windows candidate path discovery (.venv\Scripts\colab.exe & APPDATA)
+            appdata = root / "AppData" / "Roaming"
+            win_bin = appdata / "Python" / "Scripts" / "colab.exe"
+            win_bin.parent.mkdir(parents=True)
+            win_bin.write_bytes(b"MZ")
+            with patch.object(colab_runtime, "os", SimpleNamespace(name="nt", environ={"APPDATA": str(appdata), "USERPROFILE": str(root)})), \
+                 patch.object(colab_runtime.config, "ROOT", root), \
+                 patch("shutil.which", return_value=None):
+                found = colab_runtime.find_colab_bin({"APPDATA": str(appdata), "USERPROFILE": str(root)})
+            self.assertEqual(found, str(win_bin))
+
+    def test_posix_and_windows_popen_flags_utf8_env_and_global_auth_flag_order(self):
+        posix_kw = colab_runtime._popen_kwargs({"PATH": "/usr/bin"}, os_name="posix")
+        self.assertTrue(posix_kw["start_new_session"])
+        self.assertNotIn("creationflags", posix_kw)
+        self.assertEqual(posix_kw["env"]["PYTHONUTF8"], "1")
+        self.assertEqual(posix_kw["env"]["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(posix_kw["env"]["PYTHONUNBUFFERED"], "1")
+
+        nt_kw = colab_runtime._popen_kwargs({"PATH": "C:\\Windows"}, os_name="nt")
+        self.assertNotIn("start_new_session", nt_kw)
+        self.assertEqual(nt_kw["creationflags"], 0x08000000)
+        self.assertEqual(nt_kw["env"]["PYTHONUTF8"], "1")
+
+        argv = colab_runtime._build_argv("/bin/colab", "adc", ["sessions"])
+        self.assertEqual(argv, ["/bin/colab", "--auth", "adc", "sessions"])
+
+    def test_full_startup_pauses_for_drive_auth_retries_120s_mount_timeout_and_passes_zero_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            mgr = colab_runtime.ColabRuntimeManager(Path(tmp))
+            secret = "h3c_never_in_cli_history_secret"
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": secret,
+                "COLAB_SESSION": "comfy-a100",
+                "COLAB_BIN": str(fake_bin),
+            }
+            calls = []
+            online_flag = {"up": False}
+
+            def fake_probe(e=None):
+                return {"online": online_flag["up"], "devices": [{"name": "A100"}] if online_flag["up"] else []}
+
+            def fake_popen(argv, **kwargs):
+                calls.append((list(argv), kwargs))
+                sub = argv[-1] if argv[-1] == "sessions" else argv[1]
+                if "sessions" in argv:
+                    return self._make_pipe_proc(["[colab] No active sessions found on server.\n"])
+                if "new" in argv:
+                    return self._make_pipe_proc(["[colab] Creating session 'comfy-a100'...\n", "[colab] Session READY.\n"])
+                if "drivemount" in argv:
+                    mount_count = sum(1 for a, _ in calls if "drivemount" in a)
+                    if mount_count == 1:
+                        return self._make_pipe_proc(
+                            [
+                                "[colab] REQUIRED: Google Drive Authorization needed.\n",
+                                "Please visit:\n\n",
+                                "https://accounts.google.com/o/oauth2/v2/auth?client_id=test123\n\n",
+                                "Press Enter after you have granted access... ",
+                            ],
+                            [
+                                "\n[colab] Credentials propagated. Resuming mount...\n",
+                                "ValueError: mount failed\n",
+                            ],
+                            wait_for_stdin=True,
+                        )
+                    return self._make_pipe_proc(["Mounted at /content/drive\n"])
+                if "exec" in argv:
+                    online_flag["up"] = True
+                    return self._make_pipe_proc(["[start_colab] TUNNEL READY (AUTH PROTECTED): https://demo.ngrok-free.dev\n"])
+                raise AssertionError(f"Unexpected argv: {argv}")
+
+            with patch.object(colab_runtime, "probe_comfyui", side_effect=fake_probe), \
+                 patch("subprocess.Popen", side_effect=fake_popen):
+                initial = mgr.start_async(env)
+                self.assertIn(initial["state"], ("provisioning", "awaiting_drive_auth", "starting_comfy"))
+
+                # Wait until awaiting_drive_auth is reached
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    cur = mgr.status(env)
+                    if cur["state"] == "awaiting_drive_auth":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(cur["state"], "awaiting_drive_auth")
+                self.assertEqual(cur["auth_url"], "https://accounts.google.com/o/oauth2/v2/auth?client_id=test123")
+
+                ack = mgr.submit_drive_authorized()
+                self.assertTrue(ack["accepted"])
+
+                # Wait until online
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    cur = mgr.status(env)
+                    if cur["state"] == "online":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(cur["state"], "online")
+
+            # Verify drivemount retried once after propagated+mount failed, and NO secret leaked into colab argv/env
+            mount_calls = [a for a, _ in calls if "drivemount" in a]
+            self.assertEqual(len(mount_calls), 2)
+            for argv, kwargs in calls:
+                self.assertFalse(any(secret in str(x) for x in argv))
+
+    def test_drive_auth_timeout_recovers_to_error_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            mgr = colab_runtime.ColabRuntimeManager(Path(tmp), drive_auth_timeout=0.15)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COLAB_BIN": str(fake_bin),
+            }
+            mount_proc = None
+
+            def fake_popen(argv, **kwargs):
+                nonlocal mount_proc
+                if "sessions" in argv:
+                    return self._make_pipe_proc(["[comfy-a100] m-s-1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"])
+                if "drivemount" in argv:
+                    mount_proc = self._make_pipe_proc(
+                        [
+                            "[colab] REQUIRED: Google Drive Authorization needed.\n",
+                            "https://accounts.google.com/o/oauth2/v2/auth?client_id=timeout\n",
+                            "Press Enter after you have granted access... ",
+                        ],
+                        wait_for_stdin=True,
+                    )
+                    return mount_proc
+                raise AssertionError(f"Unexpected argv: {argv}")
+
+            with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}), \
+                 patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch.object(colab_runtime, "_kill_process_tree", side_effect=lambda p: p.kill()):
+                mgr.start_async(env)
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    st = mgr.status(env)
+                    if st["state"] == "error":
+                        break
+                    time.sleep(0.03)
+                self.assertEqual(st["state"], "error")
+                self.assertIsNotNone(mount_proc)
+                self.assertTrue(mount_proc.killed_event.is_set())
+
+    def test_orphan_session_warning_lock_protection_worker_guard_and_inflight_stop_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            storage = Path(tmp) / ".workbench"
+            mgr = colab_runtime.ColabRuntimeManager(storage)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": "h3c_key",
+                "COLAB_BIN": str(fake_bin),
+            }
+
+            # 1. Orphan [?] session detected in status()
+            with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}), \
+                 patch("subprocess.Popen", side_effect=lambda argv, **kw: self._make_pipe_proc(
+                     ["[?] m-s-orphan1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"]
+                 )):
+                st = mgr.status(env)
+            self.assertEqual(st["state"], "orphan_warning")
+            self.assertEqual(len(st["orphan_sessions"]), 1)
+
+            # 2. H3_WORKBENCH_WORKER=1 never spawns colab subprocesses
+            with patch.dict(os.environ, {"H3_WORKBENCH_WORKER": "1"}, clear=False), \
+                 patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}), \
+                 patch("subprocess.Popen", side_effect=AssertionError("Worker must not spawn colab!")):
+                with self.assertRaises(colab_runtime.RuntimeUnavailableError):
+                    mgr.start_async(env)
+
+            # 3. Cross-process file lock blocks concurrent A100 provisioning
+            mgr2 = colab_runtime.ColabRuntimeManager(storage)
+            with colab_runtime.runtime_file_lock(storage):
+                with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}):
+                    with self.assertRaises(colab_runtime.RuntimeBusyError):
+                        mgr2.start_async(env)
+
+            # 4. In-flight stop guard requires force=True when local_busy or remote queue non-empty
+            stop_called = {"count": 0}
+
+            def fake_stop_popen(argv, **kw):
+                if "stop" in argv:
+                    stop_called["count"] += 1
+                    return self._make_pipe_proc(["[colab] Session terminated.\n"])
+                return self._make_pipe_proc(["[colab] No active sessions found on server.\n"])
+
+            with patch.object(colab_runtime, "probe_remote_queue_count", return_value=2), \
+                 patch("subprocess.Popen", side_effect=fake_stop_popen):
+                blocked = mgr.stop(environ=env, force=False, local_busy=True)
+                self.assertFalse(blocked["stopped"])
+                self.assertTrue(blocked["confirmation_required"])
+                self.assertEqual(blocked["remote_queue"], 2)
+                self.assertEqual(stop_called["count"], 0)
+
+                forced = mgr.stop(environ=env, force=True, local_busy=True)
+                self.assertTrue(forced["stopped"])
+                self.assertEqual(stop_called["count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
