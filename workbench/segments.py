@@ -215,6 +215,19 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
     return base_records, changed, should_unlink
 
 
+def _sync_reconciled_prompt_files(out: Path, prior_segs: dict, next_records: dict):
+    for idx_key, new_rec in next_records.items():
+        old_rec = prior_segs.get(idx_key) or {}
+        seg_num = int(idx_key) + 1
+        clipless_changed = not (out / 'clips' / f'seg{seg_num}.mp4').is_file() and new_rec != old_rec
+        if 'h3' in new_rec and new_rec['h3'] is None and ('h3' not in old_rec or old_rec.get('h3') is not None):
+            (out / 'prompts' / f'seg{seg_num}.h3.txt').unlink(missing_ok=True)
+        if 'zh' in new_rec and isinstance(new_rec['zh'], str) and ('zh' not in old_rec or new_rec['zh'] != old_rec.get('zh') or clipless_changed):
+            _write_text_atomic(out / 'prompts' / f'seg{seg_num}.zh.txt', new_rec['zh'])
+        if isinstance(new_rec.get('h3'), str) and new_rec['h3'] and (new_rec['h3'] != old_rec.get('h3') or clipless_changed):
+            _write_text_atomic(out / 'prompts' / f'seg{seg_num}.h3.txt', new_rec['h3'])
+
+
 def reconcile_pending_segment(out, *, keep_pending=False, supersede=False, drain_siblings=False):
     out = Path(out)
     next_records, changed, should_unlink = preview_reconciled_segments(
@@ -225,10 +238,7 @@ def reconcile_pending_segment(out, *, keep_pending=False, supersede=False, drain
         prior_segs = dict(job.state.get('segs') or {})
         job.state['segs'] = next_records
         job.save()
-        for idx_key, new_rec in next_records.items():
-            old_rec = prior_segs.get(idx_key) or {}
-            if 'h3' in new_rec and new_rec['h3'] is None and ('h3' not in old_rec or old_rec.get('h3') is not None):
-                (out / 'prompts' / f'seg{int(idx_key) + 1}.h3.txt').unlink(missing_ok=True)
+        _sync_reconciled_prompt_files(out, prior_segs, next_records)
     if should_unlink:
         (out / 'inputs' / 'segment-edit.json').unlink(missing_ok=True)
 
@@ -392,10 +402,7 @@ def reconcile_pending_prompt_rewrite(out, request=None, *, clear_number=None, cl
         prior_segs = dict(job.state.get('segs') or {})
         job.state['segs'] = next_records
         job.save()
-        for idx_key, new_rec in next_records.items():
-            old_rec = prior_segs.get(idx_key) or {}
-            if 'h3' in new_rec and new_rec['h3'] is None and ('h3' not in old_rec or old_rec.get('h3') is not None):
-                (out / 'prompts' / f'seg{int(idx_key) + 1}.h3.txt').unlink(missing_ok=True)
+        _sync_reconciled_prompt_files(out, prior_segs, next_records)
     if clear_all or not plan_data or plan_data.get('applied'):
         if clear_all and plan_path.exists():
             plan_path.unlink(missing_ok=True)
@@ -884,8 +891,11 @@ def prepare_prompt(staged, request, pending, segment):
             baseline_zh = previous.get('zh') or pending.get('automatic_source', '')
             if prompt_format == 'h3' or pending['prompt'] != baseline_zh or previous.get('prompt_override'):
                 staged.put('segs', index, prompt_override={'format': prompt_format, 'text': pending['prompt'], 'source_version': pending['source_version']})
-        staged.put('segs', index, h3_reference_version=pending['reference_version'],
-                   pics=[p['kind'] for p in film.refs(request['film'], segment, request['frames'])])
+        pics_list = film.refs(request['film'], segment, request['frames'])
+        pic_paths = film.picture_paths(Path(request['output_dir']), segment, pics_list)
+        h3_ref_ver = pending['reference_version'] if all(p.is_file() for p in pic_paths) else None
+        staged.put('segs', index, h3_reference_version=h3_ref_ver,
+                   pics=[p['kind'] for p in pics_list])
     (staged.dir / 'prompts').mkdir(exist_ok=True)
     current = staged.state['segs'][index]
     for suffix, key in (('zh', 'zh'), ('h3', 'h3')):

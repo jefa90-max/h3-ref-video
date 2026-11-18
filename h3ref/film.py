@@ -424,6 +424,8 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
                 detail = '; '.join(issues)
                 job.put('segs', str(i), error=f"RewriteError: {detail}")
                 raise rewrite.RewriteError(detail)
+            (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(rec.get('zh') or '', encoding='utf-8')
+            (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec.get('h3') or '', encoding='utf-8')
             return
         zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
         paths = _picture_paths(job, seg, pics[i])
@@ -431,6 +433,8 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
         if (rec.get('h3') and rec.get('zh') == zh and rec.get('h3_source', rec.get('zh')) == zh
                 and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)
                 and ('subject_definitions:' not in rec['h3'] or not rewrite.cached_problems(rec['h3'], len(pics[i])))):
+            (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+            (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec['h3'], encoding='utf-8')
             if 'unapplied_edit' in rec:
                 with job.lock:
                     job.state['segs'][str(i)].pop('unapplied_edit', None)
