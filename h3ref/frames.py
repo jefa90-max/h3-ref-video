@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config, http, media, staging
+from . import config, http, media, rewrite, staging
 from .i18n import message
 
 ORIENT = {"9:16": "竖屏", "16:9": "横屏", "1:1": "方形"}
@@ -36,7 +36,29 @@ class SubmissionRejected(RuntimeError):
     """The image API explicitly rejected creation of a new task."""
 
 
+class CompositionFormatError(RuntimeError):
+    """The composition LLM returned empty, non-JSON, or schema-invalid output across all bounded retries."""
+
+
+def _extract_composition_json_text(raw_reply: str) -> str:
+    cleaned = rewrite.strip_think_blocks(
+        raw_reply,
+        lambda: ValueError(message("frame_composition_invalid", detail=raw_reply[:300])),
+    )
+    fence_open = cleaned.find("```")
+    if fence_open != -1:
+        fence_close = cleaned.find("```", fence_open + 3)
+        if fence_close == -1:
+            raise ValueError(message("frame_composition_invalid", detail=cleaned[:300]))
+        inner = cleaned[fence_open + 3:fence_close]
+        if inner[:4].lower() == "json" and (len(inner) == 4 or inner[4].isspace()):
+            inner = inner[4:]
+        return inner.strip()
+    return cleaned
+
+
 NON_RETRYABLE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
+FATAL_COMPOSITION_STATUSES = {401, 402, 403, 404, 429}
 MAX_POLL_ATTEMPTS = 600
 
 
@@ -61,7 +83,8 @@ def without_anchor_reference(text: str) -> str:
 
 
 def describe_composition(film: dict, shot: dict, *, previous_composition: dict | None = None,
-                         known_scenes: dict | None = None) -> dict:
+                         known_scenes: dict | None = None, locked_looks: dict[str, str] | None = None,
+                         max_retries: int = 3) -> dict:
     """Describe only this shot's opening image, using earlier shots for continuity."""
     shots = film.get("shots") or [shot]
     number = shots.index(shot) + 1
@@ -69,58 +92,87 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
     context = {"shot_number": number, "current_shot": visible(shot),
                "previous_shots": [visible(item) for item in shots[:number - 1]], "key_scenes": film.get("setting") or "",
                "cast": film.get("cast") or [], "previous_composition": previous_composition,
-               "known_scenes": known_scenes or {}}
-    rules = ("你是分镜美术指导。只输出 composition v2 JSON 对象，不输出 Markdown。必填 version=2；非空字符串 "
-             "scene/frame/orientation/scene_id/world_frame/action；fixed_objects 是 {name,position} 数组；"
-             "camera 是 {position,view_direction,framing,axis_side}，轴线不适用要明确写不适用；"
-             "characters 是人物状态数组，props 是道具状态数组；expected_end={characters:[],props:[]}。"
-             "characters 每项必填非空字符串字段：" + ",".join(staging.CHARACTER_FIELDS) + "。props 每项必填字段："
-             + ",".join(staging.PROP_FIELDS) + "。除 opening_direction/base_direction/knot_position 在无对应部件时允许 null，"
-             "其余为非空字符串；visibility 只能 visible/cropped/occluded/offscreen。所有数组必填，允许无人/无道具。"
-             "name 使用 cast 正式姓名，未绑定人物保留原身份，不新增参考图。appearance 只含本镜可见稳定外貌衣着；"
-             "cast.look 中旧姿势/持物/毛巾位置不能当作稳定身份，本镜动作、位置、身体朝向、视线优先。"
-             "characters/props/frame 只写首帧动作起点，不提前展示交接完成；action 保留原镜头完整多拍动作、"
-             "接触者、接触方式、释放和落点，结束状态只放 expected_end。expected_end 是计划而非图片事实。"
-             "previous_composition 是最近可信前镜计划，原剧本补充中间缺失动作，不伪造失败镜头的结果。"
-             "known_scenes 的 world_frame/fixed_objects 逐字复用；反打只改机位/画面左右，不能移动固定物。"
-             "换场新 scene_id，返回已知地点复用其 ID/布局，不能把另一地点的人物持物强加当前场景。"
-             "世界位置与 screen_position/visibility 分开；袋口、袋底、结扣各写物体方向，裁切不能清除已知方向。"
-             "机位、景别、运镜、台词与原动作不改；背影不要求露脸，转头视线允许与身体不同。"
-             "不把参考图的正面姿势当成当前姿势，不引用首镜或其它生成图，不输出参考编号，不画文字。")
+               "known_scenes": known_scenes or {}, "locked_looks": locked_looks or {}}
+    rules = (
+        "你是分镜美术指导。只输出精简的 composition v3 JSON 对象，不输出 Markdown、代码块或任何多余解释。"
+        "必填字段：{\"version\":3, \"camera\":\"...\", \"scene\":\"...\", \"characters\":[{\"name\":\"...\",\"locked_look\":\"...\",\"placement_and_pose\":\"...\"}]}；无人空镜填 \"characters\":[]。"
+        "camera：若 current_shot.camera 已指定景别/视角则忠实展开，未指定时按当前镜头人物关系与空间补足清晰机位与构图（如多人殿堂补高角度斜俯拍广角或对称全景，单人对话补近景/过肩等，不要把单一机位写死为全片固定机位）。"
+        "scene：写当前镜头的具体场景环境及前中背景核心陈设与关键道具（key_scenes 仅作参考；与 previous_composition 同场景时保持核心陈设位置一致，反打只改机位和画面左右相对关系）。"
+        "characters：name 使用 cast 正式姓名，同一镜内不重复。"
+        "locked_look：严格只写跨镜头固定不变的五官长相、发型胡须、固定头饰与固定服装；严禁把单镜临时道具、持物、动作、姿态或朝向（如手持某物、端杯、毛巾挂脖、背对镜头、正面站立）塞进 locked_look；若 locked_looks 已给出某角色锁死词，必须原样逐字复用。"
+        "placement_and_pose：只写本镜首帧（动作刚开始那一瞬，不提前画出动作结束结果）的画面左/中/右站位、身体朝向、视线、姿态与当前持物（如“画面左侧站着，侧身面向中央长案，右手轻按婚书”）。"
+        "背影镜头不要求露脸，不沿用参考图的正面立绘姿势，不引用参考图编号，不画任何字幕或文字。"
+    )
     llm = config.llm_settings()
-    out = http.request(llm["base_url"] + "/chat/completions", config.llm_key(),
-                       {"model": llm["composition_model"], "messages": [{"role": "system", "content": rules},
-                        {"role": "user", "content": json.dumps(context, ensure_ascii=False)}], "max_tokens": 8000, "stream": False},
-                       timeout=600, tries=1)
-    if not isinstance(out, dict):
-        raise http.HTTPResponseError(400, message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300]))
-    if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
-        err_obj = out.get("error")
-        detail = json.dumps(out, ensure_ascii=False)
-        low = detail.lower()
-        http_status = out.get("_http_status")
-        raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
-        if http_status in (401, 403) or raw_code in (401, 403, "invalid_api_key", "api_key_invalid", "unauthorized", "authentication_error") or any(
-            tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid", "incorrect api key", "unauthorized", "forbidden")
-        ):
-            code = 403 if http_status == 403 or raw_code == 403 else 401
-        elif isinstance(raw_code, int):
-            code = raw_code
-        elif isinstance(http_status, int) and http_status >= 400:
-            code = http_status
+    key = config.llm_key()
+    base_messages = [{"role": "system", "content": rules},
+                     {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
+    retry_messages: list[dict] = []
+    attempts = max(1, int(max_retries) + 1)
+    last_error = ""
+    for _ in range(attempts):
+        out = http.request(llm["base_url"] + "/chat/completions", key,
+                           {"model": llm["composition_model"], "messages": base_messages + retry_messages,
+                            "max_tokens": 8000, "stream": False},
+                           timeout=600, tries=1)
+        if isinstance(out, dict) and (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+            err_obj = out.get("error")
+            detail = json.dumps(out, ensure_ascii=False)
+            low = detail.lower()
+            http_status = out.get("_http_status")
+            raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
+            if http_status in (401, 403) or raw_code in (401, 403, "invalid_api_key", "api_key_invalid", "unauthorized", "authentication_error") or any(
+                tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid", "incorrect api key", "unauthorized", "forbidden")
+            ):
+                code = 403 if http_status == 403 or raw_code == 403 else 401
+            elif http_status in FATAL_COMPOSITION_STATUSES or raw_code in FATAL_COMPOSITION_STATUSES:
+                code = int(http_status if http_status in FATAL_COMPOSITION_STATUSES else raw_code)
+            elif raw_code in ("insufficient_quota", "billing_hard_limit_reached"):
+                code = 402
+            elif raw_code in ("model_not_found", "not_found"):
+                code = 404
+            elif raw_code in ("rate_limit_exceeded", "too_many_requests"):
+                code = 429
+            elif isinstance(raw_code, int):
+                code = raw_code
+            elif isinstance(http_status, int) and http_status >= 400:
+                code = http_status
+            else:
+                code = 400
+            raise http.HTTPResponseError(code, message("frame_composition_invalid", detail=detail[:300]))
+        raw_reply = ""
+        try:
+            if not isinstance(out, dict):
+                raise ValueError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300]))
+            raw_content = out["choices"][0]["message"]["content"]
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                raise ValueError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300]))
+            raw_reply = raw_content.strip()
+            cleaned = _extract_composition_json_text(raw_reply)
+            composition = json.loads(cleaned)
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            last_error = str(exc) if isinstance(exc, ValueError) else message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])
         else:
-            code = 400
-        raise http.HTTPResponseError(code, message("frame_composition_invalid", detail=detail[:300]))
-    try:
-        raw = str(out["choices"][0]["message"]["content"]).strip()
-        raw = re.sub(r"^```\w*\s*|\s*```$", "", raw).strip()
-        composition = json.loads(raw)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(message("frame_composition_invalid", detail=json.dumps(out, ensure_ascii=False)[:300])) from exc
-    return staging.validate_composition(composition, film, shot, known_scenes)
+            try:
+                validated = staging.validate_composition(composition, film, shot, known_scenes)
+            except ValueError as exc:
+                last_error = str(exc)
+            else:
+                if validated.get("version") == 3 and locked_looks:
+                    for ch in validated.get("characters") or []:
+                        if ch["name"] in locked_looks:
+                            ch["locked_look"] = locked_looks[ch["name"]]
+                return validated
+        retry_messages.append({"role": "assistant", "content": raw_reply[:2000] if raw_reply else "(empty response)"})
+        retry_messages.append({
+            "role": "user",
+            "content": f"上一轮输出未通过校验：{last_error}。请修正问题，严格只输出合法的 composition v3 JSON 对象，所有必填字段非空，不加代码块。",
+        })
+    raise CompositionFormatError(last_error)
 
 
-def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None) -> str:
+def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None, *,
+           resolve_cache: dict[str, str] | None = None) -> str:
     """Chinese prompt for one frame. Pictures in order: board (optional), each character in it."""
     aspect = film["aspect"]
     lines = [f"一张{ORIENT.get(aspect, '竖屏')}电影剧照，画幅 {aspect}，它是一段视频里一个镜头的第一帧。画风：{(film.get('look') or '').strip()}"]
@@ -131,7 +183,7 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
         lines.append(f"参考图片1是本片的角色、道具和场景参考总表，优先查找第{number}镜对应的关键场景，只采用当前镜头需要的外观线索。不要把其他场景、总表、白底和文字标注画进画面。")
         k = 2
     cam = (shot.get("camera") or "").strip().strip("【】")
-    structured = composition and composition.get("version") == 2
+    structured = staging.is_structured(composition)
     if structured:
         lines.append(staging.render_opening(composition))
     elif composition:
@@ -140,9 +192,27 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
     if not structured:
         lines.append("画面：" + (f"【{cam}】" if cam else "") + (composition["frame"] if composition else (shot.get("action") or "").strip()).rstrip("。")
                  + "。画的是这个镜头刚开始的一瞬间，动作还没做完。")
-    for c in who:
-        look = "" if structured else (c.get("look") or "").strip().rstrip("。")
-        lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
+    comp_looks = {}
+    if structured:
+        for ch in composition.get("characters") or []:
+            if ch.get("name"):
+                comp_looks[ch["name"]] = (ch.get("locked_look") or ch.get("appearance") or "").strip().rstrip("。；; ")
+    groups = staging.group_cast_by_picture(who, film.get("cast") or who, resolve_cache=resolve_cache)
+    for g in groups:
+        if len(g["all"]) <= 1 and len(g["active"]) == 1 and not g["absent"]:
+            c = g["active"][0]
+            look = "" if structured else (c.get("look") or "").strip().rstrip("。")
+            lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
+        else:
+            parts = []
+            for c in g["active"]:
+                lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
+            absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in g['absent'])}，严禁将未出场角色画进画面。" if g["absent"] else ""
+            lines.append(
+                f"参考图片{k}是多角色合图，本镜出场角色为{'、'.join(parts)}。请按各自外观特征将长相、发型、妆容和服装严格对号入座，切勿角色串脸；朝向与动作按当前镜头描述，不沿用参考图中的正面姿态。"
+                + absent_clause
+            )
         k += 1
     lines.append(TAIL)
     return NEUTRAL_PATTERN.sub(lambda match: NEUTRAL_WORDS[match.group()], "\n".join(lines))
@@ -159,6 +229,8 @@ def _upload(path: Path) -> str:
 
 
 def submit(text: str, refs: list[Path], aspect: str, *, before_submit=lambda: None) -> str:
+    if len(refs) > config.MAX_IMAGES:
+        raise SubmissionRejected(message("frame_too_many_refs", count=len(refs), limit=config.MAX_IMAGES))
     with tempfile.TemporaryDirectory() as tmp:
         urls = [_upload(media.shrink(Path(p), Path(tmp) / f"ref{i}.jpg")) for i, p in enumerate(refs)]
     body = {"model": config.IMAGE_MODEL, "prompt": text, "size": aspect, "resolution": config.IMAGE_RESOLUTION,

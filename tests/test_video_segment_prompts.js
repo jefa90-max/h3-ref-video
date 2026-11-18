@@ -180,4 +180,294 @@ for (const language of ['zh-CN','en']) {
     h.job.segments[1].source_rewrite_required=false;h.job.segments[1].source_changed=true;h.context.renderJob(h.job);
     assert.equal(c.cost.textContent,h.state.messages.segmentVideoCost);
   });
+
+  test(`manual single-segment and batch H3 rewrite buttons convert without generating video and switch to h3 view (${language})`, async () => {
+    const h = harness(language);
+    h.job.can_rewrite_prompts = true;
+    h.job.missing_h3_count = 2;
+    h.context.initializeVideoSegments();
+    h.context.renderJob(h.job);
+
+    assert.equal(h.select('rewrite-missing-prompts').disabled, false);
+    assert.equal(h.select('rewrite-all-prompts').disabled, false);
+
+    // Batch missing rewrite posts scope: "missing"
+    await h.select('rewrite-missing-prompts').fire('click');
+    assert.equal(h.posted.at(-1).url, '/api/jobs/job-1/segments/rewrite');
+    assert.deepEqual(h.posted.at(-1).body, { scope: 'missing' });
+
+    // Restore idle state, edit segment 2 source prompt and click single-segment rewrite button
+    h.state.selectedJob.status = 'succeeded';
+    h.state.selectedJob.can_rewrite_prompts = true;
+    h.render();
+    const c = await h.edit('女王轻推婚书望向唐僧');
+    assert.ok(c.rewriteH3, 'single-segment rewrite button must exist');
+    assert.equal(c.rewriteH3.disabled, false);
+    await c.rewriteH3.fire('click');
+    assert.equal(h.posted.at(-1).url, '/api/jobs/job-1/segments/2/rewrite');
+    assert.deepEqual(h.posted.at(-1).body, {
+      prompt: '女王轻推婚书望向唐僧',
+      prompt_format: 'source',
+      prompt_version: 'prompt-v2',
+    });
+
+    // Simulate worker completion with newly rewritten H3 prompt -> editor auto-switches to h3 view!
+    const seg2 = h.state.selectedJob.segments[1];
+    h.state.selectedJob.status = 'succeeded';
+    Object.assign(seg2, {
+      editable: true,
+      can_rewrite: true,
+      can_regenerate: true,
+      task_pending: false,
+      prompt_version: 'prompt-v-rewritten',
+      prompt: '女王轻推婚书望向唐僧',
+      source_prompt: '女王轻推婚书望向唐僧',
+      h3_prompt: 'subject_definitions:\n<Subject 1> Queen from <Picture 1>.\n\nsummary:\nHall.',
+      source_rewrite_required: false,
+      applied_revision: 'revision-rw-1',
+    });
+    h.render();
+    assert.equal(c.format.value, 'h3');
+    assert.match(c.editor.value, /subject_definitions:/);
+    assert.equal(c.draftNote.hidden, true);
+  });
+
+  test(`single-segment rewrite trims trailing whitespace and does not switch to stale H3 on failed request (${language})`, async () => {
+    const h = harness(language);
+    h.job.can_rewrite_prompts = true;
+    h.context.initializeVideoSegments();
+    h.context.renderJob(h.job);
+
+    // 1. Failed POST (returns null from runJobAction) must NOT leave segmentRewrites armed to switch to old h3_prompt
+    const origPost = h.context.post;
+    h.context.post = async () => { throw new Error('missing LLM key'); };
+    const c = await h.expand(2);
+    assert.equal(c.format.value, 'source');
+    await c.rewriteH3.fire('click');
+    h.render();
+    assert.equal(c.format.value, 'source', 'Failed rewrite POST must not switch editor to existing old H3');
+
+    // 2. Trailing newline/spaces in source draft still reconcile cleanly with trimmed backend source_prompt
+    h.context.post = origPost;
+    await h.edit('带末尾换行的中文词  \n', 2);
+    await c.rewriteH3.fire('click');
+    assert.equal(h.posted.at(-1).body.prompt, '带末尾换行的中文词');
+    const seg2 = h.state.selectedJob.segments[1];
+    h.state.selectedJob.status = 'succeeded';
+    Object.assign(seg2, {
+      editable: true,
+      can_rewrite: true,
+      can_regenerate: true,
+      task_pending: false,
+      prompt_version: 'prompt-v-trim',
+      prompt: '带末尾换行的中文词',
+      source_prompt: '带末尾换行的中文词',
+      h3_prompt: 'subject_definitions:\n<Subject 1> Trimmed.\n\nsummary:\nTrimmed.',
+      source_rewrite_required: false,
+    });
+    h.render();
+    assert.equal(c.format.value, 'h3');
+    assert.equal(c.conflict.hidden, true, 'Trimmed server source_prompt must not trigger false conflict');
+
+    // 3. Clicking Regenerate immediately after manual H3 conversion (without editing H3) submits source format to preserve paired Chinese prompt
+    await c.regenerate.fire('click');
+    assert.equal(h.posted.at(-1).url, '/api/jobs/job-1/segments/2/regenerate');
+    assert.equal(h.posted.at(-1).body.prompt_format, 'source');
+    assert.equal(h.posted.at(-1).body.prompt, '带末尾换行的中文词');
+  });
+
+  test(`failed single-segment rewrite does not trigger false draft conflict, and demo toolbar uses offline preview copy (${language})`, async () => {
+    const h = harness(language);
+    h.job.demo = true;
+    h.job.can_rewrite_prompts = true;
+    h.job.missing_h3_count = 1;
+    h.context.initializeVideoSegments();
+    h.context.renderJob(h.job);
+
+    // Demo mode toolbar hint must reflect offline demo preview (not paid text model)
+    assert.equal(h.select('segments-rewrite-hint').textContent, h.state.messages.segmentsRewriteDemoHint);
+
+    // Editing source draft -> submitting rewrite (which bumps server prompt_version) -> worker fails:
+    // must NOT mark user's own source draft as conflicted!
+    h.job.demo = false;
+    h.context.renderJob(h.job);
+    const c = await h.edit('待转化的新中文词', 2);
+    const origPost = h.context.post;
+    h.context.post = async (url, body) => {
+      h.posted.push({ url, body });
+      const next = structuredClone(h.state.selectedJob);
+      next.status = 'queued';
+      next.operation = 'rewrite_segment';
+      next.segments[1].prompt_version = 'prompt-v-pending-rw';
+      return next;
+    };
+    await c.rewriteH3.fire('click');
+    h.context.post = origPost;
+
+    // Now worker fails with prompt_version still 'prompt-v-pending-rw'
+    h.state.selectedJob.status = 'failed';
+    h.state.selectedJob.segments[1].error = '401 bad key';
+    h.render();
+    assert.equal(c.conflict.hidden, true, 'Failed rewrite must not trigger false self-conflict on user draft');
+    assert.equal(c.rewriteH3.disabled, false, 'Retry rewrite button must stay enabled after fixing key');
+  });
+
+  test(`retrying a server-persisted unapplied H3 edit after reload keeps custom H3 (${language})`, async () => {
+    const h = harness(language);
+    Object.assign(h.job.segments[1], {
+      prompt: 'subject_definitions:\nCustom H3.',
+      prompt_format: 'h3',
+      source_prompt: 'original source',
+      h3_prompt: 'actual H3',
+      source_rewrite_required: false,
+      error: 'failed',
+    });
+    h.render();
+    const c = await h.expand(2);
+    await c.regenerate.fire('click');
+    assert.equal(h.posted.at(-1).body.prompt_format, 'h3');
+    assert.equal(h.posted.at(-1).body.prompt, 'subject_definitions:\nCustom H3.');
+  });
+
+  test(`rewriteH3 from h3 view preserves persisted unapplied source edit on disk and failed rewrite clears pending state (${language})`, async () => {
+    const h = harness(language);
+    h.job.demo = false;
+    Object.assign(h.job.segments[1], {
+      prompt: 'UNAPPLIED_NEW_SOURCE',
+      prompt_format: 'source',
+      source_prompt: 'OLD_ACTIVE_SOURCE',
+      h3_prompt: 'subject_definitions:\n<Subject 1> from <Picture 1>.\n\nsummary:\nScene.\n\nretention_analysis:\n<Subject 1>: ok.\n\ndetailed_description:\n[Shot 1] Action.\n\noverall_soundscape:\nQuiet.\n\nnon_diegetic_music:\nN/A',
+      source_rewrite_required: true,
+      error: 'previous attempt failed',
+    });
+    h.render();
+    const c = await h.expand(2);
+    c.format.value = 'h3';
+    await c.format.fire('change');
+
+    const origPost = h.context.post;
+    h.context.post = async (url, body) => {
+      h.posted.push({ url, body });
+      const next = structuredClone(h.state.selectedJob);
+      next.status = 'queued';
+      next.operation = 'rewrite_segment';
+      next.segments[1].attempt_revision = 'rw-rev-fail';
+      return next;
+    };
+    await c.rewriteH3.fire('click');
+    h.context.post = origPost;
+    assert.equal(h.posted.at(-1).body.prompt, 'UNAPPLIED_NEW_SOURCE', 'rewriteH3 from h3 view must submit persisted unapplied source edit, not stale source_prompt');
+
+    // Now the rewrite fails; user types a local H3 draft; later an unrelated job action succeeds
+    // with the old applied_revision -> must NOT delete local H3 draft!
+    h.state.selectedJob.status = 'failed';
+    h.render();
+    c.editor.value = 'LOCAL_UNSAVED_H3_DRAFT';
+    await c.editor.fire('input');
+    h.state.selectedJob.status = 'succeeded';
+    h.state.selectedJob.operation = 'assemble';
+    h.state.selectedJob.segments[1].source_prompt = 'UNAPPLIED_NEW_SOURCE';
+    h.state.selectedJob.segments[1].source_rewrite_required = false;
+    h.state.selectedJob.segments[1].applied_revision = 'older-clip-rev';
+    h.render();
+    assert.equal(h.state.segmentDrafts.get(2).drafts.h3?.text, 'LOCAL_UNSAVED_H3_DRAFT', 'Failed rewrite must clear pending state and never delete newer local H3 drafts');
+  });
+
+  test(`rewritten clip-backed segment preserves historical clip prompts and live rewrite button carries paid framing (${language})`, async () => {
+    const h = harness(language);
+    h.job.demo = false;
+    Object.assign(h.job.segments[1], {
+      url: '/api/jobs/job-1/files/clips/seg2.mp4?v=1',
+      version: 'v1',
+      prompt: '新改中文词',
+      prompt_format: 'h3',
+      source_prompt: '新改中文词',
+      h3_prompt: 'subject_definitions:\nNew H3.',
+      prompts_unapplied_to_clip: true,
+      clip_source_prompt: '当前旧视频使用的源词',
+      clip_h3_prompt: 'subject_definitions:\nOld video H3.',
+      source_rewrite_required: false,
+    });
+    h.render();
+    const c = await h.expand(2);
+    assert.match(c.rewriteH3.textContent, /付费|paid/i, 'Live rewrite button must carry paid-action framing');
+    assert.equal(c.activeLabel.textContent, h.state.messages.segmentActivePrompts);
+    assert.equal(c.activeSource.textContent, '当前旧视频使用的源词');
+    assert.equal(c.activeH3.textContent, 'subject_definitions:\nOld video H3.');
+    assert.equal(c.attemptNote.hidden, false);
+    assert.equal(c.attemptNote.textContent, h.state.messages.segmentPromptsSavedNotInVideo);
+    assert.match(h.context.$('rewrite-missing-prompts').textContent, /付费|paid/i, 'Live batch missing-rewrite button must carry paid label');
+    assert.match(h.context.$('rewrite-all-prompts').textContent, /付费|paid/i, 'Live batch all-rewrite button must carry paid label');
+    assert.equal(h.context.$('segments-rewrite-toolbar').className.includes('live-paid'), true, 'Live batch toolbar must carry live-paid warning class');
+  });
+
+  test(`resumed/batch rewrite reconciles matching source draft and H3 view exposes stale source-draft conflict (${language})`, async () => {
+    const h = harness(language);
+    const c = await h.expand(2);
+    c.editor.value = '待续跑改写的新源词';
+    await c.editor.fire('input');
+
+    // Simulate transient failure on single-segment rewrite followed by Resume/batch rewrite completion
+    const origPost = h.context.post;
+    h.context.post = async (url, body) => {
+      h.posted.push({ url, body });
+      const next = structuredClone(h.state.selectedJob);
+      next.status = 'failed';
+      next.operation = 'rewrite_segment';
+      return next;
+    };
+    await c.rewriteH3.fire('click');
+    h.context.post = origPost;
+
+    // Now batch rewrite_prompts succeeds and promotes that exact source prompt
+    h.state.selectedJob.status = 'succeeded';
+    h.state.selectedJob.operation = 'rewrite_prompts';
+    Object.assign(h.state.selectedJob.segments[1], {
+      prompt: '待续跑改写的新源词',
+      source_prompt: '待续跑改写的新源词',
+      h3_prompt: 'subject_definitions:\nRewritten H3.',
+      prompt_version: 'prompt-v9',
+      source_rewrite_required: false,
+    });
+    h.render();
+    assert.equal(h.state.segmentDrafts.get(2)?.drafts?.source, undefined, 'Matching source draft must be reconciled on rewrite_prompts completion');
+    assert.equal(c.conflict.hidden, true, 'No false conflict after matching rewrite_prompts completion');
+    assert.equal(c.rewriteH3.disabled, false, 'rewriteH3 must remain enabled after matching rewrite completion');
+
+    // Conversely, if viewing H3 while an DIFFERENT stale source draft conflicts with a newer prompt_version,
+    // conflict warning and rebase button must be visible so rewriteH3 is not silently disabled!
+    c.format.value = 'source';
+    await c.format.fire('change');
+    c.editor.value = '未提交的旧源草稿';
+    await c.editor.fire('input');
+    c.format.value = 'h3';
+    await c.format.fire('change');
+    h.state.selectedJob.segments[1].prompt_version = 'prompt-v10';
+    h.render();
+    assert.equal(c.rewriteH3.disabled, true, 'Stale source draft must block rewriteH3 until rebased');
+    assert.equal(c.conflict.hidden, false, 'Conflict message must be visible in H3 view when source draft conflicts');
+    assert.equal(c.rebase.hidden, false, 'Rebase button must be visible in H3 view when source draft conflicts');
+    await c.rebase.fire('click');
+    assert.equal(c.rewriteH3.disabled, false, 'Rebasing from H3 view must unblock rewriteH3');
+
+    // p2/red-team#1: If editor is focused in H3 view WITHOUT local H3 edits while server updates h3_prompt + prompt_version,
+    // clicking rebase for a stale source draft must NOT fabricate a phantom H3 draft from the stale displayed H3 text!
+    c.format.value = 'source';
+    await c.format.fire('change');
+    c.editor.value = '另一版待转化的源草稿';
+    await c.editor.fire('input');
+    c.format.value = 'h3';
+    await c.format.fire('change');
+    c.editor.focus();
+    h.state.selectedJob.segments[1].h3_prompt = 'subject_definitions:\nServer updated H3 v11.';
+    h.state.selectedJob.segments[1].prompt_version = 'prompt-v11';
+    h.render();
+    assert.equal(c.conflict.hidden, false);
+    h.document.activeElement = c.rebase;
+    await c.rebase.fire('click');
+    assert.equal(h.state.segmentDrafts.get(2)?.drafts?.h3, undefined, 'Rebase on untouched focused H3 editor must not fabricate drafts.h3');
+    assert.equal(c.editor.value, 'subject_definitions:\nServer updated H3 v11.', 'Untouched focused editor adopts latest server text on rebase');
+    assert.equal(c.conflict.hidden, true, 'Conflict clears after rebase');
+    assert.equal(c.rewriteH3.disabled, false, 'rewriteH3 stays enabled without phantom H3 draft');
+  });
 }

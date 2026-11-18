@@ -48,6 +48,7 @@
   "reference_board": "场景／道具总表",
   "reference_required": "请先上传这些参考图：{names}。",
   "reference_upload_missing": "参考位「{slot}」的上传文件不存在或无效，请重新上传。",
+  "too_many_references": "参考图共 {count} 张，超出模型最多 {limit} 张的限制。请勾选多个角色合并为一张参考图，或减少单镜/单段参考图数量。",
   "review_request": "确认请求需要 approved=true 与当前分镜版本号。",
   "review_changed": "分镜已变化或尚未生成，请刷新并重新检查当前图片。",
   "review_required": "请先确认当前全部分镜或脚本计划，再生成视频。",
@@ -88,5 +89,9 @@
   "segment_expected_prompt": "非空字符串",
   "segment_expected_prompt_format": "source 或 h3",
   "segment_expected_prompt_version": "当前提示词版本",
+  "segment_expected_scope": "missing 或 all",
+  "segment_rewrite_done": "第 {number} 段英文提示词已更新并保存；现有视频未重生成、未调用视频接口。",
+  "segments_rewrite_done": "已完成 {count} 个片段的英文提示词转化；未触发视频生成。",
+  "segments_rewrite_none": "全部片段已有最新英文提示词，无需重复转化。",
   "segment_snapshot_changed": "视频片段正在切换版本，请刷新结果；草稿会保留。"
 }

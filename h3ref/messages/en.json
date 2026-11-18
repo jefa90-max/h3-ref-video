@@ -15,6 +15,7 @@
   "frame_moderation_failed": "Frame content review failed. Automatic retries are blocked. Edit the prompt and manually regenerate this frame. Original error: {reason}",
   "frames_partial": "All other frames have been processed. {count} failed frames are saved for manual repair. Complete the storyboard before generating video.",
   "frame_output_missing": "Frame output is missing: {path}",
+  "frame_too_many_refs": "Frame has {count} reference images, exceeding the {limit}-image model limit; merge characters into a group sheet or remove extra references.",
   "frame_composition_invalid": "Composition model returned missing or invalid JSON output: {detail}",
   "staging_scene": "Current scene",
   "staging_frame": "Opening instant",
@@ -46,12 +47,17 @@
   "staging_axis_side": "Axis side",
   "staging_invalid": "Staging field {path}={value}; expected {expected}.",
   "staging_known_layout": "exact known layout of scene {scene_id}",
-  "staging_plan_failed": "STAGING_INVALID {frame_key} schema=2 model={model}, record {path}: {detail}. This text request may have been charged. Edit this frame prompt and regenerate only its image; do not automatically replan.",
+  "staging_plan_failed": "STAGING_PLAN_FAILED {frame_key} model={model}, record {path}: {detail}. This text request may have been charged. Edit this frame prompt and regenerate only its image; do not automatically replan.",
+  "frame_composition_fallback": "Frame {frame_key} composition optimization failed after retries; falling back to the raw storyboard prompt: {detail}",
+  "optimize_storyboard_help": "Skip LLM storyboard prompt optimization and draw frames directly from raw shot descriptions",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}; record {path}. Other shots were processed. Manually repair failed frames in the workbench before continuing.",
   "segment_terminal_failed": "TERMINAL_FAILED Segment {number} reached remote terminal failure. Resume will not pay again. Explicitly start a new attempt from its card; record {path}.",
   "one_terminal_failed": "TERMINAL_FAILED Single-clip task reached remote terminal failure. Automatic rerun is blocked to avoid duplicate charges. Start a new job in a fresh output directory (or clear terminal_failed in {path}).",
   "segment_publication_pending": "Clip publication is uncommitted. Resume it in the workbench first: {path}.",
   "segment_generation_failed": "Segment {number} generation failed during {phase} ({error_type}). The failure is saved; inspect the log before editing or resuming its original task.",
   "rewrite_picture_token": "Invalid image reference {value}; expected <Picture N> with a positive integer N.",
-  "rewrite_picture_bound": "Image reference <Picture {number}> is outside the actual range 1..{count}."
+  "rewrite_picture_bound": "Image reference <Picture {number}> is outside the actual range 1..{count}.",
+  "rewrite_empty": "Rewrite output is empty; all six sections must be present and non-empty.",
+  "rewrite_empty_sections": "The following sections are empty: {names}.",
+  "rewrite_exhausted": "H3 rewrite failed validation across all {attempts} attempts: {detail}"
 }

@@ -8,7 +8,7 @@ Object.assign(state, {
   storyboardSignature: "", storyboardCards: new Map(), planSignature: "", linksSignature: "", videoSignature: "",
   player: null, pollTimer: null, pollFailures: 0, jobRevision: 0,
   resultTab: null, lastVideoOperation: null, segmentPage: 1, segmentPageSize: 6, segmentCards: new Map(),
-  segmentDrafts: new Map(), expandedSegments: new Set(), segmentSubmissions: new Map(), segmentJobId: null,
+  segmentDrafts: new Map(), expandedSegments: new Set(), segmentSubmissions: new Map(), segmentRewrites: new Map(), segmentJobId: null,
 });
 
 function canGenerateVideo(job) {
@@ -24,6 +24,8 @@ function renderResultActions() {
   $("resume-job").disabled = locked || job.can_resume_video === false;
   $("continue-job").disabled = locked || !canGenerateVideo(job);
   $("assemble-job").disabled = locked || !job.can_assemble;
+  $("rewrite-missing-prompts").disabled = locked || !job.can_rewrite_prompts || !(job.missing_h3_count > 0);
+  $("rewrite-all-prompts").disabled = locked || !job.can_rewrite_prompts || !(job.segments?.length > 0);
   document.querySelectorAll(".regenerate-segment").forEach((button) => {
     button.disabled = locked || button.dataset.enabled !== "true";
   });
@@ -264,11 +266,12 @@ function renderJob(job) {
   $("job-status").className = `status-badge ${job.status}`;
   $("job-kind").textContent = t(job.kind === "one" ? "oneTitle" : "filmTitle");
   $("job-mode").textContent = t(job.demo ? "demoMode" : "liveMode");
-  $("job-operation").textContent = t({ frames: "operationFrames", frame: "operationFrame", segment: "operationSegment", assemble: "operationAssemble" }[job.operation] || "operationPipeline");
+  $("job-operation").textContent = t({ frames: "operationFrames", frame: "operationFrame", segment: "operationSegment", assemble: "operationAssemble", rewrite_segment: "operationRewriteSegment", rewrite_prompts: "operationRewritePrompts" }[job.operation] || "operationPipeline");
   $("job-created").textContent = dateLabel(job.created_at);
   const failed = ["failed", "interrupted"].includes(job.status);
-  const activeStage = { pipeline: "stageGeneratingVideo", segment: "stageRegeneratingSegment", assemble: "stageAssembling" }[job.operation] || "stageGeneratingFrames";
-  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.frame_failures ? "stageFramesIncomplete" : job.review_needed ? "stageReview" : job.pending_assembly ? "stageAwaitingAssembly" : "stageFinished";
+  const activeStage = { pipeline: "stageGeneratingVideo", segment: "stageRegeneratingSegment", assemble: "stageAssembling", rewrite_segment: "stageRewritingPrompts", rewrite_prompts: "stageRewritingPrompts" }[job.operation] || "stageGeneratingFrames";
+  const unfinishedClips = Boolean(job.can_resume_pipeline || (job.kind === "film" && (job.segments || []).length > 0 && (job.segments || []).some((segment) => !segment.url)));
+  const stage = failed ? "stageFailed" : running(job) ? activeStage : job.frame_failures ? "stageFramesIncomplete" : job.review_needed ? "stageReview" : (job.pending_assembly && job.assembly?.ready !== false) ? "stageAwaitingAssembly" : unfinishedClips ? "stagePromptsReady" : "stageFinished";
   $("stage-title").textContent = t(stage);
   $("stage-hint").textContent = t(stage === "stageReview" && review.kind === "script" ? "stageScriptReviewHint" : `${stage}Hint`);
   $("job-error").hidden = !job.error;
@@ -279,8 +282,8 @@ function renderJob(job) {
   $("resume-job").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
   $("resume-job").textContent = t(job.can_resume_frames ? "resumeFrames" : "resumeJob");
   $("resume-hint").hidden = !failed && !job.can_resume_frames && !job.can_resume_pipeline;
-  const blockedSegment = ["pipeline", "segment"].includes(job.operation)
-    ? (job.segments || []).find((segment) => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || segment.terminal_failed))
+  const blockedSegment = ["pipeline", "segment", "rewrite_segment", "rewrite_prompts"].includes(job.operation)
+    ? (job.segments || []).find((segment) => (!job.segment_number || segment.number === job.segment_number) && (segment.submission_unknown || (segment.terminal_failed && (job.operation !== "rewrite_segment" && job.operation !== "rewrite_prompts" || job.can_resume_pipeline))))
     : null;
   $("resume-hint").textContent = t(job.can_resume_video === false ? (blockedSegment ? (blockedSegment.submission_unknown ? "segmentSubmissionUnknown" : "segmentTerminalFailed") : "resumeBlockedHint") : "resumeHint");
   $("review-section").hidden = job.kind !== "film";

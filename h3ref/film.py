@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import check, config, frames, http, media, rewrite, rh, staging
 from .i18n import message
+from .staging import deduplicate_paths, group_cast_by_picture
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
 LANG = {"zh": "中文", "en": "英文", "ja": "日文", "ko": "韩文", "es": "西班牙文", "pt": "葡萄牙文"}
@@ -47,12 +48,12 @@ def load(path: Path, check_images: bool = True) -> dict:
     film.setdefault("aspect", "9:16")
     for c in film.get("cast") or []:
         p = Path(c["picture"]).expanduser()
-        c["picture"] = str(p if p.is_absolute() else (base / p).resolve())
+        c["picture"] = str((p if p.is_absolute() else (base / p)).resolve())
         if check_images and not Path(c["picture"]).is_file():
             raise SystemExit(f"找不到 {c['name']} 的参考图：{c['picture']}")
     if film.get("board"):
         p = Path(film["board"]).expanduser()
-        film["board"] = str(p if p.is_absolute() else (base / p).resolve())
+        film["board"] = str((p if p.is_absolute() else (base / p)).resolve())
     shots = [s for s in film.get("shots") or [] if (s.get("action") or "").strip()]
     if not shots:
         raise SystemExit("film.json 里没有镜头（shots）")
@@ -101,12 +102,16 @@ def in_shots(c: dict, shots: list[dict]) -> bool:
     return any(n and n in text for n in [c["name"], *(c.get("aliases") or [])])
 
 
-def refs(film: dict, seg: dict, mode: str) -> list[dict]:
-    """The segment's pictures in <Picture N> order: board, each character in it, then the frames or the previous last frame.
+def refs(film: dict, seg: dict, mode: str, *, resolve_cache: dict[str, str] | None = None) -> list[dict]:
+    """The segment's pictures in <Picture N> order: board, each character sheet in it, then the frames or the previous last frame.
     Nine at most: when they run short the board goes first, then the later shots' frames."""
-    cast = [c for c in film.get("cast") or [] if in_shots(c, seg["shots"])] or list(film.get("cast") or [])
+    all_cast = list(film.get("cast") or [])
+    active_cast = [c for c in all_cast if in_shots(c, seg["shots"])] or all_cast
+    groups = group_cast_by_picture(active_cast, all_cast, resolve_cache=resolve_cache)
     board = [{"kind": "board", "path": film["board"]}] if film.get("board") else []
-    people = [{"kind": "cast", "path": c["picture"], "cast": c} for c in cast]
+    people = [{"kind": "cast", "path": g["path"], "cast": {**g["active"][0], "name": g["name"]},
+               "active_cast": g["active"], "absent_cast": g["absent"], "all_cast": g["all"]}
+              for g in groups]
     tail = []
     if mode == "shot":
         room = config.MAX_IMAGES - len(people) - len(board)
@@ -120,7 +125,7 @@ def refs(film: dict, seg: dict, mode: str) -> list[dict]:
             tail.append({"kind": "prev"})
     out = board + people + tail
     if len(out) > config.MAX_IMAGES:
-        raise SystemExit(f"第 {seg['idx'] + 1} 段要 {len(out)} 张参考图，H3 最多 {config.MAX_IMAGES} 张；减少这一段的角色")
+        raise SystemExit(f"第 {seg['idx'] + 1} 段要 {len(out)} 张参考图，H3 最多 {config.MAX_IMAGES} 张；减少这一段的角色或将多个角色合并为一张参考图")
     return out
 
 
@@ -129,6 +134,11 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     compositions = {key: value for key, value in (compositions or {}).items()
                     if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
     covered = {c['name'] for comp in compositions.values() for c in comp['characters']}
+    comp_looks: dict[str, str] = {}
+    for comp in compositions.values():
+        for ch in comp.get('characters') or []:
+            if ch.get('name'):
+                comp_looks.setdefault(ch['name'], (ch.get('locked_look') or ch.get('appearance') or '').strip().rstrip('。；; '))
     aspect = film["aspect"]
     head = (f"根据下面文字分镜生成一段{seg['seconds']}秒{ORIENT[aspect]}视频，{aspect}。"
             + (f"这是一条连续短片的第{seg['idx'] + 1}段。" if count > 1 else "")
@@ -140,8 +150,23 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
         if p["kind"] == "board":
             lines.append(f"参考图片{k}是本片的角色、道具和场景参考总表，只用来统一外观，不要把总表、白底、文字标注画进画面。")
         elif p["kind"] == "cast":
-            look = "" if p["cast"]["name"] in covered else (p["cast"].get("look") or "").strip().rstrip("。")
-            lines.append(f"参考图片{k}只约束{p['cast']['name']}身份" + (f"：{look}。" if look else "。"))
+            active_list = p.get("active_cast") or [p["cast"]]
+            absent_list = p.get("absent_cast") or []
+            all_list = p.get("all_cast") or active_list
+            if len(all_list) <= 1 and len(active_list) == 1 and not absent_list:
+                c = active_list[0]
+                look = "" if c["name"] in covered else (c.get("look") or "").strip().rstrip("。")
+                lines.append(f"参考图片{k}只约束{c['name']}身份" + (f"：{look}。" if look else "。"))
+            else:
+                parts = []
+                for c in active_list:
+                    lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                    parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
+                absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in absent_list)}，严禁将未出场角色画进画面。" if absent_list else ""
+                lines.append(
+                    f"参考图片{k}是多角色合图，本段仅约束出场角色{'、'.join(parts)}的身份与外貌，请按各自外观特征严格对号入座，切勿混淆或串脸。"
+                    + absent_clause
+                )
         elif p["kind"] == "frame":
             s = seg["shots"][p["shot"]]
             span = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒"
@@ -151,7 +176,7 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
             first = any(x["kind"] == "frame" for x in pics)
             lines.append(f"参考图片{k}是上一段的最后一个画面：" + ("只用来保持画风、光线、场景和角色状态一致，这一段的第一个镜头从它的首帧开始。"
                                                        if first else "这一段从这个画面直接接着演，画风、光线、场景和角色状态保持一致。"))
-    n = sum(1 for p in pics if p["kind"] == "cast")
+    n = sum(len(p.get("active_cast") or [p["cast"]]) for p in pics if p["kind"] == "cast")
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
     out = [head, "".join(lines)]
@@ -162,8 +187,14 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     for j, s in enumerate(seg["shots"]):
         composition = compositions.get(_frame_key(seg["idx"], j))
         cam = (s.get("camera") or "").strip().strip("【】")
-        text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
-            + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
+        if composition and composition.get("version") == 3:
+            comp_cam = composition["camera"].strip().strip("【】").rstrip("。；; ")
+            cam_label = f"{cam}，{comp_cam}" if cam and cam not in comp_cam else (comp_cam or cam)
+            act = (s.get("action") or "").strip().rstrip("。；; ")
+            text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：【{cam_label}】{staging.render_scene_and_characters(composition)}动作过程：{act}。"
+        else:
+            text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
+                + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
         if compositions and not composition and (film.get("setting") or "").strip():
             text += "场景参考：" + film["setting"].strip()
         if speech and (s.get("line") or "").strip():
@@ -210,8 +241,12 @@ def _frame_key(i: int, j: int) -> str:
     return f"s{i + 1}-{j + 1}"
 
 
-def frame_reference_paths(film: dict, shot: dict, record: dict) -> list[str]:
-    characters = record.get("character_reference_paths", [c["picture"] for c in film.get("cast") or [] if in_shots(c, [shot])])
+def frame_reference_paths(film: dict, shot: dict, record: dict, *, resolve_cache: dict[str, str] | None = None) -> list[str]:
+    if "character_reference_paths" in record:
+        characters = deduplicate_paths(record["character_reference_paths"], resolve_cache=resolve_cache)
+    else:
+        active = [c for c in film.get("cast") or [] if in_shots(c, [shot])]
+        characters = [g["path"] for g in group_cast_by_picture(active, film.get("cast") or [], resolve_cache=resolve_cache)]
     return ([film["board"]] if film.get("board") else []) + characters
 
 
@@ -232,28 +267,30 @@ def reference_version(paths, *, metadata=None) -> str:
     return hashlib.sha256(json.dumps(sources, ensure_ascii=False).encode()).hexdigest()
 
 
-def frame_reference_versions(film: dict, segs: list[dict], records: dict) -> dict[str, str]:
+def frame_reference_versions(film: dict, segs: list[dict], records: dict, *, resolve_cache: dict[str, str] | None = None) -> dict[str, str]:
     metadata = {}
-    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {})), metadata=metadata)
+    cache = {} if resolve_cache is None else resolve_cache
+    return {_frame_key(s['idx'], j): reference_version(frame_reference_paths(film, shot, records.get(_frame_key(s['idx'], j), {}), resolve_cache=cache), metadata=metadata)
             for s in segs for j, shot in enumerate(s['shots'])}
 
 
 def saved_compositions(records: dict, *, reference_versions: dict[str, str]) -> dict[str, dict]:
     return {key: rec['composition'] for key, rec in records.items()
-            if isinstance(rec.get('composition'), dict) and rec['composition'].get('version') == 2
+            if staging.is_structured(rec.get('composition'))
             and isinstance(rec.get('prompt'), str) and rec['prompt'].strip()
             and rec.get('composition_prompt') == rec['prompt']
             and rec.get('composition_reference_version')
             and rec['composition_reference_version'] == reference_versions.get(key)}
 
 
-def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False):
+def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_tasks: bool = False,
+                 optimize_storyboard: bool = True):
     """Plan in shot order, save before dispatch, and collect every independent drawing."""
     (job.dir / "frames").mkdir(exist_ok=True)
     wanted = [(i, p['shot']) for i, seg in enumerate(segs) for p in pics[i] if p['kind'] == 'frame']
     versions = frame_reference_versions(film, segs, job.state['frames'])
     effective = saved_compositions(job.state['frames'], reference_versions=versions)
-    known_scenes, previous, previous_key = {}, None, None
+    known_scenes, locked_looks, previous, previous_key = {}, {}, None, None
 
     def failure(key, exc):
         reason = f"{type(exc).__name__}: {exc}"
@@ -292,17 +329,39 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                             references = rec.get('reference_paths', references)
                         elif rec.get('prompt') or rec.get('composition'):
                             text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
+                            references = rec.get('reference_paths', references)
                             job.log('staging cache', key, 'source', previous_key)
+                        elif not optimize_storyboard:
+                            composition = None
+                            text = frames.prompt(film, shot, who, bool(film.get('board')), None)
+                            job.put('frames', key, composition=None, prompt=text, reference_paths=references)
                         else:
                             job.log('staging plan', key, 'source', previous_key)
-                            planned = frames.describe_composition(film, shot, previous_composition=copy.deepcopy(previous), known_scenes=copy.deepcopy(known_scenes))
-                            composition = staging.validate_composition(planned, film, shot, known_scenes)
-                            text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
-                            job.put('frames', key, composition=composition, prompt=text, composition_prompt=text,
-                                    composition_reference_version=versions[key], reference_paths=references)
+                            try:
+                                planned = frames.describe_composition(
+                                    film, shot,
+                                    previous_composition=copy.deepcopy(previous),
+                                    known_scenes=copy.deepcopy(known_scenes),
+                                    locked_looks=dict(locked_looks),
+                                )
+                                composition = staging.validate_composition(planned, film, shot, known_scenes)
+                                if composition.get('version') == 3:
+                                    for ch in composition.get('characters') or []:
+                                        if ch['name'] in locked_looks:
+                                            ch['locked_look'] = locked_looks[ch['name']]
+                                        else:
+                                            locked_looks[ch['name']] = ch['locked_look']
+                                text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
+                                job.put('frames', key, composition=composition, prompt=text, composition_prompt=text,
+                                        composition_reference_version=versions[key], reference_paths=references)
+                            except frames.CompositionFormatError as exc:
+                                composition = None
+                                job.log('staging fallback', key, message('frame_composition_fallback', frame_key=key, detail=str(exc)))
+                                text = frames.prompt(film, shot, who, bool(film.get('board')), None)
+                                job.put('frames', key, composition=None, prompt=text, reference_paths=references)
                         futures.append(pool.submit(draw, key, text, references, rec.get('task')))
                     except Exception as exc:
-                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in (401, 402, 403, 429) and not rec.get('task') and not rec.get('submission_unknown'):
+                        if isinstance(exc, http.HTTPResponseError) and exc.status_code in frames.FATAL_COMPOSITION_STATUSES and not rec.get('task') and not rec.get('submission_unknown'):
                             for future in futures:
                                 future.result()
                             raise
@@ -322,7 +381,12 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                         job.log('frame failed', key, f"{type(contextual).__name__}: {contextual}")
                         composition = None
                 if composition:
-                    known_scenes[composition['scene_id']] = {k: copy.deepcopy(composition[k]) for k in ('world_frame','fixed_objects')}
+                    if composition.get('version') == 2:
+                        known_scenes[composition['scene_id']] = {k: copy.deepcopy(composition[k]) for k in ('world_frame', 'fixed_objects')}
+                    elif composition.get('version') == 3:
+                        for ch in composition.get('characters') or []:
+                            if ch.get('name') and ch.get('locked_look'):
+                                locked_looks.setdefault(ch['name'], ch['locked_look'])
                     previous, previous_key = composition, key
         for future in futures:
             future.result()
@@ -361,22 +425,36 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
                 detail = '; '.join(issues)
                 job.put('segs', str(i), error=f"RewriteError: {detail}")
                 raise rewrite.RewriteError(detail)
+            (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(rec.get('zh') or '', encoding='utf-8')
+            (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec.get('h3') or '', encoding='utf-8')
             return
         zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
         paths = _picture_paths(job, seg, pics[i])
         reference = reference_version(paths) if all(path.is_file() for path in paths) else None
         if (rec.get('h3') and rec.get('zh') == zh and rec.get('h3_source', rec.get('zh')) == zh
-                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)):
+                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)
+                and ('subject_definitions:' not in rec['h3'] or not rewrite.cached_problems(rec['h3'], len(pics[i])))):
+            (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+            (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec['h3'], encoding='utf-8')
+            if 'unapplied_edit' in rec:
+                with job.lock:
+                    job.state['segs'][str(i)].pop('unapplied_edit', None)
+                    job.save()
             return
         try:
             h3 = rewrite.rewrite(zh, len(pics[i]), seg['seconds'], film['aspect'])
         except Exception as exc:
             (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
+            (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').unlink(missing_ok=True)
             job.put('segs', str(i), zh=zh, h3=None, h3_source=None, error=f"{type(exc).__name__}: {exc}")
             raise
         (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
         (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(h3, encoding='utf-8')
-        job.put('segs', str(i), zh=zh, h3=h3, h3_source=zh, h3_reference_version=reference, error=None)
+        with job.lock:
+            cur = job.state['segs'].setdefault(str(i), {})
+            cur.pop('unapplied_edit', None)
+            cur.update(zh=zh, h3=h3, h3_source=zh, h3_reference_version=reference, error=None)
+            job.save()
         job.log('prompt', f'seg{i + 1}', f'{len(pics[i])} pictures')
     abort = threading.Event()
     def run_one(seg):
@@ -463,8 +541,13 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
     http.download(st["url"], out)
     job.put("segs", str(i), phase="tail")
     media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
-    job.put("segs", str(i), file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
-            wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
+    with job.lock:
+        cur = job.state["segs"].setdefault(str(i), {})
+        cur.pop("clip_prompts", None)
+        cur.pop("manual_rewrite", None)
+        cur.update(file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
+                   wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
+        job.save()
     job.log("done", f"seg{i + 1}", f"¥{st['cny']:.3f}", f"{st.get('run_seconds')} s on the GPU")
     return job.state["segs"][str(i)]
 
@@ -627,7 +710,7 @@ def _segment_task_unresolved(rec: dict) -> bool:
 
 def invalidated_segment_records(records: dict, mode: str, redo: list[int] | None) -> dict:
     return {k: (dict(rec) if _segment_task_unresolved(rec) else
-                {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override") if key in rec})
+                {key: rec[key] for key in ("zh", "h3", "h3_source", "h3_reference_version", "prompt_override", "manual_rewrite") if key in rec})
             for k, rec in records.items()
             if any(int(k) == n - 1 or (mode != "shot" and int(k) > n - 1) for n in redo or [])}
 
@@ -713,14 +796,18 @@ def _workbench_activity_locked(job_dir: Path) -> Path | None:
 
 
 def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[int] | None = None,
-        *, resume_frame_tasks: bool = False) -> Path:
+        *, resume_frame_tasks: bool = False, optimize_storyboard: bool = True) -> Path:
     job = Job(job_dir)
     if film_path:
         job.state["film_path"] = str(Path(film_path).resolve())
         job.state["mode"] = mode
+        job.state["optimize_storyboard"] = bool(optimize_storyboard)
+    elif not optimize_storyboard:
+        job.state["optimize_storyboard"] = False
     if not job.state.get("film_path"):
         raise SystemExit("新任务要给 --film")
     mode = job.state.get("mode", mode)
+    optimize = bool(job.state.get("optimize_storyboard", optimize_storyboard))
     locked_artifact = _workbench_activity_locked(job.dir)
     if locked_artifact is not None:
         raise RuntimeError(message("segment_publication_pending", path=locked_artifact))
@@ -734,7 +821,7 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     job.log("plan", f"{len(segs)} segments", " / ".join(f"{s['seconds']}s·{len(s['shots'])} shots·{len(pics[s['idx']])} pictures" for s in segs))
     for s in segs:
         job.put("segs", str(s["idx"]), pics=[p["kind"] for p in pics[s["idx"]]])
-    failures = stage_frames(job, film, segs, pics, resume_tasks=resume_frame_tasks)
+    failures = stage_frames(job, film, segs, pics, resume_tasks=resume_frame_tasks, optimize_storyboard=optimize)
     if failures:
         job.log("frames", message("frames_partial", count=len(failures)))
         return job.dir

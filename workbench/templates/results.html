@@ -51,6 +51,13 @@
     <div id="segments-panel" role="tabpanel" aria-labelledby="tab-segments">
     <section id="segments-section" class="segments-section panel" hidden>
       <div class="section-heading"><div><h2 data-i18n="segmentsTitle"></h2><p class="hint" data-i18n="segmentsHint"></p></div><span id="segments-summary" class="hint" aria-live="polite"></span></div>
+      <div id="segments-rewrite-toolbar" class="segments-rewrite-toolbar">
+        <div class="button-row">
+          <button id="rewrite-missing-prompts" type="button" class="button secondary" data-i18n="rewriteMissingPrompts" disabled></button>
+          <button id="rewrite-all-prompts" type="button" class="button secondary" data-i18n="rewriteAllPrompts" disabled></button>
+        </div>
+        <p id="segments-rewrite-hint" class="hint" data-i18n="segmentsRewriteHint"></p>
+      </div>
       <p id="assembly-notice" class="notice warning" hidden></p>
       <div id="segment-cards" class="segment-grid"></div>
       {{ pagination("segments", "segmentPagination", "segments-page-label") }}

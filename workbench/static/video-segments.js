@@ -34,7 +34,7 @@ function renderResultTabs(job) {
     $("segments-panel").hidden = false;
     return;
   }
-  const videoOperation = ["pipeline", "segment", "assemble"].includes(job.operation);
+  const videoOperation = ["pipeline", "segment", "assemble", "rewrite_segment", "rewrite_prompts"].includes(job.operation);
   const operation = `${job.operation}:${job.operation_id || job.created_at}`;
   if (state.resultTab === null) {
     const hasVideo = (job.segments || []).some((segment) => segment.url);
@@ -66,18 +66,51 @@ function segmentDraftEntry(segment) {
 }
 
 function reconcileSegmentSubmissions(job) {
+  state.segmentRewrites ??= new Map();
   for (const segment of job.segments || []) {
     const submitted = state.segmentSubmissions.get(segment.number);
-    if (!submitted?.revision || segment.applied_revision !== submitted.revision) continue;
-    const active = submitted.prompt_format === "source" ? segment.source_prompt : segment.h3_prompt;
-    if (active !== submitted.prompt) continue;
-    const entry = state.segmentDrafts.get(segment.number);
-    if (entry?.drafts[submitted.prompt_format]?.text === submitted.prompt) {
-      delete entry.drafts[submitted.prompt_format];
-      const card = state.segmentCards.get(segment.number);
-      if (card?.editorFormat === submitted.prompt_format) card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+    if (submitted?.revision && segment.applied_revision === submitted.revision) {
+      const active = submitted.prompt_format === "source" ? segment.source_prompt : segment.h3_prompt;
+      if (active === submitted.prompt) {
+        const entry = state.segmentDrafts.get(segment.number);
+        if (entry?.drafts[submitted.prompt_format]?.text === submitted.prompt) {
+          delete entry.drafts[submitted.prompt_format];
+          const card = state.segmentCards.get(segment.number);
+          if (card?.editorFormat === submitted.prompt_format) card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+        }
+        state.segmentSubmissions.delete(segment.number);
+      }
     }
-    state.segmentSubmissions.delete(segment.number);
+    const rewritePending = state.segmentRewrites.get(segment.number);
+    if (rewritePending && ["failed", "interrupted"].includes(job.status)) {
+      state.segmentRewrites.delete(segment.number);
+    } else if (rewritePending && job.status === "succeeded") {
+      if (segment.h3_prompt && segment.source_prompt === rewritePending.prompt && !segment.source_rewrite_required) {
+        const entry = segmentDraftEntry(segment);
+        if (entry.drafts.source?.text?.trim() === rewritePending.prompt) {
+          delete entry.drafts.source;
+        }
+        if (!entry.drafts.h3) {
+          entry.selectedFormat = "h3";
+          const card = state.segmentCards.get(segment.number);
+          if (card) {
+            card.editorFormat = null;
+            card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+          }
+        }
+      }
+      state.segmentRewrites.delete(segment.number);
+    }
+    if (job.status === "succeeded" && ["rewrite_segment", "rewrite_prompts"].includes(job.operation) && segment.h3_prompt && !segment.source_rewrite_required) {
+      const entry = state.segmentDrafts.get(segment.number);
+      if (entry?.drafts.source?.text?.trim() === segment.source_prompt) {
+        delete entry.drafts.source;
+        const card = state.segmentCards.get(segment.number);
+        if (card?.editorFormat === "source") {
+          card.editorBaseline = { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+        }
+      }
+    }
   }
 }
 
@@ -102,9 +135,14 @@ function refreshSegmentControls(card, job, syncText = false) {
     card.draftNote.hidden = !draft;
     card.otherDraft.textContent = t("segmentOtherFormatDraft");
     card.otherDraft.hidden = !state.segmentDrafts.get(segment.number)?.drafts[format === "source" ? "h3" : "source"];
-    card.activeLabel.textContent = t("segmentActivePrompts");
-    card.activeSource.textContent = segment.source_prompt || t("segmentNoActiveSource");
-    card.activeH3.textContent = segment.h3_prompt || t("segmentNoActiveH3");
+    const hasClipSnapshot = Boolean(segment.url && segment.prompts_unapplied_to_clip && (segment.clip_source_prompt != null || segment.clip_h3_prompt != null));
+    const shownSource = hasClipSnapshot ? segment.clip_source_prompt : segment.source_prompt;
+    const shownH3 = hasClipSnapshot ? segment.clip_h3_prompt : segment.h3_prompt;
+    card.activeLabel.textContent = t(
+      !segment.url ? "segmentSavedPrompts" : (segment.prompts_unapplied_to_clip && !hasClipSnapshot) ? "segmentSavedPromptsPendingVideo" : "segmentActivePrompts",
+    );
+    card.activeSource.textContent = shownSource || t("segmentNoActiveSource");
+    card.activeH3.textContent = shownH3 || t("segmentNoActiveH3");
   }
   const baseline = draft || (card.editorFormat === format && card.editorBaseline) || { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
   const conflict = baseline.basePromptVersion !== segment.prompt_version || baseline.baseClipVersion !== segment.version;
@@ -115,14 +153,24 @@ function refreshSegmentControls(card, job, syncText = false) {
   card.regenerate.textContent = t(segment.terminal_failed ? "segmentRetryCurrent" : job.demo ? "regenerateSegmentDemo" : "regenerateSegmentLive");
   card.cost.textContent = t(job.demo ? "segmentDemoHint" : format === "source" && (text !== segment.source_prompt || !segment.h3_prompt || segment.source_rewrite_required) ? "segmentSourceCost" : "segmentVideoCost");
   if (card.editor) {
-    card.conflict.textContent = t("segmentDraftConflict");
-    card.conflict.hidden = !conflict;
+    const sourceDraft = state.segmentDrafts.get(segment.number)?.drafts.source;
+    const sourceText = format === "source" ? text : (sourceDraft?.text ?? segmentSavedText(segment, "source"));
+    const sourceBaseline = (format === "source" ? draft : sourceDraft) || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: segment.prompt_version, baseClipVersion: segment.version };
+    const sourceConflict = sourceBaseline.basePromptVersion !== segment.prompt_version || sourceBaseline.baseClipVersion !== segment.version;
+    const shownConflict = conflict || (format === "h3" && Boolean(sourceDraft) && sourceConflict);
+    card.conflict.textContent = t(conflict ? "segmentDraftConflict" : "segmentSourceDraftConflict");
+    card.conflict.hidden = !shownConflict;
     card.rebase.textContent = t("segmentRebaseDraft");
-    card.rebase.hidden = !conflict;
+    card.rebase.hidden = !shownConflict;
     for (const control of [card.editor, card.format, card.rebase]) {
       control.dataset.enabled = String(Boolean(segment.editable));
       control.disabled = (locked || !segment.editable) && !(control === card.editor && card.composing);
     }
+    const hasUnsavedH3Draft = format === "h3" && Boolean(state.segmentDrafts.get(segment.number)?.drafts.h3);
+    const canRewrite = Boolean((segment.can_rewrite ?? segment.editable) && !locked && sourceText.trim() && !sourceConflict && !hasUnsavedH3Draft);
+    card.rewriteH3.textContent = t(job.demo ? "segmentRewriteH3Demo" : "segmentRewriteH3Live");
+    card.rewriteH3.dataset.enabled = String(canRewrite);
+    card.rewriteH3.disabled = !canRewrite;
   }
 }
 
@@ -140,10 +188,13 @@ function expandSegmentEditor(card) {
   card.otherDraft = element("p", "hint");
   card.conflict = element("p", "hint segment-conflict"); card.conflict.id = `${prefix}-conflict`;
   card.rebase = element("button", "button secondary segment-rebase segment-control"); card.rebase.type = "button";
+  const editorActions = element("div", "segment-editor-actions");
+  card.rewriteH3 = element("button", "button secondary segment-rewrite-h3 segment-control"); card.rewriteH3.type = "button";
+  editorActions.append(card.rewriteH3);
   const active = element("details", "segment-active-prompts"); card.activeLabel = element("summary");
   card.activeSource = element("pre"); card.activeH3 = element("pre"); active.append(card.activeLabel, card.activeSource, card.activeH3);
   card.references = element("div", "segment-references hint");
-  card.details.append(card.formatLabel, card.format, card.promptLabel, card.editor, card.draftNote, card.otherDraft, card.conflict, card.rebase, active, card.references);
+  card.details.append(card.formatLabel, card.format, card.promptLabel, card.editor, card.draftNote, card.otherDraft, card.conflict, card.rebase, editorActions, active, card.references);
   card.editor.addEventListener("input", () => {
     const current = card.segment, format = segmentFormat(current), drafts = segmentDraftEntry(current).drafts;
     drafts[format] = { ...(drafts[format] || card.editorBaseline), text: card.editor.value };
@@ -160,9 +211,48 @@ function expandSegmentEditor(card) {
   });
   card.rebase.addEventListener("click", () => {
     if (card.rebase.disabled) return;
-    const current = card.segment, format = segmentFormat(current);
-    segmentDraftEntry(current).drafts[format] = { text: card.editor.value, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    const current = card.segment, format = segmentFormat(current), drafts = segmentDraftEntry(current).drafts;
+    if (drafts[format]) {
+      drafts[format] = { text: card.editor.value, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    } else {
+      card.editor.value = segmentSavedText(current, format);
+      if (card.editorFormat === format) {
+        card.editorBaseline = { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+      }
+    }
+    if (format === "h3" && drafts.source) {
+      drafts.source = { ...drafts.source, basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    }
     refreshSegmentControls(card, state.selectedJob);
+  });
+  card.rewriteH3.addEventListener("click", async () => {
+    if (card.rewriteH3.disabled) return;
+    state.segmentRewrites ??= new Map();
+    const current = card.segment;
+    const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
+    const sourceText = sourceDraft?.text ?? segmentSavedText(current, "source");
+    const trimmedSource = sourceText.trim();
+    if (!trimmedSource) return;
+    const baseline = sourceDraft || (card.editorFormat === "source" && card.editorBaseline) || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
+    const payload = { prompt: trimmedSource, prompt_format: "source", prompt_version: baseline.basePromptVersion };
+    const accepted = await runJobAction(`/api/jobs/${encodeURIComponent(state.selectedJob.id)}/segments/${current.number}/rewrite`, payload);
+    if (accepted) {
+      const updated = accepted.segments?.find(item => item.number === current.number);
+      if (updated?.prompt_version) {
+        if (sourceDraft && sourceDraft.text.trim() === trimmedSource) {
+          sourceDraft.basePromptVersion = updated.prompt_version;
+          sourceDraft.baseClipVersion = updated.version;
+        }
+        if (card.editorFormat === "source") {
+          card.editorBaseline = { basePromptVersion: updated.prompt_version, baseClipVersion: updated.version };
+        }
+      }
+      state.segmentRewrites.set(current.number, {
+        prompt: trimmedSource,
+        revision: updated?.attempt_revision || updated?.applied_revision || null,
+      });
+      renderVideoSegments(accepted);
+    }
   });
   refreshSegmentControls(card, state.selectedJob, true);
 }
@@ -205,9 +295,13 @@ function createSegmentCard(segment) {
   card.regenerate.addEventListener("click", async () => {
     if (card.regenerate.disabled) return;
     const current = card.segment, format = segmentFormat(current), draft = state.segmentDrafts.get(current.number)?.drafts[format];
-    const text = draft?.text ?? segmentSavedText(current, format);
+    const sourceDraft = state.segmentDrafts.get(current.number)?.drafts.source;
+    const rawText = draft?.text ?? segmentSavedText(current, format);
+    const preservePairedSource = format === "h3" && !draft && !sourceDraft && Boolean(current.source_prompt) && Boolean(current.h3_prompt) && rawText === current.h3_prompt && !current.source_rewrite_required;
+    const submitFormat = preservePairedSource ? "source" : format;
+    const text = preservePairedSource ? current.source_prompt : rawText;
     const baseline = draft || card.editorBaseline || { basePromptVersion: current.prompt_version, baseClipVersion: current.version };
-    const payload = { prompt: text, prompt_format: format, prompt_version: baseline.basePromptVersion, version: baseline.baseClipVersion };
+    const payload = { prompt: text, prompt_format: submitFormat, prompt_version: baseline.basePromptVersion, version: baseline.baseClipVersion };
     const submission = { ...payload, revision: null }; state.segmentSubmissions.set(current.number, submission);
     const accepted = await runJobAction(`/api/jobs/${encodeURIComponent(state.selectedJob.id)}/segments/${current.number}/regenerate`, payload);
     if (accepted) {
@@ -223,9 +317,10 @@ function createSegmentCard(segment) {
 
 function renderVideoSegments(job) {
   $("segments-section").hidden = job.kind !== "film";
+  state.segmentRewrites ??= new Map();
   if (state.segmentJobId !== job.id) {
     for (const card of state.segmentCards.values()) removeSegmentCard(card);
-    state.segmentCards.clear(); state.segmentDrafts.clear(); state.expandedSegments.clear(); state.segmentSubmissions.clear();
+    state.segmentCards.clear(); state.segmentDrafts.clear(); state.expandedSegments.clear(); state.segmentSubmissions.clear(); state.segmentRewrites.clear();
     state.segmentPage = 1; state.segmentJobId = job.id;
   }
   if (job.kind !== "film") return;
@@ -235,6 +330,17 @@ function renderVideoSegments(job) {
   $("segments-summary").textContent = t("segmentsSummary", { ready: segments.filter(s => s.url).length, total: segments.length });
   $("segments-page-label").textContent = t("segmentPageLabel", { page: state.segmentPage, pages, count: segments.length });
   renderPagination("segments", state.segmentPage, pages);
+  const canBatchRewrite = Boolean(job.can_rewrite_prompts && !state.submitting && !running(job));
+  const missingCount = Number(job.missing_h3_count || 0);
+  const missingKey = job.demo
+    ? (missingCount > 0 ? "rewriteMissingPromptsCount" : "rewriteMissingPrompts")
+    : (missingCount > 0 ? "rewriteMissingPromptsLiveCount" : "rewriteMissingPromptsLive");
+  $("rewrite-missing-prompts").textContent = t(missingKey, { count: missingCount });
+  $("rewrite-missing-prompts").disabled = !canBatchRewrite || missingCount <= 0;
+  $("rewrite-all-prompts").textContent = t(job.demo ? "rewriteAllPrompts" : "rewriteAllPromptsLive");
+  $("rewrite-all-prompts").disabled = !canBatchRewrite || !segments.length;
+  $("segments-rewrite-toolbar").className = job.demo ? "segments-rewrite-toolbar" : "segments-rewrite-toolbar live-paid";
+  $("segments-rewrite-hint").textContent = t(job.demo ? "segmentsRewriteDemoHint" : "segmentsRewriteHint");
   $("assembly-notice").hidden = !job.pending_video && !job.pending_assembly;
   $("assembly-notice").textContent = t(job.pending_video ? "segmentsNeedFrames" : "assemblyPending");
   $("assembly-hint").textContent = t(job.pending_video ? "segmentsNeedFrames" : job.assembly?.ready ? "assemblyHint" : "assemblyMissing");
@@ -252,7 +358,7 @@ function renderVideoSegments(job) {
     card.description.textContent = t("segmentDetails", { start: segment.start, end: segment.end, seconds: segment.seconds, count: segment.shots });
     card.status.textContent = t(segment.url ? "segmentReady" : "segmentWaiting");
     card.summary.textContent = t("segmentEditPrompt");
-    const note = segment.submission_unknown ? "segmentSubmissionUnknown" : segment.task_pending ? "segmentTaskPending" : segment.terminal_failed ? "segmentTerminalFailed" : segment.error ? "segmentFailedAttempt" : "";
+    const note = segment.submission_unknown ? "segmentSubmissionUnknown" : segment.task_pending ? "segmentTaskPending" : segment.terminal_failed ? "segmentTerminalFailed" : segment.error ? "segmentFailedAttempt" : (segment.url && segment.prompts_unapplied_to_clip) ? "segmentPromptsSavedNotInVideo" : "";
     const text = note ? t(note) : ""; if (card.attemptNote.textContent !== text) card.attemptNote.textContent = text;
     card.attemptNote.hidden = !text; card.error.textContent = segment.error || ""; card.error.hidden = !segment.error;
     card.sourceWarning.textContent = t("segmentSourceChanged"); card.sourceWarning.hidden = !segment.source_changed;
@@ -297,5 +403,17 @@ function initializeVideoSegments() {
   $("assemble-job").addEventListener("click", async () => {
     const job = state.selectedJob;
     if (job?.can_assemble) await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/assemble`, { version: job.assembly.version });
+  });
+  $("rewrite-missing-prompts").addEventListener("click", async () => {
+    const job = state.selectedJob;
+    if (!$("rewrite-missing-prompts").disabled && job?.can_rewrite_prompts) {
+      await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/segments/rewrite`, { scope: "missing" });
+    }
+  });
+  $("rewrite-all-prompts").addEventListener("click", async () => {
+    const job = state.selectedJob;
+    if (!$("rewrite-all-prompts").disabled && job?.can_rewrite_prompts) {
+      await runJobAction(`/api/jobs/${encodeURIComponent(job.id)}/segments/rewrite`, { scope: "all" });
+    }
   });
 }

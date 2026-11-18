@@ -30,6 +30,7 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
 2. <Picture N> is the N-th reference image in input order; the input names each one as 参考图片N. Give every image a role:
    - the reference sheet (参考总表 / 总表) is a design reference: cite it inside the Subject for the sets and props it designs;
    - an image that 只约束某角色身份 defines one <Subject> (carry over every look detail from the input: hair, eyes, outfit, props);
+   - a multi-character group sheet (多角色合图) maps a single <Picture N> to multiple distinct <Subject> entries — match each active character by the exact outfit, hair and facial features specified in the input so identities never swap, and if the input mentions absent sheet-mates (未出场角色), omit those absent characters completely from subject_definitions and every shot;
    - a key-frame image (「…」这个画面的样子) is the composition reference for the matching shot when that shot is in this segment,
      otherwise say it maps to no shot in this part;
    - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: use its opening composition as guidance, not as a hard timed keyframe;
@@ -61,6 +62,13 @@ NEGATIVE = re.compile(r"\b(no|not|without|never|avoid|don't|do not|free of)\b[^.
 
 class RewriteError(RuntimeError):
     pass
+
+
+class RewriteFatalError(RewriteError):
+    pass
+
+
+FATAL_REWRITE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
 
 
 def guide() -> str:
@@ -104,17 +112,99 @@ def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback
         "Write the rewrite now: the six sections only."]).strip()
 
 
+_THINK_EXACT_RE = re.compile(r"<think>|</think>", re.IGNORECASE)
+_THINK_ANY_RE = re.compile(r"</?think", re.IGNORECASE)
+
+
+def strip_think_blocks(raw: str, error_factory) -> str:
+    pos = 0
+    chunks = []
+    while True:
+        open_match = _THINK_EXACT_RE.search(raw, pos)
+        if open_match is None:
+            chunks.append(raw[pos:])
+            break
+        if open_match.group(0)[1] == "/":
+            raise error_factory()
+        chunks.append(raw[pos:open_match.start()])
+        close_match = _THINK_EXACT_RE.search(raw, open_match.end())
+        if close_match is None or close_match.group(0)[1] != "/":
+            raise error_factory()
+        pos = close_match.end()
+    rem = "".join(chunks)
+    if _THINK_ANY_RE.search(rem):
+        raise error_factory()
+    return rem.strip()
+
+
+def _strip_think_blocks_linear(raw: str) -> str:
+    return strip_think_blocks(raw, lambda: RewriteError(message("rewrite_empty")))
+
+
+def _strip_reasoning_and_fences(raw: str) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = _strip_think_blocks_linear(raw)
+    if not cleaned:
+        return ""
+    if cleaned.startswith("```"):
+        nl = cleaned.find("\n")
+        close_idx = cleaned.find("```", 3)
+        if nl == -1 or close_idx == -1 or close_idx != len(cleaned) - 3:
+            raise RewriteError("代码围栏未闭合或包含围栏外多余内容")
+        header = cleaned[3:nl].strip()
+        if header and not header.isalnum():
+            raise RewriteError("代码围栏标记无效")
+        cleaned = cleaned[nl + 1:close_idx].strip()
+    if "```" in cleaned:
+        raise RewriteError("提示词包含多余代码围栏")
+    return cleaned
+
+
+def strip_h3_wrappers(raw: str) -> str:
+    """Validate and remove <think>...</think> and outer code fences in O(N) time."""
+    return _strip_reasoning_and_fences(raw)
+
+
 def sections(text: str) -> dict:
-    """{section name: body}; raises when a section is missing or out of order."""
+    """{section name: body}; raises when a section is missing, empty, or out of order."""
+    text = _strip_reasoning_and_fences(text)
+    if not text:
+        raise RewriteError(message("rewrite_empty"))
     found = [(m.start(), m.group(1)) for m in re.finditer(r"^\s*(" + "|".join(SECTIONS) + r")\s*:", text, re.M)]
     names = [n for _, n in found]
-    if names != SECTIONS:
+    if names != SECTIONS or found[0][0] != 0:
         raise RewriteError("六块不全或顺序不对：" + "、".join(names))
     out = {}
     for k, (pos, name) in enumerate(found):
         end = found[k + 1][0] if k + 1 < len(found) else len(text)
         out[name] = text[pos:end].split(":", 1)[1].strip()
+    empty = [name for name in SECTIONS if not out[name]]
+    if empty:
+        raise RewriteError(message("rewrite_empty_sections", names="、".join(empty)))
     return out
+
+
+def _picture_problems(parts: dict, n_images: int) -> list[str]:
+    out = []
+    section_body = "\n".join(parts.values())
+    for token in re.findall(r"<Picture([^>]*)>", section_body):
+        if not re.fullmatch(r"\s+[0-9]+\s*", token):
+            out.append(message('rewrite_picture_token', value=('<Picture' + token + '>')[:100]))
+            continue
+        number = int(token)
+        if not 1 <= number <= n_images:
+            out.append(message('rewrite_picture_bound', number=number, count=n_images))
+    return out
+
+
+def cached_problems(text: str, n_images: int) -> list[str]:
+    """Structural and <Picture N> bound checks for cached paired H3 prompts."""
+    try:
+        parts = sections(text)
+    except RewriteError as exc:
+        return [str(exc)]
+    return _picture_problems(parts, n_images)
 
 
 def problems(text: str, n_images: int) -> list[str]:
@@ -126,13 +216,7 @@ def problems(text: str, n_images: int) -> list[str]:
     for name in ("detailed_description", "overall_soundscape"):
         for m in NEGATIVE.finditer(parts[name]):
             out.append(f"{name} still has a negative instruction: “{m.group(0)}”; remove it and describe only what is there")
-    for token in re.findall(r"<Picture([^>]*)>", text):
-        if not re.fullmatch(r"\s+[0-9]+\s*", token):
-            out.append(message('rewrite_picture_token', value=('<Picture' + token + '>')[:100]))
-            continue
-        number = int(token)
-        if not 1 <= number <= n_images:
-            out.append(message('rewrite_picture_bound', number=number, count=n_images))
+    out.extend(_picture_problems(parts, n_images))
     if "[Shot 1]" not in parts["detailed_description"]:
         out.append("detailed_description has no [Shot 1]")
     return out
@@ -162,7 +246,7 @@ def _claude(prompt: str) -> str:
     from an empty directory so no project files are read."""
     exe = claude_bin()
     if not exe:
-        raise RewriteError("没找到 claude 命令行；装上 Claude Code，或者设 H3_REWRITER=llm 用别的模型")
+        raise RewriteFatalError("没找到 claude 命令行；装上 Claude Code，或者设 H3_REWRITER=llm 用别的模型")
     with tempfile.TemporaryDirectory() as cwd:
         proc = subprocess.run([exe, "-p", "--output-format", "json", "--max-turns", "1", "--model", config.CLAUDE_MODEL,
                                "--tools", "", "--strict-mcp-config",
@@ -171,10 +255,14 @@ def _claude(prompt: str) -> str:
     try:
         out = json.loads(proc.stdout)
     except ValueError:
-        raise RewriteError(f"Claude 没有返回结果：{(proc.stderr or proc.stdout)[:300]}") from None
+        err_cls = RewriteFatalError if proc.returncode else RewriteError
+        raise err_cls(f"Claude 没有返回结果：{(proc.stderr or proc.stdout)[:300]}") from None
     if out.get("is_error"):
-        raise RewriteError(f"Claude 调用失败：{str(out.get('result'))[:300]}")
-    return str(out.get("result", ""))
+        raise RewriteFatalError(f"Claude 调用失败：{str(out.get('result'))[:300]}")
+    result = str(out.get("result") or "")
+    if not result.strip():
+        raise RewriteError("Claude 没有返回内容")
+    return result
 
 
 def _llm(prompt: str) -> str:
@@ -184,15 +272,28 @@ def _llm(prompt: str) -> str:
                            {"model": llm["rewrite_model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
                            timeout=600)
     except http.HTTPResponseError as exc:
-        raise RewriteError("改写模型请求失败：" + str(exc)[:300]) from None
+        err_cls = RewriteFatalError if exc.status_code in FATAL_REWRITE_STATUSES else RewriteError
+        raise err_cls("改写模型请求失败：" + str(exc)[:300]) from None
     if not isinstance(out, dict):
-        raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+        raise RewriteError(message("rewrite_empty"))
+    if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+        err_obj = out.get("error")
+        http_status = out.get("_http_status")
+        raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
+        detail = json.dumps(out, ensure_ascii=False)
+        low = detail.lower()
+        is_transient_5xx = (
+            (isinstance(http_status, int) and http_status >= 500 and raw_code not in FATAL_REWRITE_STATUSES)
+            or (isinstance(raw_code, int) and raw_code >= 500)
+        ) and not any(tok in low for tok in ("invalid_api_key", "api_key_invalid", "unauthorized", "insufficient_quota", "model_not_found"))
+        err_cls = RewriteError if is_transient_5xx else RewriteFatalError
+        raise err_cls("改写模型请求失败：" + detail[:300])
     choices = out.get("choices")
     first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
     msg = first.get("message") if isinstance(first.get("message"), dict) else {}
     text = msg.get("content")
-    if not text:
-        raise RewriteError("改写模型没有返回内容：" + json.dumps(out, ensure_ascii=False)[:300])
+    if not isinstance(text, str) or not text.strip():
+        raise RewriteError(message("rewrite_empty"))
     return text
 
 
@@ -202,18 +303,30 @@ def backend() -> str:
     return "claude" if claude_bin() else "llm"
 
 
-def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str) -> str:
-    """The H3 prompt for one clip. Two tries: the second one is told what was wrong with the first."""
+def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str, *, max_retries: int = 6) -> str:
+    """The H3 prompt for one clip. Retries up to `max_retries` times with concrete validation feedback."""
     call = _claude if backend() == "claude" else _llm
+    attempts = max(1, int(max_retries) + 1)
     feedback = ""
-    for _ in range(2):
-        text = call(request(prompt_zh, n_images, seconds, aspect, feedback))
-        text = re.sub(r"^```\w*\n|\n```$", "", text.strip())
-        issues = problems(text, n_images)
-        if not issues:
-            return assemble(sections(text))
+    for _ in range(attempts):
+        req_text = request(prompt_zh, n_images, seconds, aspect, feedback)
+        try:
+            raw = call(req_text)
+        except RewriteFatalError:
+            raise
+        except RewriteError as exc:
+            issues = [str(exc)]
+        else:
+            try:
+                cleaned = _strip_reasoning_and_fences(raw or "")
+            except RewriteError as exc:
+                issues = [str(exc)]
+            else:
+                issues = [message("rewrite_empty")] if not cleaned else problems(cleaned, n_images)
+                if not issues:
+                    return assemble(sections(cleaned))
         feedback = "\n".join(f"- {x}" for x in issues)
-    raise RewriteError("改写成 H3 格式两次都没过检查：" + feedback.replace("\n", " ")[:300])
+    raise RewriteError(message("rewrite_exhausted", attempts=attempts, detail=feedback.replace("\n", " ")[:300]))
 
 
 def is_rewritten(text: str) -> bool:

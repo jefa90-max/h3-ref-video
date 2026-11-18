@@ -6,14 +6,17 @@ import stat
 import sys
 from pathlib import Path
 
-from h3ref import config, film, frames
+from h3ref import config, film, frames, staging
 from h3ref.i18n import use_lang
 from .i18n import InputError, message
 from .jobs import write_json
 
 
 def read_json(path, default):
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    except FileNotFoundError:
+        return default
 
 
 def plan(request, check_images=True, *, records=None):
@@ -21,26 +24,37 @@ def plan(request, check_images=True, *, records=None):
     source = out / "inputs" / ("demo-film.json" if request["demo"] else "film.json")
     script = film.load(source, check_images=check_images)
     segments = film.plan(script["shots"])
-    pictures = {s["idx"]: film.refs(script, s, request["frames"]) for s in segments}
+    resolve_cache: dict[str, str] = {}
+    pictures = {s["idx"]: film.refs(script, s, request["frames"], resolve_cache=resolve_cache) for s in segments}
     wanted = [(s["idx"], p["shot"]) for s in segments for p in pictures[s["idx"]] if p["kind"] == "frame"]
     descriptions = []
     records = frame_records(request) if records is None else records
     pending = read_json(out / "inputs" / "frame-edit.json", {})
     active_pending = pending if pending and not pending.get("applied") else {}
-    compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records))
-    character_names = {c["picture"]: c["name"] for c in script.get("cast") or []}
+    compositions = film.saved_compositions(records, reference_versions=film.frame_reference_versions(script, segments, records, resolve_cache=resolve_cache))
+    all_cast = script.get("cast") or []
+    all_groups = film.group_cast_by_picture(all_cast, all_cast, resolve_cache=resolve_cache)
+    character_names = {}
+    for g in all_groups:
+        character_names[g["path"]] = g["name"]
+        if g["path"]:
+            character_names[staging.canonical_path_key(g["path"], resolve_cache)] = g["name"]
     for segment, shot in wanted:
         key = f"s{segment + 1}-{shot + 1}"
         pending_for_key = active_pending if active_pending.get("key") == key else {}
-        who = [c for c in script.get("cast") or [] if film.in_shots(c, [segments[segment]["shots"][shot]])]
-        characters = pending_for_key.get("character_reference_paths",
-                                         records.get(key, {}).get("character_reference_paths", [c["picture"] for c in who]))
+        who = [c for c in all_cast if film.in_shots(c, [segments[segment]["shots"][shot]])]
+        default_char_paths = [g["path"] for g in film.group_cast_by_picture(who, all_cast, resolve_cache=resolve_cache)]
+        raw_characters = pending_for_key.get("character_reference_paths",
+                                             records.get(key, {}).get("character_reference_paths", default_char_paths))
+        characters = film.deduplicate_paths(raw_characters, resolve_cache=resolve_cache)
         references = ([{"kind": "board", "path": script["board"], "name": ""}] if script.get("board") else [])
-        references += [{"kind": "character", "path": p, "name": character_names.get(p, "")} for p in characters]
+        references += [{"kind": "character", "path": p, "name": character_names.get(p) or character_names.get(staging.canonical_path_key(p, resolve_cache), "")} for p in characters]
         cached = records.get(key, {})
-        composition = compositions.get(key) or (cached.get("composition") if (cached.get("composition") or {}).get("version") != 2 else None)
+        composition = compositions.get(key) or (cached.get("composition") if not staging.is_structured(cached.get("composition")) else None)
         with use_lang(request.get("lang")):
-            prompt = pending_for_key.get("prompt") or cached.get("prompt") or frames.prompt(script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition)
+            prompt = pending_for_key.get("prompt") or cached.get("prompt") or frames.prompt(
+                script, segments[segment]["shots"][shot], who, bool(script.get("board")), composition, resolve_cache=resolve_cache,
+            )
         descriptions.append({"key": key, "segment": segment + 1, "shot": shot + 1, "prompt": prompt,
                              "references": references, "reference_paths": [r["path"] for r in references],
                              "path": str(out / "frames" / f"{key}.png")})
@@ -58,10 +72,11 @@ def character_references(request, identifier):
     source = inputs / "demo-film.json" if request["demo"] and (inputs / "demo-film.json").exists() else inputs / "film.json"
     script = film.load(source, check_images=False)
     references = []
-    for index, character in enumerate(script.get("cast") or []):
-        path = Path(character["picture"])
+    groups = film.group_cast_by_picture(script.get("cast") or [], script.get("cast") or [])
+    for index, group in enumerate(groups):
+        path = Path(group["path"]).expanduser().resolve()
         url = f"/api/jobs/{identifier}/characters/{index}?v={path.stat().st_mtime_ns}" if path.is_file() else None
-        references.append({"kind": "character", "path": str(path), "name": character["name"], "url": url})
+        references.append({"kind": "character", "path": str(path), "name": group["name"], "url": url})
     return references
 
 
@@ -283,9 +298,12 @@ def run(request):
     elif operation == "frames":
         script, segments, pictures, _ = plan(request)
         job = film.Job(out)
-        job.state.update(film_path=str(out / "inputs" / "film.json"), mode=request["frames"])
+        optimize = bool(request.get("optimize_storyboard", True))
+        job.state.update(film_path=str(out / "inputs" / "film.json"), mode=request["frames"], optimize_storyboard=optimize)
         job.save()
-        failures = film.stage_frames(job, script, segments, pictures, resume_tasks=request.get("resume_frame_tasks", False))
+        opt_kw = {} if optimize else {"optimize_storyboard": False}
+        failures = film.stage_frames(job, script, segments, pictures,
+                                     resume_tasks=request.get("resume_frame_tasks", False), **opt_kw)
         print(message("frames_partial", request["lang"], count=len(failures)) if failures else message("frames_ready", request["lang"]), flush=True)
     else:
         # Apply the CLI's --redo rule once, before any new paid generation. Retries
@@ -303,7 +321,8 @@ def run(request):
                 write_json(out / "inputs" / "request.json", request)
         film._IN_WORKBENCH_RUNNER.active = True
         try:
-            film.run(out, out / "inputs" / "film.json", request["frames"])
+            opt_kw = {} if request.get("optimize_storyboard", True) else {"optimize_storyboard": False}
+            film.run(out, out / "inputs" / "film.json", request["frames"], **opt_kw)
         finally:
             film._IN_WORKBENCH_RUNNER.active = False
 

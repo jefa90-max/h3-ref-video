@@ -8,8 +8,25 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from h3ref import film, media
+from h3ref import film, media, rewrite
 from .i18n import message
+
+
+def demo_h3_prompt(n_images: int, seconds: float, aspect: str, number: int) -> str:
+    refs_desc = ", ".join(f"<Subject {i}> from <Picture {i}>" for i in range(1, n_images + 1)) or "<Subject 1> Demo character"
+    retention = "; ".join(f"<Subject {i}>: fully_preserved" for i in range(1, max(1, n_images) + 1)) + "."
+    parts = {
+        "subject_definitions": f"{refs_desc} (DEMO offline preview for segment {number}).",
+        "summary": f"[reference generation] Offline demo H3 preview for segment {number} ({seconds:g}s, {aspect}).",
+        "retention_analysis": retention,
+        "detailed_description": (
+            f"Demo offline {aspect} clip ({seconds:g}s).\n"
+            f"[Shot 1] Offline preview of segment {number}; configure API keys and disable demo mode for real LLM rewriting."
+        ),
+        "overall_soundscape": "Natural ambient room tone and subtle movement foley.",
+        "non_diegetic_music": "N/A",
+    }
+    return "\n\n".join(f"{name}:\n{parts[name]}" for name in rewrite.SECTIONS)
 
 
 def placeholder(path, label, aspect):
@@ -41,9 +58,13 @@ def run(request):
     frames_count = 0
     if request["kind"] == "film":
         script = request["film"]
+        demo_cast_map: dict[str, str] = {}
         for index, person in enumerate(script.get("cast", [])):
-            if not Path(person["picture"]).is_file():
-                person["picture"] = str(placeholder(out / "inputs" / f"demo-cast-{index}.png", f"CAST {index + 1}", script["aspect"]))
+            orig_pic = str(person.get("picture") or "")
+            if not Path(orig_pic).is_file():
+                if orig_pic not in demo_cast_map:
+                    demo_cast_map[orig_pic] = str(placeholder(out / "inputs" / f"demo-cast-{index}.png", f"CAST {index + 1}", script["aspect"]))
+                person["picture"] = demo_cast_map[orig_pic]
         if script.get("board") and not Path(script["board"]).is_file():
             script["board"] = str(placeholder(out / "inputs" / "demo-board.png", "BOARD", script["aspect"]))
         source = out / "inputs" / "demo-film.json"
@@ -95,6 +116,17 @@ def run(request):
             clips.append(clip)
             log("demo_clip", name=name)
         final = out / ("film.mp4" if request["kind"] == "film" else "clip.mp4")
+        if request["kind"] == "film" and (out / "state.json").is_file():
+            fjob = film.Job(out)
+            changed_demo = False
+            for segment in segments:
+                srec = fjob.state.get("segs", {}).get(str(segment["idx"]))
+                if isinstance(srec, dict) and ("manual_rewrite" in srec or "clip_prompts" in srec):
+                    srec.pop("manual_rewrite", None)
+                    srec.pop("clip_prompts", None)
+                    changed_demo = True
+            if changed_demo:
+                fjob.save()
         if len(clips) == 1:
             shutil.copyfile(clips[0], final)
         else:

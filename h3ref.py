@@ -47,7 +47,13 @@ def cmd_one(a):
     t0 = time.time()
     if not st.get("h3"):
         text = Path(a.prompt).read_text(encoding="utf-8")
-        st["h3"] = text if rewrite.is_rewritten(text) else rewrite.rewrite(text, len(images), a.seconds, a.aspect)
+        if rewrite.is_rewritten(text):
+            issues = rewrite.cached_problems(text, len(images))
+            if issues:
+                raise rewrite.RewriteError("; ".join(issues))
+            st["h3"] = rewrite.strip_h3_wrappers(text)
+        else:
+            st["h3"] = rewrite.rewrite(text, len(images), a.seconds, a.aspect)
         (out / "prompt.h3.txt").write_text(st["h3"], encoding="utf-8")
         save()
         print("改写好了：", out / "prompt.h3.txt")
@@ -101,6 +107,8 @@ def main():
     f.add_argument("job", type=Path)
     f.add_argument("--film", type=Path)
     f.add_argument("--frames", default="shot", choices=["shot", "first", "none"])
+    f.add_argument("--no-optimize-storyboard", dest="optimize_storyboard", action="store_false", default=True,
+                   help=message("optimize_storyboard_help"))
     f.add_argument("--redo", type=int, action="append", default=[], help="给第 N 段换种子重跑（可以写多次）")
     r = sub.add_parser("rewrite", help="只把提示词改写成 H3 官方格式")
     r.add_argument("--prompt", required=True)
@@ -116,7 +124,7 @@ def main():
             raise SystemExit("--seconds 只能是 5 到 15")
         cmd_one(a)
     elif a.cmd == "film":
-        film.run(a.job, a.film, a.frames, a.redo, resume_frame_tasks=True)
+        film.run(a.job, a.film, a.frames, a.redo, resume_frame_tasks=True, optimize_storyboard=a.optimize_storyboard)
         failed = film.Job(a.job).state.get("frame_failures") or []
         if failed:
             raise SystemExit(message("frames_cli_incomplete", keys=", ".join(failed), path=a.job / "state.json"))

@@ -1096,15 +1096,35 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
                     self.assertIsNone(dir_and_missing_meta[str(root)][1])
                     self.assertIsNone(dir_and_missing_meta[str(root / "missing-ref.png")][1])
 
-                    actor_stats = {"count": 0}
+                    actor_stats = {"count": 0, "resolves": 0}
+                    orig_resolve = Path.resolve
+                    orig_realpath = os.path.realpath
+                    in_resolve = {"depth": 0}
                     def counted_stat(p, *a, **kw):
                         if p == actor or p == actor_resolved:
                             actor_stats["count"] += 1
                         return orig_stat(p, *a, **kw)
+                    def counted_resolve(p, *a, **kw):
+                        in_resolve["depth"] += 1
+                        try:
+                            res = orig_resolve(p, *a, **kw)
+                        finally:
+                            in_resolve["depth"] -= 1
+                        if p == actor or res == actor_resolved:
+                            actor_stats["resolves"] += 1
+                        return res
+                    def counted_realpath(p, *a, **kw):
+                        res = orig_realpath(p, *a, **kw)
+                        if in_resolve["depth"] == 0 and (str(p) == str(actor) or Path(res) == actor_resolved):
+                            actor_stats["resolves"] += 1
+                        return res
                     arts = jobs.artifacts(jobs.records["f1"])
-                    with patch.object(Path, "stat", counted_stat):
+                    with patch.object(Path, "stat", counted_stat), \
+                         patch.object(Path, "resolve", counted_resolve), \
+                         patch("os.path.realpath", counted_realpath):
                         sb_mod.view(req, arts, True, "f1", records={})
                     self.assertLessEqual(actor_stats["count"], 4, f"Expected cached actor.png stat calls, got {actor_stats['count']}")
+                    self.assertLessEqual(actor_stats["resolves"], 4, f"Expected cached actor.png resolve/realpath calls, got {actor_stats['resolves']}")
                 finally:
                     jobs.close()
 

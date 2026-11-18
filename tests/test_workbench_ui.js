@@ -523,3 +523,310 @@ test("create.js validates job-form submission, retains matching cast bindings, a
   assert.deepEqual(filmPost.body.reference_bindings, { "cast:0": "alice.png", "cast:1": "charlie.png" });
 });
 
+test("create.js supports optimize_storyboard toggle and merging/splitting multi-character reference groups", async () => {
+  const { $, element } = makeDom();
+  const posted = [];
+  let uploadCounter = 0;
+  $("output-dir").value = "/tmp/out-root";
+  $("frames").value = "shot";
+
+  const context = vm.createContext({
+    state: { language: "en", config: { output_root: "/tmp/out-root", keys: {} }, jobs: [], ready: true },
+    $, element, renderPage: null,
+    FormData: class { append() {} },
+    window: { location: { assign() {} } },
+    document: { addEventListener() {}, querySelector: () => element("div"), querySelectorAll: () => [] },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => String(v[n] ?? "")),
+    running: () => false,
+    busy: () => false,
+    renderConfig() {},
+    showError(e) { throw e; },
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    loadLanguage: async () => {},
+    request: async (url) => {
+      if (url === "/api/uploads") {
+        uploadCounter += 1;
+        return { files: [{ id: `group-${uploadCounter}.png`, name: `g${uploadCounter}.png`, path: `/tmp/g${uploadCounter}.png`, url: `/u/g${uploadCounter}` }] };
+      }
+      return { config: { output_root: "/tmp/out-root", keys: {} }, jobs: [] };
+    },
+    post: async (url, body) => {
+      posted.push({ url, body: structuredClone(body) });
+      if (url === "/api/film/references") {
+        const cast = body.film.cast || [];
+        return {
+          film: body.film,
+          slots: cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: c.look || "", required: true })),
+        };
+      }
+      return { id: "job-grouped" };
+    },
+    setTimeout: () => 1,
+    clearTimeout() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "create.js"), "utf8"), context);
+  await new Promise((r) => setImmediate(r));
+
+  // Default optimize_storyboard is checked; switching frames to "none" disables it
+  assert.equal($("optimize-storyboard").checked, true);
+  $("frames").value = "none";
+  $("frames").events.change();
+  assert.equal($("optimize-storyboard").disabled, true);
+  $("frames").value = "shot";
+  $("frames").events.change();
+  assert.equal($("optimize-storyboard").disabled, false);
+  $("optimize-storyboard").checked = false;
+  $("optimize-storyboard").events.change();
+
+  // Load 3 characters, merge cast:0 and cast:2 into one group card, upload once for both
+  $("film-json").value = JSON.stringify({
+    cast: [{ name: "Queen", look: "gold crown" }, { name: "Monk", look: "red robe" }, { name: "Monkey", look: "golden armor" }],
+    shots: [{ action: "Queen and Monkey talk" }],
+  });
+  await context.refreshFilmReferences();
+
+  function allDescendants(node) {
+    return [node, ...(node.children || []).flatMap(allDescendants)];
+  }
+  let tree = allDescendants($("film-reference-list"));
+  const checkboxes = tree.filter((n) => n.className.includes("film-cast-select"));
+  assert.equal(checkboxes.length, 3);
+  checkboxes[0].checked = true;
+  checkboxes[0].events.change();
+  checkboxes[2].checked = true;
+  checkboxes[2].events.change();
+
+  tree = allDescendants($("film-reference-list"));
+  const mergeBtn = tree.find((n) => n.className.includes("merge-cast-button"));
+  assert.ok(mergeBtn && !mergeBtn.disabled);
+  mergeBtn.events.click();
+
+  // Now there is 1 grouped card ("Queen / Monkey") + 1 solo card ("Monk") = 2 upload inputs
+  tree = allDescendants($("film-reference-list"));
+  assert.equal(tree.filter((n) => n.className.includes("film-cast-select")).length, 0, "Lone remaining ungrouped character must not render dead-end merge checkbox");
+  assert.equal(tree.find((n) => n.className.includes("merge-cast-button")), undefined, "Merge button must hide when <2 ungrouped characters remain");
+  const uploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  assert.equal(uploads.length, 2);
+  uploads[0].files = [{ name: "queen-monkey.png" }];
+  await uploads[0].events.change();
+  uploads[1].files = [{ name: "monk.png" }];
+  await uploads[1].events.change();
+
+  await $("job-form").events.submit({ preventDefault() {} });
+  const jobPost = posted.filter((p) => p.url === "/api/jobs").at(-1);
+  assert.equal(jobPost.body.optimize_storyboard, false);
+  assert.deepEqual(jobPost.body.reference_bindings, {
+    "cast:0": "group-1.png",
+    "cast:2": "group-1.png",
+    "cast:1": "group-2.png",
+  });
+  assert.deepEqual(jobPost.body.reference_groups, [["cast:0", "cast:2"]]);
+
+  // Splitting the group restores 3 individual cards
+  tree = allDescendants($("film-reference-list"));
+  const splitBtn = tree.find((n) => n.className.includes("film-group-split"));
+  assert.ok(splitBtn);
+  splitBtn.events.click();
+  tree = allDescendants($("film-reference-list"));
+  assert.equal(tree.filter((n) => n.className.includes("film-reference-upload")).length, 3);
+
+  // Partial upload on only 1 of 2 selected roles must NOT silently bind that solo image as a combined group sheet
+  context.state.filmBindings.clear();
+  context.renderFilmReferences();
+  tree = allDescendants($("film-reference-list"));
+  const soloUploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  soloUploads[0].files = [{ name: "queen-solo.png" }];
+  await soloUploads[0].events.change();
+  assert.equal(context.state.filmBindings.has("cast:0"), true);
+  assert.equal(context.state.filmBindings.has("cast:1"), false);
+
+  tree = allDescendants($("film-reference-list"));
+  const soloChecks = tree.filter((n) => n.className.includes("film-cast-select"));
+  soloChecks[0].checked = true;
+  soloChecks[0].events.change();
+  soloChecks[1].checked = true;
+  soloChecks[1].events.change();
+  tree = allDescendants($("film-reference-list"));
+  tree.find((n) => n.className.includes("merge-cast-button")).events.click();
+  assert.equal(context.state.filmBindings.has("cast:0"), false, "Solo image must not carry over to newly merged multi-role group");
+  assert.equal(context.state.filmBindings.has("cast:1"), false);
+
+  // Upload a 2-role group sheet for cast:0 + cast:1, then rename cast:1 in JSON -> dissolved group must clear multi-role sheet from cast:0
+  tree = allDescendants($("film-reference-list"));
+  const newGroupUploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  newGroupUploads[0].files = [{ name: "queen-monk-sheet.png" }];
+  await newGroupUploads[0].events.change();
+  assert.equal(context.state.filmBindings.has("cast:0"), true);
+  $("film-json").value = JSON.stringify({
+    cast: [{ name: "Queen", look: "gold crown" }, { name: "NewMonk", look: "red robe" }, { name: "Monkey", look: "golden armor" }],
+    shots: [{ action: "Queen talks" }],
+  });
+  await context.refreshFilmReferences();
+  assert.equal(context.state.filmGroups.length, 0);
+  assert.equal(context.state.filmBindings.has("cast:0"), false, "Dissolved 2-role group sheet must not stay bound to the surviving solo role");
+
+  // Toggling a cast merge checkbox updates merge button in place without destroying/recreating card DOM
+  tree = allDescendants($("film-reference-list"));
+  const firstCheck = tree.find((n) => n.className.includes("film-cast-select"));
+  firstCheck.checked = true;
+  firstCheck.events.change();
+  assert.equal(allDescendants($("film-reference-list")).includes(firstCheck), true, "Checkbox toggle must not tear down card DOM");
+
+  // 9-image limit hint accounts for frames="first" (+2 frame + prev on seg 2+) and per-segment cast subsets in "shot" mode
+  const sevenCast = Array.from({ length: 7 }, (_, i) => ({ name: `Role${i + 1}`, look: "look" }));
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: sevenCast,
+    shots: [
+      { start: 0, end: 10, action: "全员站立" },
+      { start: 10, end: 20, action: "全员交谈" },
+    ],
+  });
+  context.post = async (url, body) => {
+    if (url === "/api/film/references") {
+      return {
+        film: { ...body.film, board: true },
+        slots: [
+          ...body.film.cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: "", required: true })),
+          { id: "board", kind: "board", name: "", description: "", required: true },
+        ],
+      };
+    }
+    return {};
+  };
+  $("frames").value = "shot";
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "7 cast + board + 1 shot in shot mode (9 refs) must not warn",
+  );
+  $("frames").value = "first";
+  $("frames").events.change();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    true,
+    "7 cast + board + frame + prev in first mode on seg 2 (10 refs) must warn before submit",
+  );
+});
+
+test("create.js does not fall back to all cast on characterless single-shot scenery frames", async () => {
+  const { $, element } = makeDom();
+  $("output-dir").value = "/tmp/out-root";
+  $("frames").value = "shot";
+
+  const nineCast = Array.from({ length: 9 }, (_, i) => ({ name: `Role${i + 1}`, look: "look" }));
+  const context = vm.createContext({
+    state: { language: "en", config: { output_root: "/tmp/out-root", keys: {} }, jobs: [], ready: true },
+    $, element, renderPage: null,
+    FormData: class { append() {} },
+    window: { location: { assign() {} } },
+    document: { addEventListener() {}, querySelector: () => element("div"), querySelectorAll: () => [] },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => String(v[n] ?? "")),
+    running: () => false,
+    busy: () => false,
+    renderConfig() {},
+    showError(e) { throw e; },
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    loadLanguage: async () => {},
+    request: async () => ({ config: { output_root: "/tmp/out-root", keys: {} }, jobs: [] }),
+    post: async (url, body) => {
+      if (url === "/api/film/references") {
+        return {
+          film: { ...body.film, board: true },
+          slots: [
+            ...body.film.cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: "", required: true })),
+            { id: "board", kind: "board", name: "", description: "", required: true },
+          ],
+        };
+      }
+      return {};
+    },
+    setTimeout: () => 1,
+    clearTimeout() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "create.js"), "utf8"), context);
+  await new Promise((r) => setImmediate(r));
+
+  function allDescendants(node) {
+    return [node, ...(node.children || []).flatMap(allDescendants)];
+  }
+
+  // Seg 1 starts with a characterless scenery shot, followed by a 3-role shot; Seg 2 has the remaining 6 roles.
+  // Per-shot frame references never exceed 1 (board) + 6 (roles) = 7, and segment refs never exceed 1 + 6 + 2 = 9.
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: nineCast,
+    shots: [
+      { start: 0, end: 5, action: "空山新雨后，远景云雾缭绕" },
+      { start: 5, end: 12, action: "Role1、Role2 与 Role3 沿着石阶上山" },
+      { start: 12, end: 24, action: "Role4、Role5、Role6、Role7、Role8、Role9 在山门前等候" },
+    ],
+  });
+  $("frames").value = "shot";
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "Characterless scenery shot in shot mode must use [] (board only = 1 ref), not fall back to all 9 cast (10 refs)",
+  );
+
+  $("frames").value = "first";
+  $("frames").events.change();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "Characterless opening shot (segShots[0]) in first mode must not fall back to all 9 cast",
+  );
+
+  // Conversely, when an entire segment is characterless, segment-level refs still fall back to all cast (matching film.refs)
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: nineCast,
+    shots: [{ start: 0, end: 8, action: "空山新雨后，远景云雾缭绕" }],
+  });
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    true,
+    "Whole-segment characterless fallbackAll=true must still count all 9 cast + board + first frame (11 > 9)",
+  );
+
+  // red-team#1: In shot mode, 9 cast sheets + board + group-word shot ('众人') drops board and omits frame slots (total 9 <= 9),
+  // matching film.refs() so create.js must NOT show a false over-limit error.
+  $("frames").value = "shot";
+  $("film-json").value = JSON.stringify({
+    board: "board.png",
+    cast: nineCast,
+    shots: [{ start: 0, end: 6, action: "众人在议事厅集合商议" }],
+  });
+  await context.refreshFilmReferences();
+  assert.equal(
+    allDescendants($("film-reference-list")).some((n) => n.className.includes("field-error")),
+    false,
+    "9 cast sheets + board in shot mode drops board and omits frames (9 <= 9), matching film.refs",
+  );
+
+  // specialist-batched#1: Malformed non-array shots ({}) and non-array aliases ({} / string) during import/typing must NOT throw TypeError or lock #film-json
+  await $("film-import").events.change({
+    target: {
+      files: [{
+        name: "partial.json",
+        size: 120,
+        text: async () => JSON.stringify({
+          cast: [{ name: "Role1", aliases: { bad: 1 } }, { name: "Role2", aliases: "not-array" }],
+          shots: { not: "an-array" },
+        }),
+      }],
+      value: "partial.json",
+    },
+  });
+  assert.equal($("film-json").readOnly, false, "#film-json must unlock cleanly even when shots/aliases are malformed");
+  assert.equal($("film-import").disabled, false, "#film-import must unlock cleanly even when shots/aliases are malformed");
+  assert.ok($("film-reference-list").children.length >= 2, "Cast upload cards must still render when shots/aliases are malformed");
+});
+

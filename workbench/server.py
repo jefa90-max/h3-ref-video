@@ -115,7 +115,7 @@ def create_app(storage=None, env_path=None):
     @app.errorhandler(InputError)
     def input_error(exc):
         status = 404 if exc.key == 'not_found' else 400
-        if request.endpoint == 'regenerate_segment':
+        if request.endpoint in ('regenerate_segment', 'rewrite_segment', 'rewrite_prompts'):
             field = exc.values.get('field') or {'segment_changed': 'version', 'segment_number': 'number'}.get(exc.key)
             return segment_problem(exc.key, exc.localized(language()), status, field=field)
         return jsonify(error=jobs.redact(exc.localized(language()))), status
@@ -126,7 +126,7 @@ def create_app(storage=None, env_path=None):
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
-        if request.endpoint in ('regenerate_segment', 'get_job'):
+        if request.endpoint in ('regenerate_segment', 'rewrite_segment', 'rewrite_prompts', 'get_job'):
             import traceback
             instance = uuid.uuid4().hex
             number = (request.view_args or {}).get('number', '?')
@@ -333,9 +333,11 @@ def create_app(storage=None, env_path=None):
         if script.get("board"):
             allowed.add(Path(script["board"]).resolve())
         who = [c for c in script.get("cast") or [] if film.in_shots(c, [segment["shots"][shot_idx]])]
+        default_char_paths = [g["path"] for g in film.group_cast_by_picture(who, script.get("cast") or [])]
         pending_frame = read_json(out / "inputs" / "frame-edit.json", {})
         active_pending = pending_frame if pending_frame and not pending_frame.get("applied") and pending_frame.get("key") == key else {}
-        characters = active_pending.get("character_reference_paths") if "character_reference_paths" in active_pending else frame_records(saved).get(key, {}).get("character_reference_paths", [c["picture"] for c in who])
+        raw_characters = active_pending.get("character_reference_paths") if "character_reference_paths" in active_pending else frame_records(saved).get(key, {}).get("character_reference_paths", default_char_paths)
+        characters = film.deduplicate_paths(raw_characters)
         ref_paths = ([script["board"]] if script.get("board") else []) + list(characters)
         if not (0 <= index < len(ref_paths)):
             raise InputError("not_found", value=f"{key}/{index}")
@@ -362,6 +364,27 @@ def create_app(storage=None, env_path=None):
             return jsonify(jobs.start_video_operation(identifier, 'segment', dict(env), values.get('version'), number,
                 prompt=values.get('prompt'), prompt_format=values.get('prompt_format', '') if edited else None,
                 prompt_version=values.get('prompt_version', '') if edited else None))
+
+    @app.post("/api/jobs/<identifier>/segments/<int:number>/rewrite")
+    def rewrite_segment(identifier, number):
+        values = request.get_json()
+        if not isinstance(values, dict):
+            invalid("segment", values, "object")
+        with jobs.lock:
+            edited = any(key in values for key in ('prompt', 'prompt_format', 'prompt_version'))
+            fmt = values['prompt_format'] if 'prompt_format' in values else ('source' if edited else None)
+            return jsonify(jobs.start_video_operation(identifier, 'rewrite_segment', dict(env), None, number,
+                prompt=values.get('prompt'), prompt_format=fmt,
+                prompt_version=values.get('prompt_version', '') if edited else None, edited=edited))
+
+    @app.post("/api/jobs/<identifier>/segments/rewrite")
+    def rewrite_prompts(identifier):
+        values = request.get_json()
+        if not isinstance(values, dict):
+            invalid("segment", values, "object")
+        with jobs.lock:
+            return jsonify(jobs.start_video_operation(identifier, 'rewrite_prompts', dict(env), None,
+                scope=values.get('scope', 'missing')))
 
     @app.post("/api/jobs/<identifier>/assemble")
     def assemble_film(identifier):

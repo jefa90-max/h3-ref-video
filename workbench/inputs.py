@@ -70,7 +70,11 @@ def validate(payload, root):
     job["output_dir"] = text(job.get("output_dir", ""), "output_dir", empty=True)
     if "output_root" in job:
         job["output_root"] = text(job["output_root"], "output_root")
-    job["operation"] = choice(job.get("operation", "pipeline"), "operation", ("pipeline", "frames", "frame", "segment", "assemble"))
+    job["operation"] = choice(
+        job.get("operation", "pipeline"),
+        "operation",
+        ("pipeline", "frames", "frame", "segment", "assemble", "rewrite_segment", "rewrite_prompts"),
+    )
     if job["kind"] == "one":
         choice(job["operation"], "operation", ("pipeline",))
         job["prompt"] = text(job.get("prompt"), "prompt")
@@ -90,6 +94,9 @@ def validate(payload, root):
             invalid("check", job["check"], "choice")
     else:
         job["frames"] = choice(job.get("frames", "shot"), "frames", ("shot", "first", "none"))
+        if not isinstance(job.get("optimize_storyboard", True), bool):
+            invalid("optimize_storyboard", job.get("optimize_storyboard"), "choice")
+        job["optimize_storyboard"] = job.get("optimize_storyboard", True)
         base = Path(text(job.get("film_base_dir", "."), "film_base_dir")).expanduser()
         base = (base if base.is_absolute() else root / base).resolve()
         job["film_base_dir"] = str(base)
@@ -143,23 +150,46 @@ def validate(payload, root):
             except (SystemExit, ValueError, TypeError, KeyError, OverflowError) as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
         job["film"] = loaded
+        seg_pics = []
         for segment in planned:
             try:
-                film.refs(loaded, segment, job["frames"])
+                seg_pics.append((segment, film.refs(loaded, segment, job["frames"])))
             except SystemExit as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
+        if job["frames"] != "none":
+            saved_frames = {}
+            if job["output_dir"]:
+                out_cand = Path(job["output_dir"]).expanduser()
+                out_cand = (out_cand if out_cand.is_absolute() else root / out_cand).resolve()
+                state_cand = out_cand / "state.json"
+                if state_cand.is_file():
+                    try:
+                        saved_frames = json.loads(state_cand.read_text(encoding="utf-8")).get("frames") or {}
+                    except (OSError, ValueError):
+                        saved_frames = {}
+            for segment, pics in seg_pics:
+                seg_idx = segment["idx"]
+                for pic in pics:
+                    if pic["kind"] != "frame":
+                        continue
+                    shot_idx = pic["shot"]
+                    shot = segment["shots"][shot_idx]
+                    fkey = f"s{seg_idx + 1}-{shot_idx + 1}"
+                    frame_refs = film.frame_reference_paths(loaded, shot, saved_frames.get(fkey, {}))
+                    if len(frame_refs) > config.MAX_IMAGES:
+                        raise InputError("too_many_references", count=len(frame_refs), limit=config.MAX_IMAGES)
     return job
 
 
 def preflight(job, env):
-    if job.get("operation") in ("segment", "assemble"):
+    if job.get("operation") in ("segment", "assemble", "rewrite_segment", "rewrite_prompts"):
         from .segments import preflight as segment_preflight
         segment_preflight(job, env)
         return
     if job["demo"]:
         return
     import shutil
-    from h3ref.rewrite import is_rewritten
+    from h3ref.rewrite import is_rewritten, strip_h3_wrappers
     required = []
     out = Path(job["output_dir"]) if job.get("output_dir") else None
     state_file = out / "state.json" if out else None
@@ -168,7 +198,7 @@ def preflight(job, env):
     needs_rh, needs_rewrite, needs_frames, needs_vision, needs_composition = False, False, False, False, False
     if job["kind"] == "one":
         needs_rh = True
-        h3 = state.get("h3") or (job["prompt"] if is_rewritten(job["prompt"]) else "")
+        h3 = state.get("h3") or (strip_h3_wrappers(job["prompt"]) if is_rewritten(job["prompt"]) else "")
         needs_rewrite = not h3
         needs_vision = config.SUBTITLE_CHECKS_ENABLED and (job.get("check", False) or any(ord(ch) > 0x2E80 for ch in h3))
     else:
@@ -200,7 +230,7 @@ def preflight(job, env):
                         fkey = f"s{segment['idx'] + 1}-{p['shot'] + 1}"
                         fcached = state.get("frames", {}).get(fkey) or {}
                         needs_frames |= (not out or not (out / "frames" / f"{fkey}.png").exists() or frames.task_pending(fcached))
-                if operation != "frame":
+                if operation != "frame" and job.get("optimize_storyboard", True):
                     for picture in pics:
                         if picture["kind"] != "frame":
                             continue
@@ -215,8 +245,13 @@ def preflight(job, env):
                         paths = film.picture_paths(out, segment, pics) if out is not None else []
                         tail_invalidated = any(p["kind"] == "prev" and (segment["idx"] - 1) in invalidated for p in pics)
                         reference = film.reference_version(paths) if (out is not None and not tail_invalidated and all(p.is_file() for p in paths)) else None
-                        needs_rewrite |= not (rec.get("h3") and rec.get("zh") == zh and rec.get("h3_source", rec.get("zh")) == zh
-                                              and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference))
+                        needs_rewrite |= not (
+                            rec.get("h3")
+                            and rec.get("zh") == zh
+                            and rec.get("h3_source", rec.get("zh")) == zh
+                            and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference)
+                            and ("subject_definitions:" not in rec["h3"] or not film.rewrite.cached_problems(rec["h3"], len(pics)))
+                        )
                     needs_rh |= not (out and segment["idx"] not in invalidated and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists() and rec.get("cny") is not None)
         if operation == "frame":
             needs_frames = True
