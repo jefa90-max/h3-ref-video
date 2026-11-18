@@ -123,7 +123,7 @@ key 仅按选择写入被 git 忽略的本机 `.env`（权限 0600），不会�
 - `h3ref.py` 命令入口；`h3ref/film.py` 分镜脚本、切段、参考图顺序、中文提示词和整条流程；`staging.py` 逐镜调度结构校验与渲染；`rewrite.py` 改写成官方格式和格式检查；`frames.py` 分镜图；`rh.py` RunningHub；`config.py`、`http.py`、`i18n.py` 配置、请求脱敏与多语言文案；`check.py` 烧字幕检查；`media.py` ffmpeg；`workbench.py` 与 `workbench/` 本地 Web 工作台；`start-windows.cmd` 与 `scripts/` Windows 一键启动及发布打包。
 - `prompts/h3_examples.md`：两条手工改写、在 H3 上测过的样例（中文 Seedance 写法 → 官方六段式），改写时一起给模型看。
 - `workflows/h3-ref2va-turbo.json`：RunningHub 用户 user_3ww6n2yr 的公开工作流[「加速版-MiniMax H3｜多参图像音频极速生视频」](https://www.runninghub.cn/post/2113525277564424193)，归原作者，说明见 [workflows/README.md](workflows/README.md)。
-- 文档索引：[参与贡献与离线测试](CONTRIBUTING.md)、[工作台设计规范](DESIGN.md)、[安全说明](SECURITY.md)、[工作台交互设计](docs/design/local-workbench.md)、[视频片段审阅设计](docs/design/video-segment-review.md) 与 `docs/plans/` 方案记录。
+- 文档索引：[参与贡献与离线测试](CONTRIBUTING.md)、[工作台设计规范](DESIGN.md)、[安全说明](SECURITY.md)、[Plyr 依赖说明](docs/vendor-plyr.md)、[工作台验证记录](docs/workbench-verification.md)、[工作台交互设计](docs/design/local-workbench.md)、[视频片段审阅设计](docs/design/video-segment-review.md) 与 `docs/plans/` 方案记录。
 
 ## 许可
 
