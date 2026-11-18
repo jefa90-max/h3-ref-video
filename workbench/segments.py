@@ -754,8 +754,17 @@ def preflight(request, env):
         raise InputError('segment_terminal', number=request['segment'])
     if staged.get('submission_unknown') and not staged.get('task'):
         raise InputError('segment_locked', number=request['segment'])
-    if not env.get('RUNNINGHUB_API_KEY', '').strip():
-        raise InputError('keys', names='RUNNINGHUB_API_KEY')
+    from .inputs import invalid, video_provider_missing_keys
+    if staged.get('task'):
+        seg_provider = staged.get('provider') or 'runninghub'
+    else:
+        try:
+            seg_provider = config.video_settings(env)['provider']
+        except ValueError:
+            invalid('COMFYUI_URL', '[URL]', 'choice')
+    missing_video = video_provider_missing_keys(seg_provider, env)
+    if missing_video:
+        raise InputError('keys', names=', '.join(missing_video))
     if staged.get('task'):
         return
     if pending.get('prompt_format') == 'source' and not pending.get('reuse_h3') and not staged.get('h3'):

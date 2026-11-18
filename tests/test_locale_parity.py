@@ -51,6 +51,17 @@ class LocaleParityTest(unittest.TestCase):
                     "rewriteMissingPrompts",
                     "rewriteAllPrompts",
                     "frameReferencesAtLimit",
+                    "videoProvider",
+                    "comfyUrl",
+                    "comfyKey",
+                    "comfyPreset",
+                    "colabAutoStart",
+                    "runtimeTitle",
+                    "runtimeStart",
+                    "runtimeStop",
+                    "runtimeOpenDriveAuth",
+                    "runtimeConfirmDriveAuth",
+                    "runtimeStopConfirmWarning",
                 ):
                     self.assertIn(required_key, zh_data)
                     self.assertIn(required_key, en_data)

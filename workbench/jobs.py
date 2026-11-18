@@ -149,6 +149,7 @@ class Jobs:
         self.children = {}
         self.secrets = set()
         self.closing = False
+        self.before_video_launch = None
         (storage / "jobs").mkdir(parents=True, exist_ok=True)
         for path in sorted((storage / "jobs").glob("*.json")):
             try:
@@ -408,6 +409,15 @@ class Jobs:
             selected = newest[:limit] if limit else newest
             return [self.snapshot(record["id"], False) for record in selected]
 
+    def has_active_video_work(self):
+        with self.lock:
+            return any(
+                r.get("status") in ("queued", "running")
+                and not r.get("demo")
+                and r.get("operation", "pipeline") in ("pipeline", "segment")
+                for r in self.records.values()
+            )
+
     def available(self):
         if self.closing or self.children or any(r["status"] in ("queued", "running") for r in self.records.values()):
             raise InputError("busy")
@@ -438,6 +448,8 @@ class Jobs:
         request.pop("reset_applied", None)
         request.pop("resume_frame_tasks", None)
         preflight(request, env)
+        if self.before_video_launch is not None and not request["demo"] and request["kind"] == "one":
+            self.before_video_launch(request, env)
         with self.lock:
             self.available()
             identifier = uuid.uuid4().hex[:12]
@@ -628,6 +640,8 @@ class Jobs:
                 request["_reconciled_segs"] = reconciled_segs
             try:
                 preflight(request, env)
+                if self.before_video_launch is not None and not request["demo"]:
+                    self.before_video_launch(request, env)
             finally:
                 request.pop("_reconciled_segs", None)
             if confirmation:
@@ -685,8 +699,12 @@ class Jobs:
             elif operation == "rewrite_prompts":
                 request.pop("segment", None)
                 request["rewrite_scope"] = scope
-            preflight(request, env)
-            request.pop("_segment_preparation", None)
+            try:
+                preflight(request, env)
+                if self.before_video_launch is not None and not request["demo"] and operation == "segment":
+                    self.before_video_launch(request, env)
+            finally:
+                request.pop("_segment_preparation", None)
             if operation == "segment":
                 request["segment_revision"] = segments.prepare_regeneration(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
             elif operation == "rewrite_segment":
@@ -771,6 +789,8 @@ class Jobs:
                 request["_reconciled_segs"] = reconciled_segs
             try:
                 preflight(request, env)
+                if self.before_video_launch is not None and not request["demo"]:
+                    self.before_video_launch(request, env)
             finally:
                 request.pop("_reconciled_segs", None)
             if remaining_pipeline:

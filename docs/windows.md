@@ -7,10 +7,15 @@
 1. 将整个 ZIP 解压到自己有写入权限的目录，例如 `D:\工具\H3 工作台`。请先解压，不能直接在压缩包里双击。
 2. 双击 `start-windows.cmd`。首次会下载固定版本的 Python、FFmpeg、curl，校验 SHA-256，创建 `.venv` 并安装依赖。总下载量约 150 MB，请等待安装结束。
 3. 脚本打开浏览器并启动 `http://127.0.0.1:7860`。使用期间保留控制台窗口；结束后按 Ctrl+C。之后仍双击同一个文件，已安装的环境会复用。
-4. 在工作台配置自己的 API Key。页面默认选中“真实生成”，如需无费用试用，请手动切换到“离线演示”。此发布包不含开发者的密钥、历史任务或生成素材。
+4. 在工作台配置自己的视频后端与 API Key。视频后端默认可选 **ComfyUI（Colab / 远端自建）** 或 **RunningHub 云端**；页面默认选中“真实生成”，如需无费用试用，请手动切换到“离线演示”。此发布包不含开发者的密钥、历史任务或生成素材。
 5. 在输出目录区域选择电脑上的文件夹。设置保存在本机；每个新任务创建按时间命名的子目录，原任务续跑继续使用原目录。
 
 英文安装日志：在该目录的命令提示符中运行 `start-windows.cmd -Language en`。界面语言仍由网页中的语言选择控制。
+
+## ComfyUI / Colab 模式说明（Windows 零额外依赖出片）
+
+- **直连远端或本机 ComfyUI（无需额外安装任何 CLI）**：只要远端 Colab 或自建机器上的 ComfyUI 隧道已开启，在工作台环境配置中选择 `ComfyUI`，填写 `COMFYUI_URL`（如 `https://xxx.ngrok-free.dev`）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填；本机 `http://127.0.0.1:8188` 可留空），保存后即可直接上传参考图、生成 768p 视频（`4step` / `8step` / `full20`）并自动下载成片。发布包内置的 Python 与专用 curl 已完整支持中文/空格路径参考图上传（自动转为 ASCII 哈希文件名）及隧道鉴权下载。
+- **可选：在 Windows 上启用 Colab 一键启停按钮**：如需直接在工作台顶部卡片点击「一键启动 Colab A100 / 终止实例」，可在项目虚拟环境中额外安装 `.venv\Scripts\pip install google-colab-cli` 并完成一次 `colab auth login`。若本机遇到 Windows 凭据管理器（Credential Locker）OAuth JSON 长度限制报错，可在 `.env` 中设置 `COLAB_AUTH=adc` 改用 Google Cloud Application Default Credentials，或直接在浏览器手动运行 Colab 中的 `scripts/start_colab.py` 后由 Windows 工作台直连隧道。
 
 ## 安装位置与失败处理
 

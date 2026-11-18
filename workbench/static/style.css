@@ -172,6 +172,15 @@ h3{font-size:14px;font-weight:650}
 .segments-rewrite-toolbar.live-paid .hint{color:#81612a}
 .segments-rewrite-toolbar .button-row{flex-wrap:wrap}
 .segment-editor-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.runtime-card{padding:16px 22px;margin-bottom:18px}
+.runtime-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+.runtime-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:14px}
+.runtime-actions{flex-wrap:wrap}
+.runtime-subbox{margin:12px 0 0}
+.runtime-subbox .runtime-actions{margin-top:9px}
+.runtime-logs{margin-top:12px;font-size:12px}
+.runtime-logs summary{cursor:pointer;color:var(--accent)}
+.runtime-logs[open] summary{margin-bottom:8px}
 .checkbox-field input{width:16px;height:16px;flex:none;accent-color:var(--accent)}
 .one-options{align-items:center;margin-top:15px}
 .one-options .checkbox-field{margin:0}

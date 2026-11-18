@@ -12,16 +12,17 @@ from urllib.parse import urlsplit
 from flask import Flask, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
 
-from h3ref import config, film
+from h3ref import colab_runtime, config, film
 from .i18n import InputError, message
-from .inputs import array, invalid, text, verify_image
+from .inputs import array, invalid, needed_video_providers, text, verify_image
 from .jobs import ARTIFACT_TYPES, Jobs
 from .settings import save_env
 from .references import bind_references, describe_references
 from .directories import choose_output_folder, saved_output_root, save_output_root
 
 KEYS = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
-FIELDS = (*KEYS, "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
+FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_PRESET", "COLAB_AUTO_START",
+          "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
           "GEMINI_MODEL", "GEMINI_COMPOSITION_MODEL", "GEMINI_REWRITE_MODEL")
 
 
@@ -31,17 +32,49 @@ def create_app(storage=None, env_path=None):
     app = Flask(__name__, static_folder="static")
     app.config.update(MAX_CONTENT_LENGTH=32 * 1024 * 1024, TRUSTED_HOSTS=["127.0.0.1", "localhost", "[::1]"])
     jobs = Jobs(root, storage)
+    runtime = colab_runtime.ColabRuntimeManager(storage)
     folder_picker_lock = threading.Lock()
     env_path = Path(env_path or root / ".env")
     app.extensions["jobs"] = jobs
+    app.extensions["colab_runtime"] = runtime
     env = config.load_server_env(env_path)
     env["H3_REWRITER"] = "llm"
     env.setdefault("LLM_BASE_URL", config.LLM_DEFAULTS["apimart"]["base_url"])
     env.setdefault("LLM_MODEL", config.LLM_DEFAULTS["apimart"]["model"])
     if env.get("LLM_PROVIDER", "").strip().lower() not in ("", *config.LLM_DEFAULTS):
         env["LLM_PROVIDER"] = "apimart"
+    if env.get("VIDEO_PROVIDER", "").strip().lower() not in ("", *config.VIDEO_PROVIDERS):
+        env["VIDEO_PROVIDER"] = "runninghub"
+    if env.get("COMFYUI_PRESET", "").strip().lower() not in ("", *config.COMFY_PRESETS):
+        env["COMFYUI_PRESET"] = "4step"
+    if env.get("COLAB_AUTO_START", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
+        env["COLAB_AUTO_START"] = "0"
+    try:
+        config.validate_endpoint_url(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
+    except ValueError:
+        env["COMFYUI_URL"] = ""
     config.llm_settings(env)
+    config.video_settings(env)
     jobs.remember_secrets(env)
+
+    def ensure_video_runtime(job_request, job_env):
+        if "comfyui" not in needed_video_providers(job_request, job_env):
+            return
+        probe = colab_runtime.probe_comfyui(job_env)
+        if probe["online"]:
+            return
+        if probe.get("auth_failed"):
+            raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))
+        vcfg = config.video_settings(job_env)
+        if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(job_env):
+            try:
+                runtime.start_async(job_env)
+            except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError):
+                pass
+            raise InputError("comfy_starting")
+        raise InputError("comfy_offline")
+
+    jobs.before_video_launch = ensure_video_runtime
 
     verified_images = set()
 
@@ -71,8 +104,26 @@ def create_app(storage=None, env_path=None):
     def language():
         return "en" if request.headers.get("Accept-Language", "").lower().startswith("en") else "zh-CN"
 
+    def redact_runtime_payload(payload):
+        if not isinstance(payload, dict):
+            return payload
+        cleaned = dict(payload)
+        if isinstance(cleaned.get("error"), str):
+            cleaned["error"] = jobs.redact(cleaned["error"])
+        if isinstance(cleaned.get("logs"), list):
+            cleaned["logs"] = [jobs.redact(str(line)) for line in cleaned["logs"]]
+        if isinstance(cleaned.get("status"), dict):
+            cleaned["status"] = redact_runtime_payload(cleaned["status"])
+        return cleaned
+
     def settings():
-        return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS}, "LLM_BASE_URL": env["LLM_BASE_URL"],
+        vcfg = config.video_settings(env)
+        return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS},
+                "VIDEO_PROVIDER": vcfg["provider"], "COMFYUI_URL": vcfg["comfyui_url"],
+                "COMFYUI_PRESET": vcfg["comfyui_preset"],
+                "COLAB_AUTO_START": "1" if vcfg["colab_auto_start"] else "0",
+                "comfy_requires_key": vcfg["comfy_requires_key"],
+                "LLM_BASE_URL": env["LLM_BASE_URL"],
                 "LLM_MODEL": env["LLM_MODEL"], "LLM_PROVIDER": config.llm_settings(env)["provider"],
                 "llm_providers": {provider: {**config.llm_settings({**env, "LLM_PROVIDER": provider}),
                                              "key_names": list(config.llm_settings({**env, "LLM_PROVIDER": provider})["key_names"])}
@@ -179,14 +230,28 @@ def create_app(storage=None, env_path=None):
                 continue
             if key == "LLM_PROVIDER" and value.strip() not in config.LLM_DEFAULTS:
                 invalid(key, value, "choice")
-            if key == "LLM_BASE_URL":
+            if key == "VIDEO_PROVIDER":
+                value = value.strip().lower()
+                if value not in config.VIDEO_PROVIDERS:
+                    invalid(key, value, "choice")
+            if key == "COMFYUI_PRESET":
+                value = value.strip().lower()
+                if value not in config.COMFY_PRESETS:
+                    invalid(key, value, "choice")
+            if key == "COLAB_AUTO_START":
+                raw_flag = value.strip().lower()
+                if raw_flag not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
+                    invalid(key, value, "choice")
+                value = "1" if raw_flag in ("1", "true", "yes", "on") else "0"
+            if key in ("LLM_BASE_URL", "COMFYUI_URL"):
+                if key == "COMFYUI_URL" and not value.strip():
+                    updates[key] = ""
+                    continue
                 try:
-                    url = urlsplit(value.strip())
-                    _ = url.port
+                    cleaned_url = config.validate_endpoint_url(value, key)
                 except ValueError:
                     invalid(key, "[URL]", "choice")
-                if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
-                    invalid(key, "[URL]", "choice")
+                value = cleaned_url
             updates[key] = text(value, key, empty=key in KEYS)
         with jobs.lock:
             disk_updates = dict(updates)
@@ -202,12 +267,66 @@ def create_app(storage=None, env_path=None):
                     disk_changed = new_origin != config.url_origin(disk_base)
                     if disk_changed or mem_changed or (not env.get("LLM_API_KEY", "").strip() and "LLM_API_KEY" in disk_file):
                         disk_updates["LLM_API_KEY"] = None
+            if "COMFYUI_URL" in updates and "COMFYUI_API_KEY" not in updates:
+                new_comfy_origin = config.url_origin(updates["COMFYUI_URL"])
+                comfy_mem_changed = new_comfy_origin != config.url_origin(env.get("COMFYUI_URL", ""))
+                if comfy_mem_changed:
+                    mem_updates["COMFYUI_API_KEY"] = None
+                if persist:
+                    disk_file = config.read_env_file(env_path)
+                    disk_comfy_url = disk_file.get("COMFYUI_URL") or ""
+                    comfy_disk_changed = new_comfy_origin != config.url_origin(disk_comfy_url)
+                    if comfy_disk_changed or comfy_mem_changed or (not env.get("COMFYUI_API_KEY", "").strip() and "COMFYUI_API_KEY" in disk_file):
+                        disk_updates["COMFYUI_API_KEY"] = None
             if persist:
                 save_env(env_path, disk_updates)
             for k, v in mem_updates.items():
                 env[k] = "" if v is None else v
             jobs.remember_secrets(env)
         return jsonify(settings())
+
+    @app.get("/api/runtime/status")
+    def runtime_status():
+        with jobs.lock:
+            current_env = dict(env)
+        return jsonify(redact_runtime_payload(runtime.status(current_env)))
+
+    @app.post("/api/runtime/start")
+    def runtime_start():
+        with jobs.lock:
+            current_env = dict(env)
+        try:
+            st = runtime.start_async(current_env)
+        except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
+            raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+        return jsonify(redact_runtime_payload(st))
+
+    @app.post("/api/runtime/drive-ack")
+    def runtime_drive_ack():
+        with jobs.lock:
+            current_env = dict(env)
+        ack = runtime.submit_drive_authorized()
+        ack["status"] = runtime.status(current_env)
+        return jsonify(redact_runtime_payload(ack))
+
+    @app.post("/api/runtime/stop")
+    def runtime_stop():
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            invalid("runtime", values, "object")
+        force = values.get("force", False)
+        if not isinstance(force, bool):
+            invalid("force", force, "choice")
+        with jobs.lock:
+            current_env = dict(env)
+            local_busy = jobs.has_active_video_work()
+        try:
+            res = runtime.stop(environ=current_env, force=force, local_busy=local_busy)
+        except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, RuntimeError) as exc:
+            raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+        return jsonify(redact_runtime_payload(res))
 
     @app.post("/api/output-folder/pick")
     def pick_output_folder():

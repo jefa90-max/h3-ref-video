@@ -830,3 +830,206 @@ test("create.js does not fall back to all cast on characterless single-shot scen
   assert.ok($("film-reference-list").children.length >= 2, "Cast upload cards must still render when shots/aliases are malformed");
 });
 
+test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and serializes COLAB_AUTO_START", async () => {
+  const { $, ids } = makeDom();
+  $("persist-config").checked = true;
+  let postedPayload = null;
+  const fieldIds = [
+    "video-provider", "rh-key", "comfy-url", "comfy-key", "comfy-preset", "colab-auto-start",
+    "apimart-key", "llm-provider", "llm-key", "gemini-key", "llm-composition-model", "llm-rewrite-model", "llm-base",
+  ];
+  class FakeFormData {
+    constructor() {
+      const entries = [];
+      for (const id of fieldIds) {
+        const el = ids.get(id);
+        if (el && !el.disabled && el.name) entries.push([el.name, el.value]);
+      }
+      this._entries = entries;
+    }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  $("video-provider").name = "VIDEO_PROVIDER";
+  $("rh-key").name = "RUNNINGHUB_API_KEY";
+  $("comfy-url").name = "COMFYUI_URL";
+  $("comfy-key").name = "COMFYUI_API_KEY";
+  $("comfy-preset").name = "COMFYUI_PRESET";
+  $("colab-auto-start").name = "COLAB_AUTO_START";
+  $("apimart-key").name = "APIMART_API_KEY";
+  $("llm-provider").name = "LLM_PROVIDER";
+  $("llm-key").name = "LLM_API_KEY";
+  $("gemini-key").name = "GEMINI_API_KEY";
+  $("llm-composition-model").name = "LLM_COMPOSITION_MODEL";
+  $("llm-rewrite-model").name = "LLM_REWRITE_MODEL";
+  $("llm-base").name = "LLM_BASE_URL";
+
+  const comfyConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: false, APIMART_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_PRESET: "4step",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: FakeFormData,
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => ({ state: "offline", cli_available: true, logs: [] }) };
+      }
+      if (url === "/api/config") {
+        postedPayload = JSON.parse(opts.body);
+        return {
+          ok: true,
+          json: async () => ({
+            ...comfyConfig,
+            COMFYUI_PRESET: postedPayload.COMFYUI_PRESET,
+            COLAB_AUTO_START: postedPayload.COLAB_AUTO_START,
+            keys: { ...comfyConfig.keys, COMFYUI_API_KEY: true },
+          }),
+        };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  const freshMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(freshMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  // Missing COMFYUI_API_KEY on remote HTTPS tunnel -> configIncomplete
+  assert.equal($("config-summary").textContent, freshMessages.configIncomplete);
+  assert.equal($("rh-key").disabled, true);
+  assert.equal($("comfy-url").disabled, false);
+  assert.equal($("runtime-card").hidden, false);
+
+  // Submit COMFYUI_API_KEY, 8step preset, and COLAB_AUTO_START = "0"
+  $("comfy-key").value = "ck-secret-42";
+  $("comfy-preset").value = "8step";
+  $("colab-auto-start").value = "0";
+  await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(postedPayload.VIDEO_PROVIDER, "comfyui");
+  assert.equal(postedPayload.COMFYUI_API_KEY, "ck-secret-42");
+  assert.equal(postedPayload.COMFYUI_PRESET, "8step");
+  assert.equal(postedPayload.COLAB_AUTO_START, "0");
+  assert.equal($("comfy-key").value, "");
+  assert.equal($("config-summary").textContent, freshMessages.configReady);
+});
+
+test("common.js renders ComfyUI/Colab runtime card states, Drive auth ack, and two-step stop confirmation", async () => {
+  const { $ } = makeDom();
+  const calls = [];
+  let currentStatus = {
+    state: "awaiting_drive_auth",
+    cli_available: true,
+    auth_url: "https://accounts.google.com/o/oauth2/auth?client_id=test",
+    comfyui_url: "https://demo.ngrok-free.dev",
+    session: "comfy-a100",
+    devices: [],
+    logs: ["Waiting for Google Drive consent"],
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { *[Symbol.iterator]() {} },
+    fetch: async (url, opts) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : null });
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => currentStatus };
+      }
+      if (url === "/api/runtime/drive-ack") {
+        currentStatus = {
+          state: "online",
+          cli_available: true,
+          comfyui_url: "https://demo.ngrok-free.dev",
+          session: "comfy-a100",
+          devices: [{ name: "NVIDIA A100-SXM4-80GB" }],
+          logs: ["ComfyUI online"],
+        };
+        return { ok: true, json: async () => ({ accepted: true, status: currentStatus }) };
+      }
+      if (url === "/api/runtime/stop") {
+        const req = JSON.parse(opts.body);
+        if (!req.force) {
+          return {
+            ok: true,
+            json: async () => ({
+              stopped: false,
+              confirmation_required: true,
+              local_busy: true,
+              remote_queue: 1,
+              status: currentStatus,
+            }),
+          };
+        }
+        currentStatus = { state: "offline", cli_available: true, comfyui_url: "https://demo.ngrok-free.dev", logs: [] };
+        return { ok: true, json: async () => ({ stopped: true, confirmation_required: false, status: currentStatus }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  const freshMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  const comfyConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: true, APIMART_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_PRESET: "4step",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(freshMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("runtime-drive-box").hidden, false);
+  assert.equal($("runtime-drive-link").href, "https://accounts.google.com/o/oauth2/auth?client_id=test");
+
+  await $("runtime-drive-ack").events.click();
+  assert.equal($("runtime-drive-box").hidden, true);
+  assert.ok($("runtime-detail").textContent.includes("A100"));
+
+  // First stop click requires secondary confirmation
+  await $("runtime-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, false);
+
+  // Confirm force stop
+  await $("runtime-confirm-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, true);
+  const stopCalls = calls.filter((c) => c.url === "/api/runtime/stop");
+  assert.deepEqual(stopCalls.map((c) => c.body.force), [false, true]);
+});
+

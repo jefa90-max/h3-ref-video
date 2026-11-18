@@ -5,10 +5,12 @@ const savedLanguage = localStorage.getItem("h3-workbench-language");
 const state = {
   language: ["zh-CN", "en"].includes(savedLanguage) ? savedLanguage : "zh-CN",
   messages: {}, config: null, jobs: [], ready: false, pollError: false,
+  runtimeStatus: null, runtimeBusy: false,
 };
 let renderPage = () => {};
 let llmProvider = null;
 let llmDrafts = {};
+let runtimePollTimer = null;
 
 function t(key, values = {}) {
   return (state.messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
@@ -83,6 +85,100 @@ function dateLabel(value) {
   });
 }
 
+function comfyRequiresKey(rawUrl) {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = (parsed.hostname || "").toLowerCase();
+    if (["127.0.0.1", "localhost", "::1", "[::1]"].includes(host)) return false;
+    return parsed.protocol === "https:";
+  } catch {
+    return true;
+  }
+}
+
+function clearRuntimePoll() {
+  if (runtimePollTimer && typeof clearTimeout === "function") {
+    clearTimeout(runtimePollTimer);
+  }
+  runtimePollTimer = null;
+}
+
+function scheduleRuntimePoll(statusObj) {
+  clearRuntimePoll();
+  if (!statusObj || !["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(statusObj.state)) {
+    return;
+  }
+  if (typeof setTimeout === "function") {
+    runtimePollTimer = setTimeout(() => {
+      refreshRuntimeStatus().catch(() => {});
+    }, 2500);
+  }
+}
+
+function renderRuntimeStatus() {
+  const statusObj = state.runtimeStatus;
+  if (!statusObj) return;
+  const st = statusObj.state || "offline";
+  const badge = $("runtime-badge");
+  badge.textContent = t(`runtimeState_${st}`);
+  badge.className = "status-badge";
+  if (st === "online") badge.classList.add("succeeded");
+  else if (["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(st)) badge.classList.add("running");
+  else if (["error", "orphan_warning"].includes(st)) badge.classList.add("failed");
+
+  const configuredUrl = statusObj.comfyui_url || state.config?.COMFYUI_URL || "";
+  if (st === "online") {
+    const device = statusObj.devices?.[0]?.name || t("runtimeDefaultDevice");
+    $("runtime-detail").textContent = t("runtimeDetailOnline", { url: configuredUrl, device });
+  } else if (st === "offline") {
+    $("runtime-detail").textContent = t(configuredUrl ? "runtimeDetailOffline" : "runtimeDetailNoUrl");
+  } else if (st === "cli_unavailable") {
+    $("runtime-detail").textContent = t("runtimeDetailCliUnavailable");
+  } else if (st === "provisioning") {
+    $("runtime-detail").textContent = t("runtimeDetailProvisioning");
+  } else if (st === "awaiting_drive_auth") {
+    $("runtime-detail").textContent = t("runtimeDetailDriveAuth");
+  } else if (st === "starting_comfy") {
+    $("runtime-detail").textContent = t("runtimeDetailStartingComfy");
+  } else if (st === "stopping") {
+    $("runtime-detail").textContent = t("runtimeDetailStopping");
+  } else if (st === "orphan_warning") {
+    const sessions = (statusObj.orphan_sessions || []).map((item) => item.endpoint).join(", ");
+    $("runtime-detail").textContent = t("runtimeDetailOrphan", { sessions });
+  } else {
+    $("runtime-detail").textContent = t("runtimeDetailError", { error: statusObj.error || st });
+  }
+
+  const awaitingAuth = st === "awaiting_drive_auth";
+  $("runtime-drive-box").hidden = !awaitingAuth;
+  if (awaitingAuth && statusObj.auth_url) {
+    $("runtime-drive-link").href = statusObj.auth_url;
+    $("runtime-drive-link").hidden = false;
+  } else {
+    $("runtime-drive-link").hidden = true;
+  }
+  $("runtime-drive-ack").disabled = state.runtimeBusy || !awaitingAuth;
+
+  const transitional = ["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(st);
+  const cliReady = Boolean(statusObj.cli_available);
+  $("runtime-refresh").disabled = state.runtimeBusy;
+  $("runtime-start").disabled = state.runtimeBusy || !cliReady || st === "online" || transitional || !configuredUrl;
+  $("runtime-stop").disabled = state.runtimeBusy || !cliReady || st === "stopping" || (st === "offline" && !statusObj.has_session);
+
+  const logs = statusObj.logs || [];
+  $("runtime-logs-section").hidden = logs.length === 0;
+  $("runtime-logs").textContent = logs.join("\n");
+}
+
+async function refreshRuntimeStatus() {
+  if ((state.config?.VIDEO_PROVIDER || "runninghub") !== "comfyui") return;
+  const statusObj = await request("/api/runtime/status");
+  state.runtimeStatus = statusObj;
+  renderRuntimeStatus();
+  scheduleRuntimePoll(statusObj);
+}
+
 async function loadLanguage(language) {
   const response = await fetch(`/static/messages/${language}.json`);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -105,6 +201,22 @@ async function loadLanguage(language) {
   localStorage.setItem("h3-workbench-language", language);
   renderConfig();
   renderPage(previousSample);
+}
+
+function renderVideoProvider() {
+  const provider = $("video-provider").value || state.config?.VIDEO_PROVIDER || "runninghub";
+  const comfy = provider === "comfyui";
+  $("rh-key-field").hidden = comfy;
+  $("rh-key").disabled = comfy;
+  for (const [fieldId, inputId] of [
+    ["comfy-url-field", "comfy-url"],
+    ["comfy-key-field", "comfy-key"],
+    ["comfy-preset-field", "comfy-preset"],
+    ["colab-auto-start-field", "colab-auto-start"],
+  ]) {
+    $(fieldId).hidden = !comfy;
+    $(inputId).disabled = !comfy;
+  }
 }
 
 function renderLlmProvider(fillInputs = false) {
@@ -131,13 +243,19 @@ function renderConfig(fillInputs = false) {
   const config = state.config;
   if (!config) return;
   const keys = config.keys || {};
+  const cfgVideoProvider = config.VIDEO_PROVIDER || "runninghub";
   const activeKeyNames = config.llm_providers?.[config.LLM_PROVIDER]?.key_names
     || (config.LLM_PROVIDER === "gemini" ? ["GEMINI_API_KEY"] : ["LLM_API_KEY", "APIMART_API_KEY"]);
   const apimartFallback = (config.llm_providers?.apimart?.key_names || ["LLM_API_KEY", "APIMART_API_KEY"]).includes("APIMART_API_KEY");
   const textReady = activeKeyNames.some((name) => keys[name]);
-  const complete = keys.RUNNINGHUB_API_KEY && keys.APIMART_API_KEY && textReady && config.ffmpeg && config.ffprobe;
+  const needsComfyKey = config.comfy_requires_key ?? comfyRequiresKey(config.COMFYUI_URL);
+  const videoReady = cfgVideoProvider === "comfyui"
+    ? Boolean(config.COMFYUI_URL) && (!needsComfyKey || Boolean(keys.COMFYUI_API_KEY))
+    : Boolean(keys.RUNNINGHUB_API_KEY);
+  const complete = videoReady && keys.APIMART_API_KEY && textReady && config.ffmpeg && config.ffprobe;
   $("config-summary").textContent = t(complete ? "configReady" : "configIncomplete");
   $("rh-key-status").textContent = t(keys.RUNNINGHUB_API_KEY ? "keyPresent" : "keyMissing");
+  $("comfy-key-status").textContent = t(keys.COMFYUI_API_KEY ? "keyPresent" : (config.COMFYUI_URL && !needsComfyKey ? "keyOptionalLocal" : "keyMissing"));
   $("apimart-key-status").textContent = t(keys.APIMART_API_KEY ? "keyPresent" : "keyMissing");
   $("llm-key-status").textContent = t(keys.LLM_API_KEY ? "keyPresent" : apimartFallback ? "llmFallback" : "keyMissing");
   $("gemini-key-status").textContent = t(keys.GEMINI_API_KEY ? "keyPresent" : "keyMissing");
@@ -149,16 +267,120 @@ function renderConfig(fillInputs = false) {
   }
   if (fillInputs) {
     llmDrafts = {};
+    $("video-provider").value = cfgVideoProvider;
+    $("comfy-url").value = config.COMFYUI_URL || "";
+    $("comfy-preset").value = config.COMFYUI_PRESET || "4step";
+    $("colab-auto-start").value = config.COLAB_AUTO_START || "0";
     $("llm-provider").value = config.LLM_PROVIDER;
   }
+  renderVideoProvider();
   renderLlmProvider(fillInputs);
+
+  const showRuntime = cfgVideoProvider === "comfyui";
+  $("runtime-card").hidden = !showRuntime;
+  if (showRuntime) {
+    if (fillInputs || !state.runtimeStatus) {
+      refreshRuntimeStatus().catch(() => {});
+    } else {
+      renderRuntimeStatus();
+    }
+  } else {
+    clearRuntimePoll();
+    $("runtime-confirm").hidden = true;
+  }
 }
+
+$("video-provider").addEventListener("change", () => {
+  renderVideoProvider();
+});
 
 $("llm-provider").addEventListener("change", () => {
   if (!state.config) return;
   llmDrafts[llmProvider] = {composition_model: $("llm-composition-model").value,
     rewrite_model: $("llm-rewrite-model").value, base_url: $("llm-base").value};
   renderLlmProvider(true);
+});
+
+$("runtime-refresh").addEventListener("click", async () => {
+  state.runtimeBusy = true;
+  renderRuntimeStatus();
+  try { await refreshRuntimeStatus(); }
+  catch (error) { showError(error); }
+  finally { state.runtimeBusy = false; renderRuntimeStatus(); }
+});
+
+$("runtime-start").addEventListener("click", async () => {
+  state.runtimeBusy = true;
+  $("runtime-confirm").hidden = true;
+  clearNotices();
+  renderRuntimeStatus();
+  try {
+    state.runtimeStatus = await post("/api/runtime/start", {});
+    renderRuntimeStatus();
+    scheduleRuntimePoll(state.runtimeStatus);
+    showMessage(t("runtimeStartedNotice"));
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
+});
+
+$("runtime-drive-ack").addEventListener("click", async () => {
+  state.runtimeBusy = true;
+  clearNotices();
+  renderRuntimeStatus();
+  try {
+    const res = await post("/api/runtime/drive-ack", {});
+    if (res.status) state.runtimeStatus = res.status;
+    renderRuntimeStatus();
+    scheduleRuntimePoll(state.runtimeStatus);
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
+});
+
+async function submitRuntimeStop(force) {
+  state.runtimeBusy = true;
+  clearNotices();
+  renderRuntimeStatus();
+  try {
+    const res = await post("/api/runtime/stop", { force });
+    if (res.status) state.runtimeStatus = res.status;
+    if (res.confirmation_required) {
+      $("runtime-confirm-text").textContent = t("runtimeStopConfirmWarning", {
+        local: t(res.local_busy ? "runtimeBoolYes" : "runtimeBoolNo"),
+        queue: res.remote_queue ?? 0,
+      });
+      $("runtime-confirm").hidden = false;
+    } else {
+      $("runtime-confirm").hidden = true;
+      showMessage(t("runtimeStoppedNotice"));
+    }
+    renderRuntimeStatus();
+    scheduleRuntimePoll(state.runtimeStatus);
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
+}
+
+$("runtime-stop").addEventListener("click", async () => {
+  await submitRuntimeStop(false);
+});
+
+$("runtime-confirm-stop").addEventListener("click", async () => {
+  await submitRuntimeStop(true);
+});
+
+$("runtime-cancel-stop").addEventListener("click", () => {
+  $("runtime-confirm").hidden = true;
 });
 
 $("language").addEventListener("change", async (event) => {
@@ -178,7 +400,7 @@ $("config-form").addEventListener("submit", async (event) => {
     const payload = Object.fromEntries([...new FormData(event.target)].filter(([, value]) => value.trim()).map(([key, value]) => [key, value.trim()]));
     payload.persist = $("persist-config").checked;
     state.config = await post("/api/config", payload);
-    for (const id of ["rh-key", "apimart-key", "llm-key", "gemini-key"]) $(id).value = "";
+    for (const id of ["rh-key", "comfy-key", "apimart-key", "llm-key", "gemini-key"]) $(id).value = "";
     renderConfig(true);
     showMessage(t(payload.persist ? "configSavedDisk" : "configSaved"));
   } catch (error) { showError(error); }

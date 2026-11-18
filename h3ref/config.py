@@ -133,6 +133,16 @@ def validate_endpoint_url(raw: str, name: str) -> str:
     return cleaned.rstrip("/")
 
 
+def comfy_requires_api_key(comfyui_url: str) -> bool:
+    if not comfyui_url:
+        return False
+    parts = urlsplit(comfyui_url.strip())
+    host = (parts.hostname or "").lower()
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return False
+    return parts.scheme.lower() == "https"
+
+
 def video_settings(environ=None) -> dict:
     values = os.environ if environ is None else environ
     provider = values.get("VIDEO_PROVIDER", "").strip().lower() or "runninghub"
@@ -162,6 +172,7 @@ def video_settings(environ=None) -> dict:
         "provider": provider,
         "comfyui_url": comfyui_url,
         "comfyui_api_key": comfyui_api_key,
+        "comfy_requires_key": comfy_requires_api_key(comfyui_url),
         "comfyui_preset": preset,
         "comfyui_concurrency": comfy_concurrency,
         "runninghub_concurrency": rh_concurrency,
