@@ -1039,7 +1039,8 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         )
         staged_u2 = film.Job(out / "inputs" / f"segment-{rev_u2}")
         seg_edit_u2 = json.loads((out / "inputs" / "segment-edit.json").read_text(encoding="utf-8"))
-        with patch.object(film.rewrite, "rewrite", return_value=_valid_h3("auto_seg2", 1)):
+        expected_u2_h3 = _valid_h3("auto_seg2", 1)
+        with patch.object(film.rewrite, "rewrite", return_value=expected_u2_h3):
             segments.prepare_prompt(staged_u2, req, seg_edit_u2, planned[1])
         self.assertNotIn(
             "prompt_override",
@@ -1048,6 +1049,8 @@ class ReviewFixesRegressionTest(unittest.TestCase):
         )
         reconciled_u2, _, _ = segments.preview_reconciled_segments(out, keep_pending=False, supersede=False)
         self.assertNotIn("prompt_override", reconciled_u2["1"])
+        self.assertEqual(reconciled_u2["1"]["h3"], expected_u2_h3, "Paid staged H3 prompt must survive clipless reconciliation")
+        self.assertEqual(reconciled_u2["1"]["h3_source"], untouched_card2["prompt"])
 
 
 if __name__ == "__main__":
