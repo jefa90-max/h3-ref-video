@@ -155,7 +155,7 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 rec.update(zh='', h3=prompt_text, h3_source=None)
                 rec['prompt_override'] = {'format': fmt, 'text': prompt_text, 'source_version': pending.get('source_version')}
             else:
-                if not pending.get('reuse_h3') and prompt_text != prior_zh:
+                if 'h3' not in staged and not pending.get('reuse_h3') and prompt_text != prior_zh:
                     rec.update(h3=None, h3_source=None)
                 rec['zh'] = prompt_text
                 baseline_zh = prev_snap.get('zh') or pending.get('automatic_source', '')
