@@ -18,7 +18,7 @@ from .directories import create_output_directory
 
 ARTIFACT_TYPES = {".mp4": "video", ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
                   ".md": "report", ".txt": "file", ".json": "file"}
-SECRET_NAMES = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY",
+SECRET_NAMES = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY",
                 "VISION_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 
 

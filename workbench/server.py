@@ -20,7 +20,7 @@ from .settings import save_env
 from .references import bind_references, describe_references
 from .directories import choose_output_folder, saved_output_root, save_output_root
 
-KEYS = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
+KEYS = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
 FIELDS = (*KEYS, "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
           "GEMINI_MODEL", "GEMINI_COMPOSITION_MODEL", "GEMINI_REWRITE_MODEL")
 
