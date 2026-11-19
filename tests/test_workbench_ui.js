@@ -835,7 +835,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   $("persist-config").checked = true;
   let postedPayload = null;
   const fieldIds = [
-    "video-provider", "rh-key", "comfy-url", "comfy-key", "comfy-preset", "colab-auto-start",
+    "video-provider", "rh-key", "comfy-url", "comfy-key", "comfy-preset", "comfy-upscale", "colab-auto-start",
     "apimart-key", "llm-provider", "llm-key", "gemini-key", "llm-composition-model", "llm-rewrite-model", "llm-base",
   ];
   class FakeFormData {
@@ -854,6 +854,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   $("comfy-url").name = "COMFYUI_URL";
   $("comfy-key").name = "COMFYUI_API_KEY";
   $("comfy-preset").name = "COMFYUI_PRESET";
+  $("comfy-upscale").name = "COMFYUI_UPSCALE";
   $("colab-auto-start").name = "COLAB_AUTO_START";
   $("apimart-key").name = "APIMART_API_KEY";
   $("llm-provider").name = "LLM_PROVIDER";
@@ -868,6 +869,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
     VIDEO_PROVIDER: "comfyui",
     COMFYUI_URL: "https://demo.ngrok-free.dev",
     COMFYUI_PRESET: "4step",
+    COMFYUI_UPSCALE: "1",
     COLAB_AUTO_START: "0",
     comfy_requires_key: true,
     LLM_PROVIDER: "apimart",
@@ -901,6 +903,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
           json: async () => ({
             ...comfyConfig,
             COMFYUI_PRESET: postedPayload.COMFYUI_PRESET,
+            COMFYUI_UPSCALE: postedPayload.COMFYUI_UPSCALE,
             COLAB_AUTO_START: postedPayload.COLAB_AUTO_START,
             keys: { ...comfyConfig.keys, COMFYUI_API_KEY: true },
           }),
@@ -918,11 +921,19 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.equal($("config-summary").textContent, freshMessages.configIncomplete);
   assert.equal($("rh-key").disabled, true);
   assert.equal($("comfy-url").disabled, false);
+  assert.equal($("comfy-upscale").disabled, false);
+  assert.equal($("comfy-upscale").value, "1");
   assert.equal($("runtime-card").hidden, false);
 
-  // Submit COMFYUI_API_KEY, 8step preset, and COLAB_AUTO_START = "0"
+  // Preset copy reflects 544p base rather than legacy 768p in both locales
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  assert.ok(!freshMessages.comfyPreset4Step.includes("768p") && freshMessages.comfyPreset4Step.includes("544p"));
+  assert.ok(!zhFresh.comfyPreset4Step.includes("768p") && zhFresh.comfyPreset4Step.includes("544p"));
+
+  // Submit COMFYUI_API_KEY, 8step preset, COMFYUI_UPSCALE = "0", and COLAB_AUTO_START = "0"
   $("comfy-key").value = "ck-secret-42";
   $("comfy-preset").value = "8step";
+  $("comfy-upscale").value = "0";
   $("colab-auto-start").value = "0";
   await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
   await new Promise((r) => setImmediate(r));
@@ -930,6 +941,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.equal(postedPayload.VIDEO_PROVIDER, "comfyui");
   assert.equal(postedPayload.COMFYUI_API_KEY, "ck-secret-42");
   assert.equal(postedPayload.COMFYUI_PRESET, "8step");
+  assert.equal(postedPayload.COMFYUI_UPSCALE, "0");
   assert.equal(postedPayload.COLAB_AUTO_START, "0");
   assert.equal($("comfy-key").value, "");
   assert.equal($("config-summary").textContent, freshMessages.configReady);
@@ -1000,6 +1012,7 @@ test("common.js renders ComfyUI/Colab runtime card states, Drive auth ack, and t
     VIDEO_PROVIDER: "comfyui",
     COMFYUI_URL: "https://demo.ngrok-free.dev",
     COMFYUI_PRESET: "4step",
+    COMFYUI_UPSCALE: "1",
     COLAB_AUTO_START: "0",
     comfy_requires_key: true,
     LLM_PROVIDER: "apimart",
@@ -1252,6 +1265,17 @@ test("results.js renders live ComfyUI stage, step bar, VRAM, and elapsed progres
   assert.match($("live-progress-meta").textContent, /31\.4\/40(\.0)? GB/, "Progress meta must show VRAM usage");
   assert.match($("live-progress-meta").textContent, /2:15|02:15/, "Progress meta must show elapsed time");
   assert.equal($("live-progress-fill").style.width, "50%", "Progress fill width must reflect 2/4 = 50%");
+
+  currentJob = {
+    ...currentJob,
+    segments: [{
+      ...currentJob.segments[0],
+      live_progress: { stage: "upscale_video", node: "155", step: 60, max_steps: 120, vram_used_gb: 28.0, vram_total_gb: 40.0, elapsed_s: 190, queued: false },
+    }],
+  };
+  await context.refreshJob();
+  assert.match($("live-progress-label").textContent, /Upscaling video/, "Progress label must render upscale_video stage copy");
+  assert.equal($("live-progress-fill").style.width, "50%");
 
   currentJob = { ...currentJob, status: "succeeded", segments: [{ ...currentJob.segments[0], url: "/clip.mp4", task_pending: false, live_progress: null }] };
   await context.refreshJob();

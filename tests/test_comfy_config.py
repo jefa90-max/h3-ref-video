@@ -14,6 +14,7 @@ class ComfyConfigTest(unittest.TestCase):
         settings = config.video_settings({})
         self.assertEqual(settings["provider"], "runninghub")
         self.assertEqual(settings["comfyui_preset"], "4step")
+        self.assertTrue(settings["comfyui_upscale"])
         self.assertEqual(settings["comfyui_concurrency"], 1)
         self.assertEqual(settings["concurrency"], settings["runninghub_concurrency"])
         self.assertEqual(settings["colab_session"], "comfy-a100")
@@ -21,7 +22,7 @@ class ComfyConfigTest(unittest.TestCase):
         self.assertEqual(settings["colab_bin"], "")
         self.assertEqual(settings["colab_auth"], "")
         self.assertEqual(config.SIZES, {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)})
-        self.assertEqual(config.COMFY_SIZES, {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (992, 992)})
+        self.assertEqual(config.COMFY_SIZES, {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)})
 
     def test_comfyui_settings_parse_valid_options_and_strip_trailing_slash(self):
         settings = config.video_settings({
@@ -29,6 +30,7 @@ class ComfyConfigTest(unittest.TestCase):
             "COMFYUI_URL": "https://demo.ngrok-free.dev/",
             "COMFYUI_API_KEY": "  h3c_secret_token_value  ",
             "COMFYUI_PRESET": "8step",
+            "COMFYUI_UPSCALE": "0",
             "COMFYUI_CONCURRENCY": "2",
             "COLAB_SESSION": "my-a100",
             "COLAB_AUTO_START": "1",
@@ -39,6 +41,7 @@ class ComfyConfigTest(unittest.TestCase):
         self.assertEqual(settings["comfyui_url"], "https://demo.ngrok-free.dev")
         self.assertEqual(settings["comfyui_api_key"], "h3c_secret_token_value")
         self.assertEqual(settings["comfyui_preset"], "8step")
+        self.assertFalse(settings["comfyui_upscale"])
         self.assertEqual(settings["comfyui_concurrency"], 2)
         self.assertEqual(settings["concurrency"], 2)
         self.assertEqual(settings["colab_session"], "my-a100")
@@ -50,6 +53,7 @@ class ComfyConfigTest(unittest.TestCase):
         bad_cases = [
             ({"VIDEO_PROVIDER": "sora"}, "VIDEO_PROVIDER='sora'"),
             ({"COMFYUI_PRESET": "12step"}, "COMFYUI_PRESET='12step'"),
+            ({"COMFYUI_UPSCALE": "maybe"}, "COMFYUI_UPSCALE='maybe'"),
             ({"COMFYUI_CONCURRENCY": "0"}, "COMFYUI_CONCURRENCY='0'"),
             ({"COMFYUI_CONCURRENCY": "-2"}, "COMFYUI_CONCURRENCY='-2'"),
             ({"COMFYUI_CONCURRENCY": "two"}, "COMFYUI_CONCURRENCY='two'"),
@@ -86,6 +90,7 @@ class ComfyConfigTest(unittest.TestCase):
         env_example = config.read_env_file(config.ROOT / ".env.example")
         self.assertEqual(env_example.get("VIDEO_PROVIDER"), "comfyui")
         self.assertEqual(env_example.get("COMFYUI_PRESET"), "4step")
+        self.assertEqual(env_example.get("COMFYUI_UPSCALE"), "1")
         self.assertEqual(env_example.get("COLAB_AUTO_START"), "0")
         raw_text = (config.ROOT / ".env.example").read_text(encoding="utf-8")
         self.assertNotIn("NGROK_AUTHTOKEN=", raw_text)
@@ -95,7 +100,14 @@ class ComfyConfigTest(unittest.TestCase):
         graph = json.loads(config.COMFY_GRAPH.read_text(encoding="utf-8"))
         self.assertNotIn("nodes", graph)
         self.assertEqual(graph["136"]["class_type"], "MiniMaxH3ReferenceToVideo")
+        self.assertEqual((graph["136"]["inputs"]["width"], graph["136"]["inputs"]["height"]), (544, 960))
         self.assertEqual(graph["138"]["inputs"]["value"], "")
+        self.assertEqual(graph["154"]["class_type"], "UpscaleModelLoader")
+        self.assertEqual(graph["154"]["inputs"]["model_name"], "RealESRGAN_x2plus.pth")
+        self.assertEqual(graph["155"]["class_type"], "ImageUpscaleWithModel")
+        self.assertEqual(graph["155"]["inputs"]["upscale_model"], ["154", 0])
+        self.assertEqual(graph["155"]["inputs"]["image"], ["122", 0])
+        self.assertEqual(graph["130"]["inputs"]["images"], ["155", 0])
         loads = [n["inputs"].get("image") for n in graph.values() if n.get("class_type") == "LoadImage"]
         self.assertEqual(len(loads), 9)
         self.assertTrue(all(x == "None" for x in loads))

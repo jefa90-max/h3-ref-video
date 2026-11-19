@@ -64,11 +64,7 @@ class ComfyReviewFixesTest(unittest.TestCase):
                  mock.patch.object(start_colab, "LOCAL", local_base), \
                  mock.patch.object(start_colab, "SSD_HEADROOM_BYTES", 1024 * 1024), \
                  mock.patch("shutil.disk_usage", side_effect=[
-                     types.SimpleNamespace(free=10 * 1024 * 1024),
-                     types.SimpleNamespace(free=10 * 1024 * 1024),
-                     types.SimpleNamespace(free=10 * 1024 * 1024),
-                     types.SimpleNamespace(free=10 * 1024 * 1024),
-                     types.SimpleNamespace(free=10 * 1024 * 1024),
+                     *[types.SimpleNamespace(free=10 * 1024 * 1024) for _ in range(len(start_colab.MODEL_FILES) - 1)],
                      types.SimpleNamespace(free=512 * 1024),  # < 128KB + 1MB headroom -> symlink!
                  ]):
                 start_colab.stage_models_to_local_ssd()
@@ -369,6 +365,124 @@ class ComfyReviewFixesTest(unittest.TestCase):
             self.assertEqual(st1["state"], "running")
             st2 = comfy.poll("pid-reconnect")
             self.assertEqual(st2["state"], "running")
+
+    def test_stage_models_auto_downloads_missing_upscaler_atomically_and_syncs_to_ssd(self):
+        import io
+
+        upscale_rel = "upscale_models/RealESRGAN_x2plus.pth"
+        expected_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+        fake_weights = b"ESRGAN_X2PLUS_WEIGHTS_" * 4096
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            drive_base = root / "drive"
+            local_base = root / "local"
+            for rel in start_colab.MODEL_FILES:
+                if rel == upscale_rel:
+                    continue
+                p = drive_base / "models" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"M" * 4096)
+
+            downloaded_urls = []
+
+            class FakeResp:
+                def __init__(self, payload: bytes):
+                    self._buf = io.BytesIO(payload)
+
+                def read(self, n=-1):
+                    return self._buf.read(n)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            def fake_urlopen(req, timeout=180.0):
+                downloaded_urls.append(req.full_url)
+                return FakeResp(fake_weights)
+
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "LOCAL", local_base), \
+                 mock.patch.object(start_colab, "SSD_HEADROOM_BYTES", 1024), \
+                 mock.patch("shutil.disk_usage", return_value=types.SimpleNamespace(free=100 * 1024 * 1024)), \
+                 mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                start_colab.stage_models_to_local_ssd()
+
+            drive_file = drive_base / "models" / upscale_rel
+            ssd_file = local_base / "models" / upscale_rel
+            self.assertEqual(downloaded_urls, [expected_url])
+            self.assertTrue(drive_file.is_file())
+            self.assertFalse(drive_file.with_suffix(drive_file.suffix + ".tmp").exists())
+            self.assertEqual(drive_file.read_bytes(), fake_weights)
+            self.assertTrue(ssd_file.is_file() and not ssd_file.is_symlink())
+            self.assertEqual(ssd_file.read_bytes(), fake_weights)
+
+            # Second run must not re-download when Drive file already exists
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "LOCAL", local_base), \
+                 mock.patch.object(start_colab, "SSD_HEADROOM_BYTES", 1024), \
+                 mock.patch("shutil.disk_usage", return_value=types.SimpleNamespace(free=100 * 1024 * 1024)), \
+                 mock.patch("urllib.request.urlopen", side_effect=AssertionError("Must not re-download existing weight!")):
+                start_colab.stage_models_to_local_ssd()
+
+            # Interrupted download cleans up .tmp and leaves target absent
+            drive_file.unlink()
+            with mock.patch("urllib.request.urlopen", side_effect=OSError("connection reset")):
+                with self.assertRaises(OSError):
+                    start_colab._download_file_atomic(expected_url, drive_file, upscale_rel)
+            self.assertFalse(drive_file.exists())
+            self.assertFalse(drive_file.with_suffix(drive_file.suffix + ".tmp").exists())
+
+    def test_watchdog_queue_busy_ws_and_timeout_protection_and_passive_probes(self):
+        import io
+        import socket
+
+        # 1. WS progress_snapshot status=="running" immediately reports busy without querying /queue
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("Should short-circuit on WS running")):
+            self.assertTrue(start_colab._queue_busy(lambda: {"status": "running", "node": "155"}))
+            self.assertTrue(start_colab._queue_busy({"status": "running"}))
+
+        # 2. /queue timeout or transient error while ComfyUI process is alive must report busy (never false idle)
+        with mock.patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")), \
+             mock.patch.object(start_colab, "_comfy_process_alive", return_value=True):
+            self.assertTrue(start_colab._queue_busy(lambda: {"status": "finished"}))
+
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("transient reset")), \
+             mock.patch.object(start_colab, "_comfy_process_alive", return_value=True):
+            self.assertTrue(start_colab._queue_busy())
+
+        # 3. /queue failure when ComfyUI process is dead reports idle so watchdog can unassign dead instance
+        with mock.patch("urllib.request.urlopen", side_effect=ConnectionRefusedError("dead")), \
+             mock.patch.object(start_colab, "_comfy_process_alive", return_value=False):
+            self.assertFalse(start_colab._queue_busy(lambda: {}))
+
+        # 4. /queue returning empty lists reports idle; non-empty running or pending reports busy
+        class FakeQueueResp:
+            def __init__(self, obj):
+                self._raw = json.dumps(obj).encode("utf-8")
+
+            def read(self):
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeQueueResp({"queue_running": [], "queue_pending": []})):
+            self.assertFalse(start_colab._queue_busy(lambda: {"status": "success"}))
+        with mock.patch("urllib.request.urlopen", return_value=FakeQueueResp({"queue_running": [], "queue_pending": [[1, "pid"]]})):
+            self.assertTrue(start_colab._queue_busy(lambda: {"status": "success"}))
+
+        # 5. Passive probe paths never count as active work; real work paths do
+        for path in ("/system_stats", "/system_stats?x=1", "/queue", "/queue/", "/h3_progress"):
+            self.assertTrue(start_colab._is_passive_probe("GET", path), path)
+            self.assertTrue(start_colab._is_passive_probe("HEAD", path), path)
+        for method, path in (("POST", "/prompt"), ("POST", "/upload/image"), ("GET", "/view?filename=out.mp4"), ("POST", "/queue")):
+            self.assertFalse(start_colab._is_passive_probe(method, path), f"{method} {path}")
 
 
 if __name__ == "__main__":

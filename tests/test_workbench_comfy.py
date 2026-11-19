@@ -136,6 +136,7 @@ class WorkbenchComfyTest(unittest.TestCase):
                 start_mock.assert_not_called()
                 cfg = res.get_json()["config"]
                 self.assertEqual(cfg["VIDEO_PROVIDER"], "comfyui")
+                self.assertEqual(cfg["COMFYUI_UPSCALE"], "1")
                 self.assertEqual(cfg["COLAB_AUTO_START"], "1")
 
             headers = {"X-Workbench": "1"}
@@ -147,6 +148,7 @@ class WorkbenchComfyTest(unittest.TestCase):
                     "COMFYUI_URL": "https://tunnel-a.ngrok-free.dev/",
                     "COMFYUI_API_KEY": "super-secret-comfy-key-999",
                     "COMFYUI_PRESET": "8step",
+                    "COMFYUI_UPSCALE": "0",
                     "COLAB_AUTO_START": "0",
                     "persist": True,
                 },
@@ -158,8 +160,17 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertEqual(body["VIDEO_PROVIDER"], "comfyui")
             self.assertEqual(body["COMFYUI_URL"], "https://tunnel-a.ngrok-free.dev")
             self.assertEqual(body["COMFYUI_PRESET"], "8step")
+            self.assertEqual(body["COMFYUI_UPSCALE"], "0")
             self.assertEqual(body["COLAB_AUTO_START"], "0")
+            self.assertEqual(config.read_env_file(env_path).get("COMFYUI_UPSCALE"), "0")
             self.assertTrue(body["keys"]["COMFYUI_API_KEY"])
+
+            bad_upscale = client.post(
+                "/api/config",
+                headers=headers,
+                json={"COMFYUI_UPSCALE": "ultra", "persist": False},
+            )
+            self.assertEqual(bad_upscale.status_code, 400)
 
             # Changing COMFYUI_URL origin without supplying COMFYUI_API_KEY clears the stored key
             res2 = client.post(

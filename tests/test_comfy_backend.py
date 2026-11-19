@@ -32,7 +32,7 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertEqual(g1["137"]["inputs"]["image"], "hash1.png")
         ref_keys_1 = [k for k in g1[comfy.SIZE]["inputs"] if k.startswith("ref_images.")]
         self.assertEqual(ref_keys_1, ["ref_images.ref_image_0"])
-        self.assertEqual((g1[comfy.SIZE]["inputs"]["width"], g1[comfy.SIZE]["inputs"]["height"]), (768, 1344))
+        self.assertEqual((g1[comfy.SIZE]["inputs"]["width"], g1[comfy.SIZE]["inputs"]["height"]), (544, 960))
         self.assertEqual(g1[comfy.PROMPT]["inputs"]["value"], "prompt one")
         self.assertEqual(g1[comfy.DURATION]["inputs"]["value"], 6.0)
         self.assertEqual(g1[comfy.SEED]["inputs"]["noise_seed"], 42)
@@ -40,7 +40,7 @@ class ComfyBackendTest(unittest.TestCase):
         g2 = comfy.graph("prompt two", ["a.png", "b.jpg"], 12, "16:9", 99)
         load_nodes_2 = [nid for nid, n in g2.items() if n.get("class_type") == "LoadImage"]
         self.assertEqual(load_nodes_2, ["137", "139"])
-        self.assertEqual((g2[comfy.SIZE]["inputs"]["width"], g2[comfy.SIZE]["inputs"]["height"]), (1344, 768))
+        self.assertEqual((g2[comfy.SIZE]["inputs"]["width"], g2[comfy.SIZE]["inputs"]["height"]), (960, 544))
         ref_keys_2 = sorted(k for k in g2[comfy.SIZE]["inputs"] if k.startswith("ref_images."))
         self.assertEqual(ref_keys_2, ["ref_images.ref_image_0", "ref_images.ref_image_1"])
 
@@ -48,7 +48,7 @@ class ComfyBackendTest(unittest.TestCase):
         g9 = comfy.graph("prompt nine", names9, 15, "1:1", 7)
         load_nodes_9 = [nid for nid in comfy.IMAGES if nid in g9]
         self.assertEqual(len(load_nodes_9), 9)
-        self.assertEqual((g9[comfy.SIZE]["inputs"]["width"], g9[comfy.SIZE]["inputs"]["height"]), (992, 992))
+        self.assertEqual((g9[comfy.SIZE]["inputs"]["width"], g9[comfy.SIZE]["inputs"]["height"]), (736, 736))
         ref_keys_9 = [k for k in g9[comfy.SIZE]["inputs"] if k.startswith("ref_images.")]
         self.assertEqual(len(ref_keys_9), 9)
 
@@ -94,6 +94,57 @@ class ComfyBackendTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="invalid")
+
+    def test_upscale_graph_toggle_and_progress_stages(self):
+        from h3ref.i18n import use_lang
+
+        # Default (COMFYUI_UPSCALE unset -> enabled): 122 -> 155 (with 154 loader) -> 130
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMFYUI_UPSCALE", None)
+            g_on = comfy.graph("p", ["a.png"], 5, "9:16", 1)
+        self.assertEqual((g_on[comfy.SIZE]["inputs"]["width"], g_on[comfy.SIZE]["inputs"]["height"]), (544, 960))
+        self.assertIn(comfy.UPSCALE_LOADER, g_on)
+        self.assertIn(comfy.UPSCALE_IMAGE, g_on)
+        self.assertEqual(g_on[comfy.UPSCALE_LOADER]["inputs"]["model_name"], "RealESRGAN_x2plus.pth")
+        self.assertEqual(g_on[comfy.UPSCALE_IMAGE]["inputs"]["upscale_model"], [comfy.UPSCALE_LOADER, 0])
+        self.assertEqual(g_on[comfy.UPSCALE_IMAGE]["inputs"]["image"], [comfy.VAE_DECODE, 0])
+        self.assertEqual(g_on[comfy.CREATE_VIDEO]["inputs"]["images"], [comfy.UPSCALE_IMAGE, 0])
+
+        # COMFYUI_UPSCALE=0 removes both upscale nodes and wires CreateVideo directly to VAEDecode (122)
+        with patch.dict(os.environ, {"COMFYUI_UPSCALE": "0"}, clear=False):
+            g_off = comfy.graph("p", ["a.png"], 5, "9:16", 1)
+        self.assertNotIn(comfy.UPSCALE_LOADER, g_off)
+        self.assertNotIn(comfy.UPSCALE_IMAGE, g_off)
+        self.assertEqual(g_off[comfy.CREATE_VIDEO]["inputs"]["images"], [comfy.VAE_DECODE, 0])
+
+        # Explicit upscale=False/True keyword overrides env
+        with patch.dict(os.environ, {"COMFYUI_UPSCALE": "0"}, clear=False):
+            g_override_on = comfy.graph("p", ["a.png"], 5, "9:16", 1, upscale=True)
+        self.assertEqual(g_override_on[comfy.CREATE_VIDEO]["inputs"]["images"], [comfy.UPSCALE_IMAGE, 0])
+
+        # Live progress stage mapping and bilingual formatting for upscale nodes
+        self.assertEqual(comfy.NODE_STAGE_KEYS[comfy.UPSCALE_LOADER], "load_upscaler")
+        self.assertEqual(comfy.NODE_STAGE_KEYS[comfy.UPSCALE_IMAGE], "upscale_video")
+
+        def fake_req_upscale(url, key, body=None, **kw):
+            if url.endswith("/h3_progress"):
+                return {"prompt_id": "pid-up", "node": comfy.UPSCALE_IMAGE, "value": 40, "max": 120, "status": "running"}
+            if url.endswith("/system_stats"):
+                return {"devices": [{"name": "A100", "vram_total": 40 * (1024 ** 3), "vram_free": 20 * (1024 ** 3)}]}
+            raise AssertionError(url)
+
+        with patch.dict(os.environ, {"COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "h3c_k"}, clear=False), \
+             patch.object(comfy.http, "request", side_effect=fake_req_upscale):
+            st = comfy.live_progress("pid-up", queued=False)
+        self.assertEqual(st["stage"], "upscale_video")
+        self.assertEqual(st["step"], 40)
+        self.assertEqual(st["max_steps"], 120)
+        with use_lang("zh-CN"):
+            self.assertIn("超分高清", comfy.format_progress(st, elapsed_s=180))
+            self.assertIn("加载超分模型", comfy.format_progress({"stage": "load_upscaler"}))
+        with use_lang("en"):
+            self.assertIn("Upscaling video", comfy.format_progress(st, elapsed_s=180))
+            self.assertIn("Loading upscale model", comfy.format_progress({"stage": "load_upscaler"}))
 
     def test_real_curl_loopback_upload_and_download_with_unicode_path_and_auth_headers(self):
         received = {}

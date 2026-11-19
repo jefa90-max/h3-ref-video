@@ -471,6 +471,108 @@ class ColabRuntimeTest(unittest.TestCase):
                 self.assertIn("TUNNEL READY (AUTH PROTECTED)", client2.stdout)
                 self.assertEqual(count_file.read_text(encoding="utf-8").strip(), "1")
 
+    def test_kernel_keepalive_only_fires_when_queue_busy_after_25m_and_respects_locks_and_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            storage = root / ".workbench"
+            clock_state = {"now": 1000.0}
+            mgr = colab_runtime.ColabRuntimeManager(
+                storage,
+                clock=lambda: clock_state["now"],
+            )
+            self.assertEqual(mgr.keepalive_interval_sec, 1500.0)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": "h3c_keepalive_key",
+                "COLAB_SESSION": "comfy-a100",
+                "COLAB_BIN": str(fake_bin),
+            }
+            calls = []
+
+            def fake_run_cmd(colab_bin, auth_mode, sub_args, **kwargs):
+                calls.append((colab_bin, auth_mode, list(sub_args), kwargs.get("stdin_text"), kwargs.get("timeout")))
+                return 0, "keepalive\n"
+
+            with patch.object(mgr, "_run_command", side_effect=fake_run_cmd):
+                # 1. Under 25 min -> never sends keepalive even when queue is busy
+                clock_state["now"] = 1000.0 + 1499.0
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(calls, [])
+
+                # 2. >= 25 min but queue is empty -> MUST NOT send keepalive (preserve 60m idle watchdog)
+                clock_state["now"] = 1000.0 + 1500.0
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(calls, [])
+
+                # 3. >= 25 min and queue is busy -> sends lightweight colab exec --timeout 30 heartbeat
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=2):
+                    self.assertTrue(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][2], ["exec", "-s", "comfy-a100", "--timeout", "30"])
+                self.assertIn("keepalive", calls[0][3])
+
+                # 4. Immediately afterwards while still busy -> waits another 25 min
+                clock_state["now"] += 600.0
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(len(calls), 1)
+
+                # 5. Another 25 min passes, queue becomes empty -> stops keepalive immediately
+                clock_state["now"] += 1000.0
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(len(calls), 1)
+
+                # 6. Concurrency / lock guards: active startup/stop state, active subprocess, file lock, worker env
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
+                    mgr._active_state = "starting_comfy"
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                    mgr._active_state = None
+
+                    mgr._active_proc = object()
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                    mgr._active_proc = None
+
+                    with colab_runtime.runtime_file_lock(storage):
+                        self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+
+                    with patch.dict(os.environ, {"H3_WORKBENCH_WORKER": "1"}, clear=False):
+                        self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(len(calls), 1)
+
+            # 7. Heartbeat failure never raises or interrupts tasks; logs error and backs off during cooldown
+            with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1), \
+                 patch.object(mgr, "_run_command", return_value=(1, "WebSocket timeout")) as fail_cmd:
+                self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(fail_cmd.call_count, 1)
+                self.assertTrue(any("keepalive" in line.lower() and "failed" in line.lower() for line in mgr._logs_tail()))
+                # Within cooldown (60s), does not hammer failed keepalive
+                clock_state["now"] += 30.0
+                self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
+                self.assertEqual(fail_cmd.call_count, 1)
+
+            # 8. Background keepalive monitor thread triggers keepalive when queue is busy and stops cleanly
+            fired = threading.Event()
+
+            def fake_monitor_run(colab_bin, auth_mode, sub_args, **kwargs):
+                fired.set()
+                return 0, "keepalive\n"
+
+            clock_state["now"] += 2000.0
+            with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1), \
+                 patch.object(mgr, "_run_command", side_effect=fake_monitor_run):
+                mgr.start_keepalive_monitor(lambda: env, poll_sec=0.05)
+                try:
+                    self.assertTrue(fired.wait(timeout=2.0), "Keepalive monitor thread should fire when queue is busy")
+                finally:
+                    mgr.stop_keepalive_monitor()
+            self.assertIsNone(mgr._keepalive_thread)
+
 
 if __name__ == "__main__":
     unittest.main()
