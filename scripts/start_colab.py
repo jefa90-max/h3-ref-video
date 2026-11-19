@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -40,12 +41,13 @@ COMFY_LOG_FILE = Path("/tmp/comfyui.log")
 
 MODEL_FILES = [
     "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-    "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
     "vae/minimax_h3_video_vae_fp16.safetensors",
     "vae/minimax_h3_audio_vae_fp32.safetensors",
     "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
     "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+    "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
 ]
+SSD_HEADROOM_BYTES = 12 * (1024 ** 3)
 
 PASSIVE_PROBE_PATHS = {"/system_stats", "/queue"}
 
@@ -350,28 +352,96 @@ def ensure_pyngrok() -> None:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=True)
 
 
+def _parallel_copy_file(src: Path, dst: Path, src_size: int, rel: str) -> None:
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    total_gb = src_size / (1024 ** 3)
+    print(f"[start_colab] Copying to local SSD ({total_gb:.2f} GB): {rel}", flush=True)
+    t0 = time.time()
+    if src_size == 0 or not hasattr(os, "pread") or not hasattr(os, "pwrite"):
+        shutil.copyfile(src, tmp)
+        tmp.replace(dst)
+        print(f"[start_colab] Copied {rel} in {time.time() - t0:.1f}s", flush=True)
+        return
+
+    stripe = 32 * 1024 * 1024
+    offsets = list(range(0, src_size, stripe))
+    progress_lock = threading.Lock()
+    copied = 0
+    next_report = 8 * (1024 ** 3)
+    src_fd = os.open(str(src), os.O_RDONLY)
+    dst_fd = os.open(str(tmp), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+    try:
+        os.ftruncate(dst_fd, src_size)
+
+        def copy_stripe(offset: int) -> None:
+            nonlocal copied, next_report
+            end = min(offset + stripe, src_size)
+            pos = offset
+            while pos < end:
+                chunk = os.pread(src_fd, min(8 * 1024 * 1024, end - pos), pos)
+                if not chunk:
+                    raise IOError(f"Unexpected EOF reading {src} at {pos}")
+                written = 0
+                while written < len(chunk):
+                    written += os.pwrite(dst_fd, memoryview(chunk)[written:], pos + written)
+                pos += len(chunk)
+                with progress_lock:
+                    copied += len(chunk)
+                    if copied >= next_report and copied < src_size:
+                        print(f"[start_colab]   progress {rel}: {copied / (1024 ** 3):.1f}/{total_gb:.1f} GB", flush=True)
+                        next_report += 8 * (1024 ** 3)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for fut in [pool.submit(copy_stripe, off) for off in offsets]:
+                fut.result()
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    tmp.replace(dst)
+    print(f"[start_colab] Copied {rel} in {time.time() - t0:.1f}s", flush=True)
+
+
 def stage_models_to_local_ssd() -> None:
     src_root = BASE / "models"
     dst_root = LOCAL / "models"
     if dst_root.is_symlink():
         dst_root.unlink()
     dst_root.mkdir(parents=True, exist_ok=True)
+    max_stage_gb = float(os.environ.get("COLAB_MAX_STAGE_GB", "30").strip() or "30")
+    max_stage_bytes = int(max_stage_gb * (1024 ** 3))
     for rel in MODEL_FILES:
         src = src_root / rel
         dst = dst_root / rel
         if not src.exists():
             raise FileNotFoundError(f"Missing model in Google Drive: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.with_suffix(dst.suffix + ".tmp").unlink(missing_ok=True)
         src_size = src.stat().st_size
-        if dst.exists() and dst.stat().st_size == src_size:
+        if dst.exists() and not dst.is_symlink() and dst.stat().st_size == src_size:
             print(f"[start_colab] Cached on local SSD: {rel}", flush=True)
             continue
-        tmp = dst.with_suffix(dst.suffix + ".tmp")
-        print(f"[start_colab] Copying to local SSD ({src_size / (1024**3):.2f} GB): {rel}", flush=True)
-        t0 = time.time()
-        shutil.copyfile(src, tmp)
-        tmp.replace(dst)
-        print(f"[start_colab] Copied {rel} in {time.time() - t0:.1f}s", flush=True)
+        free_bytes = shutil.disk_usage(str(dst.parent)).free
+        if src_size > max_stage_bytes or free_bytes < src_size + SSD_HEADROOM_BYTES:
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            dst.symlink_to(src)
+            reason = (
+                f"size {src_size / (1024 ** 3):.1f} GB > {max_stage_gb:g} GB cap"
+                if src_size > max_stage_bytes
+                else f"low SSD headroom ({free_bytes / (1024 ** 3):.1f} GB free)"
+            )
+            print(f"[start_colab] Symlinked to Drive ({reason}): {rel}", flush=True)
+            continue
+        if dst.is_symlink():
+            dst.unlink()
+        _parallel_copy_file(src, dst, src_size, rel)
 
 
 def link_persistent_dirs() -> None:

@@ -59,7 +59,9 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
             extra_headers: dict | None = None) -> dict:
     """POST (with body) or GET; network errors and 5xx retry, 4xx answers come back as they are."""
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Content-Type": "application/json", "User-Agent": config.UA}
+    headers = {"User-Agent": config.UA}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     if key:
         headers["Authorization"] = "Bearer " + key
     if extra_headers:

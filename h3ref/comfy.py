@@ -47,7 +47,7 @@ _TRANSIENT_COUNTS: dict[tuple[str, str], int] = {}
 
 
 def _headers() -> dict[str, str]:
-    return {"ngrok-skip-browser-warning": "1"}
+    return {"ngrok-skip-browser-warning": "1", "User-Agent": "h3-ref-video/1.0"}
 
 
 def base_graph() -> dict:
@@ -341,8 +341,8 @@ def account() -> dict:
     base = config.comfy_url()
     key = config.comfy_key()
     hdrs = _headers()
-    stats = http.request(f"{base}/system_stats", key, timeout=15, tries=1, extra_headers=hdrs)
-    q = http.request(f"{base}/queue", key, timeout=15, tries=1, extra_headers=hdrs)
+    stats = http.request(f"{base}/system_stats", key, timeout=20, tries=3, extra_headers=hdrs)
+    q = http.request(f"{base}/queue", key, timeout=20, tries=3, extra_headers=hdrs)
     if any(isinstance(d.get("_http_status"), int) and d["_http_status"] >= 400 for d in (stats, q) if isinstance(d, dict)):
         raise RuntimeError(f"ComfyUI status check failed: {json.dumps(stats, ensure_ascii=False)[:200]}")
     devices = [

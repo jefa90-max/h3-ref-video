@@ -176,8 +176,8 @@ def _kill_process_tree(proc) -> None:
         pass
 
 
-def _probe_json(url: str, key: str, *, timeout: float = 4.0) -> tuple[int | None, dict | None]:
-    headers = {"User-Agent": config.UA, "ngrok-skip-browser-warning": "1"}
+def _probe_json(url: str, key: str, *, timeout: float = 12.0) -> tuple[int | None, dict | None]:
+    headers = {"User-Agent": "h3-ref-video/1.0", "ngrok-skip-browser-warning": "1"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -187,12 +187,14 @@ def _probe_json(url: str, key: str, *, timeout: float = 4.0) -> tuple[int | None
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
             return resp.status, payload if isinstance(payload, dict) else None
     except urllib.error.HTTPError as exc:
-        return exc.code, None
+        code = exc.code
+        exc.close()
+        return code, None
     except Exception:
         return None, None
 
 
-def probe_comfyui(environ=None, *, timeout: float = 4.0) -> dict:
+def probe_comfyui(environ=None, *, timeout: float = 12.0) -> dict:
     settings = config.video_settings(environ)
     url = settings["comfyui_url"]
     if not url:
@@ -210,7 +212,7 @@ def probe_comfyui(environ=None, *, timeout: float = 4.0) -> dict:
     return {"online": False, "configured": True, "devices": []}
 
 
-def probe_remote_queue_count(environ=None, *, timeout: float = 4.0) -> int:
+def probe_remote_queue_count(environ=None, *, timeout: float = 12.0) -> int:
     settings = config.video_settings(environ)
     url = settings["comfyui_url"]
     if not url:
@@ -580,29 +582,46 @@ class ColabRuntimeManager:
                 with self._lock:
                     self._active_state = "starting_comfy"
 
-                rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
-                if self._cancel_event.is_set():
-                    return
-                if timed_out_auth:
-                    raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
-                if "Credentials propagated" in mount_out and "mount failed" in mount_out and "Mounted at" not in mount_out:
-                    rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
-                    if self._cancel_event.is_set():
-                        return
-                    if timed_out_auth:
-                        raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
-                if rc != 0 or ("Mounted at" not in mount_out and "already mounted" not in mount_out.lower()):
-                    raise RuntimeError(message("colab_start_failed", reason=mount_out.strip()[-300:] or f"drivemount exit {rc}"))
+                drive_already_mounted = False
+                if has_target:
+                    ls_rc, ls_out = self._run_command(
+                        colab_bin, auth_mode, ["ls", "/content/drive", "-s", session_name],
+                        environ=env_copy, timeout=20.0,
+                    )
+                    drive_already_mounted = ls_rc == 0 and "MyDrive/" in ls_out
+
+                if not drive_already_mounted:
+                    mount_out = ""
+                    rc = 1
+                    timed_out_auth = False
+                    for attempt in range(8):
+                        rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
+                        if self._cancel_event.is_set():
+                            return
+                        if timed_out_auth:
+                            raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
+                        if "Connection was lost." in mount_out and "Mounted at" not in mount_out and attempt < 7:
+                            time.sleep(5.0)
+                            continue
+                        break
+                    if "Credentials propagated" in mount_out and "Mounted at" not in mount_out and "already mounted" not in mount_out.lower():
+                        rc, mount_out, timed_out_auth = self._run_drivemount_once(colab_bin, auth_mode, session_name, env_copy)
+                        if self._cancel_event.is_set():
+                            return
+                        if timed_out_auth:
+                            raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
+                    if rc != 0 or ("Mounted at" not in mount_out and "already mounted" not in mount_out.lower()):
+                        raise RuntimeError(message("colab_start_failed", reason=mount_out.strip()[-300:] or f"drivemount exit {rc}"))
 
                 with self._lock:
                     self._active_state = "starting_comfy"
                 rc, exec_out = self._run_command(
                     colab_bin,
                     auth_mode,
-                    ["exec", "-s", session_name, "--timeout", "1200"],
+                    ["exec", "-s", session_name, "--timeout", "1800"],
                     environ=env_copy,
                     stdin_text=REMOTE_START_CODE,
-                    timeout=1260.0,
+                    timeout=2400.0,
                 )
                 if self._cancel_event.is_set():
                     return
@@ -677,7 +696,7 @@ class ColabRuntimeManager:
             raise
         return self.status(env_copy)
 
-    def ensure_started(self, environ=None, *, timeout: float = 1500.0) -> dict:
+    def ensure_started(self, environ=None, *, timeout: float = 2700.0) -> dict:
         cur = self.start_async(environ)
         if cur["state"] == "online":
             return cur
