@@ -98,9 +98,27 @@ SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
 COMFY_SIZES = {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (992, 992)}
 VIDEO_PROVIDERS = ("runninghub", "comfyui")
 COMFY_PRESETS = {
-    "4step": {"steps": 4, "enable_lora": True, "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"},
-    "8step": {"steps": 8, "enable_lora": True, "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
-    "full20": {"steps": 20, "enable_lora": False, "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"},
+    "4step": {
+        "steps": 4,
+        "enable_lora": True,
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "sampler": "euler",
+        "scheduler": "simple",
+    },
+    "8step": {
+        "steps": 8,
+        "enable_lora": True,
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "sampler": "euler",
+        "scheduler": "beta",
+    },
+    "full20": {
+        "steps": 20,
+        "enable_lora": False,
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "sampler": "res_multistep",
+        "scheduler": "beta",
+    },
 }
 COLAB_AUTH_MODES = ("oauth2", "adc")
 MAX_IMAGES = 9                                                     # the workflow's nine LoadImage inputs

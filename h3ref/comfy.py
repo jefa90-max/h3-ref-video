@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode
 from . import config, http, rh
 from .i18n import message
 
-SAVE, PROMPT, DURATION, LENGTH, SIZE, STEPS, SEED = "92", "138", "132", "131", "136", "124", "129"
+SAVE, PROMPT, DURATION, LENGTH, SIZE, SAMPLER, STEPS, SEED = "92", "138", "132", "131", "136", "123", "124", "129"
 LORA, ENABLE_LORA, FULL_STEPS, TURBO_STEPS, SWITCH_MODEL, SWITCH_STEPS = "145", "146", "143", "144", "141", "142"
 IMAGES = ["137", "139", "147", "148", "149", "150", "151", "152", "153"]
 NODE_TYPES = {
@@ -26,6 +26,7 @@ NODE_TYPES = {
     DURATION: "PrimitiveFloat",
     LENGTH: "ComfyMathExpression",
     SIZE: "MiniMaxH3ReferenceToVideo",
+    SAMPLER: "KSamplerSelect",
     STEPS: "BasicScheduler",
     SEED: "RandomNoise",
     LORA: "LoraLoaderModelOnly",
@@ -121,13 +122,17 @@ def graph(prompt: str, image_names: list[str], seconds: float, aspect: str, seed
     g[DURATION]["inputs"]["value"] = max(float(config.MIN_SECONDS), min(float(config.MAX_SECONDS), float(seconds)))
     g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = config.COMFY_SIZES[aspect]
     g[SEED]["inputs"]["noise_seed"] = int(seed)
+    g[SAMPLER]["inputs"]["sampler_name"] = preset_cfg["sampler"]
+    g[STEPS]["inputs"]["scheduler"] = preset_cfg["scheduler"]
     g[ENABLE_LORA]["inputs"]["value"] = bool(preset_cfg["enable_lora"])
     g[TURBO_STEPS]["inputs"]["value"] = int(preset_cfg["steps"])
     g[FULL_STEPS]["inputs"]["value"] = 20
     if preset_cfg["enable_lora"]:
         g[LORA]["inputs"]["lora_name"] = preset_cfg["lora_name"]
+        g[STEPS]["inputs"]["model"] = [SWITCH_MODEL, 0]
     else:
         g["126"]["inputs"]["model"] = ["127", 0]
+        g[STEPS]["inputs"]["model"] = ["127", 0]
         g[SWITCH_MODEL]["inputs"]["on_true"] = ["127", 0]
         g.pop(LORA, None)
 
