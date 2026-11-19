@@ -215,7 +215,10 @@ class ColabRuntimeTest(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(cur["state"], "online")
 
-            # Verify drivemount retried once after propagated+mount failed, and NO secret leaked into colab argv/env
+            # Verify colab new requests --high-mem, drivemount retried once, and NO secret leaked into colab argv/env
+            new_calls = [a for a, _ in calls if "new" in a]
+            self.assertEqual(len(new_calls), 1)
+            self.assertIn("--high-mem", new_calls[0])
             mount_calls = [a for a, _ in calls if "drivemount" in a]
             self.assertEqual(len(mount_calls), 2)
             for argv, kwargs in calls:

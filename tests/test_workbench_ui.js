@@ -16,7 +16,7 @@ function makeDom() {
     const classes = new Set(className.split(/\s+/).filter(Boolean));
     const node = {
       tag, className, textContent, hidden: false, disabled: false, checked: false,
-      value: "", name: "", dataset: {}, events: {}, children: [], attributes: {},
+      value: "", name: "", dataset: {}, events: {}, children: [], attributes: {}, style: {},
       scrollHeight: 0, scrollTop: 0, clientHeight: 0,
       classList: {
         toggle(name, force) {
@@ -1200,5 +1200,61 @@ test("style.css normalizes all form selects to custom appearance and exact heigh
   assert.equal(pageJumpInput.height, "auto", ".page-jump input must preserve compact height");
   assert.equal(plyrInput.height, "auto", ".artifact .plyr input must not inherit 44px textbox height");
   assert.equal(checkboxInput.height, "16px", ".checkbox-field input must remain 16px");
+});
+
+test("results.js renders live ComfyUI stage, step bar, VRAM, and elapsed progress and hides when finished", async () => {
+  const { $, element } = makeDom();
+  $("results-page").dataset.jobId = "job-live-comfy";
+  let currentJob = {
+    id: "job-live-comfy", kind: "film", demo: false, status: "running", operation: "pipeline",
+    created_at: "2026-11-18T20:00:00", output_dir: "/tmp/out", logs: "submitted seg1", report: "",
+    progress: { frames: 4, clips: 0 }, artifacts: [], review: { kind: "frames", total: 4, complete: true },
+    storyboard: [],
+    segments: [{
+      number: 1, start: 0, end: 13, seconds: 13, shots: 4, url: null, task_pending: true,
+      live_progress: { stage: "sampling", node: "125", step: 2, max_steps: 4, vram_used_gb: 31.4, vram_total_gb: 40.0, elapsed_s: 135, queued: false },
+    }],
+  };
+
+  const context = vm.createContext({
+    state: { language: "en", config: {}, jobs: [] },
+    $, element, renderPage: null,
+    document: { addEventListener() {}, querySelectorAll: () => [] },
+    window: { addEventListener() {} },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => v[n] ?? ""),
+    running: (job) => Boolean(job && ["queued", "running"].includes(job.status)),
+    renderConfig() {},
+    showError() {},
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    initializePagination() {},
+    renderPagination() {},
+    initializeVideoSegments() {},
+    renderResultTabs() {},
+    renderVideoSegments() {},
+    pauseSegmentPlayers() {},
+    destroySegmentPlayers() {},
+    setTimeout: () => 1,
+    clearTimeout() {},
+    loadLanguage: async () => {},
+    request: async (url) => (url === "/api/bootstrap" ? { config: {}, jobs: [] } : currentJob),
+    post: async () => ({}),
+  });
+  for (const script of ["frame-references.js", "results.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(staticDirectory, script), "utf8"), context);
+  }
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("live-progress").hidden, false, "#live-progress must be visible while ComfyUI segment reports live_progress");
+  assert.match($("live-progress-label").textContent, /2\/4/, "Progress label must show live step ratio");
+  assert.match($("live-progress-meta").textContent, /31\.4\/40(\.0)? GB/, "Progress meta must show VRAM usage");
+  assert.match($("live-progress-meta").textContent, /2:15|02:15/, "Progress meta must show elapsed time");
+  assert.equal($("live-progress-fill").style.width, "50%", "Progress fill width must reflect 2/4 = 50%");
+
+  currentJob = { ...currentJob, status: "succeeded", segments: [{ ...currentJob.segments[0], url: "/clip.mp4", task_pending: false, live_progress: null }] };
+  await context.refreshJob();
+  assert.equal($("live-progress").hidden, true, "#live-progress must hide once job finishes");
 });
 

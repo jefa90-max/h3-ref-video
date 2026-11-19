@@ -363,6 +363,113 @@ class ComfyBackendTest(unittest.TestCase):
             self.assertIn("NVIDIA A100", out_buf.getvalue())
             self.assertIn("'queue_running': 1", out_buf.getvalue())
 
+    def test_comfy_live_progress_ws_tracker_poll_fallback_and_film_state_persistence(self):
+        from scripts import start_colab
+
+        # 1. start_colab WS event reducer tracks classic executing/progress AND ComfyUI 0.46+ progress_state
+        ws_state = {}
+        start_colab._apply_comfy_ws_event(ws_state, {"type": "execution_start", "data": {"prompt_id": "pid-live"}}, now=100.0)
+        self.assertEqual(ws_state["prompt_id"], "pid-live")
+        self.assertEqual(ws_state["status"], "running")
+
+        start_colab._apply_comfy_ws_event(ws_state, {"type": "executing", "data": {"prompt_id": "pid-live", "node": "125"}}, now=105.0)
+        start_colab._apply_comfy_ws_event(ws_state, {"type": "progress", "data": {"prompt_id": "pid-live", "node": "125", "value": 2, "max": 4}}, now=110.0)
+        self.assertEqual(ws_state["node"], "125")
+        self.assertEqual(ws_state["value"], 2)
+        self.assertEqual(ws_state["max"], 4)
+
+        start_colab._apply_comfy_ws_event(ws_state, {
+            "type": "progress_state",
+            "data": {
+                "prompt_id": "pid-live",
+                "nodes": {
+                    "125": {"state": "finished", "value": 4, "max": 4},
+                    "122": {"state": "running", "value": 1, "max": 2},
+                },
+            },
+        }, now=115.0)
+        self.assertEqual(ws_state["node"], "122")
+        self.assertEqual(ws_state["value"], 1)
+        self.assertEqual(ws_state["max"], 2)
+
+        # 2. comfy.live_progress enriches running state with node stage, step/max, and VRAM from /h3_progress + /system_stats
+        def fake_req_full(url, key, body=None, **kw):
+            if url.endswith("/h3_progress"):
+                return {"prompt_id": "pid-live", "node": "125", "value": 2, "max": 4, "status": "running"}
+            if url.endswith("/system_stats"):
+                return {"devices": [{"name": "NVIDIA A100-SXM4-40GB", "vram_total": 40 * (1024 ** 3), "vram_free": 10 * (1024 ** 3)}]}
+            raise AssertionError(url)
+
+        with patch.dict(os.environ, {"COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "h3c_k"}, clear=False), \
+             patch.object(comfy.http, "request", side_effect=fake_req_full):
+            st = comfy.live_progress("pid-live", queued=False)
+        self.assertEqual(st["stage"], "sampling")
+        self.assertEqual(st["node"], "125")
+        self.assertEqual(st["step"], 2)
+        self.assertEqual(st["max_steps"], 4)
+        self.assertEqual(st["vram_total_gb"], 40.0)
+        self.assertEqual(st["vram_used_gb"], 30.0)
+        self.assertIn("2/4", comfy.format_progress(st, elapsed_s=75))
+
+        # 3. Graceful fallback when /h3_progress returns 404 (older Drive script or direct local ComfyUI)
+        def fake_req_fallback(url, key, body=None, **kw):
+            if url.endswith("/queue"):
+                return {"queue_running": [], "queue_pending": [[1, "other"], [2, "pid-q"]]}
+            if url.endswith("/h3_progress"):
+                raise http.HTTPResponseError(404, "Not Found")
+            if url.endswith("/system_stats"):
+                return {"devices": [{"name": "A100", "vram_total": 40 * (1024 ** 3), "vram_free": 38 * (1024 ** 3)}]}
+            raise AssertionError(url)
+
+        with patch.dict(os.environ, {"COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "h3c_k"}, clear=False), \
+             patch.object(comfy.http, "request", side_effect=fake_req_fallback):
+            st_q = comfy.live_progress("pid-q", queued=True)
+        self.assertTrue(st_q["queued"])
+        self.assertEqual(st_q["queue_position"], 2)
+        self.assertEqual(st_q["stage"], "queued")
+        self.assertEqual(st_q["vram_used_gb"], 2.0)
+
+        # 4. film._generate_segment persists live_progress during polling, logs progress, and clears it on completion
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref = root / "ref.png"
+            Image.new("RGB", (8, 8), "blue").save(ref)
+            job = film.Job(root / "job-progress")
+            (job.dir / "clips").mkdir(parents=True, exist_ok=True)
+            job.put("segs", "0", h3="subject_definitions:\n<Picture 1> test\n")
+            film_doc = {"aspect": "9:16", "cast": [{"name": "A", "picture": str(ref)}], "shots": []}
+            seg = {"idx": 0, "seconds": 5, "shots": [{"action": "walk"}]}
+            pics = [{"kind": "cast", "cast": {"name": "A", "picture": str(ref)}}]
+            snapshots = []
+
+            poll_replies = [
+                {"state": "running", "queued": False, "stage": "sampling", "node": "125", "step": 2, "max_steps": 4, "vram_used_gb": 31.0, "vram_total_gb": 40.0},
+                {"state": "done", "url": "https://demo.ngrok-free.dev/view?filename=out.mp4", "cny": 0.0, "coins": 0.0, "money": 0.0, "run_seconds": 35.0},
+            ]
+
+            def fake_poll(task):
+                item = poll_replies.pop(0)
+                return item
+
+            def fake_sleep(_s):
+                snapshots.append(dict(job.state["segs"]["0"].get("live_progress") or {}))
+
+            with patch.dict(os.environ, {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "h3c_k"}, clear=False), \
+                 patch("h3ref.comfy.upload", return_value="ref.png"), \
+                 patch("h3ref.comfy.submit_with_retry", return_value="pid-live-2"), \
+                 patch("h3ref.comfy.poll", side_effect=fake_poll), \
+                 patch("h3ref.comfy.download", side_effect=lambda u, dest: dest.write_bytes(b"mp4")), \
+                 patch("h3ref.media.last_frame"), \
+                 patch("h3ref.film.time.sleep", side_effect=fake_sleep):
+                rec = film._generate_segment(job, film_doc, seg, pics, reference_paths=[ref])
+
+            self.assertTrue(snapshots and snapshots[0].get("stage") == "sampling")
+            self.assertEqual(snapshots[0].get("step"), 2)
+            self.assertEqual(snapshots[0].get("max_steps"), 4)
+            self.assertNotIn("live_progress", rec)
+            run_log = (job.dir / "run.log").read_text(encoding="utf-8")
+            self.assertIn("2/4", run_log)
+
 
 if __name__ == "__main__":
     unittest.main()
