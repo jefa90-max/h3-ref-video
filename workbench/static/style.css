@@ -162,11 +162,22 @@ h3{font-size:14px;font-weight:650}
 .checkbox-field{flex-direction:row;align-items:center;gap:9px;margin-top:15px;font-weight:500}
 .checkbox-field.disabled,.checkbox-field:has(input:disabled){opacity:.55;cursor:not-allowed}
 #optimize-storyboard-hint{margin-top:6px}
-.film-cast-group-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:11px 13px;margin:10px 0;border:1px dashed #c8d7c9;border-radius:8px;background:#f5f9f3}
-.film-cast-group-info{display:grid;gap:3px;min-width:0}
+.film-cast-group-toolbar{display:grid;gap:10px;padding:12px 13px;margin:10px 0;border:1px dashed #c8d7c9;border-radius:8px;background:#f5f9f3}
+.film-cast-group-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.film-cast-group-info{display:grid;gap:3px;min-width:0;flex:1 1 240px}
+.film-cast-group-actions{flex-wrap:wrap}
+.cast-group-builder,.film-group-add-picker{display:grid;gap:9px;padding-top:10px;border-top:1px dashed #d3e1d3}
+.film-group-add-picker{margin-top:10px}
+.cast-group-chips,.film-group-members{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.film-group-members{margin-top:8px}
+.cast-group-chip{border:1px solid #c9d8ca;background:#fff;color:var(--ink);border-radius:999px;padding:5px 12px;font-size:12px;font-weight:500;line-height:1.4;transition:background-color .15s,border-color .15s,color .15s}
+.cast-group-chip:not(:disabled):hover{background:#edf5ef;border-color:#8cb499}
+.cast-group-chip.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.film-group-member-tag{display:inline-flex;align-items:center;gap:5px;padding:3px 6px 3px 10px;border:1px solid #cde0cf;border-radius:999px;background:#fff;color:var(--ink);font-size:12px;font-weight:500}
+.cast-group-member-remove{border:0;background:transparent;color:#52655a;width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:14px;line-height:1}
+.cast-group-member-remove:not(:disabled):hover{background:#edf5ef;color:#9b4528}
 .film-group-card{border-color:#c3dbc7;background:#f4faf4}
-.cast-merge-check{margin:0;gap:8px}
-.merge-cast-button,.segments-rewrite-toolbar .button{white-space:normal;overflow-wrap:anywhere;min-height:44px}
+.merge-cast-button,.cast-group-builder-toggle,.segments-rewrite-toolbar .button{white-space:normal;overflow-wrap:anywhere;min-height:40px}
 .segments-rewrite-toolbar{display:grid;gap:8px;padding:12px 14px;margin-bottom:16px;border:1px solid var(--border);border-radius:8px;background:#f9fbf8}
 .segments-rewrite-toolbar.live-paid{background:#fff8e8;border-color:#eddfb9}
 .segments-rewrite-toolbar.live-paid .hint{color:#81612a}
