@@ -26,8 +26,10 @@ DRIVE_AUTH_TIMEOUT_SEC = 600.0
 SESSION_CACHE_TTL_SEC = 5.0
 CRASH_GRACE_SEC = 1.5
 DEFAULT_REQUEST_TIMEOUT_SEC = "90"
-KERNEL_KEEPALIVE_INTERVAL_SEC = 25 * 60.0
-KERNEL_KEEPALIVE_POLL_SEC = 60.0
+# Colab reclaims headless/disconnected runtimes after ~20 min without a kernel client;
+# keep active-job heartbeats well below that threshold.
+KERNEL_KEEPALIVE_INTERVAL_SEC = 8 * 60.0
+KERNEL_KEEPALIVE_POLL_SEC = 30.0
 KERNEL_KEEPALIVE_TIMEOUT_SEC = 30
 KERNEL_KEEPALIVE_RETRY_COOLDOWN_SEC = 60.0
 KERNEL_KEEPALIVE_CODE = 'print("keepalive")\n'
@@ -907,8 +909,9 @@ class ColabRuntimeManager:
         *,
         now: float | None = None,
         queue_count: int | None = None,
+        force_busy: bool = False,
     ) -> bool:
-        """Send a lightweight Colab kernel heartbeat only while the remote ComfyUI queue is busy."""
+        """Send a lightweight Colab kernel heartbeat only while ComfyUI work is active."""
         if os.environ.get("H3_WORKBENCH_WORKER") == "1":
             return False
         env_copy = dict(os.environ if environ is None else environ)
@@ -933,9 +936,12 @@ class ColabRuntimeManager:
         if not colab_bin:
             return False
 
-        active_queue = probe_remote_queue_count(env_copy, timeout=6.0) if queue_count is None else int(queue_count)
-        if active_queue <= 0:
-            return False
+        if force_busy:
+            active_queue = 1 if queue_count is None else max(1, int(queue_count))
+        else:
+            active_queue = probe_remote_queue_count(env_copy, timeout=6.0) if queue_count is None else int(queue_count)
+            if active_queue <= 0:
+                return False
 
         try:
             with runtime_file_lock(self.storage):
@@ -975,6 +981,25 @@ class ColabRuntimeManager:
                 self._last_keepalive_fail_at = current
             self._append_log(f"[keepalive] Kernel keepalive error: {type(exc).__name__}: {exc}")
             return False
+
+    def trigger_keepalive_async(self, environ=None, *, force_busy: bool = False) -> None:
+        """Non-blocking keepalive check when launching a real ComfyUI video job."""
+        if os.environ.get("H3_WORKBENCH_WORKER") == "1":
+            return
+        env_copy = dict(os.environ if environ is None else environ)
+        current = float(self._clock())
+        with self._lock:
+            if self._active_state is not None or self._active_proc is not None or self._keepalive_in_flight:
+                return
+            if (current - self._last_keepalive_at) < self.keepalive_interval_sec:
+                return
+        threading.Thread(
+            target=self.maybe_send_kernel_keepalive,
+            args=(env_copy,),
+            kwargs={"force_busy": force_busy},
+            name="colab-kernel-keepalive-once",
+            daemon=True,
+        ).start()
 
     def start_keepalive_monitor(self, env_provider, *, poll_sec: float | None = None) -> None:
         if os.environ.get("H3_WORKBENCH_WORKER") == "1":

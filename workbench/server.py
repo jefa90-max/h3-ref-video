@@ -81,6 +81,7 @@ def create_app(storage=None, env_path=None):
             probe = colab_runtime.probe_comfyui(env_with_lang)
             if probe["online"]:
                 runtime.start_keepalive_monitor(current_runtime_env)
+                runtime.trigger_keepalive_async(env_with_lang, force_busy=True)
                 return
             if probe.get("auth_failed"):
                 raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))

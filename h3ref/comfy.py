@@ -398,8 +398,25 @@ def format_progress(status: dict, *, elapsed_s: float | None = None) -> str:
     return " · ".join(parts)
 
 
-def _is_transient_tunnel_error(exc: http.HTTPResponseError) -> bool:
-    return exc.status_code in (502, 503, 504) or "ERR_NGROK_" in str(exc)
+_TRANSIENT_NETWORK_MARKERS = (
+    "ERR_NGROK_",
+    "ConnectionResetError",
+    "Connection reset by peer",
+    "RemoteDisconnected",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+    "TimeoutError",
+    "timed out",
+    "URLError",
+    "EOFError",
+)
+
+
+def _is_transient_tunnel_error(exc: Exception) -> bool:
+    if isinstance(exc, http.HTTPResponseError) and exc.status_code in (502, 503, 504):
+        return True
+    text = str(exc)
+    return any(marker in text for marker in _TRANSIENT_NETWORK_MARKERS)
 
 
 def poll(task: str) -> dict:
@@ -409,7 +426,7 @@ def poll(task: str) -> dict:
     hdrs = _headers()
     try:
         hist = http.request(f"{base}/history/{quote(task, safe='')}", key, extra_headers=hdrs)
-    except http.HTTPResponseError as exc:
+    except RuntimeError as exc:
         if _is_transient_tunnel_error(exc):
             with _MISSING_LOCK:
                 blips = _TRANSIENT_COUNTS.get((base, task), 0) + 1
@@ -424,12 +441,10 @@ def poll(task: str) -> dict:
     if isinstance(http_status, int) and http_status >= 400 and http_status != 404:
         raise RuntimeError(f"ComfyUI poll HTTP {http_status}: {json.dumps(hist, ensure_ascii=False)[:240]}")
 
-    with _MISSING_LOCK:
-        _TRANSIENT_COUNTS.pop((base, task), None)
-
     entry = hist.get(task)
     if isinstance(entry, dict):
         with _MISSING_LOCK:
+            _TRANSIENT_COUNTS.pop((base, task), None)
             _MISSING_COUNTS.pop((base, task), None)
         status_obj = entry.get("status") if isinstance(entry.get("status"), dict) else {}
         if status_obj.get("status_str") == "error":
@@ -455,7 +470,7 @@ def poll(task: str) -> dict:
 
     try:
         q = http.request(f"{base}/queue", key, extra_headers=hdrs)
-    except http.HTTPResponseError as exc:
+    except RuntimeError as exc:
         if _is_transient_tunnel_error(exc):
             with _MISSING_LOCK:
                 blips = _TRANSIENT_COUNTS.get((base, task), 0) + 1
@@ -469,6 +484,9 @@ def poll(task: str) -> dict:
     q_status = q.get("_http_status")
     if isinstance(q_status, int) and q_status >= 400:
         raise RuntimeError(f"ComfyUI queue HTTP {q_status}: {json.dumps(q, ensure_ascii=False)[:240]}")
+
+    with _MISSING_LOCK:
+        _TRANSIENT_COUNTS.pop((base, task), None)
 
     if _task_in_queue_list(q.get("queue_running"), task):
         with _MISSING_LOCK:
