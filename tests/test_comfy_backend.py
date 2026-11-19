@@ -66,6 +66,9 @@ class ComfyBackendTest(unittest.TestCase):
         g4 = comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="4step")
         self.assertTrue(g4[comfy.ENABLE_LORA]["inputs"]["value"])
         self.assertEqual(g4[comfy.TURBO_STEPS]["inputs"]["value"], 4)
+        self.assertEqual(g4[comfy.SAMPLER]["inputs"]["sampler_name"], "euler")
+        self.assertEqual(g4[comfy.STEPS]["inputs"]["scheduler"], "simple")
+        self.assertEqual(g4[comfy.STEPS]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertEqual(
             g4[comfy.LORA]["inputs"]["lora_name"],
             "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
@@ -74,14 +77,20 @@ class ComfyBackendTest(unittest.TestCase):
         g8 = comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="8step")
         self.assertTrue(g8[comfy.ENABLE_LORA]["inputs"]["value"])
         self.assertEqual(g8[comfy.TURBO_STEPS]["inputs"]["value"], 8)
+        self.assertEqual(g8[comfy.SAMPLER]["inputs"]["sampler_name"], "euler")
+        self.assertEqual(g8[comfy.STEPS]["inputs"]["scheduler"], "beta")
+        self.assertEqual(g8[comfy.STEPS]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertEqual(
             g8[comfy.LORA]["inputs"]["lora_name"],
-            "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         )
 
         g20 = comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="full20")
         self.assertFalse(g20[comfy.ENABLE_LORA]["inputs"]["value"])
         self.assertEqual(g20[comfy.FULL_STEPS]["inputs"]["value"], 20)
+        self.assertEqual(g20[comfy.SAMPLER]["inputs"]["sampler_name"], "res_multistep")
+        self.assertEqual(g20[comfy.STEPS]["inputs"]["scheduler"], "beta")
+        self.assertEqual(g20[comfy.STEPS]["inputs"]["model"], ["127", 0])
 
         with self.assertRaises(ValueError):
             comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="invalid")
