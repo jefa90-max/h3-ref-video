@@ -482,7 +482,7 @@ class ColabRuntimeTest(unittest.TestCase):
                 storage,
                 clock=lambda: clock_state["now"],
             )
-            self.assertEqual(mgr.keepalive_interval_sec, 1500.0)
+            self.assertEqual(mgr.keepalive_interval_sec, 480.0)
             env = {
                 "VIDEO_PROVIDER": "comfyui",
                 "COMFYUI_URL": "https://demo.ngrok-free.dev",
@@ -497,36 +497,42 @@ class ColabRuntimeTest(unittest.TestCase):
                 return 0, "keepalive\n"
 
             with patch.object(mgr, "_run_command", side_effect=fake_run_cmd):
-                # 1. Under 25 min -> never sends keepalive even when queue is busy
-                clock_state["now"] = 1000.0 + 1499.0
+                # 1. Under 8 min -> never sends keepalive even when queue is busy
+                clock_state["now"] = 1000.0 + 479.0
                 with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
                     self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(calls, [])
 
-                # 2. >= 25 min but queue is empty -> MUST NOT send keepalive (preserve 60m idle watchdog)
-                clock_state["now"] = 1000.0 + 1500.0
+                # 2. >= 8 min but queue is empty -> MUST NOT send keepalive (avoid burning compute units when idle)
+                clock_state["now"] = 1000.0 + 480.0
                 with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
                     self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(calls, [])
 
-                # 3. >= 25 min and queue is busy -> sends lightweight colab exec --timeout 30 heartbeat
+                # 3. >= 8 min and queue is busy -> sends lightweight colab exec --timeout 30 heartbeat
                 with patch.object(colab_runtime, "probe_remote_queue_count", return_value=2):
                     self.assertTrue(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0][2], ["exec", "-s", "comfy-a100", "--timeout", "30"])
                 self.assertIn("keepalive", calls[0][3])
 
-                # 4. Immediately afterwards while still busy -> waits another 25 min
-                clock_state["now"] += 600.0
+                # 4. Immediately afterwards while still busy -> waits another 8 min
+                clock_state["now"] += 300.0
                 with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
                     self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(len(calls), 1)
 
-                # 5. Another 25 min passes, queue becomes empty -> stops keepalive immediately
-                clock_state["now"] += 1000.0
+                # 5. Another 8 min passes, queue becomes empty -> stops keepalive immediately
+                clock_state["now"] += 300.0
                 with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
                     self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(len(calls), 1)
+
+                # 5b. Launching a new video job after >= 8 min idle immediately refreshes kernel via force_busy=True
+                with patch.object(colab_runtime, "probe_remote_queue_count", side_effect=AssertionError("force_busy skips /queue probe")):
+                    self.assertTrue(mgr.maybe_send_kernel_keepalive(env, force_busy=True))
+                self.assertEqual(len(calls), 2)
+                clock_state["now"] += 480.0
 
                 # 6. Concurrency / lock guards: active startup/stop state, active subprocess, file lock, worker env
                 with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
@@ -543,7 +549,7 @@ class ColabRuntimeTest(unittest.TestCase):
 
                     with patch.dict(os.environ, {"H3_WORKBENCH_WORKER": "1"}, clear=False):
                         self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
-                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(calls), 2)
 
             # 7. Heartbeat failure never raises or interrupts tasks; logs error and backs off during cooldown
             with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1), \

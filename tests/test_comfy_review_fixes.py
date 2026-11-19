@@ -366,6 +366,26 @@ class ComfyReviewFixesTest(unittest.TestCase):
             st2 = comfy.poll("pid-reconnect")
             self.assertEqual(st2["state"], "running")
 
+        # Transient TCP reset on /queue is tolerated up to 3 consecutive polls, then raises on the 4th
+        comfy._TRANSIENT_COUNTS.clear()
+        reset_err = RuntimeError("https://demo.ngrok-free.dev/queue: ConnectionResetError: [Errno 54] Connection reset by peer")
+        queue_calls = {"n": 0}
+
+        def flaky_queue_reset(url, key, body=None, **kwargs):
+            if "/history/" in url:
+                return {}
+            queue_calls["n"] += 1
+            if queue_calls["n"] <= 4:
+                raise reset_err
+            return {"queue_running": [[1, "pid-reset"]], "queue_pending": []}
+
+        with mock.patch.dict(os.environ, {"COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "k"}, clear=False), \
+             mock.patch("h3ref.comfy.http.request", side_effect=flaky_queue_reset):
+            for _ in range(3):
+                self.assertEqual(comfy.poll("pid-reset")["state"], "running")
+            with self.assertRaisesRegex(RuntimeError, "ConnectionResetError"):
+                comfy.poll("pid-reset")
+
     def test_stage_models_auto_downloads_missing_upscaler_atomically_and_syncs_to_ssd(self):
         import io
 
