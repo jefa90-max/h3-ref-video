@@ -470,6 +470,81 @@ class ComfyBackendTest(unittest.TestCase):
             run_log = (job.dir / "run.log").read_text(encoding="utf-8")
             self.assertIn("2/4", run_log)
 
+    def test_start_colab_disables_aimdo_flags_retries_fuse_pread_and_film_surfaces_error_reason(self):
+        from scripts import start_colab
+
+        # 1. start_comfyui launches main.py with --disable-dynamic-vram and --disable-pinned-memory
+        launched_cmds = []
+
+        def fake_popen(cmd, **kwargs):
+            launched_cmds.append(list(cmd))
+            return object()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(start_colab, "LOCAL", root), \
+                 patch.object(start_colab, "COMFY_LOG_FILE", root / "comfyui.log"), \
+                 patch.object(start_colab, "_http_status", side_effect=[None, 200]), \
+                 patch.object(start_colab.subprocess, "run"), \
+                 patch.object(start_colab.subprocess, "Popen", side_effect=fake_popen), \
+                 patch.object(start_colab.time, "sleep"):
+                start_colab.start_comfyui()
+
+        self.assertEqual(len(launched_cmds), 1)
+        self.assertIn("--disable-dynamic-vram", launched_cmds[0])
+        self.assertIn("--disable-pinned-memory", launched_cmds[0])
+
+        # 2. _parallel_copy_file retries transient Drive FUSE OSError during pread
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "model.safetensors"
+            dst = root / "staged.safetensors"
+            payload = b"ABCD1234" * 4096
+            src.write_bytes(payload)
+            real_pread = os.pread
+            injected = {"failed": False}
+
+            def flaky_pread(fd, n, offset):
+                if not injected["failed"]:
+                    injected["failed"] = True
+                    raise OSError("transient Drive FUSE read drop")
+                return real_pread(fd, n, offset)
+
+            with patch.object(start_colab.os, "pread", side_effect=flaky_pread), \
+                 patch.object(start_colab.time, "sleep"):
+                start_colab._parallel_copy_file(src, dst, len(payload), "text_encoders/qwen3vl.safetensors")
+
+            self.assertTrue(injected["failed"])
+            self.assertEqual(dst.read_bytes(), payload)
+
+        # 3. film._generate_segment logs and surfaces the exact remote error in TERMINAL_FAILED (both live and on resume)
+        reason = "MiniMaxH3ReferenceToVideo RuntimeError: HostBuffer.read_file_slice failed"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref = root / "ref.png"
+            Image.new("RGB", (8, 8), "green").save(ref)
+            job = film.Job(root / "job-fail")
+            (job.dir / "clips").mkdir(parents=True, exist_ok=True)
+            job.put("segs", "0", h3="subject_definitions:\n<Picture 1> test\n")
+            film_doc = {"aspect": "9:16", "cast": [{"name": "A", "picture": str(ref)}], "shots": []}
+            seg = {"idx": 0, "seconds": 5, "shots": [{"action": "walk"}]}
+            pics = [{"kind": "cast", "cast": {"name": "A", "picture": str(ref)}}]
+
+            with patch.dict(os.environ, {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "h3c_k"}, clear=False), \
+                 patch("h3ref.comfy.upload", return_value="ref.png"), \
+                 patch("h3ref.comfy.submit_with_retry", return_value="pid-fail-1"), \
+                 patch("h3ref.comfy.poll", return_value={"state": "failed", "error": reason}):
+                with self.assertRaises(RuntimeError) as ctx_first:
+                    film._generate_segment(job, film_doc, seg, pics, reference_paths=[ref])
+                with self.assertRaises(RuntimeError) as ctx_resume:
+                    film._generate_segment(job, film_doc, seg, pics, reference_paths=[ref])
+
+            self.assertIn("TERMINAL_FAILED", str(ctx_first.exception))
+            self.assertIn(reason, str(ctx_first.exception))
+            self.assertIn("TERMINAL_FAILED", str(ctx_resume.exception))
+            self.assertIn(reason, str(ctx_resume.exception))
+            self.assertIn(reason, (job.dir / "run.log").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
