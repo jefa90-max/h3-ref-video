@@ -24,19 +24,95 @@ from .i18n import message, use_lang
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 DRIVE_AUTH_TIMEOUT_SEC = 600.0
 SESSION_CACHE_TTL_SEC = 5.0
+CRASH_GRACE_SEC = 1.5
+DEFAULT_REQUEST_TIMEOUT_SEC = "90"
 REMOTE_START_CODE = (
-    "import subprocess, sys\n"
-    "p = subprocess.Popen(\n"
-    "    [sys.executable, '-u', '/content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py'],\n"
-    "    stdout=subprocess.PIPE,\n"
-    "    stderr=subprocess.STDOUT,\n"
-    "    text=True,\n"
-    ")\n"
-    "for line in p.stdout:\n"
-    "    print(line, end='', flush=True)\n"
-    "rc = p.wait()\n"
+    "import os, subprocess, sys, time\n"
+    "tmp_d = os.environ.get('H3_BOOT_TMP', '/tmp')\n"
+    "script = os.environ.get('H3_START_COLAB_SCRIPT', '/content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py')\n"
+    "pid_f = os.path.join(tmp_d, 'h3_boot.pid')\n"
+    "log_f = os.path.join(tmp_d, 'h3_boot.log')\n"
+    "rc_f = os.path.join(tmp_d, 'h3_boot.rc')\n"
+    "def alive(p):\n"
+    "    try:\n"
+    "        os.kill(p, 0)\n"
+    "    except OSError:\n"
+    "        return False\n"
+    "    if os.path.isdir('/proc'):\n"
+    "        try:\n"
+    "            raw = open(f'/proc/{p}/cmdline', 'rb').read()\n"
+    "            return bool(raw) and b'h3_boot_runner' in raw\n"
+    "        except OSError:\n"
+    "            return False\n"
+    "    return True\n"
+    "try:\n"
+    "    pid = int(open(pid_f, encoding='utf-8').read().strip()) if os.path.isfile(pid_f) else 0\n"
+    "except ValueError:\n"
+    "    pid = 0\n"
+    "if not (pid and not os.path.isfile(rc_f) and alive(pid)):\n"
+    "    for f in (log_f, rc_f):\n"
+    "        try:\n"
+    "            os.remove(f)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "    runner = (\n"
+    "        '# h3_boot_runner\\n'\n"
+    "        'import os, subprocess, sys\\n'\n"
+    "        f'with open({log_f!r}, \"a\", encoding=\"utf-8\") as out_f:\\n'\n"
+    "        f'    child = subprocess.Popen([sys.executable, \"-u\", {script!r}], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\\n'\n"
+    "        '    for line in child.stdout:\\n'\n"
+    "        '        out_f.write(line)\\n'\n"
+    "        '        out_f.flush()\\n'\n"
+    "        '    rc = child.wait()\\n'\n"
+    "        f'tmp_rc = {rc_f!r} + \".tmp\"\\n'\n"
+    "        'open(tmp_rc, \"w\", encoding=\"utf-8\").write(str(rc))\\n'\n"
+    "        f'os.replace(tmp_rc, {rc_f!r})\\n'\n"
+    "        'sys.exit(rc)\\n'\n"
+    "    )\n"
+    "    open(log_f, 'w', encoding='utf-8').close()\n"
+    "    p = subprocess.Popen(\n"
+    "        [sys.executable, '-u', '-c', runner],\n"
+    "        stdout=subprocess.DEVNULL,\n"
+    "        stderr=subprocess.DEVNULL,\n"
+    "        stdin=subprocess.DEVNULL,\n"
+    "        start_new_session=True,\n"
+    "    )\n"
+    "    open(pid_f, 'w', encoding='utf-8').write(str(p.pid))\n"
+    "    pid = p.pid\n"
+    "pos, last_beat = 0, time.monotonic()\n"
+    "while True:\n"
+    "    if os.path.isfile(log_f):\n"
+    "        with open(log_f, 'r', encoding='utf-8', errors='replace') as lf:\n"
+    "            lf.seek(pos)\n"
+    "            chunk = lf.read()\n"
+    "            pos = lf.tell()\n"
+    "        if chunk:\n"
+    "            print(chunk, end='', flush=True)\n"
+    "            last_beat = time.monotonic()\n"
+    "    if os.path.isfile(rc_f) or not alive(pid):\n"
+    "        break\n"
+    "    if time.monotonic() - last_beat >= 20:\n"
+    "        print('[start_colab] bootstrap running...', flush=True)\n"
+    "        last_beat = time.monotonic()\n"
+    "    time.sleep(0.2)\n"
+    "if os.path.isfile(log_f):\n"
+    "    with open(log_f, 'r', encoding='utf-8', errors='replace') as lf:\n"
+    "        lf.seek(pos)\n"
+    "        rest = lf.read()\n"
+    "    if rest:\n"
+    "        print(rest, end='', flush=True)\n"
+    "rc = int(open(rc_f, encoding='utf-8').read().strip()) if os.path.isfile(rc_f) else 1\n"
     "if rc != 0:\n"
     "    raise SystemExit(f'start_colab.py exited with {rc}')\n"
+)
+
+_TRANSIENT_WS_MARKERS = (
+    "Connection was lost.",
+    "Connection is already closed.",
+    "WebSocketConnectionClosedException",
+    "WebSocketTimeoutException",
+    "ReadTimeout",
+    "ConnectTimeout",
 )
 
 _STRIPPED_PROJECT_SECRETS = (
@@ -139,11 +215,28 @@ def _build_argv(colab_bin: str, auth_mode: str, sub_args: list[str]) -> list[str
     return [*prefix, *sub_args]
 
 
+def _is_transient_ws_disconnect(output: str) -> bool:
+    return any(marker in output for marker in _TRANSIENT_WS_MARKERS)
+
+
+def _is_terminal_cli_crash_line(line: str, saw_rich_box_end: bool) -> tuple[bool, bool]:
+    stripped = line.strip()
+    if "╰─" in stripped and "╯" in stripped:
+        return False, True
+    if "Connection was lost." in stripped or "WebSocketConnectionClosedException" in stripped:
+        return True, saw_rich_box_end
+    if saw_rich_box_end and stripped:
+        return True, False
+    return False, saw_rich_box_end
+
+
 def _popen_kwargs(environ=None, *, os_name: str | None = None) -> dict:
     active_os = os.name if os_name is None else os_name
     base_env = dict(os.environ if environ is None else environ)
     for secret_key in _STRIPPED_PROJECT_SECRETS:
         base_env.pop(secret_key, None)
+    if not str(base_env.get("REQUEST_TIMEOUT", "")).strip():
+        base_env["REQUEST_TIMEOUT"] = DEFAULT_REQUEST_TIMEOUT_SEC
     base_env.update(
         PYTHONUNBUFFERED="1",
         PYTHONUTF8="1",
@@ -247,9 +340,18 @@ def parse_sessions_output(output: str) -> dict:
 
 
 class ColabRuntimeManager:
-    def __init__(self, storage: Path, *, drive_auth_timeout: float = DRIVE_AUTH_TIMEOUT_SEC):
+    def __init__(
+        self,
+        storage: Path,
+        *,
+        drive_auth_timeout: float = DRIVE_AUTH_TIMEOUT_SEC,
+        crash_grace_sec: float = CRASH_GRACE_SEC,
+        retry_delay_sec: float = 4.0,
+    ):
         self.storage = Path(storage)
         self.drive_auth_timeout = float(drive_auth_timeout)
+        self.crash_grace_sec = float(crash_grace_sec)
+        self.retry_delay_sec = float(retry_delay_sec)
         self._lock = threading.RLock()
         self._active_state: str | None = None
         self._auth_url: str | None = None
@@ -296,19 +398,41 @@ class ColabRuntimeManager:
             except OSError:
                 pass
         collected: list[str] = []
+        cli_crashed = threading.Event()
 
         def reader():
+            saw_rich_box_end = False
             try:
                 for line in proc.stdout:
                     collected.append(line)
                     self._append_log(line)
+                    crashed, saw_rich_box_end = _is_terminal_cli_crash_line(line, saw_rich_box_end)
+                    if crashed:
+                        cli_crashed.set()
             except Exception:
                 pass
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()
+        crash_deadline: float | None = None
         try:
-            rc = proc.wait(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None:
+                if self._cancel_event.is_set():
+                    _kill_process_tree(proc)
+                    break
+                now = time.monotonic()
+                if cli_crashed.is_set():
+                    if crash_deadline is None:
+                        crash_deadline = now + self.crash_grace_sec
+                    elif now >= crash_deadline:
+                        _kill_process_tree(proc)
+                        break
+                if now >= deadline:
+                    _kill_process_tree(proc)
+                    break
+                time.sleep(0.02)
+            rc = proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
             _kill_process_tree(proc)
             rc = -9
@@ -481,9 +605,11 @@ class ColabRuntimeManager:
 
         lines: list[str] = []
         prompted = threading.Event()
+        cli_crashed = threading.Event()
 
         def read_output():
             buf = ""
+            saw_rich_box_end = False
             try:
                 while True:
                     ch = proc.stdout.read(1)
@@ -491,11 +617,17 @@ class ColabRuntimeManager:
                         if buf:
                             lines.append(buf)
                             self._append_log(buf)
+                            crashed, saw_rich_box_end = _is_terminal_cli_crash_line(buf, saw_rich_box_end)
+                            if crashed:
+                                cli_crashed.set()
                         break
                     buf += ch
                     if ch == "\n" or "Press Enter after you have granted access" in buf:
                         lines.append(buf)
                         self._append_log(buf)
+                        crashed, saw_rich_box_end = _is_terminal_cli_crash_line(buf, saw_rich_box_end)
+                        if crashed:
+                            cli_crashed.set()
                         m = _URL_RE.search(buf)
                         if m:
                             with self._lock:
@@ -514,6 +646,7 @@ class ColabRuntimeManager:
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
         timed_out_auth = False
+        crash_deadline: float | None = None
         try:
             deadline = time.monotonic() + 180.0
             while proc.poll() is None:
@@ -529,7 +662,14 @@ class ColabRuntimeManager:
                         _kill_process_tree(proc)
                         break
                     deadline = time.monotonic() + 180.0
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if cli_crashed.is_set():
+                    if crash_deadline is None:
+                        crash_deadline = now + self.crash_grace_sec
+                    elif now >= crash_deadline:
+                        _kill_process_tree(proc)
+                        break
+                if now >= deadline:
                     _kill_process_tree(proc)
                     break
                 time.sleep(0.05)
@@ -600,7 +740,7 @@ class ColabRuntimeManager:
                             return
                         if timed_out_auth:
                             raise RuntimeError(message("colab_drive_timeout", seconds=int(self.drive_auth_timeout)))
-                        if "Connection was lost." in mount_out and "Mounted at" not in mount_out and attempt < 7:
+                        if _is_transient_ws_disconnect(mount_out) and "Mounted at" not in mount_out and "already mounted" not in mount_out.lower() and attempt < 7:
                             time.sleep(5.0)
                             continue
                         break
@@ -615,16 +755,31 @@ class ColabRuntimeManager:
 
                 with self._lock:
                     self._active_state = "starting_comfy"
-                rc, exec_out = self._run_command(
-                    colab_bin,
-                    auth_mode,
-                    ["exec", "-s", session_name, "--timeout", "1800"],
-                    environ=env_copy,
-                    stdin_text=REMOTE_START_CODE,
-                    timeout=2400.0,
-                )
-                if self._cancel_event.is_set():
-                    return
+                exec_out = ""
+                rc = 1
+                for attempt in range(6):
+                    if self._cancel_event.is_set():
+                        return
+                    if attempt > 0 and probe_comfyui(env_copy)["online"]:
+                        rc = 0
+                        exec_out = ""
+                        break
+                    rc, exec_out = self._run_command(
+                        colab_bin,
+                        auth_mode,
+                        ["exec", "-s", session_name, "--timeout", "1800"],
+                        environ=env_copy,
+                        stdin_text=REMOTE_START_CODE,
+                        timeout=2400.0,
+                    )
+                    if self._cancel_event.is_set():
+                        return
+                    if rc == 0 and "Traceback (most recent call last)" not in exec_out:
+                        break
+                    if _is_transient_ws_disconnect(exec_out) and attempt < 5:
+                        time.sleep(self.retry_delay_sec)
+                        continue
+                    break
                 if rc != 0 or "Traceback (most recent call last)" in exec_out:
                     raise RuntimeError(message("colab_start_failed", reason=exec_out.strip()[-300:] or f"colab exec exit {rc}"))
 
