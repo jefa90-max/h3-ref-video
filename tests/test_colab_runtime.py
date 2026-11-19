@@ -322,6 +322,144 @@ class ColabRuntimeTest(unittest.TestCase):
                 self.assertTrue(forced["stopped"])
                 self.assertEqual(stop_called["count"], 1)
 
+    def test_exec_connection_lost_hung_cli_is_reaped_retried_and_remote_boot_is_single_instance(self):
+        # 1. REQUEST_TIMEOUT defaults to >=90s so jupyter_kernel_client WebSocket proxy handshakes do not abort at 10s
+        default_kw = colab_runtime._popen_kwargs({"PATH": "/usr/bin"}, os_name="posix")
+        self.assertEqual(default_kw["env"]["REQUEST_TIMEOUT"], "90")
+        custom_kw = colab_runtime._popen_kwargs({"PATH": "/usr/bin", "REQUEST_TIMEOUT": "120"}, os_name="posix")
+        self.assertEqual(custom_kw["env"]["REQUEST_TIMEOUT"], "120")
+
+        # 2. Hung `colab exec` emitting Rich `RuntimeError: Connection was lost.` (non-daemon WS thread leak) is reaped and retried
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            mgr = colab_runtime.ColabRuntimeManager(Path(tmp), crash_grace_sec=0.05, retry_delay_sec=0.02)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": "h3c_key",
+                "COLAB_SESSION": "comfy-a100",
+                "COLAB_BIN": str(fake_bin),
+            }
+            exec_procs = []
+            online = {"up": False}
+
+            class HungCrashedExecProc:
+                def __init__(self):
+                    self.pid = 80904
+                    self.killed_event = threading.Event()
+                    r_fd, w_fd = os.pipe()
+                    self.stdout = os.fdopen(r_fd, "r", encoding="utf-8", errors="replace")
+                    self._w_fd = w_fd
+                    self.stdin = MagicMock()
+                    threading.Thread(target=self._emit_crash_then_hang, daemon=True).start()
+
+                def _emit_crash_then_hang(self):
+                    os.write(
+                        self._w_fd,
+                        (
+                            "╭───────────────────── Traceback (most recent call last) ──────────────────────╮\n"
+                            "│   304 │   │   │   │   if not client.connection_ready.is_set():               │\n"
+                            "│ ❱ 305 │   │   │   │   │   raise RuntimeError(\"Connection was lost.\")         │\n"
+                            "╰──────────────────────────────────────────────────────────────────────────────╯\n"
+                            "RuntimeError: Connection was lost.\n"
+                        ).encode("utf-8"),
+                    )
+                    # Deliberately keep _w_fd open and never exit until killed, reproducing leaked KernelWebSocketClient thread
+                    self.killed_event.wait(timeout=10.0)
+                    try:
+                        os.close(self._w_fd)
+                    except OSError:
+                        pass
+
+                def poll(self):
+                    return -9 if self.killed_event.is_set() else None
+
+                def wait(self, timeout=None):
+                    if not self.killed_event.wait(timeout=timeout):
+                        raise subprocess.TimeoutExpired("colab", timeout)
+                    return -9
+
+                def kill(self):
+                    self.killed_event.set()
+
+            def fake_popen(argv, **kwargs):
+                if "sessions" in argv:
+                    return self._make_pipe_proc(["[comfy-a100] m-s-1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"])
+                if "ls" in argv:
+                    return self._make_pipe_proc(["MyDrive/\n"])
+                if "exec" in argv:
+                    if not exec_procs:
+                        hung = HungCrashedExecProc()
+                        exec_procs.append(hung)
+                        return hung
+                    ok_proc = self._make_pipe_proc(["[start_colab] TUNNEL READY (AUTH PROTECTED): https://demo.ngrok-free.dev\n"])
+                    exec_procs.append(ok_proc)
+                    online["up"] = True
+                    return ok_proc
+                raise AssertionError(f"Unexpected argv: {argv}")
+
+            with patch.object(colab_runtime, "probe_comfyui", side_effect=lambda *a, **kw: {"online": online["up"], "devices": [{"name": "A100"}] if online["up"] else []}), \
+                 patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch.object(colab_runtime, "_kill_process_tree", side_effect=lambda p: p.kill()):
+                st = mgr.ensure_started(env, timeout=5.0)
+
+            self.assertEqual(st["state"], "online")
+            self.assertEqual(len(exec_procs), 2)
+            self.assertTrue(exec_procs[0].killed_event.is_set(), "Hung crashed colab exec must be killed instead of blocking 2400s")
+
+        # 3. Real execution of REMOTE_START_CODE: mid-flight client disconnect re-attaches without spawning a duplicate start_colab.py
+        if os.name != "nt":
+            import sys
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                count_file = tmp_path / "invocations.txt"
+                started_file = tmp_path / "started.flag"
+                fake_start = tmp_path / "start_colab.py"
+                fake_start.write_text(
+                    "import pathlib, time\n"
+                    f"c = pathlib.Path({str(count_file)!r})\n"
+                    "n = int(c.read_text()) + 1 if c.exists() else 1\n"
+                    "c.write_text(str(n))\n"
+                    f"pathlib.Path({str(started_file)!r}).write_text('1')\n"
+                    "print('[start_colab] Copying models...', flush=True)\n"
+                    "time.sleep(0.4)\n"
+                    "print('[start_colab] TUNNEL READY (AUTH PROTECTED): https://demo.ngrok-free.dev', flush=True)\n",
+                    encoding="utf-8",
+                )
+                boot_env = {
+                    **os.environ,
+                    "H3_BOOT_TMP": str(tmp_path),
+                    "H3_START_COLAB_SCRIPT": str(fake_start),
+                }
+                client1 = subprocess.Popen(
+                    [sys.executable, "-u", "-c", colab_runtime.REMOTE_START_CODE],
+                    env=boot_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and not started_file.exists():
+                    time.sleep(0.02)
+                self.assertTrue(started_file.exists())
+                # Simulate WebSocket / kernel cell disconnect killing client1 while start_colab.py continues in detached session
+                client1.kill()
+                client1.wait(timeout=2.0)
+                if client1.stdout:
+                    client1.stdout.close()
+
+                client2 = subprocess.run(
+                    [sys.executable, "-u", "-c", colab_runtime.REMOTE_START_CODE],
+                    env=boot_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                self.assertEqual(client2.returncode, 0, client2.stdout + client2.stderr)
+                self.assertIn("TUNNEL READY (AUTH PROTECTED)", client2.stdout)
+                self.assertEqual(count_file.read_text(encoding="utf-8").strip(), "1")
+
 
 if __name__ == "__main__":
     unittest.main()
