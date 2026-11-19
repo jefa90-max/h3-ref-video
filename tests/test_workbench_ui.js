@@ -1131,3 +1131,74 @@ test("common.js refreshes runtime card when video submission triggers auto-start
   assert.equal(postedConfig.COMFYUI_URL, "");
 });
 
+test("style.css normalizes all form selects to custom appearance and exact height parity with text inputs", () => {
+  const rawCss = fs.readFileSync(path.join(staticDirectory, "style.css"), "utf8");
+  const topLevelCss = rawCss.replace(/@media[^{]+\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}/g, "");
+  const rules = [];
+  for (const match of topLevelCss.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
+    const selectors = match[1].trim();
+    const decls = {};
+    for (const part of match[2].split(";")) {
+      const colon = part.indexOf(":");
+      if (colon === -1) continue;
+      decls[part.slice(0, colon).trim()] = part.slice(colon + 1).trim();
+    }
+    rules.push({ selectors, decls });
+  }
+
+  const collectFor = (predicate) => {
+    const merged = {};
+    for (const rule of rules) {
+      if (predicate(rule.selectors)) {
+        if ("background" in rule.decls) {
+          delete merged["background-image"];
+        }
+        Object.assign(merged, rule.decls);
+      }
+    }
+    return merged;
+  };
+
+  const splitTopLevelCommas = (sel) => {
+    const parts = [];
+    let depth = 0, cur = "";
+    for (const ch of sel) {
+      if (ch === "(" || ch === "[") depth += 1;
+      else if (ch === ")" || ch === "]") depth -= 1;
+      if (ch === "," && depth === 0) {
+        parts.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.trim()) parts.push(cur.trim());
+    return parts;
+  };
+
+  const formSelect = collectFor((s) => splitTopLevelCommas(s).includes("select"));
+  const textInput = collectFor((s) => splitTopLevelCommas(s).some((p) => p === "input" || p.startsWith("input:where(:not(")));
+  assert.equal(formSelect.appearance, "none", "select must disable native OS popup appearance");
+  assert.equal(formSelect["-webkit-appearance"], "none", "select must disable WebKit native popup appearance on macOS");
+  assert.ok(formSelect["background-image"]?.startsWith("url("), "select must render custom dropdown chevron");
+  assert.equal(formSelect.height, "44px", "form select must set explicit 44px height");
+  assert.equal(textInput.height, formSelect.height, "single-line text input height must match form select height");
+
+  const segmentSelect = { ...formSelect, ...collectFor((s) => splitTopLevelCommas(s).includes(".segment-editor select")) };
+  assert.equal(segmentSelect.height, formSelect.height, "segment editor select must match form input height");
+
+  const headerSelect = collectFor((s) => {
+    const parts = splitTopLevelCommas(s);
+    return parts.includes("select") || parts.includes(".header-tools select");
+  });
+  assert.equal(headerSelect.height, "auto", "header language select must stay compact (height: auto)");
+  assert.ok(headerSelect["background-image"]?.startsWith("url("), "header language select must retain custom chevron background-image");
+
+  const pageJumpInput = { ...textInput, ...collectFor((s) => splitTopLevelCommas(s).includes(".page-jump input")) };
+  const plyrInput = { ...textInput, ...collectFor((s) => splitTopLevelCommas(s).includes(".artifact .plyr input")) };
+  const checkboxInput = { ...textInput, ...collectFor((s) => splitTopLevelCommas(s).includes(".checkbox-field input")) };
+  assert.equal(pageJumpInput.height, "auto", ".page-jump input must preserve compact height");
+  assert.equal(plyrInput.height, "auto", ".artifact .plyr input must not inherit 44px textbox height");
+  assert.equal(checkboxInput.height, "16px", ".checkbox-field input must remain 16px");
+});
+
