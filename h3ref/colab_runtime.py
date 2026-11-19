@@ -755,6 +755,21 @@ class ColabRuntimeManager:
 
                 with self._lock:
                     self._active_state = "starting_comfy"
+                local_start_script = config.ROOT / "scripts" / "start_colab.py"
+                if local_start_script.is_file():
+                    for _ in range(2):
+                        up_rc, _ = self._run_command(
+                            colab_bin,
+                            auth_mode,
+                            ["upload", "-s", session_name, str(local_start_script), "content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py"],
+                            environ=env_copy,
+                            timeout=60.0,
+                        )
+                        if self._cancel_event.is_set():
+                            return
+                        if up_rc == 0:
+                            break
+                        time.sleep(2.0)
                 exec_out = ""
                 rc = 1
                 for attempt in range(6):
