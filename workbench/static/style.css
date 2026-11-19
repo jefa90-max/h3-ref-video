@@ -12,6 +12,9 @@ button:focus-visible,a:focus-visible,summary:focus-visible,select:focus-visible,
 input,textarea,select{min-width:0;width:100%;border:1px solid #dce3dc;border-radius:8px;padding:10px 12px;color:var(--ink);background:#fff;transition:border-color .15s,box-shadow .15s}
 input:focus,textarea:focus,select:focus{border-color:#76a98c;box-shadow:0 0 0 3px #237b6014}
 input::placeholder,textarea::placeholder{color:#5f6e66}
+input:where(:not([type="checkbox"],[type="file"],[type="range"])),select{height:44px}
+select{-webkit-appearance:none;appearance:none;padding:0 36px 0 12px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14' fill='none'%3E%3Cpath d='M3.5 5.25L7 8.75L10.5 5.25' stroke='%2352655a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;background-size:14px 14px;cursor:pointer}
+input:disabled,textarea:disabled,select:disabled{cursor:not-allowed;opacity:.6;background-color:#f6f8f5}
 textarea{resize:vertical;display:block;line-height:1.75}
 label{display:flex;flex-direction:column;gap:7px;font-size:13px;font-weight:600}
 h1,h2,h3,p{margin:0}
@@ -24,7 +27,7 @@ h3{font-size:14px;font-weight:650}
 .brand-mark{font-size:28px;font-weight:800;letter-spacing:-1.5px;position:relative;line-height:1}
 .brand-dot{display:inline-block;width:6px;height:6px;border-radius:2px;background:#6eaa65;margin:0 0 1px 3px}
 .header-tools{display:flex;align-items:center;gap:22px}
-.header-tools select{font-size:12px;width:auto;background:transparent;border:0;padding:6px;cursor:pointer}
+.header-tools select{height:auto;font-size:12px;width:auto;background-color:transparent;background-position:right 4px center;background-size:12px 12px;border:0;padding:6px 22px 6px 8px;cursor:pointer}
 .local-badge{display:flex;align-items:center;gap:7px;font-size:12px;letter-spacing:.2px;color:#52655a}
 .local-badge>span:first-child{height:6px;width:6px;background:#6b9b70;border-radius:50%}
 .shell{max-width:1380px;margin:0 auto;padding:42px 5% 18px}
@@ -198,7 +201,7 @@ h3{font-size:14px;font-weight:650}
 .artifact .plyr{--plyr-color-main:var(--accent);--plyr-font-family:inherit;--plyr-control-icon-size:15px;--plyr-control-spacing:7px;border-radius:7px 7px 0 0}
 .artifact .plyr video{max-height:450px}
 .artifact .plyr button{font:inherit}
-.artifact .plyr input{padding:0;border:0;box-shadow:none}
+.artifact .plyr input{height:auto;padding:0;border:0;box-shadow:none}
 .artifact .plyr__controls{font-size:12px}
 .artifact .plyr__menu__container{color:var(--ink)}
 footer{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:#52655a;margin-top:34px;padding-top:17px;border-top:1px solid var(--border)}
@@ -318,7 +321,7 @@ a.history-row:hover{background:#eef4ea;border-color:#d4e2d2}
 .pagination-buttons>.hint{text-align:center}
 .page-jump{display:flex;align-items:center;gap:8px}
 .page-jump label{font-size:12px;font-weight:400;white-space:nowrap}
-.page-jump input{width:72px;padding:8px;font-size:13px;text-align:center}
+.page-jump input{width:72px;height:auto;padding:8px;font-size:13px;text-align:center}
 .empty-review{padding:28px 0;text-align:center}
 .continue-section{border-top:1px solid var(--border);padding-top:18px;margin-top:20px}
 .script-segment{border:1px solid var(--border);border-radius:7px;padding:12px;margin-top:10px;font-size:13px}
@@ -383,7 +386,7 @@ a.history-row:hover{background:#eef4ea;border-color:#d4e2d2}
 .segment-editor summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-weight:600}
 .segment-editor label{display:block;font-size:14px;font-weight:600;margin:12px 0 6px}
 .segment-editor textarea{box-sizing:border-box;width:100%;max-width:100%;font-size:16px;line-height:1.6;resize:vertical;min-height:160px}
-.segment-editor select{box-sizing:border-box;max-width:100%;min-height:44px;font-size:16px}
+.segment-editor select{box-sizing:border-box;max-width:100%;height:44px;min-height:44px;font-size:16px}
 .segment-editor pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6;max-height:280px;overflow:auto}
 .segment-card .segment-actions .button,.segment-editor .button{min-height:44px;font-size:13px;white-space:normal;overflow-wrap:anywhere}
 .segment-draft-note,.segment-conflict,.segment-source-warning,.segment-attempt,.segment-error{color:#684c16;overflow-wrap:anywhere}
