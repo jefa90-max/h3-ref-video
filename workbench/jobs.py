@@ -245,9 +245,12 @@ class Jobs:
         if record["kind"] == "one" and any(a["name"] == "clip.mp4" for a in artifacts):
             result["progress"]["clips"] = 1
         result.update(storyboard=[], character_references=[], pending_video=False, can_continue=False, review=None, review_needed=False,
-                      segments=[], assembly=None, pending_assembly=False, can_assemble=False, can_rewrite_prompts=False, missing_h3_count=0)
+                      segments=[], assembly=None, pending_assembly=False, can_assemble=False, can_rewrite_prompts=False, missing_h3_count=0,
+                      live_progress=None)
         if record["kind"] == "one":
             one_state = context["state"]
+            if record["status"] in ("queued", "running") and isinstance(one_state.get("live_progress"), dict):
+                result["live_progress"] = dict(one_state["live_progress"])
             result["can_resume_video"] = not bool(
                 (one_state.get("submission_unknown") and not one_state.get("task"))
                 or one_state.get("terminal_failed")
@@ -291,6 +294,8 @@ class Jobs:
             for card in result["segments"]:
                 if card.get("error"):
                     card["error"] = self.redact(str(card["error"]))
+                if record["status"] in ("queued", "running") and result["live_progress"] is None and isinstance(card.get("live_progress"), dict):
+                    result["live_progress"] = {"segment": card["number"], **card["live_progress"]}
             result["segment_number"] = saved.get("segment") if saved.get("operation") in ("segment", "rewrite_segment") else None
             unfinished = [card for card in result['segments'] if not card['url'] or card['task_pending']]
             raw_pending_seg = context['pending']

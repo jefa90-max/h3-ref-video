@@ -72,5 +72,21 @@
   "colab_orphan_blocked": "Detected orphaned remote Colab session(s) ({sessions}); blocked allocating another A100 to prevent double billing. Inspect or release them in Colab first.",
   "colab_drive_timeout": "Timed out waiting for Google Drive authorization ({seconds}s); cancelled mount. Click Start again and complete browser consent.",
   "colab_start_failed": "Failed to start ComfyUI on Colab: {reason}",
-  "colab_tunnel_unready": "Remote bootstrap finished, but /system_stats did not respond HTTP 200."
+  "colab_tunnel_unready": "Remote bootstrap finished, but /system_stats did not respond HTTP 200.",
+  "comfy_stage_queued": "Queued",
+  "comfy_stage_running": "ComfyUI running",
+  "comfy_stage_load_clip": "Loading text encoder",
+  "comfy_stage_load_vae": "Loading VAE",
+  "comfy_stage_load_model": "Loading video model",
+  "comfy_stage_load_lora": "Loading Turbo LoRA",
+  "comfy_stage_load_images": "Loading reference images",
+  "comfy_stage_encode_prompt": "Encoding prompt & references",
+  "comfy_stage_sampling": "Diffusion sampling",
+  "comfy_stage_decode_video": "Decoding video frames",
+  "comfy_stage_decode_audio": "Decoding audio",
+  "comfy_stage_create_video": "Muxing video & audio",
+  "comfy_stage_save_video": "Saving video",
+  "comfy_progress_queued_pos": "Queued (#{pos})",
+  "comfy_progress_vram": "VRAM {used}/{total} GB",
+  "comfy_progress_elapsed": "elapsed {elapsed}"
 }

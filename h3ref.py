@@ -82,14 +82,36 @@ def cmd_one(a):
         print(f"已提交，预计 ¥{backend.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
     provider_name = str(st.get("provider") or "runninghub").strip().lower()
     backend = comfy if provider_name == "comfyui" else rh
-    for _ in range(360):
+    poll_interval = 5 if provider_name == "comfyui" else 20
+    poll_limit = 1440 if provider_name == "comfyui" else 360
+    last_progress_sig = None
+    last_progress_log = 0.0
+    last_progress_save = 0.0
+    for _ in range(poll_limit):
         res = backend.poll(st["task"])
         if res["state"] != "running":
             break
-        time.sleep(20)
+        if provider_name == "comfyui":
+            now = time.time()
+            elapsed = max(0.0, now - t0)
+            live_info = res if "stage" in res else comfy.live_progress(st["task"], queued=bool(res.get("queued")))
+            prog = comfy.progress_payload(live_info, elapsed_s=elapsed)
+            sig = (prog["stage"], prog["step"], prog["max_steps"], prog["queue_position"])
+            if sig != last_progress_sig or (now - last_progress_save) >= 15.0:
+                st["live_progress"] = prog
+                save()
+                last_progress_save = now
+            if sig != last_progress_sig or (now - last_progress_log) >= 20.0:
+                print(f"进度：{comfy.format_progress(live_info, elapsed_s=elapsed)}", flush=True)
+                last_progress_sig = sig
+                last_progress_log = now
+        time.sleep(poll_interval)
     else:
         label = "ComfyUI" if provider_name == "comfyui" else "RunningHub"
         raise RuntimeError(f"{label} 轮询超时：{st['task']}")
+    if "live_progress" in st:
+        st.pop("live_progress", None)
+        save()
     if res["state"] == "failed":
         st.update(terminal_failed=True, error=res.get("error"))
         save()

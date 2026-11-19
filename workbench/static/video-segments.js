@@ -257,17 +257,26 @@ function expandSegmentEditor(card) {
   refreshSegmentControls(card, state.selectedJob, true);
 }
 
+function segmentPlaceholderText(segment) {
+  if (running(state.selectedJob) && segment.live_progress && typeof formatLiveProgressParts === "function") {
+    const { label, meta } = formatLiveProgressParts(segment.live_progress);
+    return meta ? `${label} · ${meta}` : label;
+  }
+  return t("segmentWaiting");
+}
+
 function updateSegmentMedia(card, segment) {
-  if (card.mediaUrl === segment.url && card.mediaLanguage === state.language) return;
+  const placeholder = segment.url ? "" : segmentPlaceholderText(segment);
+  if (card.mediaUrl === segment.url && card.mediaLanguage === state.language && card.placeholderText === placeholder) return;
   if (card.mediaUrl !== segment.url) {
     card.video?.pause(); card.player?.destroy(); card.media.replaceChildren(); card.video = null; card.player = null;
     if (segment.url) {
       card.video = element("video"); card.video.controls = true; card.video.preload = "metadata"; card.video.playsInline = true; card.video.src = segment.url;
       card.media.append(card.video); card.player = createVideoPlayer(card.video);
       card.video.addEventListener("play", () => { state.player?.pause(); for (const other of state.segmentCards.values()) if (other !== card) other.video?.pause(); });
-    } else card.media.append(element("p", "segment-placeholder hint", t("segmentWaiting")));
+    } else card.media.append(element("p", "segment-placeholder hint", placeholder));
   } else if (!card.video) {
-    card.media.children[0].textContent = t("segmentWaiting");
+    card.media.children[0].textContent = placeholder;
   } else {
     // Update player translations without replacing the prompt editor or its focus.
     const currentTime = card.video.currentTime || 0;
@@ -277,7 +286,7 @@ function updateSegmentMedia(card, segment) {
     card.media.append(card.video); card.player = createVideoPlayer(card.video);
     card.video.addEventListener("play", () => { state.player?.pause(); for (const other of state.segmentCards.values()) if (other !== card) other.video?.pause(); });
   }
-  card.mediaUrl = segment.url; card.mediaLanguage = state.language;
+  card.mediaUrl = segment.url; card.mediaLanguage = state.language; card.placeholderText = placeholder;
 }
 
 function createSegmentCard(segment) {

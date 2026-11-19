@@ -687,6 +687,7 @@ def view(request, artifacts, editable, *, context=None, editable_numbers=None):
                       'h3_missing': bool((pending_src_draft and pending_src_draft != pair['source']) or segment_needs_h3_rewrite(record, pair, automatic, has_clip=bool(version), rewrite_required=src_rewrite_req)),
                       'automatic_source_prompt': automatic['source'], 'source_changed': bool(override.get('source_version') and override['source_version'] != automatic['source_version']),
                       'error': error, 'attempt_error': pending.get('attempt_error') or unapplied.get('attempt_error'), 'task_pending': task_pending,
+                      'live_progress': attempted.get('live_progress') if (task_pending and isinstance(attempted.get('live_progress'), dict)) else None,
                       'submission_unknown': unknown, 'terminal_failed': terminal, 'attempt_revision': single_rw.get('revision') or pending.get('revision') or unapplied.get('revision') or record.get('revision'),
                       'applied_revision': record.get('revision'), 'publishing': publishing, 'reference_images': references,
                       'reference_history_known': 'reference_images' in record, 'references_for_regeneration': True,

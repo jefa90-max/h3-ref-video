@@ -446,5 +446,22 @@
   "runtimeLogsTitle": "View startup & runtime logs",
   "runtimeStartedNotice": "Colab A100 startup initiated; watch the runtime card for progress.",
   "runtimeStoppedNotice": "Colab runtime stopped and compute released.",
-  "runtimeDefaultDevice": "GPU ready"
+  "runtimeDefaultDevice": "GPU ready",
+  "liveStage_queued": "Queued",
+  "liveStage_running": "ComfyUI running",
+  "liveStage_load_clip": "Loading text encoder",
+  "liveStage_load_vae": "Loading VAE",
+  "liveStage_load_model": "Loading video model",
+  "liveStage_load_lora": "Loading Turbo LoRA",
+  "liveStage_load_images": "Loading reference images",
+  "liveStage_encode_prompt": "Encoding prompt & references",
+  "liveStage_sampling": "Diffusion sampling",
+  "liveStage_decode_video": "Decoding video frames",
+  "liveStage_decode_audio": "Decoding audio",
+  "liveStage_create_video": "Muxing video & audio",
+  "liveStage_save_video": "Saving video",
+  "liveProgressSegment": "Segment {number} · {label}",
+  "liveProgressQueuedPos": "Queued (#{pos})",
+  "liveProgressVram": "VRAM {used}/{total} GB",
+  "liveProgressElapsed": "Elapsed {elapsed}"
 }

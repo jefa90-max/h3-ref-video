@@ -543,14 +543,38 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
     backend = comfy if provider_name == "comfyui" else rh
     extra_provider = {"provider": provider_name}
     job.put("segs", str(i), phase="poll")
-    for _ in range(360):
+    poll_interval = 5 if provider_name == "comfyui" else 20
+    poll_limit = 1440 if provider_name == "comfyui" else 360
+    started_at = float(rec.get("submitted") or time.time())
+    last_progress_sig = None
+    last_progress_log = 0.0
+    last_progress_save = 0.0
+    for _ in range(poll_limit):
         st = backend.poll(rec["task"])
         if st["state"] != "running":
             break
-        time.sleep(20)
+        if provider_name == "comfyui":
+            now = time.time()
+            elapsed = max(0.0, now - started_at)
+            live_info = st if "stage" in st else comfy.live_progress(rec["task"], queued=bool(st.get("queued")))
+            prog = comfy.progress_payload(live_info, elapsed_s=elapsed)
+            sig = (prog["stage"], prog["step"], prog["max_steps"], prog["queue_position"])
+            if sig != last_progress_sig or (now - last_progress_save) >= 15.0:
+                job.put("segs", str(i), live_progress=prog)
+                last_progress_save = now
+            if sig != last_progress_sig or (now - last_progress_log) >= 20.0:
+                job.log("progress", f"seg{i + 1}", comfy.format_progress(live_info, elapsed_s=elapsed))
+                last_progress_sig = sig
+                last_progress_log = now
+        time.sleep(poll_interval)
     else:
         label = "ComfyUI" if provider_name == "comfyui" else "RunningHub"
         raise RuntimeError(f"{label} poll timed out for seg{i + 1} task {rec['task']}")
+    with job.lock:
+        cur_seg = job.state["segs"].setdefault(str(i), {})
+        if "live_progress" in cur_seg:
+            cur_seg.pop("live_progress", None)
+            job.save()
     if st["state"] == "failed":
         job.put("segs", str(i), terminal_failed=True, error=st.get("error"), **extra_provider)
         raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))

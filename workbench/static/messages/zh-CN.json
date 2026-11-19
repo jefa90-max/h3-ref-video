@@ -446,5 +446,22 @@
   "runtimeLogsTitle": "查看启动与运行日志",
   "runtimeStartedNotice": "已触发 Colab A100 启动流程，请留意卡片状态变化。",
   "runtimeStoppedNotice": "Colab 实例已终止并释放算力。",
-  "runtimeDefaultDevice": "GPU 就绪"
+  "runtimeDefaultDevice": "GPU 就绪",
+  "liveStage_queued": "排队中",
+  "liveStage_running": "ComfyUI 推理中",
+  "liveStage_load_clip": "加载文本编码器",
+  "liveStage_load_vae": "加载 VAE",
+  "liveStage_load_model": "加载视频模型",
+  "liveStage_load_lora": "加载加速 LoRA",
+  "liveStage_load_images": "读取参考图",
+  "liveStage_encode_prompt": "编码提示词与参考图",
+  "liveStage_sampling": "扩散采样",
+  "liveStage_decode_video": "解码视频帧",
+  "liveStage_decode_audio": "解码音频",
+  "liveStage_create_video": "合成音视频",
+  "liveStage_save_video": "保存成片",
+  "liveProgressSegment": "第 {number} 段 · {label}",
+  "liveProgressQueuedPos": "排队中（第 {pos} 位）",
+  "liveProgressVram": "显存 {used}/{total} GB",
+  "liveProgressElapsed": "已耗时 {elapsed}"
 }

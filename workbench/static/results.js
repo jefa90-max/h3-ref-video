@@ -256,6 +256,68 @@ function renderArtifacts(job) {
   }
 }
 
+function formatElapsedClock(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
+}
+
+function formatLiveProgressParts(progress, segmentNumber = null) {
+  const stage = progress.stage || (progress.queued ? "queued" : "running");
+  let label = stage === "queued" && progress.queue_position
+    ? t("liveProgressQueuedPos", { pos: progress.queue_position })
+    : t(`liveStage_${stage}`);
+  if (label === `liveStage_${stage}`) label = t("liveStage_running");
+  const hasSteps = Number.isFinite(progress.step) && Number.isFinite(progress.max_steps) && progress.max_steps > 0;
+  let pct = null;
+  if (hasSteps) {
+    pct = Math.max(0, Math.min(100, Math.round((progress.step * 100) / progress.max_steps)));
+    label = `${label} ${progress.step}/${progress.max_steps} (${pct}%)`;
+  }
+  if (segmentNumber) label = t("liveProgressSegment", { number: segmentNumber, label });
+  const metaParts = [];
+  if (Number.isFinite(progress.vram_used_gb) && Number.isFinite(progress.vram_total_gb) && progress.vram_total_gb > 0) {
+    metaParts.push(t("liveProgressVram", { used: progress.vram_used_gb.toFixed(1), total: progress.vram_total_gb.toFixed(1) }));
+  }
+  if (Number.isFinite(progress.elapsed_s)) {
+    metaParts.push(t("liveProgressElapsed", { elapsed: formatElapsedClock(progress.elapsed_s) }));
+  }
+  return { label, meta: metaParts.join(" · "), pct };
+}
+
+function renderLiveProgress(job) {
+  const box = $("live-progress");
+  if (!box) return;
+  let progress = job?.live_progress || null;
+  let segmentNumber = progress?.segment || null;
+  if (!progress && Array.isArray(job?.segments)) {
+    const activeSeg = job.segments.find((s) => s.live_progress);
+    if (activeSeg) {
+      progress = activeSeg.live_progress;
+      segmentNumber = activeSeg.number;
+    }
+  }
+  if (!running(job) || !progress) {
+    box.hidden = true;
+    return;
+  }
+  const { label, meta, pct } = formatLiveProgressParts(progress, segmentNumber);
+  box.hidden = false;
+  $("live-progress-label").textContent = label;
+  $("live-progress-meta").textContent = meta;
+  const fill = $("live-progress-fill");
+  if (pct !== null) {
+    fill.classList?.remove?.("indeterminate");
+    if (fill.style) fill.style.width = `${pct}%`;
+  } else {
+    if (fill.style) fill.style.width = "";
+    fill.classList?.add?.("indeterminate");
+  }
+}
+
 function renderJob(job) {
   $("job-loading").hidden = Boolean(job);
   $("job-detail").hidden = !job;
@@ -276,6 +338,7 @@ function renderJob(job) {
   $("stage-hint").textContent = t(stage === "stageReview" && review.kind === "script" ? "stageScriptReviewHint" : `${stage}Hint`);
   $("job-error").hidden = !job.error;
   $("job-error").textContent = job.error || "";
+  renderLiveProgress(job);
   $("frames-count").textContent = job.progress?.frames ?? 0;
   $("clips-count").textContent = job.progress?.clips ?? 0;
   $("files-count").textContent = job.artifacts?.length ?? 0;

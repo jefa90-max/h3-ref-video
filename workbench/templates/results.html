@@ -13,6 +13,10 @@
       <div class="job-identity"><div><span id="job-kind" class="tag"></span><span id="job-mode" class="tag"></span><span id="job-operation" class="tag"></span></div><time id="job-created"></time></div>
       <h2 id="stage-title"></h2><p id="stage-hint" class="hint"></p>
       <div id="job-error" class="notice error" role="alert" hidden></div>
+      <div id="live-progress" class="live-progress" role="status" aria-live="polite" hidden>
+        <div class="live-progress-header"><span class="live-indicator"><i></i><strong id="live-progress-label"></strong></span><span id="live-progress-meta" class="live-progress-meta"></span></div>
+        <div class="live-progress-track"><div id="live-progress-fill" class="live-progress-fill"></div></div>
+      </div>
       <div class="progress-stats"><div><strong id="frames-count">0</strong><span data-i18n="framesComplete"></span></div><div><strong id="clips-count">0</strong><span data-i18n="clipsComplete"></span></div><div><strong id="files-count">0</strong><span data-i18n="artifactCount"></span></div></div>
       <button id="resume-job" type="button" class="button secondary resume-button" data-i18n="resumeJob" hidden></button><p id="resume-hint" class="hint" data-i18n="resumeHint" hidden></p>
     </section>

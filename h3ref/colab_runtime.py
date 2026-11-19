@@ -709,7 +709,7 @@ class ColabRuntimeManager:
                     with self._lock:
                         self._active_state = "provisioning"
                     rc, out = self._run_command(
-                        colab_bin, auth_mode, ["new", "-s", session_name, "--gpu", "A100"],
+                        colab_bin, auth_mode, ["new", "-s", session_name, "--gpu", "A100", "--high-mem"],
                         environ=env_copy, timeout=180.0,
                     )
                     if self._cancel_event.is_set():

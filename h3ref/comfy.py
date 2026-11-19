@@ -36,6 +36,20 @@ NODE_TYPES = {
     SWITCH_STEPS: "ComfySwitchNode",
     **{n: "LoadImage" for n in IMAGES},
 }
+NODE_STAGE_KEYS = {
+    "128": "load_clip",
+    "119": "load_vae",
+    "120": "load_vae",
+    "127": "load_model",
+    "145": "load_lora",
+    "136": "encode_prompt",
+    "125": "sampling",
+    "122": "decode_video",
+    "121": "decode_audio",
+    "130": "create_video",
+    "92": "save_video",
+    **{n: "load_images" for n in IMAGES},
+}
 
 SubmissionRejected = rh.SubmissionRejected
 NON_RETRYABLE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
@@ -232,14 +246,125 @@ def _extract_media_item(outputs: dict) -> dict | None:
 
 
 def _task_in_queue_list(items, task: str) -> bool:
+    return _queue_position(items, task) is not None
+
+
+def _queue_position(items, task: str) -> int | None:
     if not isinstance(items, list):
-        return False
-    for entry in items:
+        return None
+    for idx, entry in enumerate(items, 1):
         if isinstance(entry, (list, tuple)) and len(entry) >= 2 and str(entry[1]) == task:
-            return True
+            return idx
         if isinstance(entry, dict) and str(entry.get("prompt_id") or "") == task:
-            return True
-    return False
+            return idx
+    return None
+
+
+def live_progress(task: str, *, queued: bool = False, queue_position: int | None = None) -> dict:
+    """Best-effort live ComfyUI stage/step/VRAM snapshot; never raises on older proxies or 404."""
+    base = config.comfy_url()
+    key = config.comfy_key()
+    hdrs = _headers()
+    info: dict = {
+        "queued": bool(queued),
+        "queue_position": queue_position if queued else None,
+        "stage": "queued" if queued else "running",
+        "node": None,
+        "step": None,
+        "max_steps": None,
+        "vram_used_gb": None,
+        "vram_total_gb": None,
+    }
+    if queued and queue_position is None:
+        try:
+            q = http.request(f"{base}/queue", key, timeout=6, tries=1, extra_headers=hdrs)
+            if isinstance(q, dict):
+                info["queue_position"] = _queue_position(q.get("queue_pending"), task)
+        except Exception:
+            pass
+    if not queued:
+        try:
+            prog = http.request(f"{base}/h3_progress", key, timeout=6, tries=1, extra_headers=hdrs)
+            if isinstance(prog, dict) and not (isinstance(prog.get("_http_status"), int) and prog["_http_status"] >= 400):
+                if prog.get("prompt_id") == task and prog.get("status") == "running":
+                    node = prog.get("node")
+                    if node is not None:
+                        node_str = str(node)
+                        info["node"] = node_str
+                        info["stage"] = NODE_STAGE_KEYS.get(node_str, "running")
+                    val = prog.get("value")
+                    mx = prog.get("max")
+                    if isinstance(val, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
+                        info["step"] = int(val)
+                        info["max_steps"] = int(mx)
+        except Exception:
+            pass
+    try:
+        stats = http.request(f"{base}/system_stats", key, timeout=6, tries=1, extra_headers=hdrs)
+        if isinstance(stats, dict) and isinstance(stats.get("devices"), list) and stats["devices"]:
+            dev = stats["devices"][0]
+            if isinstance(dev, dict):
+                vt = dev.get("vram_total")
+                vf = dev.get("vram_free")
+                if isinstance(vt, (int, float)) and vt > 0 and isinstance(vf, (int, float)) and vf >= 0:
+                    gib = float(1024 ** 3)
+                    info["vram_total_gb"] = round(vt / gib, 1)
+                    info["vram_used_gb"] = round(max(0.0, vt - vf) / gib, 1)
+    except Exception:
+        pass
+    return info
+
+
+def progress_payload(status: dict, *, elapsed_s: float | None = None) -> dict:
+    payload = {
+        "stage": status.get("stage") or ("queued" if status.get("queued") else "running"),
+        "queued": bool(status.get("queued")),
+        "queue_position": status.get("queue_position"),
+        "node": status.get("node"),
+        "step": status.get("step"),
+        "max_steps": status.get("max_steps"),
+        "vram_used_gb": status.get("vram_used_gb"),
+        "vram_total_gb": status.get("vram_total_gb"),
+        "updated_at": round(time.time(), 1),
+    }
+    if elapsed_s is not None:
+        payload["elapsed_s"] = max(0, int(round(elapsed_s)))
+    return payload
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    mins, secs = divmod(total, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def format_progress(status: dict, *, elapsed_s: float | None = None) -> str:
+    stage = status.get("stage") or ("queued" if status.get("queued") else "running")
+    if stage == "queued" and status.get("queue_position"):
+        label = message("comfy_progress_queued_pos", pos=status["queue_position"])
+    else:
+        key = f"comfy_stage_{stage}"
+        label = message(key) if stage in (
+            "queued", "running", "load_clip", "load_vae", "load_model", "load_lora",
+            "load_images", "encode_prompt", "sampling", "decode_video", "decode_audio",
+            "create_video", "save_video",
+        ) else message("comfy_stage_running")
+    step = status.get("step")
+    max_steps = status.get("max_steps")
+    if isinstance(step, int) and isinstance(max_steps, int) and max_steps > 0:
+        pct = min(100, max(0, int(round(step * 100 / max_steps))))
+        label = f"{label} {step}/{max_steps} ({pct}%)"
+    parts = [label]
+    vu = status.get("vram_used_gb")
+    vt = status.get("vram_total_gb")
+    if isinstance(vu, (int, float)) and isinstance(vt, (int, float)) and vt > 0:
+        parts.append(message("comfy_progress_vram", used=f"{vu:.1f}", total=f"{vt:.1f}"))
+    if elapsed_s is not None:
+        parts.append(message("comfy_progress_elapsed", elapsed=_format_elapsed(elapsed_s)))
+    return " · ".join(parts)
 
 
 def _is_transient_tunnel_error(exc: http.HTTPResponseError) -> bool:

@@ -19,6 +19,8 @@ import json
 import os
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -49,7 +51,200 @@ MODEL_FILES = [
 ]
 SSD_HEADROOM_BYTES = 12 * (1024 ** 3)
 
-PASSIVE_PROBE_PATHS = {"/system_stats", "/queue"}
+PASSIVE_PROBE_PATHS = {"/system_stats", "/queue", "/h3_progress"}
+COMFY_WS_CLIENT_ID = "h3-ref-video"
+
+
+def _apply_comfy_ws_event(state: dict, msg: dict, *, now: float | None = None) -> None:
+    """Fold a ComfyUI /ws JSON event into the latest execution progress snapshot."""
+    if not isinstance(msg, dict):
+        return
+    event_type = msg.get("type")
+    data = msg.get("data")
+    if not isinstance(data, dict):
+        return
+    ts = time.time() if now is None else float(now)
+    prompt_id = data.get("prompt_id")
+    if event_type == "execution_start":
+        state.clear()
+        state.update(prompt_id=prompt_id, status="running", node=None, value=None, max=None, updated_at=ts)
+    elif event_type == "executing":
+        node = data.get("node")
+        if node is None:
+            if not prompt_id or state.get("prompt_id") == prompt_id:
+                state.update(status="finished", node=None, updated_at=ts)
+        else:
+            prev_node = state.get("node")
+            state.update(
+                prompt_id=prompt_id or state.get("prompt_id"),
+                status="running",
+                node=str(node),
+                updated_at=ts,
+            )
+            if prev_node != str(node):
+                state["value"] = None
+                state["max"] = None
+    elif event_type == "progress":
+        node = data.get("node")
+        state.update(
+            prompt_id=prompt_id or state.get("prompt_id"),
+            status="running",
+            value=data.get("value"),
+            max=data.get("max"),
+            updated_at=ts,
+        )
+        if node is not None:
+            state["node"] = str(node)
+    elif event_type == "progress_state":
+        nodes = data.get("nodes")
+        if isinstance(nodes, dict):
+            running_item = None
+            for nid, info in nodes.items():
+                if isinstance(info, dict) and info.get("state") == "running":
+                    running_item = (str(nid), info)
+                    break
+            if running_item is not None:
+                nid, info = running_item
+                state.update(
+                    prompt_id=prompt_id or info.get("prompt_id") or state.get("prompt_id"),
+                    status="running",
+                    node=nid,
+                    value=info.get("value"),
+                    max=info.get("max"),
+                    updated_at=ts,
+                )
+    elif event_type in ("execution_success", "execution_error", "execution_interrupted"):
+        if not prompt_id or state.get("prompt_id") == prompt_id:
+            state.update(status=event_type.removeprefix("execution_"), node=None, updated_at=ts)
+
+
+def _recv_exact(sock: socket.socket, rx_buf: bytearray, n: int) -> bytes:
+    while len(rx_buf) < n:
+        part = sock.recv(max(4096, n - len(rx_buf)))
+        if not part:
+            raise EOFError("WebSocket closed")
+        rx_buf.extend(part)
+    out = bytes(rx_buf[:n])
+    del rx_buf[:n]
+    return out
+
+
+def _send_ws_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:
+    mask = os.urandom(4)
+    length = len(payload)
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", length))
+    header.extend(mask)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(bytes(header) + masked)
+
+
+def _start_comfy_progress_tracker(log):
+    lock = threading.Lock()
+    state: dict = {}
+
+    def snapshot() -> dict:
+        with lock:
+            return dict(state)
+
+    def run_loop() -> None:
+        while True:
+            sock = None
+            try:
+                sock = socket.create_connection((COMFY_HOST, COMFY_PORT), timeout=10.0)
+                key = base64.b64encode(os.urandom(16)).decode("ascii")
+                req = (
+                    f"GET /ws?clientId={COMFY_WS_CLIENT_ID} HTTP/1.1\r\n"
+                    f"Host: {COMFY_HOST}:{COMFY_PORT}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("ascii")
+                sock.sendall(req)
+                buf = b""
+                while b"\r\n\r\n" not in buf and len(buf) < 16384:
+                    part = sock.recv(4096)
+                    if not part:
+                        raise EOFError("Handshake closed")
+                    buf += part
+                head_bytes, rest = buf.split(b"\r\n\r\n", 1)
+                head = head_bytes.decode("latin-1", errors="replace")
+                if " 101 " not in head.splitlines()[0]:
+                    raise RuntimeError(f"WS upgrade rejected: {head.splitlines()[0]}")
+                rx_buf = bytearray(rest)
+                sock.settimeout(30.0)
+                frag_opcode = None
+                frag_buf = bytearray()
+                while True:
+                    try:
+                        hdr = _recv_exact(sock, rx_buf, 2)
+                    except socket.timeout:
+                        _send_ws_frame(sock, 0x9, b"hb")
+                        continue
+                    b1, b2 = hdr[0], hdr[1]
+                    fin = (b1 & 0x80) != 0
+                    opcode = b1 & 0x0F
+                    masked = (b2 & 0x80) != 0
+                    length = b2 & 0x7F
+                    if length == 126:
+                        length = struct.unpack("!H", _recv_exact(sock, rx_buf, 2))[0]
+                    elif length == 127:
+                        length = struct.unpack("!Q", _recv_exact(sock, rx_buf, 8))[0]
+                    mask_key = _recv_exact(sock, rx_buf, 4) if masked else b""
+                    payload = _recv_exact(sock, rx_buf, length) if length else b""
+                    if masked:
+                        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+                    if opcode == 0x8:
+                        break
+                    if opcode == 0x9:
+                        _send_ws_frame(sock, 0xA, payload[:125])
+                        continue
+                    if opcode == 0xA:
+                        continue
+                    if opcode in (0x1, 0x2):
+                        if fin:
+                            if opcode == 0x1:
+                                try:
+                                    msg = json.loads(payload.decode("utf-8", errors="replace"))
+                                except ValueError:
+                                    continue
+                                with lock:
+                                    _apply_comfy_ws_event(state, msg)
+                        else:
+                            frag_opcode = opcode
+                            frag_buf = bytearray(payload)
+                    elif opcode == 0x0 and frag_opcode is not None:
+                        frag_buf.extend(payload)
+                        if fin:
+                            if frag_opcode == 0x1:
+                                try:
+                                    msg = json.loads(frag_buf.decode("utf-8", errors="replace"))
+                                except ValueError:
+                                    pass
+                                else:
+                                    with lock:
+                                        _apply_comfy_ws_event(state, msg)
+                            frag_opcode = None
+                            frag_buf.clear()
+            except Exception:
+                time.sleep(3.0)
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+    threading.Thread(target=run_loop, daemon=True).start()
+    return snapshot
 
 
 def _read_secret(dotfile_name: str, env_name: str, *, required: bool = True) -> str:
@@ -181,6 +376,8 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"{stamp} {msg}", flush=True)
 
+    progress_snapshot = _start_comfy_progress_tracker(log)
+
     HopByHop = {
         "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
         "te", "trailers", "transfer-encoding", "upgrade",
@@ -207,6 +404,15 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
                 self._reject()
                 return
             path_only = self.path.split("?", 1)[0]
+            if self.command == "GET" and path_only == "/h3_progress":
+                body = json.dumps(progress_snapshot()).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             is_work = not (self.command == "GET" and path_only in PASSIVE_PROBE_PATHS)
             if is_work:
                 touch_activity()
