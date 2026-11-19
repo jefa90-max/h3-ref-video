@@ -223,6 +223,11 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
             parsed = frames.describe_composition(self.script, self.script["shots"][0])
         self.assertEqual(parsed["version"], 3)
         self.assertEqual(req.call_count, 4)
+        # System prompt enforces safe non-violent, non-gory visual rewrites so image generation is not blocked
+        system_prompt = req.call_args_list[0].args[2]["messages"][0]["content"]
+        self.assertIn("暴力", system_prompt)
+        self.assertIn("血腥", system_prompt)
+        self.assertIn("内容安全", system_prompt)
         # Retry messages include feedback from prior validation error
         final_messages = req.call_args_list[3].args[2]["messages"]
         self.assertGreater(len(final_messages), 2)
