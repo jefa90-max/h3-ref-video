@@ -183,6 +183,8 @@ class ColabRuntimeTest(unittest.TestCase):
                             wait_for_stdin=True,
                         )
                     return self._make_pipe_proc(["Mounted at /content/drive\n"])
+                if "upload" in argv:
+                    return self._make_pipe_proc(["[colab] Uploaded 'start_colab.py' to 'content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py'\n"])
                 if "exec" in argv:
                     online_flag["up"] = True
                     return self._make_pipe_proc(["[start_colab] TUNNEL READY (AUTH PROTECTED): https://demo.ngrok-free.dev\n"])
@@ -215,10 +217,14 @@ class ColabRuntimeTest(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(cur["state"], "online")
 
-            # Verify colab new requests --high-mem, drivemount retried once, and NO secret leaked into colab argv/env
+            # Verify colab new requests --high-mem, start_colab.py is synced to Drive before exec, drivemount retried once, and NO secret leaked
             new_calls = [a for a, _ in calls if "new" in a]
             self.assertEqual(len(new_calls), 1)
             self.assertIn("--high-mem", new_calls[0])
+            upload_calls = [a for a, _ in calls if "upload" in a]
+            self.assertEqual(len(upload_calls), 1)
+            self.assertTrue(upload_calls[0][-2].endswith("start_colab.py"))
+            self.assertEqual(upload_calls[0][-1], "content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py")
             mount_calls = [a for a, _ in calls if "drivemount" in a]
             self.assertEqual(len(mount_calls), 2)
             for argv, kwargs in calls:
@@ -391,6 +397,8 @@ class ColabRuntimeTest(unittest.TestCase):
                     return self._make_pipe_proc(["[comfy-a100] m-s-1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"])
                 if "ls" in argv:
                     return self._make_pipe_proc(["MyDrive/\n"])
+                if "upload" in argv:
+                    return self._make_pipe_proc(["[colab] Uploaded\n"])
                 if "exec" in argv:
                     if not exec_procs:
                         hung = HungCrashedExecProc()
