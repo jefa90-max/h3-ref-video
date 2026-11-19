@@ -50,6 +50,39 @@ class ComfyReviewFixesTest(unittest.TestCase):
         src = (config.ROOT / "scripts" / "start_colab.py").read_text(encoding="utf-8")
         self.assertNotIn("--authtoken-from-env", src)
 
+        # 3. Verify _parallel_copy_file copies multi-stripe payload byte-for-byte and stage_models_to_local_ssd symlinks when disk headroom is low
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            drive_base = root / "drive"
+            local_base = root / "local"
+            for rel in start_colab.MODEL_FILES:
+                p = drive_base / "models" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(os.urandom(64 * 1024) if "qwen3vl" not in rel else b"Q" * (128 * 1024))
+
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "LOCAL", local_base), \
+                 mock.patch.object(start_colab, "SSD_HEADROOM_BYTES", 1024 * 1024), \
+                 mock.patch("shutil.disk_usage", side_effect=[
+                     types.SimpleNamespace(free=10 * 1024 * 1024),
+                     types.SimpleNamespace(free=10 * 1024 * 1024),
+                     types.SimpleNamespace(free=10 * 1024 * 1024),
+                     types.SimpleNamespace(free=10 * 1024 * 1024),
+                     types.SimpleNamespace(free=10 * 1024 * 1024),
+                     types.SimpleNamespace(free=512 * 1024),  # < 128KB + 1MB headroom -> symlink!
+                 ]):
+                start_colab.stage_models_to_local_ssd()
+
+            first_rel = start_colab.MODEL_FILES[0]
+            last_rel = start_colab.MODEL_FILES[-1]
+            self.assertFalse((local_base / "models" / first_rel).is_symlink())
+            self.assertEqual(
+                (local_base / "models" / first_rel).read_bytes(),
+                (drive_base / "models" / first_rel).read_bytes(),
+            )
+            self.assertTrue((local_base / "models" / last_rel).is_symlink())
+            self.assertEqual((local_base / "models" / last_rel).read_bytes(), b"Q" * (128 * 1024))
+
     def test_comfy_rejection_then_switch_to_runninghub_polls_runninghub_not_comfy(self):
         # Reproduces Critical #2: ComfyUI SubmissionRejected leaves provider="comfyui" in state.json;
         # switching VIDEO_PROVIDER=runninghub must overwrite provider="runninghub" and poll rh.poll, never comfy.poll.
@@ -221,6 +254,29 @@ class ComfyReviewFixesTest(unittest.TestCase):
                 self.assertTrue(res["stopped"])
                 self.assertEqual(len(stop_invoked), 1)
                 self.assertEqual(mgr.status(env)["state"], "offline")
+
+            # 3b. Cold A100 kernel WebSocket warmup ("Connection was lost.") retries drivemount automatically
+            mount_attempts = []
+
+            def flaky_drivemount(cb, am, sn, ec):
+                mount_attempts.append(1)
+                if len(mount_attempts) == 1:
+                    return 1, "RuntimeError: Connection was lost.\n", False
+                return 0, "Mounted at /content/drive\n", False
+
+            with mock.patch("h3ref.colab_runtime.probe_comfyui", side_effect=[
+                {"online": False, "auth_failed": False},
+                {"online": True, "auth_failed": False, "devices": [{"name": "A100"}]},
+                {"online": True, "auth_failed": False, "devices": [{"name": "A100"}]},
+            ]), \
+                 mock.patch.object(mgr, "_run_drivemount_once", side_effect=flaky_drivemount), \
+                 mock.patch.object(mgr, "_run_command", side_effect=lambda cb, am, args, **kw: (
+                     (0, "[comfy-a100] m-s-1 | Hardware: A100\n") if args[0] == "sessions" else (0, "TUNNEL READY\n")
+                 )), \
+                 mock.patch("h3ref.colab_runtime.time.sleep"):
+                st_online = mgr.ensure_started(env, timeout=5.0)
+                self.assertEqual(st_online["state"], "online")
+                self.assertEqual(len(mount_attempts), 2)
 
             # 4. English Accept-Language returns English runtime error on missing CLI
             app = server.create_app(storage=root / ".wb2", env_path=root / ".env-empty")

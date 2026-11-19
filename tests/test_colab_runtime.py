@@ -237,6 +237,8 @@ class ColabRuntimeTest(unittest.TestCase):
                 nonlocal mount_proc
                 if "sessions" in argv:
                     return self._make_pipe_proc(["[comfy-a100] m-s-1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"])
+                if "ls" in argv:
+                    return self._make_pipe_proc([""], returncode=1)
                 if "drivemount" in argv:
                     mount_proc = self._make_pipe_proc(
                         [
