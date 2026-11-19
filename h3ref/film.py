@@ -507,6 +507,13 @@ def _video_provider_name(rec: dict | None = None) -> str:
     return config.video_settings()["provider"]
 
 
+def _terminal_failed_message(number: int, path: Path, error: object = None) -> str:
+    reason = str(error or "").strip()
+    if reason:
+        return message("segment_terminal_failed_with_reason", number=number, reason=reason, path=path)
+    return message("segment_terminal_failed", number=number, path=path)
+
+
 def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
@@ -514,7 +521,7 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
     if out.exists() and rec.get("cny") is not None:
         return rec
     if rec.get("terminal_failed"):
-        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
+        raise RuntimeError(_terminal_failed_message(i + 1, job.file, rec.get("error")))
     provider_name = _video_provider_name(rec)
     backend = comfy if provider_name == "comfyui" else rh
     extra_provider = {"provider": provider_name}
@@ -576,8 +583,11 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
             cur_seg.pop("live_progress", None)
             job.save()
     if st["state"] == "failed":
-        job.put("segs", str(i), terminal_failed=True, error=st.get("error"), **extra_provider)
-        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
+        err = st.get("error")
+        job.put("segs", str(i), terminal_failed=True, error=err, **extra_provider)
+        if err:
+            job.log("failed", f"seg{i + 1}", str(err))
+        raise RuntimeError(_terminal_failed_message(i + 1, job.file, err))
     job.put("segs", str(i), phase="download")
     if provider_name == "comfyui":
         comfy.download(st["url"], out)

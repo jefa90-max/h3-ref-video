@@ -52,6 +52,7 @@
   "optimize_storyboard_help": "Skip LLM storyboard prompt optimization and draw frames directly from raw shot descriptions",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}; record {path}. Other shots were processed. Manually repair failed frames in the workbench before continuing.",
   "segment_terminal_failed": "TERMINAL_FAILED Segment {number} reached remote terminal failure. Resume will not pay again. Explicitly start a new attempt from its card; record {path}.",
+  "segment_terminal_failed_with_reason": "TERMINAL_FAILED Segment {number} reached remote terminal failure ({reason}). Resume will not pay again. Explicitly start a new attempt from its card; record {path}.",
   "one_terminal_failed": "TERMINAL_FAILED Single-clip task reached remote terminal failure. Automatic rerun is blocked to avoid duplicate charges. Start a new job in a fresh output directory (or clear terminal_failed in {path}).",
   "segment_publication_pending": "Clip publication is uncommitted. Resume it in the workbench first: {path}.",
   "segment_generation_failed": "Segment {number} generation failed during {phase} ({error_type}). The failure is saved; inspect the log before editing or resuming its original task.",

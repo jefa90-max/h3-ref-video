@@ -35,6 +35,7 @@ BASE = Path(os.environ.get("COMFY_DRIVE_BASE", "/content/drive/MyDrive/MiniMax_C
 LOCAL = Path(os.environ.get("COMFY_LOCAL_DIR", "/content/ComfyUI_local"))
 COMFY_HOST = "127.0.0.1"
 COMFY_PORT = 8188
+COMFY_LAUNCH_FLAGS = ("--disable-dynamic-vram", "--disable-pinned-memory")
 GATEWAY_PORT = 8189
 SUPERVISOR_PID_FILE = Path("/tmp/comfy_supervisor.pid")
 SUPERVISOR_LOG_FILE = Path("/tmp/comfy_supervisor.log")
@@ -585,7 +586,19 @@ def _parallel_copy_file(src: Path, dst: Path, src_size: int, rel: str) -> None:
             end = min(offset + stripe, src_size)
             pos = offset
             while pos < end:
-                chunk = os.pread(src_fd, min(8 * 1024 * 1024, end - pos), pos)
+                want = min(8 * 1024 * 1024, end - pos)
+                chunk = b""
+                for attempt in range(3):
+                    try:
+                        chunk = os.pread(src_fd, want, pos)
+                        if chunk:
+                            break
+                        if attempt < 2:
+                            time.sleep(2.0)
+                    except OSError:
+                        if attempt >= 2:
+                            raise
+                        time.sleep(2.0)
                 if not chunk:
                     raise IOError(f"Unexpected EOF reading {src} at {pos}")
                 written = 0
@@ -620,7 +633,7 @@ def stage_models_to_local_ssd() -> None:
     if dst_root.is_symlink():
         dst_root.unlink()
     dst_root.mkdir(parents=True, exist_ok=True)
-    max_stage_gb = float(os.environ.get("COLAB_MAX_STAGE_GB", "30").strip() or "30")
+    max_stage_gb = float(os.environ.get("COLAB_MAX_STAGE_GB", "80").strip() or "80")
     max_stage_bytes = int(max_stage_gb * (1024 ** 3))
     for rel in MODEL_FILES:
         src = src_root / rel
@@ -670,7 +683,7 @@ def start_comfyui() -> None:
     time.sleep(1)
     with COMFY_LOG_FILE.open("w", encoding="utf-8") as log_f:
         subprocess.Popen(
-            [sys.executable, "main.py", "--listen", COMFY_HOST, "--port", str(COMFY_PORT)],
+            [sys.executable, "main.py", "--listen", COMFY_HOST, "--port", str(COMFY_PORT), *COMFY_LAUNCH_FLAGS],
             cwd=str(LOCAL),
             stdout=log_f,
             stderr=subprocess.STDOUT,
