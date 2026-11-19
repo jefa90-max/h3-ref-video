@@ -22,7 +22,7 @@ from .references import bind_references, describe_references
 from .directories import choose_output_folder, saved_output_root, save_output_root
 
 KEYS = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
-FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_PRESET", "COLAB_AUTO_START",
+FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_PRESET", "COMFYUI_UPSCALE", "COLAB_AUTO_START",
           "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
           "GEMINI_MODEL", "GEMINI_COMPOSITION_MODEL", "GEMINI_REWRITE_MODEL")
 
@@ -48,6 +48,8 @@ def create_app(storage=None, env_path=None):
         env["VIDEO_PROVIDER"] = "runninghub"
     if env.get("COMFYUI_PRESET", "").strip().lower() not in ("", *config.COMFY_PRESETS):
         env["COMFYUI_PRESET"] = "4step"
+    if env.get("COMFYUI_UPSCALE", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
+        env["COMFYUI_UPSCALE"] = "1"
     if env.get("COLAB_AUTO_START", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
         env["COLAB_AUTO_START"] = "0"
     try:
@@ -58,6 +60,18 @@ def create_app(storage=None, env_path=None):
     config.video_settings(env)
     jobs.remember_secrets(env)
 
+    def current_runtime_env():
+        with jobs.lock:
+            return dict(env)
+
+    orig_jobs_close = jobs.close
+
+    def close_with_runtime():
+        runtime.stop_keepalive_monitor()
+        orig_jobs_close()
+
+    jobs.close = close_with_runtime
+
     def ensure_video_runtime(job_request, job_env):
         if "comfyui" not in needed_video_providers(job_request, job_env):
             return
@@ -66,6 +80,7 @@ def create_app(storage=None, env_path=None):
         with use_lang(lang):
             probe = colab_runtime.probe_comfyui(env_with_lang)
             if probe["online"]:
+                runtime.start_keepalive_monitor(current_runtime_env)
                 return
             if probe.get("auth_failed"):
                 raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))
@@ -73,6 +88,7 @@ def create_app(storage=None, env_path=None):
             if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(env_with_lang):
                 try:
                     runtime.start_async(env_with_lang)
+                    runtime.start_keepalive_monitor(current_runtime_env)
                 except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError):
                     pass
                 raise InputError("comfy_starting")
@@ -125,6 +141,7 @@ def create_app(storage=None, env_path=None):
         return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS},
                 "VIDEO_PROVIDER": vcfg["provider"], "COMFYUI_URL": vcfg["comfyui_url"],
                 "COMFYUI_PRESET": vcfg["comfyui_preset"],
+                "COMFYUI_UPSCALE": "1" if vcfg["comfyui_upscale"] else "0",
                 "COLAB_AUTO_START": "1" if vcfg["colab_auto_start"] else "0",
                 "comfy_requires_key": vcfg["comfy_requires_key"],
                 "LLM_BASE_URL": env["LLM_BASE_URL"],
@@ -242,7 +259,7 @@ def create_app(storage=None, env_path=None):
                 value = value.strip().lower()
                 if value not in config.COMFY_PRESETS:
                     invalid(key, value, "choice")
-            if key == "COLAB_AUTO_START":
+            if key in ("COMFYUI_UPSCALE", "COLAB_AUTO_START"):
                 raw_flag = value.strip().lower()
                 if raw_flag not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
                     invalid(key, value, "choice")
@@ -295,7 +312,10 @@ def create_app(storage=None, env_path=None):
         with jobs.lock:
             current_env = {**env, "H3_LANG": lang}
         with use_lang(lang):
-            return jsonify(redact_runtime_payload(runtime.status(current_env)))
+            st = runtime.status(current_env)
+            if st.get("state") == "online":
+                runtime.start_keepalive_monitor(current_runtime_env)
+            return jsonify(redact_runtime_payload(st))
 
     @app.post("/api/runtime/start")
     def runtime_start():
@@ -307,6 +327,7 @@ def create_app(storage=None, env_path=None):
                 st = runtime.start_async(current_env)
             except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
                 raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+            runtime.start_keepalive_monitor(current_runtime_env)
             return jsonify(redact_runtime_payload(st))
 
     @app.post("/api/runtime/drive-ack")

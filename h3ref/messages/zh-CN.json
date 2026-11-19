@@ -85,6 +85,8 @@
   "comfy_stage_sampling": "扩散采样",
   "comfy_stage_decode_video": "解码视频帧",
   "comfy_stage_decode_audio": "解码音频",
+  "comfy_stage_load_upscaler": "加载超分模型",
+  "comfy_stage_upscale_video": "超分高清",
   "comfy_stage_create_video": "合成音视频",
   "comfy_stage_save_video": "保存成片",
   "comfy_progress_queued_pos": "排队中（第 {pos} 位）",

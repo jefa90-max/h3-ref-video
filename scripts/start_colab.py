@@ -38,6 +38,7 @@ COMFY_PORT = 8188
 COMFY_LAUNCH_FLAGS = ("--disable-dynamic-vram", "--disable-pinned-memory")
 GATEWAY_PORT = 8189
 SUPERVISOR_PID_FILE = Path("/tmp/comfy_supervisor.pid")
+COMFY_PID_FILE = Path("/tmp/comfyui.pid")
 SUPERVISOR_LOG_FILE = Path("/tmp/comfy_supervisor.log")
 NGROK_LOG_FILE = Path("/tmp/ngrok.log")
 COMFY_LOG_FILE = Path("/tmp/comfyui.log")
@@ -48,8 +49,12 @@ MODEL_FILES = [
     "vae/minimax_h3_audio_vae_fp32.safetensors",
     "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
     "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+    "upscale_models/RealESRGAN_x2plus.pth",
     "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
 ]
+AUTO_DOWNLOAD_MODELS = {
+    "upscale_models/RealESRGAN_x2plus.pth": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+}
 SSD_HEADROOM_BYTES = 12 * (1024 ** 3)
 
 PASSIVE_PROBE_PATHS = {"/system_stats", "/queue", "/h3_progress"}
@@ -236,6 +241,10 @@ def _start_comfy_progress_tracker(log):
                             frag_opcode = None
                             frag_buf.clear()
             except Exception:
+                if not _comfy_process_alive():
+                    with lock:
+                        if state.get("status") == "running":
+                            state.clear()
                 time.sleep(3.0)
             finally:
                 if sock is not None:
@@ -317,14 +326,39 @@ def _check_authorization(header_value: str | None, expected_key: str) -> bool:
     return False
 
 
-def _queue_busy() -> bool:
+def _comfy_process_alive() -> bool:
+    if _pid_alive(COMFY_PID_FILE) is not None:
+        return True
+    try:
+        res = subprocess.run(
+            ["pgrep", "-f", f"main.py.*{COMFY_PORT}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return res.returncode == 0
+    except OSError:
+        return False
+
+
+def _is_passive_probe(method: str, path: str) -> bool:
+    if method.upper() not in ("GET", "HEAD"):
+        return False
+    path_only = path.split("?", 1)[0].rstrip("/") or "/"
+    return path_only in PASSIVE_PROBE_PATHS
+
+
+def _queue_busy(progress_snapshot=None) -> bool:
+    snap = progress_snapshot() if callable(progress_snapshot) else progress_snapshot
+    if isinstance(snap, dict) and snap.get("status") == "running":
+        return True
     req = urllib.request.Request(f"http://{COMFY_HOST}:{COMFY_PORT}/queue", method="GET")
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         return bool(payload.get("queue_running") or payload.get("queue_pending"))
     except Exception:
-        return False
+        return _comfy_process_alive()
 
 
 def _unassign_colab_runtime(log) -> bool:
@@ -404,7 +438,7 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
             if not _check_authorization(self.headers.get("Authorization"), api_key):
                 self._reject()
                 return
-            path_only = self.path.split("?", 1)[0]
+            path_only = self.path.split("?", 1)[0].rstrip("/") or "/"
             if self.command == "GET" and path_only == "/h3_progress":
                 body = json.dumps(progress_snapshot()).encode("utf-8")
                 self.send_response(200)
@@ -414,7 +448,7 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            is_work = not (self.command == "GET" and path_only in PASSIVE_PROBE_PATHS)
+            is_work = not _is_passive_probe(self.command, self.path)
             if is_work:
                 touch_activity()
             content_len = int(self.headers.get("Content-Length") or 0)
@@ -524,11 +558,11 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
             if skip_comfy_check or _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
                 log(f"[supervisor] ngrok exited with {ngrok_proc.returncode}; restarting...")
                 ngrok_proc = spawn_ngrok()
-        if not skip_comfy_check and _queue_busy():
+        if not skip_comfy_check and _queue_busy(progress_snapshot):
             touch_activity()
             continue
         if idle_elapsed() >= idle_seconds:
-            if not skip_comfy_check and _queue_busy():
+            if not skip_comfy_check and _queue_busy(progress_snapshot):
                 touch_activity()
                 continue
             log(f"[watchdog] Idle for >= {idle_minutes:g} min with empty queue. Unassigning runtime...")
@@ -627,6 +661,34 @@ def _parallel_copy_file(src: Path, dst: Path, src_size: int, rel: str) -> None:
     print(f"[start_colab] Copied {rel} in {time.time() - t0:.1f}s", flush=True)
 
 
+def _download_file_atomic(url: str, dst: Path, rel: str) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    print(f"[start_colab] Downloading missing model to Drive: {rel}", flush=True)
+    t0 = time.time()
+    req = urllib.request.Request(url, headers={"User-Agent": "h3-ref-video-colab-bootstrap/1.0"}, method="GET")
+    total_bytes = 0
+    try:
+        with urllib.request.urlopen(req, timeout=180.0) as resp, tmp.open("wb") as out_f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+                total_bytes += len(chunk)
+        if total_bytes == 0:
+            raise IOError(f"Downloaded 0 bytes for {rel} from {url}")
+        tmp.replace(dst)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    print(f"[start_colab] Downloaded {rel} ({total_bytes / (1024 ** 2):.1f} MB in {time.time() - t0:.1f}s)", flush=True)
+
+
 def stage_models_to_local_ssd() -> None:
     src_root = BASE / "models"
     dst_root = LOCAL / "models"
@@ -638,8 +700,12 @@ def stage_models_to_local_ssd() -> None:
     for rel in MODEL_FILES:
         src = src_root / rel
         dst = dst_root / rel
-        if not src.exists():
-            raise FileNotFoundError(f"Missing model in Google Drive: {src}")
+        if not src.exists() or src.stat().st_size == 0:
+            download_url = AUTO_DOWNLOAD_MODELS.get(rel)
+            if download_url:
+                _download_file_atomic(download_url, src, rel)
+            else:
+                raise FileNotFoundError(f"Missing model in Google Drive: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.with_suffix(dst.suffix + ".tmp").unlink(missing_ok=True)
         src_size = src.stat().st_size
@@ -682,7 +748,7 @@ def start_comfyui() -> None:
     subprocess.run(["pkill", "-f", f"main.py.*{COMFY_PORT}"], check=False)
     time.sleep(1)
     with COMFY_LOG_FILE.open("w", encoding="utf-8") as log_f:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "main.py", "--listen", COMFY_HOST, "--port", str(COMFY_PORT), *COMFY_LAUNCH_FLAGS],
             cwd=str(LOCAL),
             stdout=log_f,
@@ -690,6 +756,8 @@ def start_comfyui() -> None:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+    if getattr(proc, "pid", None):
+        COMFY_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
     for i in range(90):
         if _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
             print(f"[start_colab] ComfyUI UP in {i * 2}s", flush=True)

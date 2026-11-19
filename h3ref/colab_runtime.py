@@ -26,6 +26,11 @@ DRIVE_AUTH_TIMEOUT_SEC = 600.0
 SESSION_CACHE_TTL_SEC = 5.0
 CRASH_GRACE_SEC = 1.5
 DEFAULT_REQUEST_TIMEOUT_SEC = "90"
+KERNEL_KEEPALIVE_INTERVAL_SEC = 25 * 60.0
+KERNEL_KEEPALIVE_POLL_SEC = 60.0
+KERNEL_KEEPALIVE_TIMEOUT_SEC = 30
+KERNEL_KEEPALIVE_RETRY_COOLDOWN_SEC = 60.0
+KERNEL_KEEPALIVE_CODE = 'print("keepalive")\n'
 REMOTE_START_CODE = (
     "import os, subprocess, sys, time\n"
     "tmp_d = os.environ.get('H3_BOOT_TMP', '/tmp')\n"
@@ -347,11 +352,19 @@ class ColabRuntimeManager:
         drive_auth_timeout: float = DRIVE_AUTH_TIMEOUT_SEC,
         crash_grace_sec: float = CRASH_GRACE_SEC,
         retry_delay_sec: float = 4.0,
+        keepalive_interval_sec: float = KERNEL_KEEPALIVE_INTERVAL_SEC,
+        keepalive_poll_sec: float = KERNEL_KEEPALIVE_POLL_SEC,
+        keepalive_retry_cooldown_sec: float = KERNEL_KEEPALIVE_RETRY_COOLDOWN_SEC,
+        clock=time.monotonic,
     ):
         self.storage = Path(storage)
         self.drive_auth_timeout = float(drive_auth_timeout)
         self.crash_grace_sec = float(crash_grace_sec)
         self.retry_delay_sec = float(retry_delay_sec)
+        self.keepalive_interval_sec = float(keepalive_interval_sec)
+        self.keepalive_poll_sec = float(keepalive_poll_sec)
+        self.keepalive_retry_cooldown_sec = float(keepalive_retry_cooldown_sec)
+        self._clock = clock
         self._lock = threading.RLock()
         self._active_state: str | None = None
         self._auth_url: str | None = None
@@ -363,6 +376,12 @@ class ColabRuntimeManager:
         self._active_proc = None
         self._worker_thread: threading.Thread | None = None
         self._sessions_cache: tuple[float, dict] | None = None
+        self._last_keepalive_at = float(self._clock())
+        self._last_keepalive_fail_at: float | None = None
+        self._keepalive_in_flight = False
+        self._keepalive_stop = threading.Event()
+        self._keepalive_env_provider = None
+        self._keepalive_thread: threading.Thread | None = None
 
     def _logs_tail(self) -> list[str]:
         with self._lock:
@@ -806,6 +825,8 @@ class ColabRuntimeManager:
                             self._last_error = None
                             self._active_state = None
                             self._sessions_cache = None
+                            self._last_keepalive_at = float(self._clock())
+                            self._last_keepalive_fail_at = None
                         return
                     time.sleep(1.5)
                 raise RuntimeError(message("colab_start_failed", reason=message("colab_tunnel_unready")))
@@ -880,6 +901,115 @@ class ColabRuntimeManager:
             time.sleep(1.0)
         raise TimeoutError(f"Timed out after {timeout}s waiting for Colab ComfyUI runtime")
 
+    def maybe_send_kernel_keepalive(
+        self,
+        environ=None,
+        *,
+        now: float | None = None,
+        queue_count: int | None = None,
+    ) -> bool:
+        """Send a lightweight Colab kernel heartbeat only while the remote ComfyUI queue is busy."""
+        if os.environ.get("H3_WORKBENCH_WORKER") == "1":
+            return False
+        env_copy = dict(os.environ if environ is None else environ)
+        try:
+            settings = config.video_settings(env_copy)
+        except ValueError:
+            return False
+        if settings["provider"] != "comfyui" or not settings["comfyui_url"]:
+            return False
+        current = float(self._clock()) if now is None else float(now)
+        with self._lock:
+            if self._active_state is not None or self._active_proc is not None or self._keepalive_in_flight:
+                return False
+            if (current - self._last_keepalive_at) < self.keepalive_interval_sec:
+                return False
+            if (
+                self._last_keepalive_fail_at is not None
+                and (current - self._last_keepalive_fail_at) < self.keepalive_retry_cooldown_sec
+            ):
+                return False
+        colab_bin = find_colab_bin(env_copy)
+        if not colab_bin:
+            return False
+
+        active_queue = probe_remote_queue_count(env_copy, timeout=6.0) if queue_count is None else int(queue_count)
+        if active_queue <= 0:
+            return False
+
+        try:
+            with runtime_file_lock(self.storage):
+                with self._lock:
+                    if self._active_state is not None or self._active_proc is not None or self._keepalive_in_flight:
+                        return False
+                    self._keepalive_in_flight = True
+                try:
+                    rc, out = self._run_command(
+                        colab_bin,
+                        settings["colab_auth"],
+                        ["exec", "-s", settings["colab_session"], "--timeout", str(KERNEL_KEEPALIVE_TIMEOUT_SEC)],
+                        environ=env_copy,
+                        stdin_text=KERNEL_KEEPALIVE_CODE,
+                        timeout=float(KERNEL_KEEPALIVE_TIMEOUT_SEC) + 15.0,
+                    )
+                    if rc == 0 and "Traceback (most recent call last)" not in out:
+                        with self._lock:
+                            self._last_keepalive_at = current
+                            self._last_keepalive_fail_at = None
+                        self._append_log(
+                            f"[keepalive] Kernel keepalive sent (session={settings['colab_session']}, queue={active_queue})"
+                        )
+                        return True
+                    detail = (out.strip() or f"exit {rc}")[-200:]
+                    with self._lock:
+                        self._last_keepalive_fail_at = current
+                    self._append_log(f"[keepalive] Kernel keepalive failed (rc={rc}): {detail}")
+                    return False
+                finally:
+                    with self._lock:
+                        self._keepalive_in_flight = False
+        except RuntimeBusyError:
+            return False
+        except Exception as exc:
+            with self._lock:
+                self._last_keepalive_fail_at = current
+            self._append_log(f"[keepalive] Kernel keepalive error: {type(exc).__name__}: {exc}")
+            return False
+
+    def start_keepalive_monitor(self, env_provider, *, poll_sec: float | None = None) -> None:
+        if os.environ.get("H3_WORKBENCH_WORKER") == "1":
+            return
+        interval = max(0.05, float(self.keepalive_poll_sec if poll_sec is None else poll_sec))
+        with self._lock:
+            self._keepalive_env_provider = env_provider
+            if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+                return
+            self._keepalive_stop.clear()
+
+            def monitor_loop() -> None:
+                while not self._keepalive_stop.wait(timeout=interval):
+                    with self._lock:
+                        provider = self._keepalive_env_provider
+                    if provider is None:
+                        continue
+                    try:
+                        current_env = provider()
+                        self.maybe_send_kernel_keepalive(current_env)
+                    except Exception as exc:
+                        self._append_log(f"[keepalive] Monitor error: {type(exc).__name__}: {exc}")
+
+            t = threading.Thread(target=monitor_loop, name="colab-kernel-keepalive", daemon=True)
+            self._keepalive_thread = t
+            t.start()
+
+    def stop_keepalive_monitor(self) -> None:
+        self._keepalive_stop.set()
+        with self._lock:
+            thread = self._keepalive_thread
+            self._keepalive_thread = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
     def stop(self, *, environ=None, force: bool = False, local_busy: bool = False) -> dict:
         if os.environ.get("H3_WORKBENCH_WORKER") == "1":
             raise RuntimeUnavailableError(message("colab_worker_forbidden"))
@@ -901,17 +1031,26 @@ class ColabRuntimeManager:
 
         with self._lock:
             active_worker = self._worker_thread if self._active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy") else None
+            keepalive_running = self._keepalive_in_flight
             proc_to_cancel = self._active_proc
-            if active_worker is not None:
+            if active_worker is not None or keepalive_running:
                 self._cancel_event.set()
                 self._drive_ack_event.set()
         if proc_to_cancel is not None:
             _kill_process_tree(proc_to_cancel)
         if active_worker is not None and active_worker.is_alive():
             active_worker.join(timeout=5.0)
+        if keepalive_running:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if not self._keepalive_in_flight:
+                        break
+                time.sleep(0.02)
 
         with runtime_file_lock(self.storage):
             with self._lock:
+                self._cancel_event.clear()
                 self._active_state = "stopping"
                 self._last_error = None
             try:
@@ -926,8 +1065,10 @@ class ColabRuntimeManager:
                     raise RuntimeError(out.strip()[-240:] or f"colab stop exit {rc}")
             finally:
                 with self._lock:
+                    self._cancel_event.clear()
                     self._active_state = None
                     self._sessions_cache = None
+        self.stop_keepalive_monitor()
         return {
             "stopped": True,
             "confirmation_required": False,

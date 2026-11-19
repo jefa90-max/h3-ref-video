@@ -173,7 +173,7 @@
       "chroma_subsampling": "auto",
       "codec": "none",
       "images": [
-        "122",
+        "155",
         0
       ],
       "audio": [
@@ -214,8 +214,8 @@
         "138",
         0
       ],
-      "width": 768,
-      "height": 1344,
+      "width": 544,
+      "height": 960,
       "length": [
         "131",
         1
@@ -444,6 +444,31 @@
     "class_type": "LoadImage",
     "_meta": {
       "title": "Load Image 9"
+    }
+  },
+  "154": {
+    "inputs": {
+      "model_name": "RealESRGAN_x2plus.pth"
+    },
+    "class_type": "UpscaleModelLoader",
+    "_meta": {
+      "title": "Load Upscale Model"
+    }
+  },
+  "155": {
+    "inputs": {
+      "upscale_model": [
+        "154",
+        0
+      ],
+      "image": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "ImageUpscaleWithModel",
+    "_meta": {
+      "title": "Upscale Image (using Model)"
     }
   }
 }

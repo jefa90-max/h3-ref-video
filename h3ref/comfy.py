@@ -1,9 +1,9 @@
 """ComfyUI remote backend: MiniMax H3 reference-to-video workflow (workflows/comfy-h3-ref2va.json).
 
 Uploads reference images with pure ASCII content-hash filenames (<sha256[:16]><ext>), builds a dynamic 1..9 image
-API prompt graph with deterministic 768p dimensions and preset-locked step/LoRA pairs, submits to /prompt, polls
-/history/{prompt_id} + /queue (failing fast if missing twice consecutively after an instance restart), and downloads
-completed videos via /view with tunnel authentication headers.
+API prompt graph with native 544p base dimensions, optional 2x RealESRGAN_x2plus upscaling, and preset-locked
+step/LoRA pairs, submits to /prompt, polls /history/{prompt_id} + /queue (failing fast if missing twice
+consecutively after an instance restart), and downloads completed videos via /view with tunnel authentication headers.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from .i18n import message
 
 SAVE, PROMPT, DURATION, LENGTH, SIZE, SAMPLER, STEPS, SEED = "92", "138", "132", "131", "136", "123", "124", "129"
 LORA, ENABLE_LORA, FULL_STEPS, TURBO_STEPS, SWITCH_MODEL, SWITCH_STEPS = "145", "146", "143", "144", "141", "142"
+VAE_DECODE, CREATE_VIDEO, UPSCALE_LOADER, UPSCALE_IMAGE = "122", "130", "154", "155"
+UPSCALE_MODEL_NAME = "RealESRGAN_x2plus.pth"
 IMAGES = ["137", "139", "147", "148", "149", "150", "151", "152", "153"]
 NODE_TYPES = {
     SAVE: "SaveVideo",
@@ -35,6 +37,10 @@ NODE_TYPES = {
     TURBO_STEPS: "PrimitiveInt",
     SWITCH_MODEL: "ComfySwitchNode",
     SWITCH_STEPS: "ComfySwitchNode",
+    VAE_DECODE: "VAEDecode",
+    CREATE_VIDEO: "CreateVideo",
+    UPSCALE_LOADER: "UpscaleModelLoader",
+    UPSCALE_IMAGE: "ImageUpscaleWithModel",
     **{n: "LoadImage" for n in IMAGES},
 }
 NODE_STAGE_KEYS = {
@@ -47,6 +53,8 @@ NODE_STAGE_KEYS = {
     "125": "sampling",
     "122": "decode_video",
     "121": "decode_audio",
+    "154": "load_upscaler",
+    "155": "upscale_video",
     "130": "create_video",
     "92": "save_video",
     **{n: "load_images" for n in IMAGES},
@@ -106,16 +114,27 @@ def upload(path: Path) -> str:
     return f"{subfolder}/{name.strip()}" if subfolder else name.strip()
 
 
-def graph(prompt: str, image_names: list[str], seconds: float, aspect: str, seed: int, *, preset: str | None = None) -> dict:
-    """Build a ComfyUI API prompt graph with dynamic 1..9 LoadImage inputs and preset-locked LoRA/steps."""
+def graph(
+    prompt: str,
+    image_names: list[str],
+    seconds: float,
+    aspect: str,
+    seed: int,
+    *,
+    preset: str | None = None,
+    upscale: bool | None = None,
+) -> dict:
+    """Build a ComfyUI API prompt graph with dynamic 1..9 LoadImage inputs, preset-locked LoRA/steps, and optional 2x upscaling."""
     if not 1 <= len(image_names) <= len(IMAGES):
         raise ValueError(f"H3 需要 1 到 {len(IMAGES)} 张参考图，这一段有 {len(image_names)} 张")
     if aspect not in config.COMFY_SIZES:
         raise ValueError(f"画幅只支持 {', '.join(config.COMFY_SIZES)}")
-    preset_name = (preset if preset is not None else config.video_settings()["comfyui_preset"]).strip().lower()
+    vcfg = config.video_settings() if (preset is None or upscale is None) else None
+    preset_name = (preset if preset is not None else vcfg["comfyui_preset"]).strip().lower()
     if preset_name not in config.COMFY_PRESETS:
         raise ValueError(f"COMFYUI_PRESET={preset_name!r} (4step | 8step | full20)")
     preset_cfg = config.COMFY_PRESETS[preset_name]
+    use_upscale = vcfg["comfyui_upscale"] if upscale is None else bool(upscale)
 
     g = base_graph()
     g[PROMPT]["inputs"]["value"] = prompt
@@ -135,6 +154,16 @@ def graph(prompt: str, image_names: list[str], seconds: float, aspect: str, seed
         g[STEPS]["inputs"]["model"] = ["127", 0]
         g[SWITCH_MODEL]["inputs"]["on_true"] = ["127", 0]
         g.pop(LORA, None)
+
+    if use_upscale:
+        g[UPSCALE_LOADER]["inputs"]["model_name"] = UPSCALE_MODEL_NAME
+        g[UPSCALE_IMAGE]["inputs"]["upscale_model"] = [UPSCALE_LOADER, 0]
+        g[UPSCALE_IMAGE]["inputs"]["image"] = [VAE_DECODE, 0]
+        g[CREATE_VIDEO]["inputs"]["images"] = [UPSCALE_IMAGE, 0]
+    else:
+        g[CREATE_VIDEO]["inputs"]["images"] = [VAE_DECODE, 0]
+        g.pop(UPSCALE_LOADER, None)
+        g.pop(UPSCALE_IMAGE, None)
 
     for idx, node_id in enumerate(IMAGES):
         ref_key = f"ref_images.ref_image_{idx}"
@@ -352,11 +381,8 @@ def format_progress(status: dict, *, elapsed_s: float | None = None) -> str:
         label = message("comfy_progress_queued_pos", pos=status["queue_position"])
     else:
         key = f"comfy_stage_{stage}"
-        label = message(key) if stage in (
-            "queued", "running", "load_clip", "load_vae", "load_model", "load_lora",
-            "load_images", "encode_prompt", "sampling", "decode_video", "decode_audio",
-            "create_video", "save_video",
-        ) else message("comfy_stage_running")
+        known_stages = {"queued", "running", *NODE_STAGE_KEYS.values()}
+        label = message(key) if stage in known_stages else message("comfy_stage_running")
     step = status.get("step")
     max_steps = status.get("max_steps")
     if isinstance(step, int) and isinstance(max_steps, int) and max_steps > 0:

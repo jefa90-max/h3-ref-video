@@ -95,7 +95,7 @@ RH_CONCURRENCY = int(env("RUNNINGHUB_CONCURRENCY", "3"))          # set to the a
 RH_COIN_CNY = float(env("RUNNINGHUB_COIN_CNY", str(399 / 180000)))  # what one RH coin cost you (Max monthly: ¥399 for 180k)
 H3_STEPS = int(env("H3_STEPS", "20"))
 SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
-COMFY_SIZES = {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (992, 992)}
+COMFY_SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
 VIDEO_PROVIDERS = ("runninghub", "comfyui")
 COMFY_PRESETS = {
     "4step": {
@@ -171,6 +171,13 @@ def video_settings(environ=None) -> dict:
         raise ValueError(f"COMFYUI_PRESET={preset!r} (4step | 8step | full20)")
     comfyui_url = validate_endpoint_url(values.get("COMFYUI_URL", ""), "COMFYUI_URL")
     comfyui_api_key = values.get("COMFYUI_API_KEY", "").strip()
+    raw_upscale = values.get("COMFYUI_UPSCALE", "").strip().lower() or "1"
+    if raw_upscale in ("0", "false", "no", "off"):
+        comfyui_upscale = False
+    elif raw_upscale in ("1", "true", "yes", "on"):
+        comfyui_upscale = True
+    else:
+        raise ValueError(f"COMFYUI_UPSCALE={raw_upscale!r} (0 | 1)")
     comfy_concurrency = _parse_positive_int(values.get("COMFYUI_CONCURRENCY", "").strip() or "1", "COMFYUI_CONCURRENCY")
     raw_rh_conc = values.get("RUNNINGHUB_CONCURRENCY", "").strip()
     rh_concurrency = _parse_positive_int(raw_rh_conc, "RUNNINGHUB_CONCURRENCY") if raw_rh_conc else RH_CONCURRENCY
@@ -192,6 +199,7 @@ def video_settings(environ=None) -> dict:
         "comfyui_api_key": comfyui_api_key,
         "comfy_requires_key": comfy_requires_api_key(comfyui_url),
         "comfyui_preset": preset,
+        "comfyui_upscale": comfyui_upscale,
         "comfyui_concurrency": comfy_concurrency,
         "runninghub_concurrency": rh_concurrency,
         "concurrency": comfy_concurrency if provider == "comfyui" else rh_concurrency,

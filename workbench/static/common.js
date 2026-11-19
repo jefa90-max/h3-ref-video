@@ -215,6 +215,7 @@ function renderVideoProvider() {
     ["comfy-url-field", "comfy-url"],
     ["comfy-key-field", "comfy-key"],
     ["comfy-preset-field", "comfy-preset"],
+    ["comfy-upscale-field", "comfy-upscale"],
     ["colab-auto-start-field", "colab-auto-start"],
   ]) {
     $(fieldId).hidden = !comfy;
@@ -273,6 +274,7 @@ function renderConfig(fillInputs = false) {
     $("video-provider").value = cfgVideoProvider;
     $("comfy-url").value = config.COMFYUI_URL || "";
     $("comfy-preset").value = config.COMFYUI_PRESET || "4step";
+    $("comfy-upscale").value = config.COMFYUI_UPSCALE ?? "1";
     $("colab-auto-start").value = config.COLAB_AUTO_START || "0";
     $("llm-provider").value = config.LLM_PROVIDER;
   }

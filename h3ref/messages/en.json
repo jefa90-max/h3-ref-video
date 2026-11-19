@@ -85,6 +85,8 @@
   "comfy_stage_sampling": "Diffusion sampling",
   "comfy_stage_decode_video": "Decoding video frames",
   "comfy_stage_decode_audio": "Decoding audio",
+  "comfy_stage_load_upscaler": "Loading upscale model",
+  "comfy_stage_upscale_video": "Upscaling video",
   "comfy_stage_create_video": "Muxing video & audio",
   "comfy_stage_save_video": "Saving video",
   "comfy_progress_queued_pos": "Queued (#{pos})",
