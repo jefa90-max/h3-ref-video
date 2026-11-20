@@ -223,14 +223,6 @@ def _render_v3_character(character: dict, other_names: set[str] | None = None) -
     return sentence.rstrip('。；; ') + '。'
 
 
-def render_scene_and_characters(composition: dict) -> str:
-    scene_body = re.sub(r'^场景(?:为|是|：|:)\s*', '', composition['scene'].strip()).rstrip('。；; ')
-    chars = composition.get('characters') or []
-    all_names = {c['name'].strip() for c in chars if c.get('name')}
-    char_line = ''.join(_render_v3_character(c, all_names) for c in chars)
-    return f'场景为{scene_body}。' + char_line
-
-
 def render_opening(composition: dict) -> str:
     c = composition
     if c.get('version') == 3:

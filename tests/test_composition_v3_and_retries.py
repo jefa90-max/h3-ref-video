@@ -138,6 +138,89 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
         # Historical v2 cached composition in s1-2 still renders via v2 branch
         self.assertIn(v2_fixture["world_frame"], compiled_v3)
 
+    def test_v3_video_prompt_deduplicates_looks_scenes_camera_and_anchors_first_frames(self):
+        script = copy.deepcopy(self.script)
+        script["shots"] = [
+            {"start": 0, "end": 3, "camera": "中景，缓慢右移", "action": "女王轻推婚书望向唐僧"},
+            {"start": 3, "end": 6, "camera": "近景，缓慢推进", "action": "唐僧低眉合十婉拒"},
+            {"start": 6, "end": 9, "camera": "", "action": "女王步入凉亭远望宫门"},
+            {"start": 9, "end": 12, "camera": "特写，手持微晃", "action": "女王轻叹一声收回视线"},
+        ]
+        segs = film.plan(script["shots"])
+        pics = film.refs(script, segs[0], "shot")
+        # board (1) + 3 cast (2,3,4) + 4 frames (5,6,7,8) = 8 pictures
+        queen_look = "头戴九凤朝阳金冠，身穿大红绣金凤袍，容貌端庄华贵"
+        monk_look = "头戴五佛宝冠，身披大红织金锦襕袈裟，内着白僧衣，面容白净"
+        comps = {
+            "s1-1": {
+                "version": 3,
+                "camera": "平视中景，镜头缓慢向右横移，对称构图",
+                "scene": "西梁女国金銮宝殿内部，红柱金砖，雕花长案摆在正中",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面左侧站着，右手轻按婚书"},
+                    {"name": "唐僧", "locked_look": monk_look, "placement_and_pose": "画面中央坐着，双手合十"},
+                ],
+            },
+            "s1-2": {
+                "version": 3,
+                "camera": "平视近景，缓慢向前推近",
+                "scene": "西梁女国金銮宝殿内部，红柱金砖与雕花长案前",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面左侧虚化站立"},
+                    {"name": "唐僧", "locked_look": monk_look, "placement_and_pose": "画面中央端坐低眉"},
+                ],
+            },
+            "s1-3": {
+                "version": 3,
+                "camera": "全景平视，缓摇跟随",
+                "scene": "御花园八角凉亭，石栏外垂柳拂风，远处可见朱红宫门",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面右侧凭栏而立"},
+                ],
+            },
+            "s1-4": {
+                "version": 3,
+                "camera": "人物特写，浅景深",
+                "scene": "御花园八角凉亭石栏旁，背景虚化的垂柳与宫门",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面中央微侧脸"},
+                ],
+            },
+        }
+        prompt_text = film.compile_prompt(script, segs[0], pics, 1, compositions=comps)
+        header, storyboard_body = prompt_text.split("分镜：\n", 1)
+
+        # Locked look appears ONCE in the cast header, NEVER repeated across shots
+        # self.script has no board and only 女王 + 唐僧 appear -> pics are 女王(1), 唐僧(2), frames(3,4,5,6)
+        self.assertEqual(prompt_text.count(queen_look), 1)
+        self.assertEqual(prompt_text.count(monk_look), 1)
+        self.assertIn(f"参考图片1只约束女王身份：{queen_look}。", header)
+        self.assertIn(f"参考图片2只约束唐僧身份：{monk_look}。", header)
+        self.assertNotIn(queen_look, storyboard_body)
+
+        # Static first-frame placement prose is omitted when the shot already has a first-frame image
+        self.assertNotIn("画面左侧站着，右手轻按婚书", storyboard_body)
+        self.assertNotIn("画面右侧凭栏而立", storyboard_body)
+
+        # Scene is established once at segment level, omitted on same-scene s1-2 and s1-4,
+        # and re-stated only when s1-3 genuinely switches location to the garden pavilion
+        self.assertIn("场景基调：西梁女国金銮宝殿内部，红柱金砖，雕花长案摆在正中。", header)
+        self.assertEqual(storyboard_body.count("金銮宝殿"), 0)
+        self.assertEqual(storyboard_body.count("场景切换为：御花园八角凉亭"), 1)
+        self.assertEqual(storyboard_body.count("御花园八角凉亭"), 1)
+
+        # Camera is not double-concatenated; empty shot.camera falls back to composition.camera
+        self.assertIn("0–3秒：【中景，缓慢右移】从参考图片3开始。动作过程：女王轻推婚书望向唐僧。", storyboard_body)
+        self.assertNotIn("对称构图", storyboard_body)
+        self.assertIn("3–6秒：【近景，缓慢推进】切至参考图片4。动作过程：唐僧低眉合十婉拒。", storyboard_body)
+        self.assertIn("6–9秒：【全景平视，缓摇跟随】切至参考图片5。场景切换为：御花园八角凉亭", storyboard_body)
+        self.assertIn("9–12秒：【特写，手持微晃】切至参考图片6。动作过程：女王轻叹一声收回视线。", storyboard_body)
+
+        # Rewrite rules direct H3 to define appearance once and focus detailed_description on motion/camera
+        self.assertIn("00:04.000", rewrite.RULES)
+        self.assertIn("motion progression", rewrite.RULES)
+        self.assertIn("without re-reciting", rewrite.RULES)
+
     def test_programmatic_locked_look_persists_and_overrides_drift_across_shots_and_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
