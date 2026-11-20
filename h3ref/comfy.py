@@ -19,7 +19,7 @@ from .i18n import message
 
 SAVE, PROMPT, DURATION, LENGTH, SIZE, SAMPLER, STEPS, SEED = "92", "138", "132", "131", "136", "123", "124", "129"
 LORA, ENABLE_LORA, FULL_STEPS, TURBO_STEPS, SWITCH_MODEL, SWITCH_STEPS = "145", "146", "143", "144", "141", "142"
-VAE_DECODE, CREATE_VIDEO, UPSCALE_LOADER, UPSCALE_IMAGE = "122", "130", "154", "155"
+VAE_DECODE, CREATE_VIDEO, UPSCALE_LOADER, UPSCALE_IMAGE, EASYCACHE = "122", "130", "154", "155", "156"
 UPSCALE_MODEL_NAME = "RealESRGAN_x2plus.pth"
 IMAGES = ["137", "139", "147", "148", "149", "150", "151", "152", "153"]
 NODE_TYPES = {
@@ -41,6 +41,7 @@ NODE_TYPES = {
     CREATE_VIDEO: "CreateVideo",
     UPSCALE_LOADER: "UpscaleModelLoader",
     UPSCALE_IMAGE: "ImageUpscaleWithModel",
+    EASYCACHE: "EasyCache",
     **{n: "LoadImage" for n in IMAGES},
 }
 NODE_STAGE_KEYS = {
@@ -148,11 +149,20 @@ def graph(
     g[FULL_STEPS]["inputs"]["value"] = 20
     if preset_cfg["enable_lora"]:
         g[LORA]["inputs"]["lora_name"] = preset_cfg["lora_name"]
+        g["126"]["inputs"]["model"] = [SWITCH_MODEL, 0]
         g[STEPS]["inputs"]["model"] = [SWITCH_MODEL, 0]
+        g.pop(EASYCACHE, None)
     else:
-        g["126"]["inputs"]["model"] = ["127", 0]
-        g[STEPS]["inputs"]["model"] = ["127", 0]
-        g[SWITCH_MODEL]["inputs"]["on_true"] = ["127", 0]
+        if preset_cfg.get("enable_easycache"):
+            g[EASYCACHE]["inputs"]["model"] = ["127", 0]
+            model_ref = [EASYCACHE, 0]
+        else:
+            g.pop(EASYCACHE, None)
+            model_ref = ["127", 0]
+        g["126"]["inputs"]["model"] = model_ref
+        g[STEPS]["inputs"]["model"] = model_ref
+        g[SWITCH_MODEL]["inputs"]["on_true"] = model_ref
+        g[SWITCH_MODEL]["inputs"]["on_false"] = model_ref
         g.pop(LORA, None)
 
     if use_upscale:

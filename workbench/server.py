@@ -47,7 +47,7 @@ def create_app(storage=None, env_path=None):
     if env.get("VIDEO_PROVIDER", "").strip().lower() not in ("", *config.VIDEO_PROVIDERS):
         env["VIDEO_PROVIDER"] = "runninghub"
     if env.get("COMFYUI_PRESET", "").strip().lower() not in ("", *config.COMFY_PRESETS):
-        env["COMFYUI_PRESET"] = "4step"
+        env["COMFYUI_PRESET"] = "full20"
     if env.get("COMFYUI_UPSCALE", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
         env["COMFYUI_UPSCALE"] = "1"
     if env.get("COLAB_AUTO_START", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
