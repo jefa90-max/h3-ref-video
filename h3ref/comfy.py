@@ -1,7 +1,7 @@
 """ComfyUI remote backend: MiniMax H3 reference-to-video workflow (workflows/comfy-h3-ref2va.json).
 
 Uploads reference images with pure ASCII content-hash filenames (<sha256[:16]><ext>), builds a dynamic 1..9 image
-API prompt graph with native 544p base dimensions, optional 2x RealESRGAN_x2plus upscaling, and preset-locked
+API prompt graph with selectable 768p/544p native dimensions, optional 2x RealESRGAN_x2plus upscaling, and preset-locked
 step/LoRA pairs, submits to /prompt, polls /history/{prompt_id} + /queue (failing fast if missing twice
 consecutively after an instance restart), and downloads completed videos via /view with tunnel authentication headers.
 """
@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode
 from . import config, http, rh
 from .i18n import message
 
-SAVE, PROMPT, DURATION, LENGTH, SIZE, SAMPLER, STEPS, SEED = "92", "138", "132", "131", "136", "123", "124", "129"
+SAVE, PROMPT, DURATION, LENGTH, SIZE, SAMPLER, STEPS, SEED, CLIP = "92", "138", "132", "131", "136", "123", "124", "129", "128"
 LORA, ENABLE_LORA, FULL_STEPS, TURBO_STEPS, SWITCH_MODEL, SWITCH_STEPS = "145", "146", "143", "144", "141", "142"
 VAE_DECODE, CREATE_VIDEO, UPSCALE_LOADER, UPSCALE_IMAGE, EASYCACHE = "122", "130", "154", "155", "156"
 UPSCALE_MODEL_NAME = "RealESRGAN_x2plus.pth"
@@ -31,6 +31,7 @@ NODE_TYPES = {
     SAMPLER: "KSamplerSelect",
     STEPS: "BasicScheduler",
     SEED: "RandomNoise",
+    CLIP: "CLIPLoader",
     LORA: "LoraLoaderModelOnly",
     ENABLE_LORA: "PrimitiveBoolean",
     FULL_STEPS: "PrimitiveInt",
@@ -124,13 +125,18 @@ def graph(
     *,
     preset: str | None = None,
     upscale: bool | None = None,
+    resolution: str | None = None,
 ) -> dict:
-    """Build a ComfyUI API prompt graph with dynamic 1..9 LoadImage inputs, preset-locked LoRA/steps, and optional 2x upscaling."""
+    """Build a ComfyUI API prompt graph with dynamic 1..9 LoadImage inputs, selectable resolution, preset-locked LoRA/steps, and optional 2x upscaling."""
     if not 1 <= len(image_names) <= len(IMAGES):
         raise ValueError(f"H3 需要 1 到 {len(IMAGES)} 张参考图，这一段有 {len(image_names)} 张")
-    if aspect not in config.COMFY_SIZES:
-        raise ValueError(f"画幅只支持 {', '.join(config.COMFY_SIZES)}")
-    vcfg = config.video_settings() if (preset is None or upscale is None) else None
+    vcfg = config.video_settings() if (preset is None or upscale is None or resolution is None) else None
+    resolution_name = (resolution if resolution is not None else vcfg["comfyui_resolution"]).strip().lower()
+    if resolution_name not in config.COMFY_RESOLUTIONS:
+        raise ValueError(f"COMFYUI_RESOLUTION={resolution_name!r} (768p | 544p)")
+    sizes = config.COMFY_RESOLUTIONS[resolution_name]
+    if aspect not in sizes:
+        raise ValueError(f"画幅只支持 {', '.join(sizes)}")
     preset_name = (preset if preset is not None else vcfg["comfyui_preset"]).strip().lower()
     if preset_name not in config.COMFY_PRESETS:
         raise ValueError(f"COMFYUI_PRESET={preset_name!r} (4step | 8step | full20)")
@@ -140,7 +146,7 @@ def graph(
     g = base_graph()
     g[PROMPT]["inputs"]["value"] = prompt
     g[DURATION]["inputs"]["value"] = max(float(config.MIN_SECONDS), min(float(config.MAX_SECONDS), float(seconds)))
-    g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = config.COMFY_SIZES[aspect]
+    g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = sizes[aspect]
     g[SEED]["inputs"]["noise_seed"] = int(seed)
     g[SAMPLER]["inputs"]["sampler_name"] = preset_cfg["sampler"]
     g[STEPS]["inputs"]["scheduler"] = preset_cfg["scheduler"]

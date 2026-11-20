@@ -1,4 +1,4 @@
-"""Cross-platform Colab A100 lifecycle controller for remote ComfyUI.
+"""Cross-platform Colab GPU lifecycle controller for remote ComfyUI.
 
 Decoupled from h3ref/comfy.py: machines without google-colab-cli still probe /system_stats
 and run full video generation whenever the remote ComfyUI endpoint is online.
@@ -220,6 +220,13 @@ def _build_argv(colab_bin: str, auth_mode: str, sub_args: list[str]) -> list[str
     if auth_mode:
         prefix += ["--auth", auth_mode]
     return [*prefix, *sub_args]
+
+
+def _new_session_args(session_name: str, gpu: str) -> list[str]:
+    args = ["new", "-s", session_name, "--gpu", gpu]
+    if gpu == "A100":
+        args.append("--high-mem")
+    return args
 
 
 def _is_transient_ws_disconnect(output: str) -> bool:
@@ -493,6 +500,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": cli_available,
                 "devices": probe.get("devices", []),
                 "comfyui_version": probe.get("comfyui_version"),
@@ -508,6 +516,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": cli_available,
                 "devices": [],
                 "auth_url": None,
@@ -528,6 +537,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": cli_available,
                 "devices": [],
                 "auth_url": auth_url if active == "awaiting_drive_auth" else None,
@@ -542,6 +552,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": False,
                 "devices": [],
                 "auth_url": None,
@@ -558,6 +569,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": True,
                 "has_session": has_named,
                 "devices": [],
@@ -572,6 +584,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": True,
                 "has_session": has_named,
                 "devices": [],
@@ -585,6 +598,7 @@ class ColabRuntimeManager:
             "provider": settings["provider"],
             "comfyui_url": settings["comfyui_url"],
             "session": settings["colab_session"],
+            "gpu": settings["colab_gpu"],
             "cli_available": True,
             "has_session": has_named,
             "devices": [],
@@ -730,7 +744,7 @@ class ColabRuntimeManager:
                     with self._lock:
                         self._active_state = "provisioning"
                     rc, out = self._run_command(
-                        colab_bin, auth_mode, ["new", "-s", session_name, "--gpu", "A100", "--high-mem"],
+                        colab_bin, auth_mode, _new_session_args(session_name, settings["colab_gpu"]),
                         environ=env_copy, timeout=180.0,
                     )
                     if self._cancel_event.is_set():
@@ -1104,6 +1118,7 @@ class ColabRuntimeManager:
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
                 "session": settings["colab_session"],
+                "gpu": settings["colab_gpu"],
                 "cli_available": True,
                 "has_session": False,
                 "devices": [],

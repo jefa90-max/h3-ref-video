@@ -94,8 +94,8 @@
   "segments_rewrite_done": "Converted English prompts for {count} segment(s); no video generation was triggered.",
   "segments_rewrite_none": "All segments already have up-to-date English prompts; nothing to rewrite.",
   "segment_snapshot_changed": "Clip versions are changing. Refresh the results; your draft is preserved.",
-  "comfy_offline": "Remote ComfyUI is offline. Start Colab A100 from the top runtime status card (or start your ComfyUI tunnel) and wait until it is Online before generating video.",
-  "comfy_starting": "Remote ComfyUI is offline; Colab A100 startup has been triggered automatically. Complete Google Drive authorization if prompted in the top runtime card and retry once Online.",
+  "comfy_offline": "Remote ComfyUI is offline. Start Colab GPU from the top runtime status card (or start your ComfyUI tunnel) and wait until it is Online before generating video.",
+  "comfy_starting": "Remote ComfyUI is offline; Colab GPU startup has been triggered automatically. Complete Google Drive authorization if prompted in the top runtime card and retry once Online.",
   "comfy_auth_failed": "Remote ComfyUI tunnel rejected authentication (HTTP {code}). Check that COMFYUI_API_KEY matches .comfyui_api_key.",
   "comfy_runtime_action": "{detail}"
 }

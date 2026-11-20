@@ -22,7 +22,8 @@ from .references import bind_references, describe_references
 from .directories import choose_output_folder, saved_output_root, save_output_root
 
 KEYS = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
-FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_PRESET", "COMFYUI_UPSCALE", "COLAB_AUTO_START",
+FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_PRESET", "COMFYUI_RESOLUTION", "COMFYUI_UPSCALE",
+          "COLAB_GPU", "COLAB_AUTO_START",
           "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
           "GEMINI_MODEL", "GEMINI_COMPOSITION_MODEL", "GEMINI_REWRITE_MODEL")
 
@@ -48,8 +49,12 @@ def create_app(storage=None, env_path=None):
         env["VIDEO_PROVIDER"] = "runninghub"
     if env.get("COMFYUI_PRESET", "").strip().lower() not in ("", *config.COMFY_PRESETS):
         env["COMFYUI_PRESET"] = "full20"
+    if env.get("COMFYUI_RESOLUTION", "").strip().lower() not in ("", *config.COMFY_RESOLUTIONS):
+        env["COMFYUI_RESOLUTION"] = "768p"
     if env.get("COMFYUI_UPSCALE", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
-        env["COMFYUI_UPSCALE"] = "1"
+        env["COMFYUI_UPSCALE"] = "0"
+    if env.get("COLAB_GPU", "").strip().upper() not in ("", *config.COLAB_GPUS):
+        env["COLAB_GPU"] = "G4"
     if env.get("COLAB_AUTO_START", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
         env["COLAB_AUTO_START"] = "0"
     try:
@@ -142,7 +147,9 @@ def create_app(storage=None, env_path=None):
         return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS},
                 "VIDEO_PROVIDER": vcfg["provider"], "COMFYUI_URL": vcfg["comfyui_url"],
                 "COMFYUI_PRESET": vcfg["comfyui_preset"],
+                "COMFYUI_RESOLUTION": vcfg["comfyui_resolution"],
                 "COMFYUI_UPSCALE": "1" if vcfg["comfyui_upscale"] else "0",
+                "COLAB_GPU": vcfg["colab_gpu"],
                 "COLAB_AUTO_START": "1" if vcfg["colab_auto_start"] else "0",
                 "comfy_requires_key": vcfg["comfy_requires_key"],
                 "LLM_BASE_URL": env["LLM_BASE_URL"],
@@ -259,6 +266,14 @@ def create_app(storage=None, env_path=None):
             if key == "COMFYUI_PRESET":
                 value = value.strip().lower()
                 if value not in config.COMFY_PRESETS:
+                    invalid(key, value, "choice")
+            if key == "COMFYUI_RESOLUTION":
+                value = value.strip().lower()
+                if value not in config.COMFY_RESOLUTIONS:
+                    invalid(key, value, "choice")
+            if key == "COLAB_GPU":
+                value = value.strip().upper()
+                if value not in config.COLAB_GPUS:
                     invalid(key, value, "choice")
             if key in ("COMFYUI_UPSCALE", "COLAB_AUTO_START"):
                 raw_flag = value.strip().lower()

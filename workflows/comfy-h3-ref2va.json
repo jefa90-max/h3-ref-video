@@ -147,7 +147,7 @@
   },
   "128": {
     "inputs": {
-      "clip_name": "qwen3vl_32b_minimax_h3_bf16.safetensors",
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
       "type": "minimax",
       "device": "default"
     },
@@ -173,7 +173,7 @@
       "chroma_subsampling": "auto",
       "codec": "none",
       "images": [
-        "155",
+        "122",
         0
       ],
       "audio": [
@@ -214,8 +214,8 @@
         "138",
         0
       ],
-      "width": 544,
-      "height": 960,
+      "width": 768,
+      "height": 1344,
       "length": [
         "131",
         1

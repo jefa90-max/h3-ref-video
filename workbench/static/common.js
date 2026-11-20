@@ -123,23 +123,25 @@ function renderRuntimeStatus() {
   const statusObj = state.runtimeStatus;
   if (!statusObj) return;
   const st = statusObj.state || "offline";
+  const gpu = statusObj.gpu || state.config?.COLAB_GPU || "G4";
   const badge = $("runtime-badge");
-  badge.textContent = t(`runtimeState_${st}`);
+  badge.textContent = t(`runtimeState_${st}`, { gpu });
   badge.className = "status-badge";
   if (st === "online") badge.classList.add("succeeded");
   else if (["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(st)) badge.classList.add("running");
   else if (["error", "orphan_warning"].includes(st)) badge.classList.add("failed");
+  $("runtime-start").textContent = t("runtimeStartGpu", { gpu });
 
   const configuredUrl = statusObj.comfyui_url || state.config?.COMFYUI_URL || "";
   if (st === "online") {
     const device = statusObj.devices?.[0]?.name || t("runtimeDefaultDevice");
     $("runtime-detail").textContent = t("runtimeDetailOnline", { url: configuredUrl, device });
   } else if (st === "offline") {
-    $("runtime-detail").textContent = t(configuredUrl ? "runtimeDetailOffline" : "runtimeDetailNoUrl");
+    $("runtime-detail").textContent = t(configuredUrl ? "runtimeDetailOffline" : "runtimeDetailNoUrl", { gpu });
   } else if (st === "cli_unavailable") {
     $("runtime-detail").textContent = t("runtimeDetailCliUnavailable");
   } else if (st === "provisioning") {
-    $("runtime-detail").textContent = t("runtimeDetailProvisioning");
+    $("runtime-detail").textContent = t("runtimeDetailProvisioning", { gpu });
   } else if (st === "awaiting_drive_auth") {
     $("runtime-detail").textContent = t("runtimeDetailDriveAuth");
   } else if (st === "starting_comfy") {
@@ -148,7 +150,7 @@ function renderRuntimeStatus() {
     $("runtime-detail").textContent = t("runtimeDetailStopping");
   } else if (st === "orphan_warning") {
     const sessions = (statusObj.orphan_sessions || []).map((item) => item.endpoint).join(", ");
-    $("runtime-detail").textContent = t("runtimeDetailOrphan", { sessions });
+    $("runtime-detail").textContent = t("runtimeDetailOrphan", { sessions, gpu });
   } else {
     $("runtime-detail").textContent = t("runtimeDetailError", { error: statusObj.error || st });
   }
@@ -215,7 +217,9 @@ function renderVideoProvider() {
     ["comfy-url-field", "comfy-url"],
     ["comfy-key-field", "comfy-key"],
     ["comfy-preset-field", "comfy-preset"],
+    ["comfy-resolution-field", "comfy-resolution"],
     ["comfy-upscale-field", "comfy-upscale"],
+    ["colab-gpu-field", "colab-gpu"],
     ["colab-auto-start-field", "colab-auto-start"],
   ]) {
     $(fieldId).hidden = !comfy;
@@ -274,7 +278,9 @@ function renderConfig(fillInputs = false) {
     $("video-provider").value = cfgVideoProvider;
     $("comfy-url").value = config.COMFYUI_URL || "";
     $("comfy-preset").value = config.COMFYUI_PRESET || "full20";
-    $("comfy-upscale").value = config.COMFYUI_UPSCALE ?? "1";
+    $("comfy-resolution").value = config.COMFYUI_RESOLUTION || "768p";
+    $("comfy-upscale").value = config.COMFYUI_UPSCALE ?? "0";
+    $("colab-gpu").value = config.COLAB_GPU || "G4";
     $("colab-auto-start").value = config.COLAB_AUTO_START || "0";
     $("llm-provider").value = config.LLM_PROVIDER;
   }
@@ -323,7 +329,8 @@ $("runtime-start").addEventListener("click", async () => {
     state.runtimeStatus = await post("/api/runtime/start", {});
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
-    showMessage(t("runtimeStartedNotice"));
+    const gpu = state.runtimeStatus?.gpu || state.config?.COLAB_GPU || "G4";
+    showMessage(t("runtimeStartedNotice", { gpu }));
   } catch (error) {
     showError(error);
   } finally {

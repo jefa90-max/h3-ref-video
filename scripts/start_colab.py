@@ -1,4 +1,4 @@
-"""Remote Colab A100 bootstrap for ComfyUI + authenticated ngrok tunnel + idle auto-shutdown.
+"""Remote Colab GPU bootstrap for ComfyUI + authenticated ngrok tunnel + idle auto-shutdown.
 
 Secrets and domain configuration are read from private dotfiles in Google Drive
 (/content/drive/MyDrive/MiniMax_ComfyUI/) so they never enter local CLI argv or
@@ -15,14 +15,18 @@ import base64
 import binascii
 import hmac
 import http.client
+import importlib
+import importlib.metadata
 import json
 import os
+import re
 import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -50,11 +54,17 @@ MODEL_FILES = [
     "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
     "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
     "upscale_models/RealESRGAN_x2plus.pth",
-    "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+    "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
 ]
 AUTO_DOWNLOAD_MODELS = {
     "upscale_models/RealESRGAN_x2plus.pth": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+    "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors": (
+        "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/"
+        "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    ),
 }
+SAGE_REPO_URL = "git+https://github.com/thu-ml/SageAttention.git"
+SAGE_TRITON_FALLBACK_SPEC = "sageattention==1.0.6"
 SSD_HEADROOM_BYTES = 12 * (1024 ** 3)
 
 PASSIVE_PROBE_PATHS = {"/system_stats", "/queue", "/h3_progress"}
@@ -593,6 +603,205 @@ def ensure_pyngrok() -> None:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=True)
 
 
+def _detect_torch_cuda_info() -> tuple[str, str, str] | None:
+    """Return (torch_version, arch_dot, sm_arch) for GPU 0, or None if CUDA is unavailable."""
+    try:
+        import torch  # type: ignore
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+            return None
+        major, minor = torch.cuda.get_device_capability(0)
+        return (str(getattr(torch, "__version__", "unknown")), f"{major}.{minor}", f"sm{major}{minor}")
+    except Exception:
+        return None
+
+
+def _sage_wheel_cache_dir(torch_version: str, sm_arch: str) -> Path:
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    safe_torch = re.sub(r"[^A-Za-z0-9._+-]", "_", torch_version)
+    return BASE / "wheels" / f"sageattention-{py_tag}-torch{safe_torch}-{sm_arch}"
+
+
+def _purge_sageattention_modules() -> None:
+    for name in [k for k in sys.modules if k == "sageattention" or k.startswith("sageattention.")]:
+        sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+
+
+def _sageattention_usable(sm_arch: str | None) -> tuple[bool, str]:
+    importlib.invalidate_caches()
+    try:
+        mod = importlib.import_module("sageattention")
+    except Exception as exc:
+        return False, f"import failed: {type(exc).__name__}: {exc}"
+    if not callable(getattr(mod, "sageattn", None)):
+        return False, "sageattention.sageattn not found"
+    try:
+        ver = importlib.metadata.version("sageattention")
+    except Exception:
+        ver = str(getattr(mod, "__version__", "") or "unknown")
+    if sm_arch in ("sm120", "sm121"):
+        if not callable(getattr(mod, "sageattn_qk_int8_pv_fp8_cuda", None)):
+            return False, f"sageattention {ver} lacks {sm_arch} CUDA FP8 kernels (Triton V1 unsupported on Blackwell)"
+        core_mod = sys.modules.get("sageattention.core")
+        if core_mod is not None and hasattr(core_mod, "SM89_ENABLED"):
+            if not core_mod.SM89_ENABLED:
+                return False, f"sageattention {ver} compiled {sm_arch} CUDA extension is not enabled"
+        else:
+            try:
+                importlib.import_module("sageattention._qattn_sm89")
+            except Exception as exc:
+                return False, f"sageattention {ver} missing compiled {sm_arch} CUDA extension ({type(exc).__name__}: {exc})"
+    return True, f"sageattention {ver} ({sm_arch or 'default'})"
+
+
+def _find_nvcc() -> str | None:
+    found = shutil.which("nvcc")
+    if found:
+        return found
+    for cand in ("/usr/local/cuda/bin/nvcc", "/usr/bin/nvcc"):
+        if Path(cand).is_file():
+            return cand
+    return None
+
+
+def ensure_sageattention() -> tuple[bool, str]:
+    """Ensure a compatible SageAttention package is available; never raises on failure."""
+    try:
+        cuda_info = _detect_torch_cuda_info()
+        if cuda_info is None:
+            reason = "CUDA GPU unavailable"
+            print(f"[start_colab] SageAttention skipped: {reason}", flush=True)
+            return False, reason
+        torch_ver, arch_dot, sm_arch = cuda_info
+        major = int(arch_dot.split(".", 1)[0])
+        if major < 8:
+            reason = f"GPU {sm_arch} below compute capability 8.0"
+            print(f"[start_colab] SageAttention skipped: {reason}", flush=True)
+            return False, reason
+
+        ok, detail = _sageattention_usable(sm_arch)
+        if ok:
+            print(f"[start_colab] SageAttention ready: {detail}", flush=True)
+            return True, detail
+
+        cache_dir = _sage_wheel_cache_dir(torch_ver, sm_arch)
+        cached_wheels = sorted(cache_dir.glob("sageattention-*.whl"), reverse=True) if cache_dir.is_dir() else []
+        for whl in cached_wheels:
+            print(f"[start_colab] Installing cached SageAttention wheel: {whl.name}", flush=True)
+            res = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", str(whl)],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            if res.returncode == 0:
+                _purge_sageattention_modules()
+                ok, detail = _sageattention_usable(sm_arch)
+                if ok:
+                    print(f"[start_colab] SageAttention ready from Drive wheel cache: {detail}", flush=True)
+                    return True, f"{detail} [cached wheel]"
+
+        last_err = detail
+        nvcc_path = _find_nvcc()
+        if nvcc_path:
+            if not shutil.which("ninja"):
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "ninja"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            print(
+                f"[start_colab] Building single-arch SageAttention wheel for {sm_arch} (torch {torch_ver}); "
+                "will cache to Drive for instant future startups...",
+                flush=True,
+            )
+            t0 = time.time()
+            with tempfile.TemporaryDirectory(prefix="sage_wheel_") as tmp_dir:
+                build_env = {
+                    **os.environ,
+                    "TORCH_CUDA_ARCH_LIST": arch_dot,
+                    "EXT_PARALLEL": "4",
+                    "MAX_JOBS": "4",
+                }
+                if "CUDA_HOME" not in build_env and nvcc_path.endswith("/bin/nvcc"):
+                    build_env["CUDA_HOME"] = str(Path(nvcc_path).parent.parent)
+                res = subprocess.run(
+                    [
+                        sys.executable, "-m", "pip", "wheel",
+                        "--no-build-isolation", "--no-deps",
+                        "-w", tmp_dir, SAGE_REPO_URL,
+                    ],
+                    env=build_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                    check=False,
+                )
+                built_wheels = sorted(Path(tmp_dir).glob("sageattention-*.whl")) if res.returncode == 0 else []
+                if built_wheels:
+                    built_whl = built_wheels[0]
+                    if BASE.exists():
+                        try:
+                            cache_dir.mkdir(parents=True, exist_ok=True)
+                            dst_whl = cache_dir / built_whl.name
+                            tmp_dst = dst_whl.with_suffix(".whl.tmp")
+                            shutil.copyfile(built_whl, tmp_dst)
+                            tmp_dst.replace(dst_whl)
+                            print(f"[start_colab] Cached SageAttention wheel to Drive: {dst_whl.name}", flush=True)
+                        except OSError as cache_exc:
+                            print(f"[start_colab] Warning: failed to cache SageAttention wheel: {cache_exc}", flush=True)
+                    inst = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", str(built_whl)],
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        check=False,
+                    )
+                    if inst.returncode == 0:
+                        _purge_sageattention_modules()
+                        ok, detail = _sageattention_usable(sm_arch)
+                        if ok:
+                            print(f"[start_colab] SageAttention built & ready in {time.time() - t0:.1f}s: {detail}", flush=True)
+                            return True, f"{detail} [built]"
+                        last_err = detail
+                    else:
+                        last_err = (inst.stderr or inst.stdout or f"pip install exit {inst.returncode}").strip()[-240:]
+                else:
+                    last_err = (res.stderr or res.stdout or f"pip wheel exit {res.returncode}").strip()[-240:]
+        else:
+            last_err = "nvcc not found for CUDA build"
+
+        if sm_arch not in ("sm120", "sm121"):
+            print(f"[start_colab] Falling back to pure Triton {SAGE_TRITON_FALLBACK_SPEC} on {sm_arch}...", flush=True)
+            fb = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--no-deps", SAGE_TRITON_FALLBACK_SPEC],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            if fb.returncode == 0:
+                _purge_sageattention_modules()
+                ok, detail = _sageattention_usable(sm_arch)
+                if ok:
+                    print(f"[start_colab] SageAttention ready via Triton fallback: {detail}", flush=True)
+                    return True, f"{detail} [triton fallback]"
+                last_err = detail
+            else:
+                last_err = (fb.stderr or fb.stdout or f"pip fallback exit {fb.returncode}").strip()[-240:]
+
+        print(f"[start_colab] SageAttention unavailable ({last_err}); continuing with default attention.", flush=True)
+        return False, last_err
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        print(f"[start_colab] SageAttention setup error ({reason}); continuing with default attention.", flush=True)
+        return False, reason
+
+
 def _parallel_copy_file(src: Path, dst: Path, src_size: int, rel: str) -> None:
     tmp = dst.with_suffix(dst.suffix + ".tmp")
     tmp.unlink(missing_ok=True)
@@ -669,16 +878,36 @@ def _download_file_atomic(url: str, dst: Path, rel: str) -> None:
     t0 = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": "h3-ref-video-colab-bootstrap/1.0"}, method="GET")
     total_bytes = 0
+    expected_bytes: int | None = None
+    next_report = 1024 ** 3
     try:
         with urllib.request.urlopen(req, timeout=180.0) as resp, tmp.open("wb") as out_f:
+            raw_len = resp.headers.get("Content-Length") if getattr(resp, "headers", None) else None
+            if raw_len and str(raw_len).strip().isdigit():
+                expected_bytes = int(str(raw_len).strip())
             while True:
                 chunk = resp.read(1024 * 1024)
                 if not chunk:
                     break
                 out_f.write(chunk)
                 total_bytes += len(chunk)
+                if total_bytes >= next_report:
+                    if expected_bytes:
+                        print(
+                            f"[start_colab]   downloading {rel}: "
+                            f"{total_bytes / (1024 ** 3):.1f}/{expected_bytes / (1024 ** 3):.1f} GB",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[start_colab]   downloading {rel}: {total_bytes / (1024 ** 3):.1f} GB",
+                            flush=True,
+                        )
+                    next_report += 1024 ** 3
         if total_bytes == 0:
             raise IOError(f"Downloaded 0 bytes for {rel} from {url}")
+        if expected_bytes is not None and total_bytes != expected_bytes:
+            raise IOError(f"Incomplete download for {rel}: got {total_bytes} of {expected_bytes} bytes")
         tmp.replace(dst)
     except BaseException:
         try:
@@ -741,15 +970,25 @@ def link_persistent_dirs() -> None:
         dst.symlink_to(target)
 
 
-def start_comfyui() -> None:
+def start_comfyui(*, use_sage_attention: bool | None = None, sage_detail: str = "") -> None:
     if _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
         print(f"[start_colab] ComfyUI already running on {COMFY_HOST}:{COMFY_PORT}.", flush=True)
         return
+    if use_sage_attention is None:
+        cuda_info = _detect_torch_cuda_info()
+        sm_arch = cuda_info[2] if cuda_info else None
+        use_sage_attention, sage_detail = _sageattention_usable(sm_arch)
+    launch_flags = list(COMFY_LAUNCH_FLAGS)
+    if use_sage_attention:
+        launch_flags.append("--use-sage-attention")
+        print(f"[start_colab] SageAttention enabled (--use-sage-attention): {sage_detail or 'available'}", flush=True)
+    else:
+        print(f"[start_colab] SageAttention disabled (default attention): {sage_detail or 'not installed'}", flush=True)
     subprocess.run(["pkill", "-f", f"main.py.*{COMFY_PORT}"], check=False)
     time.sleep(1)
     with COMFY_LOG_FILE.open("w", encoding="utf-8") as log_f:
         proc = subprocess.Popen(
-            [sys.executable, "main.py", "--listen", COMFY_HOST, "--port", str(COMFY_PORT), *COMFY_LAUNCH_FLAGS],
+            [sys.executable, "main.py", "--listen", COMFY_HOST, "--port", str(COMFY_PORT), *launch_flags],
             cwd=str(LOCAL),
             stdout=log_f,
             stderr=subprocess.STDOUT,
@@ -842,9 +1081,10 @@ def main() -> None:
         return
 
     ensure_comfyui_code()
+    sage_ok, sage_detail = ensure_sageattention()
     stage_models_to_local_ssd()
     link_persistent_dirs()
-    start_comfyui()
+    start_comfyui(use_sage_attention=sage_ok, sage_detail=sage_detail)
     ensure_supervisor_and_tunnel()
 
 

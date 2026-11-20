@@ -95,8 +95,13 @@ RH_CONCURRENCY = int(env("RUNNINGHUB_CONCURRENCY", "3"))          # set to the a
 RH_COIN_CNY = float(env("RUNNINGHUB_COIN_CNY", str(399 / 180000)))  # what one RH coin cost you (Max monthly: ¥399 for 180k)
 H3_STEPS = int(env("H3_STEPS", "20"))
 SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
-COMFY_SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
+COMFY_RESOLUTIONS = {
+    "768p": {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (1024, 1024)},
+    "544p": {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)},
+}
+COMFY_SIZES = COMFY_RESOLUTIONS["768p"]
 VIDEO_PROVIDERS = ("runninghub", "comfyui")
+COLAB_GPUS = ("G4", "A100", "H100")
 COMFY_PRESETS = {
     "full20": {
         "steps": 20,
@@ -172,9 +177,12 @@ def video_settings(environ=None) -> dict:
     preset = values.get("COMFYUI_PRESET", "").strip().lower() or "full20"
     if preset not in COMFY_PRESETS:
         raise ValueError(f"COMFYUI_PRESET={preset!r} (full20 | 8step | 4step)")
+    resolution = values.get("COMFYUI_RESOLUTION", "").strip().lower() or "768p"
+    if resolution not in COMFY_RESOLUTIONS:
+        raise ValueError(f"COMFYUI_RESOLUTION={resolution!r} (768p | 544p)")
     comfyui_url = validate_endpoint_url(values.get("COMFYUI_URL", ""), "COMFYUI_URL")
     comfyui_api_key = values.get("COMFYUI_API_KEY", "").strip()
-    raw_upscale = values.get("COMFYUI_UPSCALE", "").strip().lower() or "1"
+    raw_upscale = values.get("COMFYUI_UPSCALE", "").strip().lower() or "0"
     if raw_upscale in ("0", "false", "no", "off"):
         comfyui_upscale = False
     elif raw_upscale in ("1", "true", "yes", "on"):
@@ -185,6 +193,9 @@ def video_settings(environ=None) -> dict:
     raw_rh_conc = values.get("RUNNINGHUB_CONCURRENCY", "").strip()
     rh_concurrency = _parse_positive_int(raw_rh_conc, "RUNNINGHUB_CONCURRENCY") if raw_rh_conc else RH_CONCURRENCY
     colab_session = values.get("COLAB_SESSION", "").strip() or "comfy-a100"
+    colab_gpu = values.get("COLAB_GPU", "").strip().upper() or "G4"
+    if colab_gpu not in COLAB_GPUS:
+        raise ValueError(f"COLAB_GPU={colab_gpu!r} (G4 | A100 | H100)")
     raw_auto = values.get("COLAB_AUTO_START", "").strip().lower() or "0"
     if raw_auto in ("0", "false", "no", "off"):
         colab_auto_start = False
@@ -202,11 +213,13 @@ def video_settings(environ=None) -> dict:
         "comfyui_api_key": comfyui_api_key,
         "comfy_requires_key": comfy_requires_api_key(comfyui_url),
         "comfyui_preset": preset,
+        "comfyui_resolution": resolution,
         "comfyui_upscale": comfyui_upscale,
         "comfyui_concurrency": comfy_concurrency,
         "runninghub_concurrency": rh_concurrency,
         "concurrency": comfy_concurrency if provider == "comfyui" else rh_concurrency,
         "colab_session": colab_session,
+        "colab_gpu": colab_gpu,
         "colab_auto_start": colab_auto_start,
         "colab_bin": colab_bin,
         "colab_auth": colab_auth,
