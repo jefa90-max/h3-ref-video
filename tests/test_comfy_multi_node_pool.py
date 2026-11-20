@@ -444,6 +444,33 @@ class ComfyMultiNodePoolExecutionTest(unittest.TestCase):
         with mock.patch.object(start_colab.urllib.request, "urlopen", return_value=_FakeResp()):
             self.assertEqual(start_colab._discover_ngrok_public_url(), "https://rand-1234.ngrok-free.app")
 
+    def test_graph_uses_unique_save_video_prefix_and_colab_isolates_local_io_dirs(self):
+        # Regression for dual-G4 live test where two concurrent nodes wrote MiniMax_H3_00013_.mp4 to shared Drive output/.
+        g1 = comfy.graph("prompt a", ["ref1.png"], 5, "9:16", 12345, preset="full20", upscale=False, resolution="768p")
+        g2 = comfy.graph("prompt a", ["ref1.png"], 5, "9:16", 12345, preset="full20", upscale=False, resolution="768p")
+        p1 = g1[comfy.SAVE]["inputs"]["filename_prefix"]
+        p2 = g2[comfy.SAVE]["inputs"]["filename_prefix"]
+        self.assertTrue(p1.startswith("video/MiniMax_H3_"))
+        self.assertTrue(p2.startswith("video/MiniMax_H3_"))
+        self.assertNotEqual(p1, p2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            drive_base = Path(tmp) / "drive"
+            local_dir = Path(tmp) / "local"
+            local_dir.mkdir(parents=True)
+            # Simulate pre-existing Drive symlinks for input/output from older bootstrap runs
+            (drive_base / "output").mkdir(parents=True)
+            (drive_base / "input").mkdir(parents=True)
+            (local_dir / "output").symlink_to(drive_base / "output")
+            (local_dir / "input").symlink_to(drive_base / "input")
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "LOCAL", local_dir):
+                start_colab.link_persistent_dirs()
+            self.assertTrue((local_dir / "user").is_symlink())
+            self.assertEqual((local_dir / "user").resolve(), (drive_base / "user").resolve())
+            self.assertTrue((local_dir / "input").is_dir() and not (local_dir / "input").is_symlink())
+            self.assertTrue((local_dir / "output").is_dir() and not (local_dir / "output").is_symlink())
+
 
 if __name__ == "__main__":
     unittest.main()
