@@ -5,6 +5,7 @@ and run full video generation whenever the remote ComfyUI endpoint is online.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
 import os
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import config, http
+from . import comfy, config, http
 from .i18n import message, use_lang
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -301,35 +302,134 @@ def _probe_json(url: str, key: str, *, timeout: float = 12.0) -> tuple[int | Non
         return None, None
 
 
-def probe_comfyui(environ=None, *, timeout: float = 12.0) -> dict:
-    settings = config.video_settings(environ)
-    url = settings["comfyui_url"]
-    if not url:
-        return {"online": False, "configured": False, "devices": []}
-    status_code, payload = _probe_json(f"{url}/system_stats", settings["comfyui_api_key"], timeout=timeout)
+def _probe_single_node(url: str, shared_key: str, *, timeout: float = 12.0, include_queue: bool = False) -> dict:
+    key = shared_key
+    label = comfy.endpoint_label(url)
+    status_code, payload = _probe_json(f"{url}/system_stats", key, timeout=timeout)
     if status_code == 200 and isinstance(payload, dict):
         devices = [
             {"name": d.get("name"), "vram_total": d.get("vram_total"), "vram_free": d.get("vram_free")}
             for d in (payload.get("devices") or []) if isinstance(d, dict)
         ]
         version = (payload.get("system") or {}).get("comfyui_version") if isinstance(payload.get("system"), dict) else None
-        return {"online": True, "configured": True, "devices": devices, "comfyui_version": version}
+        queue_running = 0
+        queue_pending = 0
+        if include_queue:
+            q_code, q_payload = _probe_json(f"{url}/queue", key, timeout=min(timeout, 6.0))
+            if q_code == 200 and isinstance(q_payload, dict):
+                r_list = q_payload.get("queue_running") or []
+                p_list = q_payload.get("queue_pending") or []
+                queue_running = len(r_list) if isinstance(r_list, list) else 0
+                queue_pending = len(p_list) if isinstance(p_list, list) else 0
+        return {
+            "url": url,
+            "label": label,
+            "online": True,
+            "auth_failed": False,
+            "status_code": 200,
+            "devices": devices,
+            "comfyui_version": version,
+            "queue_running": queue_running,
+            "queue_pending": queue_pending,
+        }
     if status_code in (401, 403):
-        return {"online": False, "configured": True, "auth_failed": True, "status_code": status_code, "devices": []}
-    return {"online": False, "configured": True, "devices": []}
+        return {
+            "url": url,
+            "label": label,
+            "online": False,
+            "auth_failed": True,
+            "status_code": status_code,
+            "devices": [],
+            "comfyui_version": None,
+            "queue_running": 0,
+            "queue_pending": 0,
+        }
+    return {
+        "url": url,
+        "label": label,
+        "online": False,
+        "auth_failed": False,
+        "status_code": status_code,
+        "devices": [],
+        "comfyui_version": None,
+        "queue_running": 0,
+        "queue_pending": 0,
+    }
+
+
+def probe_comfyui_nodes(environ=None, *, timeout: float = 12.0, include_queue: bool = False) -> list[dict]:
+    settings = config.video_settings(environ)
+    urls = settings["comfyui_urls"]
+    if not urls:
+        return []
+    key = settings["comfyui_api_key"]
+    if len(urls) == 1:
+        return [_probe_single_node(urls[0], key, timeout=timeout, include_queue=include_queue)]
+    workers = max(1, min(8, len(urls)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_probe_single_node, u, key, timeout=timeout, include_queue=include_queue) for u in urls]
+        return [fut.result() for fut in futures]
+
+
+def probe_comfyui(environ=None, *, timeout: float = 12.0) -> dict:
+    settings = config.video_settings(environ)
+    urls = settings["comfyui_urls"]
+    if not urls:
+        return {"online": False, "configured": False, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}
+    nodes = probe_comfyui_nodes(environ, timeout=timeout, include_queue=len(urls) > 1)
+    online_nodes = [n for n in nodes if n["online"]]
+    if online_nodes:
+        devices = [d for n in online_nodes for d in (n.get("devices") or [])]
+        return {
+            "online": True,
+            "configured": True,
+            "devices": devices,
+            "comfyui_version": online_nodes[0].get("comfyui_version"),
+            "nodes": nodes,
+            "online_count": len(online_nodes),
+            "total_count": len(nodes),
+        }
+    auth_node = next((n for n in nodes if n.get("auth_failed")), None)
+    if auth_node is not None:
+        return {
+            "online": False,
+            "configured": True,
+            "auth_failed": True,
+            "status_code": auth_node.get("status_code", 401),
+            "devices": [],
+            "nodes": nodes,
+            "online_count": 0,
+            "total_count": len(nodes),
+        }
+    return {
+        "online": False,
+        "configured": True,
+        "devices": [],
+        "nodes": nodes,
+        "online_count": 0,
+        "total_count": len(nodes),
+    }
 
 
 def probe_remote_queue_count(environ=None, *, timeout: float = 12.0) -> int:
     settings = config.video_settings(environ)
-    url = settings["comfyui_url"]
-    if not url:
+    urls = settings["comfyui_urls"]
+    if not urls:
         return 0
-    status_code, payload = _probe_json(f"{url}/queue", settings["comfyui_api_key"], timeout=timeout)
-    if status_code == 200 and isinstance(payload, dict):
-        running = payload.get("queue_running") or []
-        pending = payload.get("queue_pending") or []
-        return (len(running) if isinstance(running, list) else 0) + (len(pending) if isinstance(pending, list) else 0)
-    return 0
+    shared_key = settings["comfyui_api_key"]
+
+    def count_one(url: str) -> int:
+        status_code, payload = _probe_json(f"{url}/queue", shared_key, timeout=timeout)
+        if status_code == 200 and isinstance(payload, dict):
+            running = payload.get("queue_running") or []
+            pending = payload.get("queue_pending") or []
+            return (len(running) if isinstance(running, list) else 0) + (len(pending) if isinstance(pending, list) else 0)
+        return 0
+
+    if len(urls) == 1:
+        return count_one(urls[0])
+    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
+        return sum(pool.map(count_one, urls))
 
 
 def parse_sessions_output(output: str) -> dict:
@@ -492,6 +592,12 @@ class ColabRuntimeManager:
         colab_bin = find_colab_bin(environ)
         cli_available = bool(colab_bin)
         probe = probe_comfyui(environ)
+        node_meta = {
+            "comfyui_urls": settings["comfyui_urls"],
+            "nodes": probe.get("nodes") or [],
+            "online_count": probe.get("online_count", 1 if probe["online"] else 0),
+            "total_count": probe.get("total_count", len(settings["comfyui_urls"])),
+        }
         if probe["online"]:
             with self._lock:
                 self._last_error = None
@@ -499,6 +605,7 @@ class ColabRuntimeManager:
                 "state": "online",
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
+                **node_meta,
                 "session": settings["colab_session"],
                 "gpu": settings["colab_gpu"],
                 "cli_available": cli_available,
@@ -515,6 +622,7 @@ class ColabRuntimeManager:
                 "state": "error",
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
+                **node_meta,
                 "session": settings["colab_session"],
                 "gpu": settings["colab_gpu"],
                 "cli_available": cli_available,
@@ -536,6 +644,7 @@ class ColabRuntimeManager:
                 "state": active,
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
+                **node_meta,
                 "session": settings["colab_session"],
                 "gpu": settings["colab_gpu"],
                 "cli_available": cli_available,
@@ -551,6 +660,7 @@ class ColabRuntimeManager:
                 "state": "cli_unavailable",
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
+                **node_meta,
                 "session": settings["colab_session"],
                 "gpu": settings["colab_gpu"],
                 "cli_available": False,
@@ -568,6 +678,7 @@ class ColabRuntimeManager:
                 "state": "orphan_warning",
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
+                **node_meta,
                 "session": settings["colab_session"],
                 "gpu": settings["colab_gpu"],
                 "cli_available": True,
@@ -583,6 +694,7 @@ class ColabRuntimeManager:
                 "state": "error",
                 "provider": settings["provider"],
                 "comfyui_url": settings["comfyui_url"],
+                **node_meta,
                 "session": settings["colab_session"],
                 "gpu": settings["colab_gpu"],
                 "cli_available": True,
@@ -597,6 +709,7 @@ class ColabRuntimeManager:
             "state": "offline",
             "provider": settings["provider"],
             "comfyui_url": settings["comfyui_url"],
+            **node_meta,
             "session": settings["colab_session"],
             "gpu": settings["colab_gpu"],
             "cli_available": True,

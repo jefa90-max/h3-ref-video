@@ -279,6 +279,9 @@ function formatLiveProgressParts(progress, segmentNumber = null) {
   }
   if (segmentNumber) label = t("liveProgressSegment", { number: segmentNumber, label });
   const metaParts = [];
+  if (progress.node_label) {
+    metaParts.push(t("liveProgressNode", { node: progress.node_label }));
+  }
   if (Number.isFinite(progress.vram_used_gb) && Number.isFinite(progress.vram_total_gb) && progress.vram_total_gb > 0) {
     metaParts.push(t("liveProgressVram", { used: progress.vram_used_gb.toFixed(1), total: progress.vram_total_gb.toFixed(1) }));
   }

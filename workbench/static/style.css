@@ -187,6 +187,10 @@ h3{font-size:14px;font-weight:650}
 .runtime-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}
 .runtime-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:14px}
 .runtime-actions{flex-wrap:wrap}
+.runtime-nodes{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+.runtime-node-item{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
+.runtime-node-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.runtime-node-meta{margin:0}
 .runtime-subbox{margin:12px 0 0}
 .runtime-subbox .runtime-actions{margin-top:9px}
 .runtime-logs{margin-top:12px;font-size:12px}

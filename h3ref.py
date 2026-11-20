@@ -63,46 +63,65 @@ def cmd_one(a):
         else config.video_settings()["provider"]
     )
     backend = comfy if provider_name == "comfyui" else rh
+    endpoint_url = str(st.get("comfyui_url") or "").strip() or None
     if not st.get("task"):
         if st.get("submission_unknown"):
             unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
             raise RuntimeError(message(unknown_key, number=1, path=state_file))
-        names = backend.upload_many(images) if hasattr(backend, "upload_many") else [backend.upload(p) for p in images]
+        if provider_name == "comfyui":
+            endpoint_url = film._select_single_comfy_endpoint(log=lambda detail: print(detail, flush=True))
+        ep_kw = film._comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
+        if provider_name == "comfyui":
+            names = comfy.upload_many(images, **ep_kw)
+        else:
+            names = backend.upload_many(images) if hasattr(backend, "upload_many") else [backend.upload(p) for p in images]
         st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
         g = backend.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
         def record_submission(unknown):
             st["provider"] = provider_name
+            if provider_name == "comfyui" and endpoint_url:
+                st["comfyui_url"] = endpoint_url
             st["submission_unknown"] = unknown
             save()
-        st["task"] = backend.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
-                                               record_submission=record_submission)
+        st["task"] = backend.submit_with_retry(
+            g,
+            log=lambda detail: print(detail, flush=True),
+            record_submission=record_submission,
+            **ep_kw,
+        )
         st["provider"] = provider_name
+        if provider_name == "comfyui" and endpoint_url:
+            st["comfyui_url"] = endpoint_url
         st["submission_unknown"] = False
         save()
         print(f"已提交，预计 ¥{backend.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
     provider_name = str(st.get("provider") or "runninghub").strip().lower()
     backend = comfy if provider_name == "comfyui" else rh
+    if provider_name == "comfyui" and not endpoint_url:
+        endpoint_url = str(st.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+    ep_kw = film._comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
+    multi_node = provider_name == "comfyui" and len(config.video_settings()["comfyui_urls"]) > 1
     poll_interval = 5 if provider_name == "comfyui" else 20
     poll_limit = 1440 if provider_name == "comfyui" else 360
     last_progress_sig = None
     last_progress_log = 0.0
     last_progress_save = 0.0
     for _ in range(poll_limit):
-        res = backend.poll(st["task"])
+        res = backend.poll(st["task"], **ep_kw) if provider_name == "comfyui" else backend.poll(st["task"])
         if res["state"] != "running":
             break
         if provider_name == "comfyui":
             now = time.time()
             elapsed = max(0.0, now - t0)
-            live_info = res if "stage" in res else comfy.live_progress(st["task"], queued=bool(res.get("queued")))
-            prog = comfy.progress_payload(live_info, elapsed_s=elapsed)
+            live_info = res if "stage" in res else comfy.live_progress(st["task"], queued=bool(res.get("queued")), **ep_kw)
+            prog = comfy.progress_payload(live_info, elapsed_s=elapsed, endpoint=endpoint_url if multi_node else None)
             sig = (prog["stage"], prog["step"], prog["max_steps"], prog["queue_position"])
             if sig != last_progress_sig or (now - last_progress_save) >= 15.0:
                 st["live_progress"] = prog
                 save()
                 last_progress_save = now
             if sig != last_progress_sig or (now - last_progress_log) >= 20.0:
-                print(f"进度：{comfy.format_progress(live_info, elapsed_s=elapsed)}", flush=True)
+                print(f"进度：{comfy.format_progress(live_info, elapsed_s=elapsed, include_node=multi_node)}", flush=True)
                 last_progress_sig = sig
                 last_progress_log = now
         time.sleep(poll_interval)

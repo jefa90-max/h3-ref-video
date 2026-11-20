@@ -162,14 +162,49 @@ def validate_endpoint_url(raw: str, name: str) -> str:
     return cleaned.rstrip("/")
 
 
-def comfy_requires_api_key(comfyui_url: str) -> bool:
+def parse_endpoint_urls(raw: str, name: str) -> list[str]:
+    """Parse one or more comma/newline-separated http(s) endpoint URLs, preserving order and deduplicating."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return []
+    parts: list[str] = []
+    for line in cleaned.splitlines():
+        for chunk in line.split(","):
+            item = chunk.strip()
+            if item:
+                parts.append(item)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        url = validate_endpoint_url(part, name)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def format_endpoint_urls(urls: list[str]) -> str:
+    return ",".join(urls)
+
+
+def comfy_requires_api_key(comfyui_url: str | list[str]) -> bool:
     if not comfyui_url:
         return False
-    parts = urlsplit(comfyui_url.strip())
-    host = (parts.hostname or "").lower()
-    if host in ("127.0.0.1", "localhost", "::1"):
-        return False
-    return parts.scheme.lower() == "https"
+    if isinstance(comfyui_url, (list, tuple)):
+        candidates = list(comfyui_url)
+    else:
+        raw = str(comfyui_url).strip()
+        if not raw:
+            return False
+        candidates = [chunk.strip() for line in raw.splitlines() for chunk in line.split(",") if chunk.strip()]
+    for url in candidates:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            continue
+        if parts.scheme.lower() == "https":
+            return True
+    return False
 
 
 def video_settings(environ=None) -> dict:
@@ -183,7 +218,8 @@ def video_settings(environ=None) -> dict:
     resolution = values.get("COMFYUI_RESOLUTION", "").strip().lower() or "768p"
     if resolution not in COMFY_RESOLUTIONS:
         raise ValueError(f"COMFYUI_RESOLUTION={resolution!r} (768p | 544p)")
-    comfyui_url = validate_endpoint_url(values.get("COMFYUI_URL", ""), "COMFYUI_URL")
+    comfyui_urls = parse_endpoint_urls(values.get("COMFYUI_URL", ""), "COMFYUI_URL")
+    comfyui_url = comfyui_urls[0] if comfyui_urls else ""
     comfyui_api_key = values.get("COMFYUI_API_KEY", "").strip()
     raw_upscale = values.get("COMFYUI_UPSCALE", "").strip().lower() or "0"
     if raw_upscale in ("0", "false", "no", "off"):
@@ -192,7 +228,13 @@ def video_settings(environ=None) -> dict:
         comfyui_upscale = True
     else:
         raise ValueError(f"COMFYUI_UPSCALE={raw_upscale!r} (0 | 1)")
-    comfy_concurrency = _parse_positive_int(values.get("COMFYUI_CONCURRENCY", "").strip() or "1", "COMFYUI_CONCURRENCY")
+    raw_comfy_conc = values.get("COMFYUI_CONCURRENCY", "").strip()
+    if raw_comfy_conc:
+        comfy_concurrency = _parse_positive_int(raw_comfy_conc, "COMFYUI_CONCURRENCY")
+        comfy_concurrency_explicit = True
+    else:
+        comfy_concurrency = max(1, len(comfyui_urls))
+        comfy_concurrency_explicit = False
     raw_rh_conc = values.get("RUNNINGHUB_CONCURRENCY", "").strip()
     rh_concurrency = _parse_positive_int(raw_rh_conc, "RUNNINGHUB_CONCURRENCY") if raw_rh_conc else RH_CONCURRENCY
     colab_session = values.get("COLAB_SESSION", "").strip() or "comfy-a100"
@@ -213,12 +255,15 @@ def video_settings(environ=None) -> dict:
     return {
         "provider": provider,
         "comfyui_url": comfyui_url,
+        "comfyui_urls": comfyui_urls,
+        "comfyui_urls_text": format_endpoint_urls(comfyui_urls),
         "comfyui_api_key": comfyui_api_key,
-        "comfy_requires_key": comfy_requires_api_key(comfyui_url),
+        "comfy_requires_key": comfy_requires_api_key(comfyui_urls),
         "comfyui_preset": preset,
         "comfyui_resolution": resolution,
         "comfyui_upscale": comfyui_upscale,
         "comfyui_concurrency": comfy_concurrency,
+        "comfyui_concurrency_explicit": comfy_concurrency_explicit,
         "runninghub_concurrency": rh_concurrency,
         "concurrency": comfy_concurrency if provider == "comfyui" else rh_concurrency,
         "colab_session": colab_session,
@@ -288,11 +333,18 @@ def rh_key() -> str:
     return need("RUNNINGHUB_API_KEY", "RunningHub 的 API key，控制台「API 调用」里拿")
 
 
+def comfy_urls(environ=None) -> list[str]:
+    urls = video_settings(environ)["comfyui_urls"]
+    if urls:
+        return urls
+    return parse_endpoint_urls(
+        need("COMFYUI_URL", "远端 ComfyUI 隧道地址（支持逗号分隔多节点），例如 https://xxx.ngrok-free.dev"),
+        "COMFYUI_URL",
+    )
+
+
 def comfy_url(environ=None) -> str:
-    url = video_settings(environ)["comfyui_url"]
-    if url:
-        return url
-    return validate_endpoint_url(need("COMFYUI_URL", "远端 ComfyUI 隧道地址，例如 https://xxx.ngrok-free.dev"), "COMFYUI_URL")
+    return comfy_urls(environ)[0]
 
 
 def comfy_key(environ=None) -> str:

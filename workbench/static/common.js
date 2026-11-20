@@ -90,14 +90,20 @@ function dateLabel(value) {
 
 function comfyRequiresKey(rawUrl) {
   if (!rawUrl) return false;
-  try {
-    const parsed = new URL(rawUrl);
-    const host = (parsed.hostname || "").toLowerCase();
-    if (["127.0.0.1", "localhost", "::1", "[::1]"].includes(host)) return false;
-    return parsed.protocol === "https:";
-  } catch {
-    return true;
+  const items = Array.isArray(rawUrl)
+    ? rawUrl
+    : String(rawUrl).split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean);
+  for (const item of items) {
+    try {
+      const parsed = new URL(item);
+      const host = (parsed.hostname || "").toLowerCase();
+      if (["127.0.0.1", "localhost", "::1", "[::1]"].includes(host)) continue;
+      if (parsed.protocol === "https:") return true;
+    } catch {
+      return true;
+    }
   }
+  return false;
 }
 
 function clearRuntimePoll() {
@@ -119,6 +125,37 @@ function scheduleRuntimePoll(statusObj) {
   }
 }
 
+function renderRuntimeNodes(nodes) {
+  const list = $("runtime-nodes");
+  if (!list) return;
+  if (!Array.isArray(nodes) || nodes.length <= 1) {
+    list.hidden = true;
+    if (typeof list.replaceChildren === "function") list.replaceChildren();
+    return;
+  }
+  const rows = nodes.map((node) => {
+    const li = element("li", "runtime-node-item");
+    const stateKey = node.online
+      ? "runtimeNodeOnline"
+      : (node.auth_failed ? "runtimeNodeAuthFailed" : "runtimeNodeOffline");
+    const badgeClass = node.online ? "status-badge succeeded" : (node.auth_failed ? "status-badge failed" : "status-badge");
+    const label = node.label || node.url || "";
+    const devName = node.devices?.[0]?.name || "";
+    const queueTotal = (Number(node.queue_running) || 0) + (Number(node.queue_pending) || 0);
+    const metaParts = [];
+    if (devName) metaParts.push(devName);
+    if (node.online) metaParts.push(t("runtimeNodeQueue", { count: queueTotal }));
+    li.append(
+      element("span", badgeClass, t(stateKey)),
+      element("code", "runtime-node-url", label),
+      ...(metaParts.length ? [element("span", "hint runtime-node-meta", metaParts.join(" · "))] : []),
+    );
+    return li;
+  });
+  list.replaceChildren(...rows);
+  list.hidden = false;
+}
+
 function renderRuntimeStatus() {
   const statusObj = state.runtimeStatus;
   if (!statusObj) return;
@@ -133,11 +170,28 @@ function renderRuntimeStatus() {
   $("runtime-start").textContent = t("runtimeStartGpu", { gpu });
 
   const configuredUrl = statusObj.comfyui_url || state.config?.COMFYUI_URL || "";
+  const nodes = Array.isArray(statusObj.nodes) ? statusObj.nodes : [];
+  const totalCount = Number.isFinite(statusObj.total_count) ? statusObj.total_count : nodes.length;
+  const onlineCount = Number.isFinite(statusObj.online_count) ? statusObj.online_count : nodes.filter((n) => n.online).length;
+  const isMultiNode = totalCount > 1;
   if (st === "online") {
-    const device = statusObj.devices?.[0]?.name || t("runtimeDefaultDevice");
-    $("runtime-detail").textContent = t("runtimeDetailOnline", { url: configuredUrl, device });
+    if (isMultiNode) {
+      const concurrency = state.config?.effective_comfyui_concurrency || onlineCount;
+      $("runtime-detail").textContent = t("runtimeDetailMultiOnline", {
+        online: onlineCount,
+        total: totalCount,
+        concurrency: Math.min(concurrency, Math.max(1, onlineCount)),
+      });
+    } else {
+      const device = statusObj.devices?.[0]?.name || t("runtimeDefaultDevice");
+      $("runtime-detail").textContent = t("runtimeDetailOnline", { url: configuredUrl, device });
+    }
   } else if (st === "offline") {
-    $("runtime-detail").textContent = t(configuredUrl ? "runtimeDetailOffline" : "runtimeDetailNoUrl", { gpu });
+    if (isMultiNode) {
+      $("runtime-detail").textContent = t("runtimeDetailMultiOffline", { total: totalCount, gpu });
+    } else {
+      $("runtime-detail").textContent = t(configuredUrl ? "runtimeDetailOffline" : "runtimeDetailNoUrl", { gpu });
+    }
   } else if (st === "cli_unavailable") {
     $("runtime-detail").textContent = t("runtimeDetailCliUnavailable");
   } else if (st === "provisioning") {
@@ -154,6 +208,7 @@ function renderRuntimeStatus() {
   } else {
     $("runtime-detail").textContent = t("runtimeDetailError", { error: statusObj.error || st });
   }
+  renderRuntimeNodes(nodes);
 
   const awaitingAuth = st === "awaiting_drive_auth";
   $("runtime-drive-box").hidden = !awaitingAuth;
@@ -216,14 +271,15 @@ function renderVideoProvider() {
   for (const [fieldId, inputId] of [
     ["comfy-url-field", "comfy-url"],
     ["comfy-key-field", "comfy-key"],
+    ["comfy-concurrency-field", "comfy-concurrency"],
     ["comfy-preset-field", "comfy-preset"],
     ["comfy-resolution-field", "comfy-resolution"],
     ["comfy-upscale-field", "comfy-upscale"],
     ["colab-gpu-field", "colab-gpu"],
     ["colab-auto-start-field", "colab-auto-start"],
   ]) {
-    $(fieldId).hidden = !comfy;
-    $(inputId).disabled = !comfy;
+    if ($(fieldId)) $(fieldId).hidden = !comfy;
+    if ($(inputId)) $(inputId).disabled = !comfy;
   }
 }
 
@@ -277,6 +333,7 @@ function renderConfig(fillInputs = false) {
     llmDrafts = {};
     $("video-provider").value = cfgVideoProvider;
     $("comfy-url").value = config.COMFYUI_URL || "";
+    if ($("comfy-concurrency")) $("comfy-concurrency").value = config.COMFYUI_CONCURRENCY || "";
     $("comfy-preset").value = config.COMFYUI_PRESET || "full20";
     $("comfy-resolution").value = config.COMFYUI_RESOLUTION || "768p";
     $("comfy-upscale").value = config.COMFYUI_UPSCALE ?? "0";
@@ -412,6 +469,9 @@ $("config-form").addEventListener("submit", async (event) => {
     const payload = Object.fromEntries([...new FormData(event.target)].filter(([, value]) => value.trim()).map(([key, value]) => [key, value.trim()]));
     if (!$("comfy-url").disabled && !$("comfy-url").value.trim()) {
       payload.COMFYUI_URL = "";
+    }
+    if ($("comfy-concurrency") && !$("comfy-concurrency").disabled && !$("comfy-concurrency").value.trim()) {
+      payload.COMFYUI_CONCURRENCY = "";
     }
     payload.persist = $("persist-config").checked;
     state.config = await post("/api/config", payload);

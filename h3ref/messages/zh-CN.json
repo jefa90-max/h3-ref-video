@@ -91,5 +91,13 @@
   "comfy_stage_save_video": "保存成片",
   "comfy_progress_queued_pos": "排队中（第 {pos} 位）",
   "comfy_progress_vram": "显存 {used}/{total} GB",
-  "comfy_progress_elapsed": "已耗时 {elapsed}"
+  "comfy_progress_elapsed": "已耗时 {elapsed}",
+  "comfy_progress_node": "节点 {node}",
+  "comfy_pool_ready": "ComfyUI 节点池就绪：{online}/{total} 个节点在线（可用：{nodes}）",
+  "comfy_pool_all_offline": "已配置的 {count} 个 ComfyUI 节点均不可达或鉴权失败，请检查节点服务状态与 COMFYUI_API_KEY。",
+  "comfy_node_skipped": "节点 {node} 不可用（{reason}），本次并发分发将跳过该节点。",
+  "comfy_node_isolated": "节点 {node} 发生故障已隔离（{reason}），不再派发新段。",
+  "comfy_node_failover": "第 {number} 段尚未提交，节点 {node} 不可用，已切换至备用健康节点重试。",
+  "comfy_node_reason_auth": "鉴权失败 HTTP {code}",
+  "comfy_node_reason_offline": "连接超时或服务未启动"
 }

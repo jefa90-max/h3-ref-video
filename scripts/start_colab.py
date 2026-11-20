@@ -286,6 +286,35 @@ def _normalize_public_url(raw: str) -> str:
     return cleaned
 
 
+def _resolve_ngrok_domain() -> str:
+    """Resolve optional static ngrok URL; 'ephemeral'/'auto' or blank requests an ephemeral tunnel."""
+    override = os.environ.get("H3_NGROK_DOMAIN", "").strip()
+    if override:
+        if override.lower() in ("ephemeral", "auto", "random", "none"):
+            return ""
+        return _normalize_public_url(override)
+    raw = _read_secret(".ngrok_domain", "NGROK_URL", required=False)
+    if not raw or raw.lower() in ("ephemeral", "auto", "random"):
+        return ""
+    return _normalize_public_url(raw)
+
+
+def _discover_ngrok_public_url(*, timeout: float = 3.0) -> str:
+    """Read the active HTTPS public_url from ngrok's local inspection API (127.0.0.1:4040)."""
+    req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    for item in payload.get("tunnels") or []:
+        if isinstance(item, dict):
+            pub = str(item.get("public_url") or "").strip().rstrip("/")
+            if pub.startswith("https://"):
+                return pub
+    return ""
+
+
 def _idle_timeout_minutes() -> float:
     raw = _read_secret(".idle_timeout_min", "COLAB_IDLE_TIMEOUT_MIN", required=False) or "60"
     minutes = float(raw)
@@ -400,7 +429,7 @@ def _unassign_colab_runtime(log) -> bool:
 def run_supervisor(*, skip_comfy_check: bool = False) -> None:
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
     ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN")
-    public_url = _normalize_public_url(_read_secret(".ngrok_domain", "NGROK_URL"))
+    public_url = _resolve_ngrok_domain()
     idle_minutes = _idle_timeout_minutes()
     idle_seconds = idle_minutes * 60.0
 
@@ -541,16 +570,19 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
 
     def spawn_ngrok() -> subprocess.Popen:
         child_env = {**os.environ, "NGROK_AUTHTOKEN": ngrok_token}
+        cmd = [ngrok_bin, "http", f"{COMFY_HOST}:{GATEWAY_PORT}", "--log=stdout"]
+        if public_url:
+            cmd.insert(3, f"--url={public_url}")
         with NGROK_LOG_FILE.open("a", encoding="utf-8") as ngrok_log:
             return subprocess.Popen(
-                [ngrok_bin, "http", f"{COMFY_HOST}:{GATEWAY_PORT}", f"--url={public_url}", "--log=stdout"],
+                cmd,
                 env=child_env,
                 stdout=ngrok_log,
                 stderr=subprocess.STDOUT,
             )
 
     ngrok_proc = spawn_ngrok()
-    log(f"[supervisor] Spawned ngrok pid={ngrok_proc.pid} for {public_url} (idle_timeout={idle_minutes:g}m)")
+    log(f"[supervisor] Spawned ngrok pid={ngrok_proc.pid} for {public_url or 'ephemeral-domain'} (idle_timeout={idle_minutes:g}m)")
 
     def handle_term(signum, frame):
         ngrok_proc.terminate()
@@ -1028,20 +1060,21 @@ def start_comfyui(*, use_sage_attention: bool | None = None, sage_detail: str = 
 def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
     ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN")
-    public_url = _normalize_public_url(_read_secret(".ngrok_domain", "NGROK_URL"))
+    public_url = _resolve_ngrok_domain()
     auth_headers = {
         "Authorization": f"Bearer {api_key}",
         "ngrok-skip-browser-warning": "1",
         "User-Agent": "h3-ref-video-colab-bootstrap/1.0",
     }
-    probe_target = f"{public_url}/system_stats"
+    active_url = public_url or _discover_ngrok_public_url()
     if (
-        _pid_alive(SUPERVISOR_PID_FILE)
+        active_url
+        and _pid_alive(SUPERVISOR_PID_FILE)
         and _http_status(f"http://{COMFY_HOST}:{GATEWAY_PORT}/system_stats") == 401
-        and (skip_comfy_check or _http_status(probe_target, headers=auth_headers, timeout=6.0) == 200)
+        and (skip_comfy_check or _http_status(f"{active_url}/system_stats", headers=auth_headers, timeout=6.0) == 200)
     ):
-        print(f"[start_colab] Already online and auth-protected: {public_url}", flush=True)
-        return public_url
+        print(f"[start_colab] Already online and auth-protected: {active_url}", flush=True)
+        return active_url
 
     old_pid = _pid_alive(SUPERVISOR_PID_FILE)
     if old_pid:
@@ -1069,10 +1102,11 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
     expected_status = 502 if skip_comfy_check else 200
     for _ in range(30):
         unauth = _http_status(f"http://{COMFY_HOST}:{GATEWAY_PORT}/system_stats")
-        authed = _http_status(probe_target, headers=auth_headers, timeout=6.0)
+        resolved_url = public_url or _discover_ngrok_public_url()
+        authed = _http_status(f"{resolved_url}/system_stats", headers=auth_headers, timeout=6.0) if resolved_url else None
         if unauth == 401 and authed == expected_status:
-            print(f"[start_colab] TUNNEL READY (AUTH PROTECTED): {public_url}", flush=True)
-            return public_url
+            print(f"[start_colab] TUNNEL READY (AUTH PROTECTED): {resolved_url}", flush=True)
+            return resolved_url
         time.sleep(2)
     sup_tail = SUPERVISOR_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1200:] if SUPERVISOR_LOG_FILE.exists() else ""
     ng_tail = NGROK_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1200:] if NGROK_LOG_FILE.exists() else ""

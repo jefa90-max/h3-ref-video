@@ -31,6 +31,7 @@
         </div>
       </div>
       <p id="runtime-detail" class="hint"></p>
+      <ul id="runtime-nodes" class="runtime-nodes" hidden></ul>
       <div id="runtime-drive-box" class="notice warning runtime-subbox" hidden>
         <p class="hint" data-i18n="runtimeDetailDriveAuth"></p>
         <div class="button-row runtime-actions">
@@ -60,8 +61,9 @@
             <label><span data-i18n="videoProvider"></span><select id="video-provider" name="VIDEO_PROVIDER"><option value="comfyui" data-i18n="videoProviderComfy"></option><option value="runninghub" data-i18n="videoProviderRh"></option></select></label>
             <label><span><span data-i18n="apimartKey"></span> <span id="apimart-key-status" class="key-state"></span></span><input id="apimart-key" name="APIMART_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder"></label>
             <label id="rh-key-field" class="wide"><span><span data-i18n="rhKey"></span> <span id="rh-key-status" class="key-state"></span></span><input id="rh-key" name="RUNNINGHUB_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="keyPlaceholder"></label>
-            <label id="comfy-url-field" class="wide" hidden><span data-i18n="comfyUrl"></span><input id="comfy-url" name="COMFYUI_URL" type="url" spellcheck="false" data-i18n-placeholder="comfyUrlPlaceholder" disabled></label>
+            <label id="comfy-url-field" class="wide" hidden><span data-i18n="comfyUrl"></span><textarea id="comfy-url" name="COMFYUI_URL" rows="2" spellcheck="false" data-i18n-placeholder="comfyUrlPlaceholder" disabled></textarea></label>
             <label id="comfy-key-field" hidden><span><span data-i18n="comfyKey"></span> <span id="comfy-key-status" class="key-state"></span></span><input id="comfy-key" name="COMFYUI_API_KEY" type="password" autocomplete="off" data-i18n-placeholder="comfyKeyPlaceholder" disabled></label>
+            <label id="comfy-concurrency-field" hidden><span data-i18n="comfyConcurrency"></span><input id="comfy-concurrency" name="COMFYUI_CONCURRENCY" type="number" min="1" max="64" inputmode="numeric" data-i18n-placeholder="comfyConcurrencyPlaceholder" disabled></label>
             <label id="comfy-preset-field" hidden><span data-i18n="comfyPreset"></span><select id="comfy-preset" name="COMFYUI_PRESET" disabled><option value="full20" data-i18n="comfyPresetFull20"></option><option value="8step" data-i18n="comfyPreset8Step"></option><option value="4step" data-i18n="comfyPreset4Step"></option></select></label>
             <label id="comfy-resolution-field" hidden><span data-i18n="comfyResolution"></span><select id="comfy-resolution" name="COMFYUI_RESOLUTION" disabled><option value="768p" data-i18n="comfyResolution768p"></option><option value="544p" data-i18n="comfyResolution544p"></option></select></label>
             <label id="comfy-upscale-field" hidden><span data-i18n="comfyUpscale"></span><select id="comfy-upscale" name="COMFYUI_UPSCALE" disabled><option value="0" data-i18n="comfyUpscaleOff"></option><option value="1" data-i18n="comfyUpscaleOn"></option></select></label>

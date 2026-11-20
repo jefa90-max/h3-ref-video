@@ -91,5 +91,13 @@
   "comfy_stage_save_video": "Saving video",
   "comfy_progress_queued_pos": "Queued (#{pos})",
   "comfy_progress_vram": "VRAM {used}/{total} GB",
-  "comfy_progress_elapsed": "elapsed {elapsed}"
+  "comfy_progress_elapsed": "elapsed {elapsed}",
+  "comfy_progress_node": "node {node}",
+  "comfy_pool_ready": "ComfyUI node pool ready: {online}/{total} online ({nodes})",
+  "comfy_pool_all_offline": "None of the {count} configured ComfyUI node(s) are reachable or authorized; check endpoints and COMFYUI_API_KEY.",
+  "comfy_node_skipped": "Node {node} unavailable ({reason}); skipping it for dispatch.",
+  "comfy_node_isolated": "Node {node} isolated after failure ({reason}); no new segments will be dispatched to it.",
+  "comfy_node_failover": "Segment {number} had not been submitted when node {node} failed; failing over to another healthy node.",
+  "comfy_node_reason_auth": "auth rejected HTTP {code}",
+  "comfy_node_reason_offline": "unreachable or offline"
 }

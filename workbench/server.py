@@ -22,7 +22,7 @@ from .references import bind_references, describe_references
 from .directories import choose_output_folder, saved_output_root, save_output_root
 
 KEYS = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY")
-FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_PRESET", "COMFYUI_RESOLUTION", "COMFYUI_UPSCALE",
+FIELDS = (*KEYS, "VIDEO_PROVIDER", "COMFYUI_URL", "COMFYUI_CONCURRENCY", "COMFYUI_PRESET", "COMFYUI_RESOLUTION", "COMFYUI_UPSCALE",
           "COLAB_GPU", "COLAB_AUTO_START",
           "LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_COMPOSITION_MODEL", "LLM_REWRITE_MODEL",
           "GEMINI_MODEL", "GEMINI_COMPOSITION_MODEL", "GEMINI_REWRITE_MODEL")
@@ -58,9 +58,15 @@ def create_app(storage=None, env_path=None):
     if env.get("COLAB_AUTO_START", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
         env["COLAB_AUTO_START"] = "0"
     try:
-        config.validate_endpoint_url(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
+        env["COMFYUI_URL"] = config.format_endpoint_urls(config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL"))
     except ValueError:
         env["COMFYUI_URL"] = ""
+    raw_comfy_conc = env.get("COMFYUI_CONCURRENCY", "").strip()
+    if raw_comfy_conc:
+        try:
+            config._parse_positive_int(raw_comfy_conc, "COMFYUI_CONCURRENCY")
+        except ValueError:
+            env["COMFYUI_CONCURRENCY"] = ""
     config.llm_settings(env)
     config.video_settings(env)
     jobs.remember_secrets(env)
@@ -145,7 +151,11 @@ def create_app(storage=None, env_path=None):
     def settings():
         vcfg = config.video_settings(env)
         return {"keys": {key: bool(env.get(key, "").strip()) for key in KEYS},
-                "VIDEO_PROVIDER": vcfg["provider"], "COMFYUI_URL": vcfg["comfyui_url"],
+                "VIDEO_PROVIDER": vcfg["provider"],
+                "COMFYUI_URL": vcfg["comfyui_urls_text"],
+                "COMFYUI_URLS": vcfg["comfyui_urls"],
+                "COMFYUI_CONCURRENCY": str(vcfg["comfyui_concurrency"]) if vcfg["comfyui_concurrency_explicit"] else "",
+                "effective_comfyui_concurrency": vcfg["comfyui_concurrency"],
                 "COMFYUI_PRESET": vcfg["comfyui_preset"],
                 "COMFYUI_RESOLUTION": vcfg["comfyui_resolution"],
                 "COMFYUI_UPSCALE": "1" if vcfg["comfyui_upscale"] else "0",
@@ -253,7 +263,7 @@ def create_app(storage=None, env_path=None):
             if key not in FIELDS:
                 invalid("config", key, "choice")
             # Never quote a key's value in an error response.
-            if not isinstance(value, str) or "\0" in value or len(f"{key}={value}".splitlines()) != 1:
+            if not isinstance(value, str) or "\0" in value or (key != "COMFYUI_URL" and len(f"{key}={value}".splitlines()) != 1):
                 invalid(key, "[REDACTED]" if key in KEYS else value, "text")
             if key in KEYS and not value.strip():
                 continue
@@ -280,15 +290,35 @@ def create_app(storage=None, env_path=None):
                 if raw_flag not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
                     invalid(key, value, "choice")
                 value = "1" if raw_flag in ("1", "true", "yes", "on") else "0"
-            if key in ("LLM_BASE_URL", "COMFYUI_URL"):
-                if key == "COMFYUI_URL" and not value.strip():
-                    updates[key] = ""
+            if key == "COMFYUI_CONCURRENCY":
+                cleaned_conc = value.strip()
+                if not cleaned_conc:
+                    updates[key] = None
                     continue
+                try:
+                    parsed_conc = config._parse_positive_int(cleaned_conc, key)
+                except ValueError:
+                    invalid(key, cleaned_conc, "number", low=1, high=64)
+                if parsed_conc > 64:
+                    invalid(key, cleaned_conc, "number", low=1, high=64)
+                updates[key] = str(parsed_conc)
+                continue
+            if key == "LLM_BASE_URL":
                 try:
                     cleaned_url = config.validate_endpoint_url(value, key)
                 except ValueError:
                     invalid(key, "[URL]", "choice")
                 value = cleaned_url
+            if key == "COMFYUI_URL":
+                if not value.strip():
+                    updates[key] = ""
+                    continue
+                try:
+                    parsed_urls = config.parse_endpoint_urls(value, key)
+                except ValueError:
+                    invalid(key, "[URL]", "choice")
+                updates[key] = config.format_endpoint_urls(parsed_urls)
+                continue
             updates[key] = text(value, key, empty=key in KEYS)
         with jobs.lock:
             disk_updates = dict(updates)
@@ -305,14 +335,20 @@ def create_app(storage=None, env_path=None):
                     if disk_changed or mem_changed or (not env.get("LLM_API_KEY", "").strip() and "LLM_API_KEY" in disk_file):
                         disk_updates["LLM_API_KEY"] = None
             if "COMFYUI_URL" in updates and "COMFYUI_API_KEY" not in updates:
-                new_comfy_origin = config.url_origin(updates["COMFYUI_URL"])
-                comfy_mem_changed = new_comfy_origin != config.url_origin(env.get("COMFYUI_URL", ""))
+                def _comfy_origins(raw_str: str) -> set[tuple[str, str, int | None]]:
+                    try:
+                        return {config.url_origin(u) for u in config.parse_endpoint_urls(raw_str or "", "COMFYUI_URL")}
+                    except ValueError:
+                        return set()
+                new_comfy_origins = _comfy_origins(updates["COMFYUI_URL"])
+                mem_comfy_origins = _comfy_origins(env.get("COMFYUI_URL", ""))
+                comfy_mem_changed = bool(mem_comfy_origins) and not (new_comfy_origins & mem_comfy_origins)
                 if comfy_mem_changed:
                     mem_updates["COMFYUI_API_KEY"] = None
                 if persist:
                     disk_file = config.read_env_file(env_path)
-                    disk_comfy_url = disk_file.get("COMFYUI_URL") or ""
-                    comfy_disk_changed = new_comfy_origin != config.url_origin(disk_comfy_url)
+                    disk_comfy_origins = _comfy_origins(disk_file.get("COMFYUI_URL") or "")
+                    comfy_disk_changed = bool(disk_comfy_origins) and not (new_comfy_origins & disk_comfy_origins)
                     if comfy_disk_changed or comfy_mem_changed or (not env.get("COMFYUI_API_KEY", "").strip() and "COMFYUI_API_KEY" in disk_file):
                         disk_updates["COMFYUI_API_KEY"] = None
             if persist:
