@@ -347,7 +347,10 @@ class ComfyReviewFixesTest(unittest.TestCase):
     def test_comfy_full20_omits_lora_node_and_poll_tolerates_transient_ngrok_reconnect(self):
         g20 = comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="full20")
         self.assertNotIn(comfy.LORA, g20)
-        self.assertEqual(g20["126"]["inputs"]["model"], ["127", 0])
+        self.assertIn(comfy.EASYCACHE, g20)
+        self.assertEqual(g20[comfy.EASYCACHE]["inputs"]["model"], ["127", 0])
+        self.assertEqual(g20["126"]["inputs"]["model"], [comfy.EASYCACHE, 0])
+        self.assertEqual(g20[comfy.STEPS]["inputs"]["model"], [comfy.EASYCACHE, 0])
 
         calls = {"n": 0}
 

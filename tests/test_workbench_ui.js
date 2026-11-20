@@ -925,10 +925,14 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.equal($("comfy-upscale").value, "1");
   assert.equal($("runtime-card").hidden, false);
 
-  // Preset copy reflects 544p base rather than legacy 768p in both locales
+  // Preset copy reflects 544p + EasyCache default (full20) rather than legacy 768p in both locales
   const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
-  assert.ok(!freshMessages.comfyPreset4Step.includes("768p") && freshMessages.comfyPreset4Step.includes("544p"));
-  assert.ok(!zhFresh.comfyPreset4Step.includes("768p") && zhFresh.comfyPreset4Step.includes("544p"));
+  for (const key of ["comfyPresetFull20", "comfyPreset8Step", "comfyPreset4Step"]) {
+    assert.ok(!freshMessages[key].includes("768p"), `en ${key} should not mention 768p`);
+    assert.ok(!zhFresh[key].includes("768p"), `zh-CN ${key} should not mention 768p`);
+  }
+  assert.ok(freshMessages.comfyPresetFull20.includes("544p") && freshMessages.comfyPresetFull20.includes("EasyCache"));
+  assert.ok(zhFresh.comfyPresetFull20.includes("544p") && zhFresh.comfyPresetFull20.includes("EasyCache"));
 
   // Submit COMFYUI_API_KEY, 8step preset, COMFYUI_UPSCALE = "0", and COLAB_AUTO_START = "0"
   $("comfy-key").value = "ck-secret-42";
