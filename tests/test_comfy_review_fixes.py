@@ -271,6 +271,8 @@ class ComfyReviewFixesTest(unittest.TestCase):
                  )), \
                  mock.patch("h3ref.colab_runtime.time.sleep"):
                 st_online = mgr.ensure_started(env, timeout=5.0)
+                if mgr._worker_thread is not None:
+                    mgr._worker_thread.join(timeout=5.0)
                 self.assertEqual(st_online["state"], "online")
                 self.assertEqual(len(mount_attempts), 2)
 
@@ -347,8 +349,10 @@ class ComfyReviewFixesTest(unittest.TestCase):
     def test_comfy_full20_omits_lora_node_and_poll_tolerates_transient_ngrok_reconnect(self):
         g20 = comfy.graph("p", ["a.png"], 5, "9:16", 1, preset="full20")
         self.assertNotIn(comfy.LORA, g20)
+        self.assertIn(comfy.SPARSE_ATTN, g20)
+        self.assertEqual(g20[comfy.SPARSE_ATTN]["inputs"]["model"], ["127", 0])
         self.assertIn(comfy.EASYCACHE, g20)
-        self.assertEqual(g20[comfy.EASYCACHE]["inputs"]["model"], ["127", 0])
+        self.assertEqual(g20[comfy.EASYCACHE]["inputs"]["model"], [comfy.SPARSE_ATTN, 0])
         self.assertEqual(g20["126"]["inputs"]["model"], [comfy.EASYCACHE, 0])
         self.assertEqual(g20[comfy.STEPS]["inputs"]["model"], [comfy.EASYCACHE, 0])
 

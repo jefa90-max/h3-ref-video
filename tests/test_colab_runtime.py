@@ -328,6 +328,8 @@ class ColabRuntimeTest(unittest.TestCase):
                         break
                     time.sleep(0.03)
                 self.assertEqual(st["state"], "error")
+                if mgr._worker_thread is not None:
+                    mgr._worker_thread.join(timeout=5.0)
                 self.assertIsNotNone(mount_proc)
                 self.assertTrue(mount_proc.killed_event.is_set())
 
@@ -471,6 +473,8 @@ class ColabRuntimeTest(unittest.TestCase):
                  patch("subprocess.Popen", side_effect=fake_popen), \
                  patch.object(colab_runtime, "_kill_process_tree", side_effect=lambda p: p.kill()):
                 st = mgr.ensure_started(env, timeout=5.0)
+                if mgr._worker_thread is not None:
+                    mgr._worker_thread.join(timeout=5.0)
 
             self.assertEqual(st["state"], "online")
             self.assertEqual(len(exec_procs), 2)

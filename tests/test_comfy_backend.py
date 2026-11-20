@@ -86,6 +86,7 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertEqual(g4[comfy.STEPS]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertEqual(g4["126"]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertNotIn(comfy.EASYCACHE, g4)
+        self.assertNotIn(comfy.SPARSE_ATTN, g4)
         self.assertEqual(
             g4[comfy.LORA]["inputs"]["lora_name"],
             "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
@@ -99,6 +100,7 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertEqual(g8[comfy.STEPS]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertEqual(g8["126"]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertNotIn(comfy.EASYCACHE, g8)
+        self.assertNotIn(comfy.SPARSE_ATTN, g8)
         self.assertEqual(
             g8[comfy.LORA]["inputs"]["lora_name"],
             "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
@@ -114,8 +116,11 @@ class ComfyBackendTest(unittest.TestCase):
             self.assertEqual(g[comfy.SAMPLER]["inputs"]["sampler_name"], "res_multistep")
             self.assertEqual(g[comfy.STEPS]["inputs"]["scheduler"], "beta")
             self.assertNotIn(comfy.LORA, g)
+            self.assertIn(comfy.SPARSE_ATTN, g)
+            self.assertEqual(g[comfy.SPARSE_ATTN]["inputs"]["model"], ["127", 0])
+            self.assertEqual(g[comfy.SPARSE_ATTN]["inputs"]["selection"], "sol-attn")
             self.assertIn(comfy.EASYCACHE, g)
-            self.assertEqual(g[comfy.EASYCACHE]["inputs"]["model"], ["127", 0])
+            self.assertEqual(g[comfy.EASYCACHE]["inputs"]["model"], [comfy.SPARSE_ATTN, 0])
             self.assertEqual(g[comfy.STEPS]["inputs"]["model"], [comfy.EASYCACHE, 0])
             self.assertEqual(g["126"]["inputs"]["model"], [comfy.EASYCACHE, 0])
 
