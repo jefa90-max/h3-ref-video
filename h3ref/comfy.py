@@ -11,6 +11,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
@@ -225,6 +226,7 @@ def graph(
     use_upscale = vcfg["comfyui_upscale"] if upscale is None else bool(upscale)
 
     g = base_graph()
+    g[SAVE]["inputs"]["filename_prefix"] = f"video/MiniMax_H3_{uuid.uuid4().hex[:12]}"
     g[PROMPT]["inputs"]["value"] = prompt
     g[DURATION]["inputs"]["value"] = max(float(config.MIN_SECONDS), min(float(config.MAX_SECONDS), float(seconds)))
     g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = sizes[aspect]

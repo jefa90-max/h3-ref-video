@@ -1010,15 +1010,21 @@ def stage_models_to_local_ssd() -> None:
 
 
 def link_persistent_dirs() -> None:
-    for sub in ("user", "output", "input"):
-        target = BASE / sub
-        target.mkdir(parents=True, exist_ok=True)
-        dst = LOCAL / sub
-        if dst.is_symlink():
-            dst.unlink()
-        elif dst.exists():
-            shutil.rmtree(dst)
-        dst.symlink_to(target)
+    # Keep user settings on Drive, but isolate per-instance input/output on local SSD so
+    # concurrent Colab runtimes never collide on shared Drive filenames or FUSE sync lag.
+    user_target = BASE / "user"
+    user_target.mkdir(parents=True, exist_ok=True)
+    user_dst = LOCAL / "user"
+    if user_dst.is_symlink():
+        user_dst.unlink()
+    elif user_dst.exists():
+        shutil.rmtree(user_dst)
+    user_dst.symlink_to(user_target)
+    for sub in ("input", "output"):
+        local_dir = LOCAL / sub
+        if local_dir.is_symlink():
+            local_dir.unlink()
+        local_dir.mkdir(parents=True, exist_ok=True)
 
 
 def start_comfyui(*, use_sage_attention: bool | None = None, sage_detail: str = "") -> None:
