@@ -24,6 +24,7 @@ _CLI_SPEC.loader.exec_module(cli_main)
 class ComfyBackendTest(unittest.TestCase):
     def setUp(self):
         comfy._MISSING_COUNTS.clear()
+        comfy.clear_upload_cache()
 
     def test_dynamic_reference_graph_for_1_2_and_9_images_and_bounds(self):
         g1 = comfy.graph("prompt one", ["hash1.png"], 6, "9:16", 42)
@@ -272,6 +273,44 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertNotIn(r"D:\\\\工具", captured["input"])
         self.assertIn('filename=\\"abcd1234abcd1234.png\\"', captured["input"])
         self.assertIn('ngrok-skip-browser-warning: 1', captured["input"])
+
+    def test_upload_many_deduplicates_by_content_hash_preserves_order_and_invalidates_on_loadimage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img_a1 = root / "board.png"
+            img_a2 = root / "board_copy.png"
+            img_b = root / "cast.png"
+            Image.new("RGB", (8, 8), "red").save(img_a1)
+            img_a2.write_bytes(img_a1.read_bytes())  # Identical content -> same content-hash
+            Image.new("RGB", (8, 8), "blue").save(img_b)
+
+            upload_calls = []
+
+            def fake_http_upload(url, key, path, fields, **kw):
+                upload_calls.append(kw["filename"])
+                return {"name": kw["filename"], "subfolder": "", "type": "input"}
+
+            with patch.dict(os.environ, {"COMFYUI_URL": "https://demo.ngrok-free.dev", "COMFYUI_API_KEY": "k1"}, clear=False), \
+                 patch.object(comfy.http, "upload", side_effect=fake_http_upload):
+                first = comfy.upload_many([img_a1, img_b, img_a2])
+                self.assertEqual(len(first), 3)
+                self.assertEqual(first[0], first[2])
+                self.assertNotEqual(first[0], first[1])
+                self.assertEqual(len(upload_calls), 2)
+
+                # Second batch reuses remote cache without re-uploading any identical files
+                second = comfy.upload_many([img_b, img_a1])
+                self.assertEqual(second, [first[1], first[0]])
+                self.assertEqual(len(upload_calls), 2)
+
+                # LoadImage rejection from /prompt clears endpoint cache so retry re-uploads
+                with patch.object(comfy.http, "request", return_value={"node_errors": {"137": {"errors": [{"type": "invalid_image"}]}}}):
+                    with self.assertRaises(comfy.SubmissionRejected):
+                        comfy.submit({})
+
+                third = comfy.upload_many([img_a1])
+                self.assertEqual(third, [first[0]])
+                self.assertEqual(len(upload_calls), 3)
 
     def test_poll_handles_images_and_videos_outputs_queue_and_missing_prompt_fast_fail(self):
         env_vars = {

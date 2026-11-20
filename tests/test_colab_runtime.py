@@ -216,6 +216,8 @@ class ColabRuntimeTest(unittest.TestCase):
                         break
                     time.sleep(0.02)
                 self.assertEqual(cur["state"], "online")
+                if mgr._worker_thread is not None:
+                    mgr._worker_thread.join(timeout=5.0)
 
             # Verify default GPU G4 omits --high-mem, start_colab.py is synced to Drive before exec, drivemount retried once, and NO secret leaked
             new_calls = [a for a, _ in calls if "new" in a]
