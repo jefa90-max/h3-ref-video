@@ -534,7 +534,7 @@ def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, refe
         if missing:
             raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
         job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
-        names = [backend.upload(p) for p in paths]
+        names = backend.upload_many(paths) if hasattr(backend, "upload_many") else [backend.upload(p) for p in paths]
         seed = int(rec["seed"] if rec.get("seed") is not None else random.randrange(10 ** 14, 10 ** 15))
         g = backend.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
         job.put("segs", str(i), phase="submit")

@@ -67,7 +67,7 @@ def cmd_one(a):
         if st.get("submission_unknown"):
             unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
             raise RuntimeError(message(unknown_key, number=1, path=state_file))
-        names = [backend.upload(p) for p in images]
+        names = backend.upload_many(images) if hasattr(backend, "upload_many") else [backend.upload(p) for p in images]
         st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
         g = backend.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
         def record_submission(unknown):

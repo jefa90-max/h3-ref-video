@@ -11,6 +11,7 @@ import hashlib
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -69,6 +70,8 @@ _VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv")
 _MISSING_LOCK = threading.Lock()
 _MISSING_COUNTS: dict[tuple[str, str], int] = {}
 _TRANSIENT_COUNTS: dict[tuple[str, str], int] = {}
+_UPLOAD_LOCK = threading.Lock()
+_UPLOADED_CACHE: dict[tuple[str, str], str] = {}
 
 
 def _headers() -> dict[str, str]:
@@ -91,11 +94,27 @@ def _ascii_hash_filename(path: Path) -> str:
     return f"{digest}{ext}"
 
 
-def upload(path: Path) -> str:
+def clear_upload_cache(base_url: str | None = None) -> None:
+    """Clear cached (endpoint, content-hash) upload mappings."""
+    with _UPLOAD_LOCK:
+        if base_url is None:
+            _UPLOADED_CACHE.clear()
+        else:
+            for cache_key in [k for k in _UPLOADED_CACHE if k[0] == base_url]:
+                _UPLOADED_CACHE.pop(cache_key, None)
+
+
+def upload(path: Path, *, force: bool = False) -> str:
     """Upload an input image to ComfyUI /upload/image under an ASCII content-hash filename."""
     base = config.comfy_url()
     key = config.comfy_key()
     ascii_name = _ascii_hash_filename(path)
+    cache_key = (base, ascii_name)
+    if not force:
+        with _UPLOAD_LOCK:
+            cached = _UPLOADED_CACHE.get(cache_key)
+        if cached:
+            return cached
     out = http.upload(
         f"{base}/upload/image",
         key,
@@ -113,7 +132,31 @@ def upload(path: Path) -> str:
             detail = detail.replace(key, "[key]")
         raise RuntimeError(f"upload to ComfyUI failed: {detail}")
     subfolder = str(out.get("subfolder") or "").strip("/")
-    return f"{subfolder}/{name.strip()}" if subfolder else name.strip()
+    remote_name = f"{subfolder}/{name.strip()}" if subfolder else name.strip()
+    with _UPLOAD_LOCK:
+        _UPLOADED_CACHE[cache_key] = remote_name
+    return remote_name
+
+
+def upload_many(paths: list[Path], *, max_workers: int = 4) -> list[str]:
+    """Upload reference images concurrently with content-hash deduplication while preserving order."""
+    if not paths:
+        return []
+    keys: list[str] = []
+    unique_paths: dict[str, Path] = {}
+    for p in paths:
+        file_key = _ascii_hash_filename(p) if p.is_file() else str(p)
+        keys.append(file_key)
+        unique_paths.setdefault(file_key, p)
+    if len(unique_paths) == 1:
+        only_key, only_path = next(iter(unique_paths.items()))
+        uploaded = {only_key: upload(only_path)}
+    else:
+        workers = max(1, min(int(max_workers), len(unique_paths)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {k: pool.submit(upload, p) for k, p in unique_paths.items()}
+            uploaded = {k: fut.result() for k, fut in futures.items()}
+    return [uploaded[k] for k in keys]
 
 
 def graph(
@@ -210,6 +253,8 @@ def submit(g: dict) -> str:
         )
     except http.HTTPResponseError as exc:
         if exc.status_code in NON_RETRYABLE_STATUSES:
+            if any(tok in str(exc) for tok in ("LoadImage", "invalid_image", "image_not_found")):
+                clear_upload_cache(base)
             raise SubmissionRejected(message("comfy_submission_rejected", reason=str(exc))) from exc
         raise
     if not isinstance(out, dict):
@@ -217,6 +262,10 @@ def submit(g: dict) -> str:
     status = out.get("_http_status")
     node_errors = out.get("node_errors")
     if (isinstance(status, int) and status in NON_RETRYABLE_STATUSES) or out.get("error") or (isinstance(node_errors, dict) and node_errors):
+        if (isinstance(node_errors, dict) and (set(node_errors.keys()) & set(IMAGES))) or any(
+            tok in json.dumps(out, ensure_ascii=False) for tok in ("LoadImage", "invalid_image", "image_not_found")
+        ):
+            clear_upload_cache(base)
         detail = json.dumps(out, ensure_ascii=False)[:300]
         raise SubmissionRejected(message("comfy_submission_rejected", reason=detail))
     prompt_id = out.get("prompt_id")
