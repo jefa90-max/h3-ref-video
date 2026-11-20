@@ -610,15 +610,23 @@ class ComfyReviewFixesTest(unittest.TestCase):
             self.assertEqual(len(run_cmds), 1)
             self.assertIn(str(cached_whl), run_cmds[0])
 
-        # 3. Single-arch wheel build caches .whl atomically to Drive with TORCH_CUDA_ARCH_LIST=12.0
+        # 3. Single-arch wheel build patches -std=c++17 -> -std=c++20 for PyTorch 2.14+ and caches .whl atomically to Drive
         with tempfile.TemporaryDirectory() as tmp:
             drive_base = Path(tmp) / "drive"
             drive_base.mkdir()
             build_envs = []
+            patched_setup_contents = []
 
             def fake_build_run(cmd, **kw):
+                if cmd[:2] == ["git", "clone"]:
+                    clone_dst = Path(cmd[-1])
+                    clone_dst.mkdir(parents=True, exist_ok=True)
+                    (clone_dst / "setup.py").write_text('CXX_FLAGS = ["-O3", "-std=c++17"]\nNVCC_FLAGS = ["-std=c++17"]\n', encoding="utf-8")
+                    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
                 if "wheel" in cmd:
                     build_envs.append(kw.get("env") or {})
+                    src_setup = Path(cmd[-1]) / "setup.py"
+                    patched_setup_contents.append(src_setup.read_text(encoding="utf-8"))
                     out_dir = Path(cmd[cmd.index("-w") + 1])
                     (out_dir / "sageattention-2.2.0-cp313-cp313-linux_x86_64.whl").write_bytes(b"PK-built-wheel")
                 return types.SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -635,6 +643,8 @@ class ComfyReviewFixesTest(unittest.TestCase):
             self.assertTrue(ok)
             self.assertIn("built", detail)
             self.assertEqual(build_envs[0].get("TORCH_CUDA_ARCH_LIST"), "12.0")
+            self.assertIn("-std=c++20", patched_setup_contents[0])
+            self.assertNotIn("-std=c++17", patched_setup_contents[0])
             self.assertEqual(len(cached_files), 1)
             self.assertEqual(cached_files[0].read_bytes(), b"PK-built-wheel")
 
