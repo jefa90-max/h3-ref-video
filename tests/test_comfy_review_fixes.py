@@ -507,6 +507,180 @@ class ComfyReviewFixesTest(unittest.TestCase):
         for method, path in (("POST", "/prompt"), ("POST", "/upload/image"), ("GET", "/view?filename=out.mp4"), ("POST", "/queue")):
             self.assertFalse(start_colab._is_passive_probe(method, path), f"{method} {path}")
 
+    def test_nvfp4_text_encoder_auto_download_and_truncation_guard(self):
+        import io
+
+        clip_rel = "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+        expected_url = (
+            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/"
+            "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+        )
+        self.assertIn(clip_rel, start_colab.MODEL_FILES)
+        self.assertNotIn("text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors", start_colab.MODEL_FILES)
+        self.assertEqual(start_colab.AUTO_DOWNLOAD_MODELS.get(clip_rel), expected_url)
+
+        payload = b"NVFP4_AWQ_WEIGHTS_" * 1024
+
+        class FakeResp:
+            def __init__(self, body: bytes, advertised_len: int | None = None):
+                self._buf = io.BytesIO(body)
+                self.headers = {"Content-Length": str(advertised_len)} if advertised_len is not None else {}
+
+            def read(self, n=-1):
+                return self._buf.read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            drive_base = root / "drive"
+            local_base = root / "local"
+            for rel in start_colab.MODEL_FILES:
+                if rel == clip_rel:
+                    continue
+                p = drive_base / "models" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"M" * 4096)
+
+            seen_urls = []
+
+            def fake_urlopen(req, timeout=180.0):
+                seen_urls.append(req.full_url)
+                return FakeResp(payload, advertised_len=len(payload))
+
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "LOCAL", local_base), \
+                 mock.patch.object(start_colab, "SSD_HEADROOM_BYTES", 1024), \
+                 mock.patch("shutil.disk_usage", return_value=types.SimpleNamespace(free=100 * 1024 * 1024)), \
+                 mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                start_colab.stage_models_to_local_ssd()
+
+            drive_clip = drive_base / "models" / clip_rel
+            ssd_clip = local_base / "models" / clip_rel
+            self.assertEqual(seen_urls, [expected_url])
+            self.assertEqual(drive_clip.read_bytes(), payload)
+            self.assertEqual(ssd_clip.read_bytes(), payload)
+            self.assertFalse(drive_clip.with_suffix(drive_clip.suffix + ".tmp").exists())
+
+            # Truncated Content-Length must fail fast and clean up .tmp without leaving partial file
+            drive_clip.unlink()
+            with mock.patch("urllib.request.urlopen", return_value=FakeResp(b"short", advertised_len=99999)):
+                with self.assertRaisesRegex(IOError, "Incomplete download"):
+                    start_colab._download_file_atomic(expected_url, drive_clip, clip_rel)
+            self.assertFalse(drive_clip.exists())
+            self.assertFalse(drive_clip.with_suffix(drive_clip.suffix + ".tmp").exists())
+
+    def test_sageattention_cache_build_fallback_and_comfyui_launch_flag(self):
+        # 1. Blackwell sm120 rejects Triton-only V1 (lacking sageattn_qk_int8_pv_fp8_cuda)
+        triton_v1 = types.SimpleNamespace(sageattn=lambda *a, **kw: None, __version__="1.0.6")
+        with mock.patch.object(start_colab.importlib.metadata, "version", return_value="1.0.6"), \
+             mock.patch.object(start_colab.importlib, "import_module", return_value=triton_v1):
+            ok_sm120, reason = start_colab._sageattention_usable("sm120")
+            ok_sm80, _ = start_colab._sageattention_usable("sm80")
+        self.assertFalse(ok_sm120)
+        self.assertIn("Blackwell", reason)
+        self.assertTrue(ok_sm80)
+
+        # 2. Drive wheel cache hit installs cached wheel without invoking git source build
+        with tempfile.TemporaryDirectory() as tmp:
+            drive_base = Path(tmp) / "drive"
+            with mock.patch.object(start_colab, "BASE", drive_base):
+                cache_dir = start_colab._sage_wheel_cache_dir("2.14.0+cu130", "sm120")
+                cache_dir.mkdir(parents=True)
+                cached_whl = cache_dir / "sageattention-2.2.0-cp313-cp313-linux_x86_64.whl"
+                cached_whl.write_bytes(b"PK-fake-wheel")
+
+                run_cmds = []
+                usable_states = iter([(False, "missing"), (True, "sageattention 2.2.0 (sm120)")])
+
+                def fake_run(cmd, **kw):
+                    run_cmds.append(list(cmd))
+                    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with mock.patch.object(start_colab, "_detect_torch_cuda_info", return_value=("2.14.0+cu130", "12.0", "sm120")), \
+                     mock.patch.object(start_colab, "_sageattention_usable", side_effect=lambda arch: next(usable_states)), \
+                     mock.patch("subprocess.run", side_effect=fake_run):
+                    ok, detail = start_colab.ensure_sageattention()
+            self.assertTrue(ok)
+            self.assertIn("cached wheel", detail)
+            self.assertEqual(len(run_cmds), 1)
+            self.assertIn(str(cached_whl), run_cmds[0])
+
+        # 3. Single-arch wheel build caches .whl atomically to Drive with TORCH_CUDA_ARCH_LIST=12.0
+        with tempfile.TemporaryDirectory() as tmp:
+            drive_base = Path(tmp) / "drive"
+            drive_base.mkdir()
+            build_envs = []
+
+            def fake_build_run(cmd, **kw):
+                if "wheel" in cmd:
+                    build_envs.append(kw.get("env") or {})
+                    out_dir = Path(cmd[cmd.index("-w") + 1])
+                    (out_dir / "sageattention-2.2.0-cp313-cp313-linux_x86_64.whl").write_bytes(b"PK-built-wheel")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            usable_states = iter([(False, "missing"), (True, "sageattention 2.2.0 (sm120)")])
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "_detect_torch_cuda_info", return_value=("2.14.0+cu130", "12.0", "sm120")), \
+                 mock.patch.object(start_colab, "_find_nvcc", return_value="/usr/local/cuda/bin/nvcc"), \
+                 mock.patch("shutil.which", return_value="/usr/bin/ninja"), \
+                 mock.patch.object(start_colab, "_sageattention_usable", side_effect=lambda arch: next(usable_states)), \
+                 mock.patch("subprocess.run", side_effect=fake_build_run):
+                ok, detail = start_colab.ensure_sageattention()
+                cached_files = list(start_colab._sage_wheel_cache_dir("2.14.0+cu130", "sm120").glob("sageattention-*.whl"))
+            self.assertTrue(ok)
+            self.assertIn("built", detail)
+            self.assertEqual(build_envs[0].get("TORCH_CUDA_ARCH_LIST"), "12.0")
+            self.assertEqual(len(cached_files), 1)
+            self.assertEqual(cached_files[0].read_bytes(), b"PK-built-wheel")
+
+        # 4. Build failure on Blackwell safely returns (False, reason) without raising or installing broken Triton V1
+        with tempfile.TemporaryDirectory() as tmp:
+            drive_base = Path(tmp) / "drive"
+            drive_base.mkdir()
+            cmds = []
+
+            def fake_fail_run(cmd, **kw):
+                cmds.append(list(cmd))
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="nvcc error")
+
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "_detect_torch_cuda_info", return_value=("2.14.0+cu130", "12.0", "sm120")), \
+                 mock.patch.object(start_colab, "_find_nvcc", return_value="/usr/local/cuda/bin/nvcc"), \
+                 mock.patch("shutil.which", return_value="/usr/bin/ninja"), \
+                 mock.patch.object(start_colab, "_sageattention_usable", return_value=(False, "missing")), \
+                 mock.patch("subprocess.run", side_effect=fake_fail_run):
+                ok, reason = start_colab.ensure_sageattention()
+            self.assertFalse(ok)
+            self.assertIn("nvcc error", reason)
+            self.assertFalse(any(start_colab.SAGE_TRITON_FALLBACK_SPEC in c for c in cmds))
+
+        # 5. start_comfyui appends --use-sage-attention when enabled and omits it when disabled
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            launched = []
+
+            def fake_popen(argv, **kw):
+                launched.append(list(argv))
+                return types.SimpleNamespace(pid=12345)
+
+            with mock.patch.object(start_colab, "LOCAL", tmp_path), \
+                 mock.patch.object(start_colab, "COMFY_LOG_FILE", tmp_path / "comfy.log"), \
+                 mock.patch.object(start_colab, "COMFY_PID_FILE", tmp_path / "comfy.pid"), \
+                 mock.patch.object(start_colab, "_http_status", side_effect=[None, 200, None, 200]), \
+                 mock.patch("subprocess.run"), \
+                 mock.patch("time.sleep"), \
+                 mock.patch("subprocess.Popen", side_effect=fake_popen):
+                start_colab.start_comfyui(use_sage_attention=True, sage_detail="sageattention 2.2.0 (sm120)")
+                start_colab.start_comfyui(use_sage_attention=False, sage_detail="nvcc error")
+
+            self.assertIn("--use-sage-attention", launched[0])
+            self.assertNotIn("--use-sage-attention", launched[1])
+
 
 if __name__ == "__main__":
     unittest.main()

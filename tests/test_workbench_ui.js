@@ -835,7 +835,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   $("persist-config").checked = true;
   let postedPayload = null;
   const fieldIds = [
-    "video-provider", "rh-key", "comfy-url", "comfy-key", "comfy-preset", "comfy-upscale", "colab-auto-start",
+    "video-provider", "rh-key", "comfy-url", "comfy-key", "comfy-preset", "comfy-resolution", "comfy-upscale", "colab-gpu", "colab-auto-start",
     "apimart-key", "llm-provider", "llm-key", "gemini-key", "llm-composition-model", "llm-rewrite-model", "llm-base",
   ];
   class FakeFormData {
@@ -854,7 +854,9 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   $("comfy-url").name = "COMFYUI_URL";
   $("comfy-key").name = "COMFYUI_API_KEY";
   $("comfy-preset").name = "COMFYUI_PRESET";
+  $("comfy-resolution").name = "COMFYUI_RESOLUTION";
   $("comfy-upscale").name = "COMFYUI_UPSCALE";
+  $("colab-gpu").name = "COLAB_GPU";
   $("colab-auto-start").name = "COLAB_AUTO_START";
   $("apimart-key").name = "APIMART_API_KEY";
   $("llm-provider").name = "LLM_PROVIDER";
@@ -869,7 +871,9 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
     VIDEO_PROVIDER: "comfyui",
     COMFYUI_URL: "https://demo.ngrok-free.dev",
     COMFYUI_PRESET: "4step",
-    COMFYUI_UPSCALE: "1",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
     COLAB_AUTO_START: "0",
     comfy_requires_key: true,
     LLM_PROVIDER: "apimart",
@@ -894,7 +898,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
     FormData: FakeFormData,
     fetch: async (url, opts) => {
       if (url === "/api/runtime/status") {
-        return { ok: true, json: async () => ({ state: "offline", cli_available: true, logs: [] }) };
+        return { ok: true, json: async () => ({ state: "offline", gpu: comfyConfig.COLAB_GPU, cli_available: true, logs: [] }) };
       }
       if (url === "/api/config") {
         postedPayload = JSON.parse(opts.body);
@@ -903,7 +907,9 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
           json: async () => ({
             ...comfyConfig,
             COMFYUI_PRESET: postedPayload.COMFYUI_PRESET,
+            COMFYUI_RESOLUTION: postedPayload.COMFYUI_RESOLUTION,
             COMFYUI_UPSCALE: postedPayload.COMFYUI_UPSCALE,
+            COLAB_GPU: postedPayload.COLAB_GPU,
             COLAB_AUTO_START: postedPayload.COLAB_AUTO_START,
             keys: { ...comfyConfig.keys, COMFYUI_API_KEY: true },
           }),
@@ -921,23 +927,28 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.equal($("config-summary").textContent, freshMessages.configIncomplete);
   assert.equal($("rh-key").disabled, true);
   assert.equal($("comfy-url").disabled, false);
+  assert.equal($("comfy-resolution").disabled, false);
+  assert.equal($("comfy-resolution").value, "768p");
   assert.equal($("comfy-upscale").disabled, false);
-  assert.equal($("comfy-upscale").value, "1");
+  assert.equal($("comfy-upscale").value, "0");
+  assert.equal($("colab-gpu").disabled, false);
+  assert.equal($("colab-gpu").value, "G4");
   assert.equal($("runtime-card").hidden, false);
+  assert.ok($("runtime-start").textContent.includes("G4"));
 
-  // Preset copy reflects 544p + EasyCache default (full20) rather than legacy 768p in both locales
+  // Preset copy reflects EasyCache default without hardcoding a single resolution, and resolution/GPU options exist in both locales
   const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
-  for (const key of ["comfyPresetFull20", "comfyPreset8Step", "comfyPreset4Step"]) {
-    assert.ok(!freshMessages[key].includes("768p"), `en ${key} should not mention 768p`);
-    assert.ok(!zhFresh[key].includes("768p"), `zh-CN ${key} should not mention 768p`);
-  }
-  assert.ok(freshMessages.comfyPresetFull20.includes("544p") && freshMessages.comfyPresetFull20.includes("EasyCache"));
-  assert.ok(zhFresh.comfyPresetFull20.includes("544p") && zhFresh.comfyPresetFull20.includes("EasyCache"));
+  assert.ok(freshMessages.comfyPresetFull20.includes("EasyCache") && !freshMessages.comfyPresetFull20.includes("544p"));
+  assert.ok(zhFresh.comfyPresetFull20.includes("EasyCache") && !zhFresh.comfyPresetFull20.includes("544p"));
+  assert.ok(freshMessages.comfyResolution768p.includes("768×1344") && zhFresh.comfyResolution768p.includes("768×1344"));
+  assert.ok(freshMessages.comfyResolution544p.includes("544×960") && zhFresh.comfyResolution544p.includes("544×960"));
 
-  // Submit COMFYUI_API_KEY, 8step preset, COMFYUI_UPSCALE = "0", and COLAB_AUTO_START = "0"
+  // Submit COMFYUI_API_KEY, 8step preset, 544p resolution, COMFYUI_UPSCALE = "1", COLAB_GPU = "H100", and COLAB_AUTO_START = "0"
   $("comfy-key").value = "ck-secret-42";
   $("comfy-preset").value = "8step";
-  $("comfy-upscale").value = "0";
+  $("comfy-resolution").value = "544p";
+  $("comfy-upscale").value = "1";
+  $("colab-gpu").value = "H100";
   $("colab-auto-start").value = "0";
   await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
   await new Promise((r) => setImmediate(r));
@@ -945,7 +956,9 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.equal(postedPayload.VIDEO_PROVIDER, "comfyui");
   assert.equal(postedPayload.COMFYUI_API_KEY, "ck-secret-42");
   assert.equal(postedPayload.COMFYUI_PRESET, "8step");
-  assert.equal(postedPayload.COMFYUI_UPSCALE, "0");
+  assert.equal(postedPayload.COMFYUI_RESOLUTION, "544p");
+  assert.equal(postedPayload.COMFYUI_UPSCALE, "1");
+  assert.equal(postedPayload.COLAB_GPU, "H100");
   assert.equal(postedPayload.COLAB_AUTO_START, "0");
   assert.equal($("comfy-key").value, "");
   assert.equal($("config-summary").textContent, freshMessages.configReady);

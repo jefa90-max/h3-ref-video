@@ -136,7 +136,9 @@ class WorkbenchComfyTest(unittest.TestCase):
                 start_mock.assert_not_called()
                 cfg = res.get_json()["config"]
                 self.assertEqual(cfg["VIDEO_PROVIDER"], "comfyui")
-                self.assertEqual(cfg["COMFYUI_UPSCALE"], "1")
+                self.assertEqual(cfg["COMFYUI_RESOLUTION"], "768p")
+                self.assertEqual(cfg["COMFYUI_UPSCALE"], "0")
+                self.assertEqual(cfg["COLAB_GPU"], "G4")
                 self.assertEqual(cfg["COLAB_AUTO_START"], "1")
 
             headers = {"X-Workbench": "1"}
@@ -148,7 +150,9 @@ class WorkbenchComfyTest(unittest.TestCase):
                     "COMFYUI_URL": "https://tunnel-a.ngrok-free.dev/",
                     "COMFYUI_API_KEY": "super-secret-comfy-key-999",
                     "COMFYUI_PRESET": "8step",
-                    "COMFYUI_UPSCALE": "0",
+                    "COMFYUI_RESOLUTION": "544p",
+                    "COMFYUI_UPSCALE": "1",
+                    "COLAB_GPU": "H100",
                     "COLAB_AUTO_START": "0",
                     "persist": True,
                 },
@@ -160,17 +164,23 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertEqual(body["VIDEO_PROVIDER"], "comfyui")
             self.assertEqual(body["COMFYUI_URL"], "https://tunnel-a.ngrok-free.dev")
             self.assertEqual(body["COMFYUI_PRESET"], "8step")
-            self.assertEqual(body["COMFYUI_UPSCALE"], "0")
+            self.assertEqual(body["COMFYUI_RESOLUTION"], "544p")
+            self.assertEqual(body["COMFYUI_UPSCALE"], "1")
+            self.assertEqual(body["COLAB_GPU"], "H100")
             self.assertEqual(body["COLAB_AUTO_START"], "0")
-            self.assertEqual(config.read_env_file(env_path).get("COMFYUI_UPSCALE"), "0")
+            disk_env = config.read_env_file(env_path)
+            self.assertEqual(disk_env.get("COMFYUI_RESOLUTION"), "544p")
+            self.assertEqual(disk_env.get("COMFYUI_UPSCALE"), "1")
+            self.assertEqual(disk_env.get("COLAB_GPU"), "H100")
             self.assertTrue(body["keys"]["COMFYUI_API_KEY"])
 
-            bad_upscale = client.post(
-                "/api/config",
-                headers=headers,
-                json={"COMFYUI_UPSCALE": "ultra", "persist": False},
-            )
-            self.assertEqual(bad_upscale.status_code, 400)
+            for bad_payload in (
+                {"COMFYUI_UPSCALE": "ultra", "persist": False},
+                {"COMFYUI_RESOLUTION": "1080p", "persist": False},
+                {"COLAB_GPU": "T4", "persist": False},
+            ):
+                bad_res = client.post("/api/config", headers=headers, json=bad_payload)
+                self.assertEqual(bad_res.status_code, 400, bad_payload)
 
             # Changing COMFYUI_URL origin without supplying COMFYUI_API_KEY clears the stored key
             res2 = client.post(

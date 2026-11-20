@@ -217,10 +217,12 @@ class ColabRuntimeTest(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(cur["state"], "online")
 
-            # Verify colab new requests --high-mem, start_colab.py is synced to Drive before exec, drivemount retried once, and NO secret leaked
+            # Verify default GPU G4 omits --high-mem, start_colab.py is synced to Drive before exec, drivemount retried once, and NO secret leaked
             new_calls = [a for a, _ in calls if "new" in a]
             self.assertEqual(len(new_calls), 1)
-            self.assertIn("--high-mem", new_calls[0])
+            self.assertEqual(new_calls[0][1:], ["new", "-s", "comfy-a100", "--gpu", "G4"])
+            self.assertNotIn("--high-mem", new_calls[0])
+            self.assertEqual(cur["gpu"], "G4")
             upload_calls = [a for a, _ in calls if "upload" in a]
             self.assertEqual(len(upload_calls), 1)
             self.assertTrue(upload_calls[0][-2].endswith("start_colab.py"))
@@ -229,6 +231,59 @@ class ColabRuntimeTest(unittest.TestCase):
             self.assertEqual(len(mount_calls), 2)
             for argv, kwargs in calls:
                 self.assertFalse(any(secret in str(x) for x in argv))
+
+    def test_colab_gpu_selection_builds_expected_new_session_args(self):
+        self.assertEqual(
+            colab_runtime._new_session_args("comfy-a100", "G4"),
+            ["new", "-s", "comfy-a100", "--gpu", "G4"],
+        )
+        self.assertEqual(
+            colab_runtime._new_session_args("comfy-a100", "H100"),
+            ["new", "-s", "comfy-a100", "--gpu", "H100"],
+        )
+        self.assertEqual(
+            colab_runtime._new_session_args("comfy-a100", "A100"),
+            ["new", "-s", "comfy-a100", "--gpu", "A100", "--high-mem"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            mgr = colab_runtime.ColabRuntimeManager(Path(tmp))
+            for gpu, want_high_mem in (("A100", True), ("H100", False)):
+                env = {
+                    "VIDEO_PROVIDER": "comfyui",
+                    "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                    "COLAB_GPU": gpu,
+                    "COLAB_BIN": str(fake_bin),
+                }
+                new_calls = []
+                online = {"up": False}
+
+                def fake_popen(argv, **kw):
+                    if "sessions" in argv:
+                        return self._make_pipe_proc(["[colab] No active sessions found on server.\n"])
+                    if "new" in argv:
+                        new_calls.append(list(argv))
+                        return self._make_pipe_proc(["[colab] Session READY.\n"])
+                    if "drivemount" in argv:
+                        return self._make_pipe_proc(["Mounted at /content/drive\n"])
+                    if "upload" in argv:
+                        return self._make_pipe_proc(["Uploaded\n"])
+                    if "exec" in argv:
+                        online["up"] = True
+                        return self._make_pipe_proc(["TUNNEL READY\n"])
+                    raise AssertionError(argv)
+
+                with patch.object(colab_runtime, "probe_comfyui", side_effect=lambda *a, **kw: {"online": online["up"], "devices": [{"name": gpu}] if online["up"] else []}), \
+                     patch("subprocess.Popen", side_effect=fake_popen):
+                    st = mgr.ensure_started(env, timeout=5.0)
+                    if mgr._worker_thread is not None:
+                        mgr._worker_thread.join(timeout=5.0)
+                self.assertEqual(st["gpu"], gpu)
+                self.assertEqual(len(new_calls), 1)
+                self.assertIn("--gpu", new_calls[0])
+                self.assertEqual(new_calls[0][new_calls[0].index("--gpu") + 1], gpu)
+                self.assertEqual("--high-mem" in new_calls[0], want_high_mem)
 
     def test_drive_auth_timeout_recovers_to_error_state(self):
         with tempfile.TemporaryDirectory() as tmp:
