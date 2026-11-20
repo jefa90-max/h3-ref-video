@@ -1299,3 +1299,139 @@ test("results.js renders live ComfyUI stage, step bar, VRAM, and elapsed progres
   assert.equal($("live-progress").hidden, true, "#live-progress must hide once job finishes");
 });
 
+test("common.js renders multi-node ComfyUI pool status list, COMFYUI_CONCURRENCY, and results.js shows node_label", async () => {
+  const { ids, $ } = makeDom();
+  $("persist-config").checked = true;
+  let postedConfig = null;
+  class FakeFormData {
+    constructor() {
+      const entries = [];
+      for (const id of ["video-provider", "comfy-url", "comfy-concurrency", "comfy-preset", "comfy-resolution", "comfy-upscale", "colab-gpu", "colab-auto-start", "llm-provider", "llm-composition-model", "llm-rewrite-model", "llm-base"]) {
+        const el = ids.get(id);
+        if (el && !el.disabled && el.name) entries.push([el.name, el.value]);
+      }
+      this._entries = entries;
+    }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  $("video-provider").name = "VIDEO_PROVIDER";
+  $("comfy-url").name = "COMFYUI_URL";
+  $("comfy-concurrency").name = "COMFYUI_CONCURRENCY";
+  $("comfy-preset").name = "COMFYUI_PRESET";
+  $("comfy-resolution").name = "COMFYUI_RESOLUTION";
+  $("comfy-upscale").name = "COMFYUI_UPSCALE";
+  $("colab-gpu").name = "COLAB_GPU";
+  $("colab-auto-start").name = "COLAB_AUTO_START";
+  $("llm-provider").name = "LLM_PROVIDER";
+  $("llm-composition-model").name = "LLM_COMPOSITION_MODEL";
+  $("llm-rewrite-model").name = "LLM_REWRITE_MODEL";
+  $("llm-base").name = "LLM_BASE_URL";
+
+  const multiConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: true, APIMART_API_KEY: true, LLM_API_KEY: true, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node-a.example.com,https://node-b.example.com",
+    COMFYUI_URLS: ["https://node-a.example.com", "https://node-b.example.com"],
+    COMFYUI_CONCURRENCY: "",
+    effective_comfyui_concurrency: 2,
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+
+  let statusPayload = {
+    state: "online",
+    gpu: "G4",
+    cli_available: true,
+    comfyui_url: "https://node-a.example.com",
+    online_count: 1,
+    total_count: 2,
+    nodes: [
+      { url: "https://node-a.example.com", label: "node-a.example.com", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 1, queue_pending: 0 },
+      { url: "https://node-b.example.com", label: "node-b.example.com", online: false, auth_failed: false, devices: [], queue_running: 0, queue_pending: 0 },
+    ],
+    logs: [],
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "zh-CN" },
+      title: "",
+    },
+    localStorage: { getItem: () => "zh-CN", setItem() {} },
+    FormData: FakeFormData,
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") return { ok: true, json: async () => statusPayload };
+      if (url === "/api/config") {
+        postedConfig = JSON.parse(opts.body);
+        return { ok: true, json: async () => ({ ...multiConfig, COMFYUI_CONCURRENCY: postedConfig.COMFYUI_CONCURRENCY ?? "" }) };
+      }
+      return { ok: true, json: async () => zhMessages };
+    },
+  });
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(zhFresh)}; state.config = ${JSON.stringify(multiConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("comfy-concurrency").disabled, false);
+  assert.equal($("runtime-nodes").hidden, false, "Multi-node status must reveal #runtime-nodes list");
+  assert.equal($("runtime-nodes").children.length, 2);
+  assert.match($("runtime-detail").textContent, /1\/2/);
+
+  // Submitting blank COMFYUI_CONCURRENCY sends "" so server reverts to auto concurrency
+  $("comfy-concurrency").value = "";
+  await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
+  assert.equal(postedConfig.COMFYUI_CONCURRENCY, "");
+
+  // Single-node status hides #runtime-nodes
+  statusPayload = { state: "online", gpu: "G4", cli_available: true, comfyui_url: "https://node-a.example.com", online_count: 1, total_count: 1, nodes: [statusPayload.nodes[0]], devices: [{ name: "RTX PRO 6000" }], logs: [] };
+  await context.refreshRuntimeStatus();
+  assert.equal($("runtime-nodes").hidden, true, "Single-node status must keep #runtime-nodes hidden");
+
+  // Verify results.js formatLiveProgressParts renders node_label in both locales
+  for (const [lang, dict, expected] of [
+    ["zh-CN", zhFresh, "节点 node-b.example.com"],
+    ["en", JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8")), "Node node-b.example.com"],
+  ]) {
+    const rDom = makeDom();
+    rDom.$("results-page").dataset = { jobId: "job-multi" };
+    const rCtx = vm.createContext({
+      state: { language: lang, config: {}, jobs: [] },
+      $: rDom.$,
+      element: () => ({}),
+      renderPage: null,
+      document: { addEventListener() {}, querySelectorAll: () => [] },
+      window: { addEventListener() {} },
+      t: (k, v = {}) => (dict[k] || k).replace(/\{(\w+)\}/g, (_, n) => v[n] ?? ""),
+      running: () => true,
+      renderConfig() {}, showError() {}, showMessage() {}, clearNotices() {}, dateLabel: () => "",
+      initializePagination() {}, renderPagination() {}, initializeVideoSegments() {}, renderResultTabs() {},
+      renderVideoSegments() {}, pauseSegmentPlayers() {}, destroySegmentPlayers() {},
+      setTimeout: () => 1, clearTimeout() {}, loadLanguage: async () => {},
+      request: async () => ({}), post: async () => ({}),
+    });
+    vm.runInContext(fs.readFileSync(path.join(staticDirectory, "results.js"), "utf8"), rCtx);
+    const parts = rCtx.formatLiveProgressParts({
+      stage: "sampling", step: 10, max_steps: 20, vram_used_gb: 41.6, vram_total_gb: 95.0,
+      elapsed_s: 125, node_label: "node-b.example.com",
+    }, 2);
+    assert.ok(parts.meta.includes(expected), `${lang} live progress meta must include node label: ${parts.meta}`);
+  }
+});
+
+
