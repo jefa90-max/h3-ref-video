@@ -63,7 +63,7 @@ AUTO_DOWNLOAD_MODELS = {
         "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
     ),
 }
-SAGE_REPO_URL = "git+https://github.com/thu-ml/SageAttention.git"
+SAGE_REPO_URL = "https://github.com/thu-ml/SageAttention.git"
 SAGE_TRITON_FALLBACK_SPEC = "sageattention==1.0.6"
 SSD_HEADROOM_BYTES = 12 * (1024 ** 3)
 
@@ -721,27 +721,46 @@ def ensure_sageattention() -> tuple[bool, str]:
             )
             t0 = time.time()
             with tempfile.TemporaryDirectory(prefix="sage_wheel_") as tmp_dir:
-                build_env = {
-                    **os.environ,
-                    "TORCH_CUDA_ARCH_LIST": arch_dot,
-                    "EXT_PARALLEL": "4",
-                    "MAX_JOBS": "4",
-                }
-                if "CUDA_HOME" not in build_env and nvcc_path.endswith("/bin/nvcc"):
-                    build_env["CUDA_HOME"] = str(Path(nvcc_path).parent.parent)
-                res = subprocess.run(
-                    [
-                        sys.executable, "-m", "pip", "wheel",
-                        "--no-build-isolation", "--no-deps",
-                        "-w", tmp_dir, SAGE_REPO_URL,
-                    ],
-                    env=build_env,
+                src_dir = Path(tmp_dir) / "src"
+                whl_out_dir = Path(tmp_dir) / "wheels"
+                whl_out_dir.mkdir(parents=True, exist_ok=True)
+                clone_res = subprocess.run(
+                    ["git", "clone", "--depth", "1", SAGE_REPO_URL, str(src_dir)],
                     capture_output=True,
                     text=True,
-                    timeout=900,
+                    timeout=180,
                     check=False,
                 )
-                built_wheels = sorted(Path(tmp_dir).glob("sageattention-*.whl")) if res.returncode == 0 else []
+                if clone_res.returncode != 0:
+                    res = clone_res
+                    built_wheels = []
+                else:
+                    setup_py = src_dir / "setup.py"
+                    if setup_py.is_file():
+                        setup_text = setup_py.read_text(encoding="utf-8")
+                        if "-std=c++17" in setup_text:
+                            setup_py.write_text(setup_text.replace("-std=c++17", "-std=c++20"), encoding="utf-8")
+                    build_env = {
+                        **os.environ,
+                        "TORCH_CUDA_ARCH_LIST": arch_dot,
+                        "EXT_PARALLEL": "4",
+                        "MAX_JOBS": "4",
+                    }
+                    if "CUDA_HOME" not in build_env and nvcc_path.endswith("/bin/nvcc"):
+                        build_env["CUDA_HOME"] = str(Path(nvcc_path).parent.parent)
+                    res = subprocess.run(
+                        [
+                            sys.executable, "-m", "pip", "wheel",
+                            "--no-build-isolation", "--no-deps",
+                            "-w", str(whl_out_dir), str(src_dir),
+                        ],
+                        env=build_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=900,
+                        check=False,
+                    )
+                    built_wheels = sorted(whl_out_dir.glob("sageattention-*.whl")) if res.returncode == 0 else []
                 if built_wheels:
                     built_whl = built_wheels[0]
                     if BASE.exists():
