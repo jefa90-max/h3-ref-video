@@ -640,6 +640,98 @@ class ColabRuntimeTest(unittest.TestCase):
                     mgr.stop_keepalive_monitor()
             self.assertIsNone(mgr._keepalive_thread)
 
+    def test_kernel_keepalive_keeps_warm_during_local_work_and_grace_window_then_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            storage = root / ".workbench"
+            clock_state = {"now": 1000.0}
+            mgr = colab_runtime.ColabRuntimeManager(
+                storage,
+                clock=lambda: clock_state["now"],
+            )
+            self.assertEqual(mgr.keepalive_idle_grace_sec, 45 * 60.0)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": "h3c_keepalive_key",
+                "COLAB_SESSION": "comfy-a100",
+                "COLAB_BIN": str(fake_bin),
+            }
+            calls = []
+
+            def fake_run_cmd(colab_bin, auth_mode, sub_args, **kwargs):
+                calls.append(list(sub_args))
+                return 0, "keepalive\n"
+
+            with patch.object(mgr, "_run_command", side_effect=fake_run_cmd), \
+                 patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                # 1. Local storyboard/frame job running while ComfyUI queue=0 and ComfyUI online -> sends keepalive
+                clock_state["now"] = 1000.0 + 480.0
+                with patch.object(colab_runtime, "probe_comfyui", return_value={"online": True}):
+                    self.assertTrue(mgr.maybe_send_kernel_keepalive(env, local_busy=True))
+                self.assertEqual(len(calls), 1)
+                self.assertIn("local_active", mgr._logs_tail()[-1])
+
+                # 2. Local job finishes; user reviews frames for 16 min (within 45 min grace) -> still keeps warm
+                clock_state["now"] += 960.0
+                with patch.object(colab_runtime, "probe_comfyui", return_value={"online": True}):
+                    self.assertTrue(mgr.maybe_send_kernel_keepalive(env, local_busy=False))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("idle_grace", mgr._logs_tail()[-1])
+
+                # 3. If ComfyUI is actually offline during grace window -> never calls colab exec
+                clock_state["now"] += 480.0
+                with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}):
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env, local_busy=False))
+                self.assertEqual(len(calls), 2)
+
+                # 4. Once 45 min passes since last real activity (idle_grace does not reset activity timer) -> stops!
+                clock_state["now"] = 1000.0 + 480.0 + 45 * 60.0
+                with patch.object(colab_runtime, "probe_comfyui", return_value={"online": True}) as probe_mock:
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env, local_busy=False))
+                probe_mock.assert_not_called()
+                self.assertEqual(len(calls), 2)
+
+                # 5. User edits a frame -> mark_local_activity refreshes the grace window
+                mgr.mark_local_activity()
+                clock_state["now"] += 480.0
+                with patch.object(colab_runtime, "probe_comfyui", return_value={"online": True}):
+                    self.assertTrue(mgr.maybe_send_kernel_keepalive(env, local_busy=False))
+                self.assertEqual(len(calls), 3)
+
+            # 6. Session lost (404/401) during keepalive clears stale sessions cache and activity grace
+            mgr._sessions_cache = (clock_state["now"], {"named": [{"name": "comfy-a100"}], "orphans": []})
+            clock_state["now"] += 480.0
+            with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 patch.object(colab_runtime, "probe_comfyui", return_value={"online": True}), \
+                 patch.object(
+                     mgr,
+                     "_run_command",
+                     return_value=(1, "[colab] Session 'comfy-a100' appears to be lost (404/401). Cleaning up.\n"),
+                 ):
+                self.assertFalse(mgr.maybe_send_kernel_keepalive(env, local_busy=False))
+            self.assertIsNone(mgr._sessions_cache)
+            self.assertIsNone(mgr._last_activity_at)
+
+            # 7. Background monitor passes local_busy_provider so frames/review stay warm with queue=0
+            fired = threading.Event()
+
+            def fake_monitor_run(colab_bin, auth_mode, sub_args, **kwargs):
+                fired.set()
+                return 0, "keepalive\n"
+
+            clock_state["now"] += 1000.0
+            with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 patch.object(colab_runtime, "probe_comfyui", return_value={"online": True}), \
+                 patch.object(mgr, "_run_command", side_effect=fake_monitor_run):
+                mgr.start_keepalive_monitor(lambda: env, poll_sec=0.05, local_busy_provider=lambda: True)
+                try:
+                    self.assertTrue(fired.wait(timeout=2.0), "Keepalive monitor should fire when local_busy_provider is True")
+                finally:
+                    mgr.stop_keepalive_monitor()
+
 
 if __name__ == "__main__":
     unittest.main()

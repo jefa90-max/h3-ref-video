@@ -349,6 +349,46 @@ class WorkbenchComfyTest(unittest.TestCase):
                 self.assertEqual(ok_res.status_code, 201)
                 launch_mock.assert_called_once()
 
+    def test_workbench_tracks_non_video_active_work_and_marks_activity_only_on_mutations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_path = root / ".env"
+            env_path.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://demo.ngrok-free.dev\nCOMFYUI_API_KEY=comfy-secret-token-123\n",
+                encoding="utf-8",
+            )
+            app = server.create_app(storage=root / ".workbench", env_path=env_path)
+            client = app.test_client()
+            jobs = app.extensions["jobs"]
+            runtime = app.extensions["colab_runtime"]
+            self.addCleanup(runtime.stop_keepalive_monitor)
+
+            # Passive GET /api/runtime/status must not refresh local activity grace
+            with mock.patch.object(runtime, "status", return_value={"state": "online", "logs": [], "error": None}):
+                res = client.get("/api/runtime/status")
+                self.assertEqual(res.status_code, 200)
+            self.assertIsNone(runtime._last_activity_at)
+            self.assertEqual(runtime._local_busy_provider, jobs.has_active_work)
+
+            # Running storyboard frames job counts as active work (keeps Colab warm) even though not active video work
+            jobs.records["frames-1"] = {
+                "id": "frames-1",
+                "kind": "film",
+                "demo": False,
+                "operation": "frames",
+                "status": "running",
+                "output_dir": str(root / "frames-1"),
+                "created_at": "2026-11-22T00:00:00+0000",
+            }
+            self.assertTrue(jobs.has_active_work())
+            self.assertFalse(jobs.has_active_video_work())
+
+            # Real user POST mutation on /api/runtime/start marks local activity
+            with mock.patch.object(runtime, "start_async", return_value={"state": "provisioning", "logs": [], "error": None}):
+                start_res = client.post("/api/runtime/start", headers={"X-Workbench": "1"}, json={})
+                self.assertEqual(start_res.status_code, 200)
+            self.assertIsNotNone(runtime._last_activity_at)
+
     def test_windows_package_includes_comfy_modules_workflow_and_start_colab(self):
         files = package_windows.package_files(config.ROOT)
         for expected in (

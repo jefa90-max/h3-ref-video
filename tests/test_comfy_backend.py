@@ -681,6 +681,84 @@ class ComfyBackendTest(unittest.TestCase):
             self.assertIn(reason, str(ctx_resume.exception))
             self.assertIn(reason, (job.dir / "run.log").read_text(encoding="utf-8"))
 
+    def test_ngrok_offline_404_html_surfaces_err_code_and_localized_message(self):
+        from h3ref.i18n import use_lang
+
+        # Realistic >2KB ngrok offline HTML page where <noscript> ERR_NGROK_3200 appears past byte 1500
+        preload_padding = "".join(
+            f'    <link rel="preload" href="https://assets.ngrok.com/fonts/font-{i}.woff" as="font" crossorigin="anonymous" />\n'
+            for i in range(18)
+        )
+        ngrok_404_html = (
+            '<!DOCTYPE html>\n<html class="h-full" lang="en-US" dir="ltr">\n  <head>\n'
+            '    <meta charset="utf-8">\n'
+            f"{preload_padding}"
+            "    <noscript>The endpoint demo-node.ngrok-free.dev is offline. (ERR_NGROK_3200)</noscript>\n"
+            "  </head>\n  <body id=\"ngrok\"></body>\n</html>\n"
+        )
+        self.assertGreater(ngrok_404_html.index("ERR_NGROK_3200"), 1500)
+
+        class OfflineNgrokHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def _send_offline(self):
+                body = ngrok_404_html.encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("ngrok-error-code", "ERR_NGROK_3200")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _send_offline
+            do_POST = _send_offline
+
+        server = HTTPServer(("127.0.0.1", 0), OfflineNgrokHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+
+        base_url = f"http://127.0.0.1:{port}"
+        with tempfile.TemporaryDirectory() as tmp:
+            img = Path(tmp) / "ref.png"
+            Image.new("RGB", (8, 8), "blue").save(img)
+
+            # 1. http.upload extracts ERR_NGROK_3200 instead of truncating at <!DOCTYPE html>
+            with self.assertRaises(http.HTTPResponseError) as upload_err:
+                http.upload(f"{base_url}/upload/image", "k", img, {"type": "input"}, file_field_name="image")
+            self.assertEqual(upload_err.exception.status_code, 404)
+            self.assertIn("ERR_NGROK_3200", str(upload_err.exception))
+            self.assertIn("offline", str(upload_err.exception))
+            self.assertNotIn("<!DOCTYPE html>", str(upload_err.exception))
+
+            # 2. comfy.upload raises localized tunnel-offline HTTPResponseError in zh-CN and en
+            with patch.dict(os.environ, {"COMFYUI_URL": base_url, "COMFYUI_API_KEY": "k"}, clear=False):
+                with use_lang("zh-CN"), self.assertRaises(http.HTTPResponseError) as zh_err:
+                    comfy.upload(img, force=True)
+                self.assertEqual(zh_err.exception.status_code, 404)
+                self.assertIn("隧道已离线", str(zh_err.exception))
+                self.assertIn("ERR_NGROK_3200", str(zh_err.exception))
+
+                with use_lang("en"), self.assertRaises(http.HTTPResponseError) as en_err:
+                    comfy.upload(img, force=True)
+                self.assertEqual(en_err.exception.status_code, 404)
+                self.assertIn("tunnel is offline", str(en_err.exception))
+                self.assertIn("ERR_NGROK_3200", str(en_err.exception))
+
+                # 3. comfy.submit surfaces tunnel-offline HTTPResponseError instead of misclassifying as SubmissionRejected
+                with use_lang("zh-CN"), self.assertRaises(http.HTTPResponseError) as sub_err:
+                    comfy.submit({"1": {"class_type": "Dummy", "inputs": {}}})
+                self.assertNotIsInstance(sub_err.exception, comfy.SubmissionRejected)
+                self.assertIn("ERR_NGROK_3200", str(sub_err.exception))
+
+                # 4. http.request surfaces ERR_NGROK_3200 so comfy.poll recognizes it as a transient tunnel blip
+                comfy._TRANSIENT_COUNTS.clear()
+                st = comfy.poll("pid-ngrok-html")
+                self.assertEqual(st["state"], "running")
+
 
 if __name__ == "__main__":
     unittest.main()
