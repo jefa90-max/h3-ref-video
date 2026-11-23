@@ -444,6 +444,56 @@ class ComfyMultiNodePoolExecutionTest(unittest.TestCase):
         with mock.patch.object(start_colab.urllib.request, "urlopen", return_value=_FakeResp()):
             self.assertEqual(start_colab._discover_ngrok_public_url(), "https://rand-1234.ngrok-free.app")
 
+    def test_start_colab_cloudflared_tunnel_discovers_trycloudflare_url_without_ngrok_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            drive_base = root / "drive"
+            drive_base.mkdir(parents=True)
+            (drive_base / ".comfyui_api_key").write_text("cf-shared-key\n", encoding="utf-8")
+            # Deliberately NO .ngrok_token file!
+            cf_log = root / "cloudflared.log"
+            cf_url = root / "cloudflared_url.txt"
+            sup_pid = root / "sup.pid"
+            sup_log = root / "sup.log"
+
+            sample_log = (
+                "2026-11-22T00:00:01Z INF Requesting new quick Tunnel on trycloudflare.com...\n"
+                "2026-11-22T00:00:03Z INF +------------------------------------------------------------+\n"
+                "2026-11-22T00:00:03Z INF |  https://gentle-breeze-42.trycloudflare.com                |\n"
+                "2026-11-22T00:00:03Z INF +------------------------------------------------------------+\n"
+            )
+            cf_log.write_text(sample_log, encoding="utf-8")
+            discovered = start_colab._discover_cloudflared_public_url(log_file=cf_log, url_file=cf_url)
+            self.assertEqual(discovered, "https://gentle-breeze-42.trycloudflare.com")
+            self.assertEqual(cf_url.read_text(encoding="utf-8").strip(), "https://gentle-breeze-42.trycloudflare.com")
+
+            # ensure_supervisor_and_tunnel with H3_TUNNEL_PROVIDER=cloudflared succeeds with zero ngrok token
+            def fake_popen(cmd, **kw):
+                cf_log.write_text(sample_log, encoding="utf-8")
+                return mock.MagicMock(pid=9999)
+
+            def fake_status(url, *, headers=None, timeout=4.0):
+                if "127.0.0.1:8189" in url:
+                    return 401
+                if url.startswith("https://gentle-breeze-42.trycloudflare.com/system_stats"):
+                    self.assertEqual((headers or {}).get("Authorization"), "Bearer cf-shared-key")
+                    return 200
+                return None
+
+            with mock.patch.dict(os.environ, {"H3_TUNNEL_PROVIDER": "cloudflared"}, clear=False), \
+                 mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "CLOUDFLARED_LOG_FILE", cf_log), \
+                 mock.patch.object(start_colab, "CLOUDFLARED_URL_FILE", cf_url), \
+                 mock.patch.object(start_colab, "SUPERVISOR_PID_FILE", sup_pid), \
+                 mock.patch.object(start_colab, "SUPERVISOR_LOG_FILE", sup_log), \
+                 mock.patch.object(start_colab, "ensure_cloudflared", return_value="/tmp/cloudflared"), \
+                 mock.patch.object(start_colab.subprocess, "run"), \
+                 mock.patch.object(start_colab.subprocess, "Popen", side_effect=fake_popen), \
+                 mock.patch.object(start_colab, "_http_status", side_effect=fake_status), \
+                 mock.patch.object(start_colab.time, "sleep"):
+                url = start_colab.ensure_supervisor_and_tunnel()
+            self.assertEqual(url, "https://gentle-breeze-42.trycloudflare.com")
+
     def test_graph_uses_unique_save_video_prefix_and_colab_isolates_local_io_dirs(self):
         # Regression for dual-G4 live test where two concurrent nodes wrote MiniMax_H3_00013_.mp4 to shared Drive output/.
         g1 = comfy.graph("prompt a", ["ref1.png"], 5, "9:16", 12345, preset="full20", upscale=False, resolution="768p")

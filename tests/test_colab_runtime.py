@@ -732,6 +732,250 @@ class ColabRuntimeTest(unittest.TestCase):
                 finally:
                     mgr.stop_keepalive_monitor()
 
+    def test_secondary_colab_node_cloudflared_ephemeral_url_lifecycle_keepalive_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            storage = root / ".workbench"
+            clock_state = {"now": 5000.0}
+            url_events: list[tuple[str, str | None, str | None]] = []
+            mgr = colab_runtime.ColabRuntimeManager(
+                storage,
+                clock=lambda: clock_state["now"],
+                on_ephemeral_url_change=lambda slot, old_u, new_u: url_events.append((slot, old_u, new_u)),
+            )
+
+            # 1. Missing COMFYUI_API_KEY fails fast for secondary public tunnel
+            with self.assertRaises(ValueError):
+                mgr.start_async(
+                    {
+                        "VIDEO_PROVIDER": "comfyui",
+                        "COMFYUI_URL": "https://node1.ngrok-free.dev",
+                        "COLAB_BIN": str(fake_bin),
+                    },
+                    slot="secondary",
+                )
+
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://node1.ngrok-free.dev",
+                "COMFYUI_API_KEY": "shared-secret-key-999",
+                "COLAB_SESSION": "comfy-a100",
+                "COLAB_GPU": "G4",
+                "COLAB_BIN": str(fake_bin),
+            }
+            sec_url_1 = "https://alpha-one.trycloudflare.com"
+            sec_url_2 = "https://beta-two.trycloudflare.com"
+            sec_online = {"url": None}
+            exec_stdins: list[str] = []
+            cmd_log: list[list[str]] = []
+
+            def fake_probe(environ=None, *, timeout=12.0):
+                urls = colab_runtime.config.video_settings(environ)["comfyui_urls"]
+                nodes = []
+                for u in urls:
+                    is_up = (u == "https://node1.ngrok-free.dev") or (sec_online["url"] is not None and u == sec_online["url"])
+                    nodes.append({
+                        "url": u,
+                        "label": u.removeprefix("https://"),
+                        "online": is_up,
+                        "auth_failed": False,
+                        "devices": [{"name": "RTX PRO 6000"}] if is_up else [],
+                        "queue_running": 0,
+                        "queue_pending": 0,
+                    })
+                online_nodes = [n for n in nodes if n["online"]]
+                return {
+                    "online": bool(online_nodes),
+                    "configured": bool(urls),
+                    "devices": [d for n in online_nodes for d in n["devices"]],
+                    "nodes": nodes,
+                    "online_count": len(online_nodes),
+                    "total_count": len(nodes),
+                }
+
+            current_random = {"url": sec_url_1}
+
+            def fake_run_cmd(colab_bin, auth_mode, sub_args, **kwargs):
+                cmd_log.append(list(sub_args))
+                if sub_args == ["sessions"]:
+                    lines = ["[comfy-a100] m-s-1 | Hardware: G4"]
+                    if sec_online["url"]:
+                        lines.append("[comfy-a100-2] m-s-2 | Hardware: G4")
+                    return 0, "\n".join(lines) + "\n"
+                if sub_args[:3] == ["new", "-s", "comfy-a100-2"]:
+                    return 0, "Session READY\n"
+                if sub_args[:2] == ["upload", "-s"]:
+                    return 0, "Uploaded\n"
+                if sub_args[:3] == ["exec", "-s", "comfy-a100-2"]:
+                    stdin_text = kwargs.get("stdin_text") or ""
+                    exec_stdins.append(stdin_text)
+                    if "keepalive" in stdin_text:
+                        return 0, "keepalive\n"
+                    sec_online["url"] = current_random["url"]
+                    return 0, f"[start_colab] TUNNEL READY (AUTH PROTECTED): {current_random['url']}\n"
+                if sub_args == ["stop", "-s", "comfy-a100-2"]:
+                    sec_online["url"] = None
+                    return 0, "Stopped\n"
+                return 0, ""
+
+            with patch.object(colab_runtime, "probe_comfyui", side_effect=fake_probe), \
+                 patch.object(mgr, "_run_command", side_effect=fake_run_cmd), \
+                 patch.object(mgr, "_run_drivemount_once", return_value=(0, "Mounted at /content/drive\n", False)):
+                # 2. Start secondary node even while primary is already online
+                mgr.start_async(env, slot="secondary")
+                worker = mgr._slots["secondary"].worker_thread
+                self.assertIsNotNone(worker)
+                worker.join(timeout=5.0)
+                self.assertFalse(worker.is_alive())
+
+                # Verify cloudflared tunnel provider injected & ephemeral URL remembered
+                self.assertTrue(any("H3_TUNNEL_PROVIDER" in s and "cloudflared" in s for s in exec_stdins))
+                saved = mgr.remembered_node("secondary")
+                self.assertIsNotNone(saved)
+                self.assertEqual(saved["url"], sec_url_1)
+                self.assertEqual(saved["session"], "comfy-a100-2")
+                self.assertEqual(url_events[-1], ("secondary", None, sec_url_1))
+
+                # 3. Keepalive works independently for secondary session comfy-a100-2
+                clock_state["now"] += 480.0
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
+                    self.assertTrue(mgr.maybe_send_kernel_keepalive(env, slot="secondary"))
+                self.assertIn(["exec", "-s", "comfy-a100-2", "--timeout", "30"], cmd_log)
+
+                # 4. Stop secondary node enforces queue check, then stops session and clears ephemeral URL
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
+                    need_confirm = mgr.stop(environ=env, force=False, local_busy=False, slot="secondary")
+                self.assertFalse(need_confirm["stopped"])
+                self.assertTrue(need_confirm["confirmation_required"])
+
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                    stopped = mgr.stop(environ=env, force=True, local_busy=False, slot="secondary")
+                self.assertTrue(stopped["stopped"])
+                self.assertIsNone(mgr.remembered_node("secondary"))
+                self.assertEqual(url_events[-1], ("secondary", sec_url_1, None))
+
+                # 5. Re-starting replaces any stale remembered URL cleanly, and dead URL auto-cleans on status()
+                mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url_1, "gpu": "G4", "tunnel": "cloudflared"})
+                current_random["url"] = sec_url_2
+                mgr.start_async(env, slot="secondary")
+                mgr._slots["secondary"].worker_thread.join(timeout=5.0)
+                self.assertEqual(mgr.remembered_node("secondary")["url"], sec_url_2)
+                self.assertEqual(url_events[-1], ("secondary", sec_url_1, sec_url_2))
+
+                # Simulate VM reclaimed externally -> status() probes offline, sees no comfy-a100-2 session, cleans up dead URL
+                sec_online["url"] = None
+                st = mgr.status({**env, "COMFYUI_URL": f"https://node1.ngrok-free.dev,{sec_url_2}"})
+                self.assertIsNone(mgr.remembered_node("secondary"))
+                self.assertNotIn(sec_url_2, st["comfyui_urls"])
+                self.assertEqual(url_events[-1], ("secondary", sec_url_2, None))
+
+    def test_provision_retries_5_times_on_503_fails_fast_on_400_and_isolates_query_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            storage = root / ".workbench"
+
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://node1.ngrok-free.dev",
+                "COMFYUI_API_KEY": "secret-k-123",
+                "COLAB_SESSION": "comfy-a100",
+                "COLAB_GPU": "G4",
+                "COLAB_BIN": str(fake_bin),
+            }
+
+            # Verify defaults: 5 retries (6 attempts total)
+            default_mgr = colab_runtime.ColabRuntimeManager(storage)
+            self.assertEqual(default_mgr.provision_retries, 5)
+            self.assertEqual(len(default_mgr.provision_retry_delays), 5)
+
+            # 1. Transient 503 succeeds on 4th attempt (after 3 retries) with COLAB_CLI_ASSIGN_RETRIES=0
+            mgr = colab_runtime.ColabRuntimeManager(storage, provision_retry_delays=(0.01, 0.01, 0.01, 0.01, 0.01))
+            new_envs = []
+            new_count = {"n": 0}
+            online = {"up": False}
+            query_record_flags = []
+
+            def fake_run_retry_success(colab_bin, auth_mode, sub_args, **kwargs):
+                if sub_args == ["sessions"]:
+                    query_record_flags.append(kwargs.get("record_slot"))
+                    return 0, "[colab] No active sessions found on server.\n"
+                if sub_args[:2] == ["new", "-s"]:
+                    new_count["n"] += 1
+                    new_envs.append((kwargs.get("environ") or {}).get("COLAB_CLI_ASSIGN_RETRIES"))
+                    if new_count["n"] <= 3:
+                        return 1, "[colab] Creating session 'comfy-a100'...\nColabRequestError: 503 Service Unavailable\n"
+                    return 0, "[colab] Creating session 'comfy-a100'...\n[colab] Session READY.\n"
+                if sub_args[:2] == ["exec", "-s"]:
+                    online["up"] = True
+                    return 0, "[start_colab] TUNNEL READY (AUTH PROTECTED): https://node1.ngrok-free.dev\n"
+                return 0, ""
+
+            with patch.object(colab_runtime, "probe_comfyui", side_effect=lambda *a, **kw: {"online": online["up"], "devices": []}), \
+                 patch.object(mgr, "_run_command", side_effect=fake_run_retry_success), \
+                 patch.object(mgr, "_run_drivemount_once", return_value=(0, "Mounted at /content/drive\n", False)):
+                mgr.start_async(env)
+                mgr._worker_thread.join(timeout=5.0)
+            self.assertEqual(new_count["n"], 4)
+            self.assertEqual(new_envs, ["0", "0", "0", "0"])
+            self.assertEqual(query_record_flags, [False])
+            self.assertIsNone(mgr._last_error)
+            self.assertTrue(any("503 Service Unavailable" in line for line in mgr._logs_tail()))
+
+            # 2. Persistent 503 inside Rich traceback (whose source frame shows `except TooManyAssignmentsError:`)
+            # MUST still be recognized as retryable 503 and exhaust all 6 attempts (1 initial + 5 retries)
+            rich_503_output = (
+                "[colab] Creating session 'comfy-a100'...\n"
+                "╭───────────────────── Traceback (most recent call last) ──────────────────────╮\n"
+                "│ /site-packages/colab_cli/commands/session.py:167 in new                      │\n"
+                "│   167 │   res = state.client.assign(...)                                     │\n"
+                "│   170 │   except TooManyAssignmentsError:                                    │\n"
+                "╰──────────────────────────────────────────────────────────────────────────────╯\n"
+                "ColabRequestError: Failed to issue request POST \n"
+                "https://colab.research.google.com/tun/m/assign?variant=GPU&accelerator=G4: Service Unavailable\n"
+            )
+            self.assertTrue(colab_runtime._is_retryable_provision_failure(1, rich_503_output))
+            mgr2 = colab_runtime.ColabRuntimeManager(storage, provision_retry_delays=(0.01,))
+            attempts2 = {"n": 0}
+
+            def fake_run_always_503(colab_bin, auth_mode, sub_args, **kwargs):
+                if sub_args == ["sessions"]:
+                    return 0, "[colab] No active sessions found on server.\n"
+                if sub_args[:2] == ["new", "-s"]:
+                    attempts2["n"] += 1
+                    return 1, rich_503_output
+                return 0, ""
+
+            with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}), \
+                 patch.object(mgr2, "_run_command", side_effect=fake_run_always_503):
+                mgr2.start_async(env)
+                mgr2._worker_thread.join(timeout=5.0)
+            self.assertEqual(attempts2["n"], 6)
+            self.assertIn("6", mgr2._last_error or "")
+            self.assertIn("503 Service Unavailable", mgr2._last_error or "")
+
+            # 3. Non-retryable 400 / 412 fails fast on attempt 1 without wasting 5 retries
+            mgr3 = colab_runtime.ColabRuntimeManager(storage, provision_retry_delays=(0.01,))
+            attempts3 = {"n": 0}
+
+            def fake_run_400(colab_bin, auth_mode, sub_args, **kwargs):
+                if sub_args == ["sessions"]:
+                    return 0, "[colab] No active sessions found on server.\n"
+                if sub_args[:2] == ["new", "-s"]:
+                    attempts3["n"] += 1
+                    return 1, "[colab] Backend rejected accelerator 'G4'.\n"
+                return 0, ""
+
+            with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False}), \
+                 patch.object(mgr3, "_run_command", side_effect=fake_run_400):
+                mgr3.start_async(env)
+                mgr3._worker_thread.join(timeout=5.0)
+            self.assertEqual(attempts3["n"], 1)
+            self.assertIn("Backend rejected accelerator", mgr3._last_error or "")
+
 
 if __name__ == "__main__":
     unittest.main()

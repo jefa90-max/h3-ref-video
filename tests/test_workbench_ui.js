@@ -1434,4 +1434,122 @@ test("common.js renders multi-node ComfyUI pool status list, COMFYUI_CONCURRENCY
   }
 });
 
+test("common.js supports starting, Drive-authorizing, syncing ephemeral URL, and stopping the 2nd Colab node", async () => {
+  const { $ } = makeDom();
+  const calls = [];
+  let stage = "idle";
+  const cfg = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node1.ngrok-free.dev",
+    COMFYUI_URLS: ["https://node1.ngrok-free.dev"],
+    COMFYUI_CONCURRENCY: "",
+    effective_comfyui_concurrency: 1,
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+
+  function makeStatus() {
+    const primaryNode = { url: "https://node1.ngrok-free.dev", label: "node1.ngrok-free.dev", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 0, queue_pending: 0 };
+    if (stage === "idle") {
+      return {
+        state: "online", gpu: "G4", cli_available: true, comfyui_url: primaryNode.url, comfyui_urls: [primaryNode.url],
+        online_count: 1, total_count: 1, effective_comfyui_concurrency: 1, nodes: [primaryNode], devices: primaryNode.devices, logs: [],
+        managed_nodes: [
+          { slot: "primary", session: "comfy-a100", url: primaryNode.url, state: "online", online: true, has_session: true, logs: [] },
+          { slot: "secondary", session: "comfy-a100-2", url: "", state: "offline", online: false, has_session: false, logs: [] },
+        ],
+      };
+    }
+    if (stage === "drive_auth") {
+      return {
+        state: "online", gpu: "G4", cli_available: true, comfyui_url: primaryNode.url, comfyui_urls: [primaryNode.url],
+        online_count: 1, total_count: 1, effective_comfyui_concurrency: 1, nodes: [primaryNode], devices: primaryNode.devices, logs: [],
+        managed_nodes: [
+          { slot: "primary", session: "comfy-a100", url: primaryNode.url, state: "online", online: true, has_session: true, logs: [] },
+          { slot: "secondary", session: "comfy-a100-2", url: "", state: "awaiting_drive_auth", online: false, has_session: true, auth_url: "https://accounts.google.com/o/oauth2/auth?node=2", logs: ["mounting drive..."] },
+        ],
+      };
+    }
+    const secNode = { url: "https://fresh-42.trycloudflare.com", label: "fresh-42.trycloudflare.com", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 0, queue_pending: 0 };
+    return {
+      state: "online", gpu: "G4", cli_available: true, comfyui_url: primaryNode.url, comfyui_urls: [primaryNode.url, secNode.url],
+      online_count: 2, total_count: 2, effective_comfyui_concurrency: 2, nodes: [primaryNode, secNode], devices: [...primaryNode.devices, ...secNode.devices], logs: [],
+      managed_nodes: [
+        { slot: "primary", session: "comfy-a100", url: primaryNode.url, state: "online", online: true, has_session: true, logs: [] },
+        { slot: "secondary", session: "comfy-a100-2", url: secNode.url, label: secNode.label, state: "online", online: true, has_session: true, devices: secNode.devices, queue_running: 0, queue_pending: 0, logs: [] },
+      ],
+    };
+  }
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "zh-CN" },
+      title: "",
+    },
+    localStorage: { getItem: () => "zh-CN", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ url, body });
+      if (url === "/api/runtime/status") return { ok: true, json: async () => makeStatus() };
+      if (url === "/api/runtime/start") {
+        stage = "drive_auth";
+        return { ok: true, json: async () => makeStatus() };
+      }
+      if (url === "/api/runtime/drive-ack") {
+        stage = "online_2";
+        return { ok: true, json: async () => ({ accepted: true, slot: "secondary", status: makeStatus() }) };
+      }
+      if (url === "/api/runtime/stop") {
+        stage = "idle";
+        return { ok: true, json: async () => ({ stopped: true, slot: "secondary", confirmation_required: false, status: makeStatus() }) };
+      }
+      return { ok: true, json: async () => zhMessages };
+    },
+  });
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(zhFresh)}; state.config = ${JSON.stringify(cfg)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("runtime-start-secondary").hidden, false);
+  assert.equal($("runtime-start-secondary").disabled, false);
+
+  // Click "+ Start 2nd node" -> posts { slot: "secondary" } and reveals secondary Drive OAuth box
+  await $("runtime-start-secondary").events.click();
+  assert.deepEqual(calls.find((c) => c.url === "/api/runtime/start").body, { slot: "secondary" });
+  assert.equal($("runtime-drive-box").hidden, false);
+  assert.equal($("runtime-drive-link").href, "https://accounts.google.com/o/oauth2/auth?node=2");
+  assert.ok($("runtime-drive-text").textContent.includes("comfy-a100-2"));
+
+  // Confirm Drive auth -> posts { slot: "secondary" }, node 2 comes online, #comfy-url syncs automatically
+  await $("runtime-drive-ack").events.click();
+  assert.deepEqual(calls.find((c) => c.url === "/api/runtime/drive-ack").body, { slot: "secondary" });
+  assert.equal($("comfy-url").value, "https://node1.ngrok-free.dev,https://fresh-42.trycloudflare.com");
+  assert.equal($("runtime-start-secondary").hidden, true);
+  assert.equal($("runtime-nodes").children.length, 2);
+
+  // Inline stop button on Node 2 row stops secondary node and cleans #comfy-url back to primary only
+  const secRow = $("runtime-nodes").children[1];
+  const stopBtn = secRow.children.find((el) => el.events?.click);
+  assert.ok(stopBtn, "Secondary node row must render an inline Stop button");
+  await stopBtn.events.click();
+  assert.deepEqual(calls.find((c) => c.url === "/api/runtime/stop").body, { force: false, slot: "secondary" });
+  assert.equal($("comfy-url").value, "https://node1.ngrok-free.dev");
+  assert.equal($("runtime-start-secondary").hidden, false);
+});
+
 

@@ -389,6 +389,73 @@ class WorkbenchComfyTest(unittest.TestCase):
                 self.assertEqual(start_res.status_code, 200)
             self.assertIsNotNone(runtime._last_activity_at)
 
+    def test_secondary_colab_node_endpoints_sync_env_and_auto_concurrency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join([
+                    "VIDEO_PROVIDER=comfyui",
+                    "COMFYUI_URL=https://node1.ngrok-free.dev",
+                    "COMFYUI_API_KEY=shared-comfy-key-1234",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            storage = root / ".workbench"
+            app = server.create_app(storage=storage, env_path=env_path)
+            client = app.test_client()
+            headers = {"X-Workbench": "1"}
+            runtime = app.extensions["colab_runtime"]
+            self.addCleanup(runtime.stop_keepalive_monitor)
+
+            # Invalid slot rejected with 400
+            self.assertEqual(client.post("/api/runtime/start", headers=headers, json={"slot": "third"}).status_code, 400)
+
+            # POST /api/runtime/start with slot="secondary" routes cleanly
+            with mock.patch.object(runtime, "start_async", return_value={"state": "online", "managed_nodes": [], "logs": []}) as start_mock:
+                res = client.post("/api/runtime/start", headers=headers, json={"slot": "secondary"})
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(start_mock.call_args.kwargs.get("slot"), "secondary")
+
+            # POST /api/runtime/drive-ack with slot="secondary" routes cleanly
+            with mock.patch.object(runtime, "submit_drive_authorized", return_value={"accepted": True, "slot": "secondary", "state": "starting_comfy"}) as ack_mock, \
+                 mock.patch.object(runtime, "status", return_value={"state": "online", "managed_nodes": [], "logs": []}):
+                ack = client.post("/api/runtime/drive-ack", headers=headers, json={"slot": "secondary"})
+                self.assertEqual(ack.status_code, 200)
+                self.assertEqual(ack_mock.call_args.kwargs.get("slot"), "secondary")
+
+            # Remembering a random URL automatically updates live config, .env, and auto-concurrency (1 -> 2)
+            rand_1 = "https://wind-11.trycloudflare.com"
+            rand_2 = "https://rain-22.trycloudflare.com"
+            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": rand_1, "gpu": "G4", "tunnel": "cloudflared"})
+            cfg1 = client.get("/api/bootstrap").get_json()["config"]
+            self.assertEqual(cfg1["COMFYUI_URLS"], ["https://node1.ngrok-free.dev", rand_1])
+            self.assertEqual(cfg1["effective_comfyui_concurrency"], 2)
+            self.assertTrue(cfg1["keys"]["COMFYUI_API_KEY"])
+            self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], f"https://node1.ngrok-free.dev,{rand_1}")
+
+            # New ephemeral URL replaces old one (never accumulates dead URLs)
+            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": rand_2, "gpu": "G4", "tunnel": "cloudflared"})
+            cfg2 = client.get("/api/bootstrap").get_json()["config"]
+            self.assertEqual(cfg2["COMFYUI_URLS"], ["https://node1.ngrok-free.dev", rand_2])
+            self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], f"https://node1.ngrok-free.dev,{rand_2}")
+
+            # Workbench restart reloads remembered secondary URL even if .env only had primary
+            env_path.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://node1.ngrok-free.dev\nCOMFYUI_API_KEY=shared-comfy-key-1234\n",
+                encoding="utf-8",
+            )
+            app2 = server.create_app(storage=storage, env_path=env_path)
+            self.addCleanup(app2.extensions["colab_runtime"].stop_keepalive_monitor)
+            cfg_restarted = app2.test_client().get("/api/bootstrap").get_json()["config"]
+            self.assertEqual(cfg_restarted["COMFYUI_URLS"], ["https://node1.ngrok-free.dev", rand_2])
+
+            # Clearing secondary removes the dead ephemeral URL and reverts concurrency back to 1
+            app2.extensions["colab_runtime"]._set_remembered_node("secondary", None)
+            cfg3 = app2.test_client().get("/api/bootstrap").get_json()["config"]
+            self.assertEqual(cfg3["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+            self.assertEqual(cfg3["effective_comfyui_concurrency"], 1)
+
     def test_windows_package_includes_comfy_modules_workflow_and_start_colab(self):
         files = package_windows.package_files(config.ROOT)
         for expected in (
