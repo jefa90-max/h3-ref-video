@@ -6,6 +6,7 @@ const state = {
   language: ["zh-CN", "en"].includes(savedLanguage) ? savedLanguage : "zh-CN",
   messages: {}, config: null, jobs: [], ready: false, pollError: false,
   runtimeStatus: null, runtimeBusy: false,
+  runtimeAuthSlot: "primary", runtimeStopSlot: "primary", watchingSecondaryStart: false,
 };
 let renderPage = () => {};
 let llmProvider = null;
@@ -113,9 +114,23 @@ function clearRuntimePoll() {
   runtimePollTimer = null;
 }
 
+const RUNTIME_TRANSITIONAL = ["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"];
+
+function isTransitionalState(st) {
+  return RUNTIME_TRANSITIONAL.includes(st);
+}
+
+function getManagedNode(statusObj, slot) {
+  const list = Array.isArray(statusObj?.managed_nodes) ? statusObj.managed_nodes : [];
+  return list.find((item) => item && item.slot === slot) || null;
+}
+
 function scheduleRuntimePoll(statusObj) {
   clearRuntimePoll();
-  if (!statusObj || !["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(statusObj.state)) {
+  if (!statusObj) return;
+  const managedTransitional = Array.isArray(statusObj.managed_nodes)
+    && statusObj.managed_nodes.some((m) => m && isTransitionalState(m.state));
+  if (!isTransitionalState(statusObj.state) && !managedTransitional) {
     return;
   }
   if (typeof setTimeout === "function") {
@@ -125,47 +140,110 @@ function scheduleRuntimePoll(statusObj) {
   }
 }
 
-function renderRuntimeNodes(nodes) {
+function renderRuntimeNodes(nodes, secondary, gpu) {
   const list = $("runtime-nodes");
   if (!list) return;
-  if (!Array.isArray(nodes) || nodes.length <= 1) {
+  const secActive = Boolean(
+    secondary
+    && (secondary.online || isTransitionalState(secondary.state) || secondary.has_session || secondary.state === "error")
+  );
+  const rawNodes = Array.isArray(nodes) ? nodes : [];
+  if (rawNodes.length <= 1 && !secActive) {
     list.hidden = true;
     if (typeof list.replaceChildren === "function") list.replaceChildren();
     return;
   }
-  const rows = nodes.map((node) => {
+  const items = rawNodes.map((n) => ({ ...n, _isSecondary: Boolean(secondary?.url && n.url === secondary.url) }));
+  if (secActive && !items.some((n) => n._isSecondary)) {
+    items.push({
+      url: secondary.url || "",
+      label: secondary.label || secondary.session || t("runtimeNodeSecondaryTag"),
+      online: Boolean(secondary.online),
+      auth_failed: Boolean(secondary.auth_failed),
+      devices: secondary.devices || [],
+      queue_running: secondary.queue_running || 0,
+      queue_pending: secondary.queue_pending || 0,
+      _isSecondary: true,
+    });
+  }
+  const rows = items.map((node) => {
     const li = element("li", "runtime-node-item");
-    const stateKey = node.online
-      ? "runtimeNodeOnline"
-      : (node.auth_failed ? "runtimeNodeAuthFailed" : "runtimeNodeOffline");
-    const badgeClass = node.online ? "status-badge succeeded" : (node.auth_failed ? "status-badge failed" : "status-badge");
+    const isSec = Boolean(node._isSecondary);
+    let badgeText = "";
+    let badgeClass = "status-badge";
+    if (isSec && secondary && isTransitionalState(secondary.state)) {
+      badgeText = t(`runtimeState_${secondary.state}`, { gpu });
+      badgeClass = "status-badge running";
+    } else if (isSec && secondary && secondary.state === "error") {
+      badgeText = t("runtimeState_error");
+      badgeClass = "status-badge failed";
+    } else if (node.online) {
+      badgeText = t("runtimeNodeOnline");
+      badgeClass = "status-badge succeeded";
+    } else if (node.auth_failed) {
+      badgeText = t("runtimeNodeAuthFailed");
+      badgeClass = "status-badge failed";
+    } else {
+      badgeText = t("runtimeNodeOffline");
+    }
     const label = node.label || node.url || "";
     const devName = node.devices?.[0]?.name || "";
     const queueTotal = (Number(node.queue_running) || 0) + (Number(node.queue_pending) || 0);
     const metaParts = [];
+    if (isSec) metaParts.push(t("runtimeNodeSecondaryTag"));
     if (devName) metaParts.push(devName);
     if (node.online) metaParts.push(t("runtimeNodeQueue", { count: queueTotal }));
-    li.append(
-      element("span", badgeClass, t(stateKey)),
+    if (isSec && secondary?.state === "error" && secondary.error) metaParts.push(secondary.error);
+    const children = [
+      element("span", badgeClass, badgeText),
       element("code", "runtime-node-url", label),
       ...(metaParts.length ? [element("span", "hint runtime-node-meta", metaParts.join(" · "))] : []),
-    );
+    ];
+    if (isSec && secondary && (secondary.online || secondary.has_session || isTransitionalState(secondary.state))) {
+      const stopBtn = element("button", "button text-button runtime-node-action", t("runtimeStopNode"));
+      stopBtn.type = "button";
+      stopBtn.disabled = state.runtimeBusy || secondary.state === "stopping";
+      stopBtn.addEventListener("click", () => submitRuntimeStop(false, "secondary"));
+      children.push(stopBtn);
+    }
+    li.append(...children);
     return li;
   });
   list.replaceChildren(...rows);
   list.hidden = false;
 }
 
+function syncConfigFromRuntimeStatus(statusObj) {
+  if (!state.config || !statusObj || !Array.isArray(statusObj.comfyui_urls)) return;
+  const joined = statusObj.comfyui_urls.join(",");
+  const urlsChanged = joined !== (state.config.COMFYUI_URL || "");
+  if (urlsChanged) {
+    state.config.COMFYUI_URL = joined;
+    state.config.COMFYUI_URLS = statusObj.comfyui_urls.slice();
+    const urlInput = $("comfy-url");
+    if (urlInput && (!document.activeElement || document.activeElement !== urlInput)) {
+      urlInput.value = joined;
+    }
+  }
+  if (Number.isFinite(statusObj.effective_comfyui_concurrency)) {
+    state.config.effective_comfyui_concurrency = statusObj.effective_comfyui_concurrency;
+  }
+}
+
 function renderRuntimeStatus() {
   const statusObj = state.runtimeStatus;
   if (!statusObj) return;
+  syncConfigFromRuntimeStatus(statusObj);
   const st = statusObj.state || "offline";
   const gpu = statusObj.gpu || state.config?.COLAB_GPU || "G4";
+  const primary = getManagedNode(statusObj, "primary");
+  const secondary = getManagedNode(statusObj, "secondary");
+  const primaryState = primary?.state || st;
   const badge = $("runtime-badge");
   badge.textContent = t(`runtimeState_${st}`, { gpu });
   badge.className = "status-badge";
   if (st === "online") badge.classList.add("succeeded");
-  else if (["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(st)) badge.classList.add("running");
+  else if (isTransitionalState(st)) badge.classList.add("running");
   else if (["error", "orphan_warning"].includes(st)) badge.classList.add("failed");
   $("runtime-start").textContent = t("runtimeStartGpu", { gpu });
 
@@ -208,25 +286,63 @@ function renderRuntimeStatus() {
   } else {
     $("runtime-detail").textContent = t("runtimeDetailError", { error: statusObj.error || st });
   }
-  renderRuntimeNodes(nodes);
+  renderRuntimeNodes(nodes, secondary, gpu);
 
-  const awaitingAuth = st === "awaiting_drive_auth";
+  if (state.watchingSecondaryStart && secondary?.online && secondary.url) {
+    state.watchingSecondaryStart = false;
+    showMessage(t("runtimeSecondaryReadyNotice", { url: secondary.url }));
+  } else if (state.watchingSecondaryStart && secondary && ["error", "offline"].includes(secondary.state)) {
+    state.watchingSecondaryStart = false;
+  }
+
+  let authSlot = null;
+  let authUrl = null;
+  let authSession = "";
+  if (st === "awaiting_drive_auth" || primaryState === "awaiting_drive_auth") {
+    authSlot = "primary";
+    authUrl = primary?.auth_url || statusObj.auth_url || null;
+    authSession = primary?.session || statusObj.session || "";
+  } else if (secondary?.state === "awaiting_drive_auth") {
+    authSlot = "secondary";
+    authUrl = secondary.auth_url || null;
+    authSession = secondary.session || "";
+  }
+  const awaitingAuth = Boolean(authSlot);
+  state.runtimeAuthSlot = authSlot || "primary";
   $("runtime-drive-box").hidden = !awaitingAuth;
-  if (awaitingAuth && statusObj.auth_url) {
-    $("runtime-drive-link").href = statusObj.auth_url;
+  if ($("runtime-drive-text")) {
+    $("runtime-drive-text").textContent = authSlot === "secondary" && authSession
+      ? t("runtimeDetailDriveAuthNode", { session: authSession })
+      : t("runtimeDetailDriveAuth");
+  }
+  if (awaitingAuth && authUrl) {
+    $("runtime-drive-link").href = authUrl;
     $("runtime-drive-link").hidden = false;
   } else {
     $("runtime-drive-link").hidden = true;
   }
   $("runtime-drive-ack").disabled = state.runtimeBusy || !awaitingAuth;
 
-  const transitional = ["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"].includes(st);
+  const primaryTransitional = isTransitionalState(primaryState);
+  const secondaryTransitional = Boolean(secondary && isTransitionalState(secondary.state));
   const cliReady = Boolean(statusObj.cli_available);
+  const primaryOnline = primary ? Boolean(primary.online) : st === "online";
   $("runtime-refresh").disabled = state.runtimeBusy;
-  $("runtime-start").disabled = state.runtimeBusy || !cliReady || st === "online" || transitional || !configuredUrl;
-  $("runtime-stop").disabled = state.runtimeBusy || !cliReady || st === "stopping" || (st === "offline" && !statusObj.has_session);
+  $("runtime-start").disabled = state.runtimeBusy || !cliReady || primaryOnline || primaryTransitional || !configuredUrl;
+  $("runtime-stop").disabled = state.runtimeBusy || !cliReady || primaryState === "stopping" || (!primaryOnline && !primaryTransitional && !(primary?.has_session ?? statusObj.has_session));
 
-  const logs = statusObj.logs || [];
+  const startSecBtn = $("runtime-start-secondary");
+  if (startSecBtn) {
+    const showSecondaryStart = cliReady && (!secondary || (!secondary.online && !secondaryTransitional));
+    startSecBtn.hidden = !showSecondaryStart;
+    startSecBtn.textContent = t("runtimeStartSecondaryGpu", { gpu });
+    startSecBtn.disabled = state.runtimeBusy || !cliReady || secondaryTransitional || !state.config?.keys?.COMFYUI_API_KEY;
+  }
+
+  const secLogs = Array.isArray(secondary?.logs) ? secondary.logs : [];
+  const logs = (secondaryTransitional || secondary?.state === "error") && secLogs.length
+    ? secLogs
+    : (statusObj.logs || secLogs);
   $("runtime-logs-section").hidden = logs.length === 0;
   $("runtime-logs").textContent = logs.join("\n");
 }
@@ -377,31 +493,45 @@ $("runtime-refresh").addEventListener("click", async () => {
   finally { state.runtimeBusy = false; renderRuntimeStatus(); }
 });
 
-$("runtime-start").addEventListener("click", async () => {
+async function submitRuntimeStart(slot = "primary") {
   state.runtimeBusy = true;
   $("runtime-confirm").hidden = true;
   clearNotices();
   renderRuntimeStatus();
   try {
-    state.runtimeStatus = await post("/api/runtime/start", {});
+    const payload = slot === "primary" ? {} : { slot };
+    state.runtimeStatus = await post("/api/runtime/start", payload);
+    if (slot === "secondary") state.watchingSecondaryStart = true;
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
     const gpu = state.runtimeStatus?.gpu || state.config?.COLAB_GPU || "G4";
-    showMessage(t("runtimeStartedNotice", { gpu }));
+    showMessage(t(slot === "secondary" ? "runtimeSecondaryStartedNotice" : "runtimeStartedNotice", { gpu }));
   } catch (error) {
+    if (slot === "secondary") state.watchingSecondaryStart = false;
     showError(error);
   } finally {
     state.runtimeBusy = false;
     renderRuntimeStatus();
   }
+}
+
+$("runtime-start").addEventListener("click", async () => {
+  await submitRuntimeStart("primary");
 });
+
+if ($("runtime-start-secondary")) {
+  $("runtime-start-secondary").addEventListener("click", async () => {
+    await submitRuntimeStart("secondary");
+  });
+}
 
 $("runtime-drive-ack").addEventListener("click", async () => {
   state.runtimeBusy = true;
   clearNotices();
   renderRuntimeStatus();
   try {
-    const res = await post("/api/runtime/drive-ack", {});
+    const payload = state.runtimeAuthSlot === "secondary" ? { slot: "secondary" } : {};
+    const res = await post("/api/runtime/drive-ack", payload);
     if (res.status) state.runtimeStatus = res.status;
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
@@ -413,12 +543,14 @@ $("runtime-drive-ack").addEventListener("click", async () => {
   }
 });
 
-async function submitRuntimeStop(force) {
+async function submitRuntimeStop(force, slot = "primary") {
   state.runtimeBusy = true;
+  state.runtimeStopSlot = slot;
   clearNotices();
   renderRuntimeStatus();
   try {
-    const res = await post("/api/runtime/stop", { force });
+    const payload = slot === "primary" ? { force } : { force, slot };
+    const res = await post("/api/runtime/stop", payload);
     if (res.status) state.runtimeStatus = res.status;
     if (res.confirmation_required) {
       $("runtime-confirm-text").textContent = t("runtimeStopConfirmWarning", {
@@ -441,11 +573,11 @@ async function submitRuntimeStop(force) {
 }
 
 $("runtime-stop").addEventListener("click", async () => {
-  await submitRuntimeStop(false);
+  await submitRuntimeStop(false, "primary");
 });
 
 $("runtime-confirm-stop").addEventListener("click", async () => {
-  await submitRuntimeStop(true);
+  await submitRuntimeStop(true, state.runtimeStopSlot || "primary");
 });
 
 $("runtime-cancel-stop").addEventListener("click", () => {

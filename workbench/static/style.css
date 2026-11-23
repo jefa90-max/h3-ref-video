@@ -191,6 +191,7 @@ h3{font-size:14px;font-weight:650}
 .runtime-node-item{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
 .runtime-node-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .runtime-node-meta{margin:0}
+.runtime-node-action{margin-left:auto;padding:2px 8px;font-size:12px}
 .runtime-subbox{margin:12px 0 0}
 .runtime-subbox .runtime-actions{margin-top:9px}
 .runtime-logs{margin-top:12px;font-size:12px}

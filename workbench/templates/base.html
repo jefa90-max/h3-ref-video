@@ -27,13 +27,14 @@
         <div class="button-row runtime-actions">
           <button id="runtime-refresh" type="button" class="button text-button" data-i18n="runtimeRefresh"></button>
           <button id="runtime-start" type="button" class="button secondary" data-i18n="runtimeStart"></button>
+          <button id="runtime-start-secondary" type="button" class="button secondary" data-i18n="runtimeStartSecondary" hidden></button>
           <button id="runtime-stop" type="button" class="button secondary" data-i18n="runtimeStop"></button>
         </div>
       </div>
       <p id="runtime-detail" class="hint"></p>
       <ul id="runtime-nodes" class="runtime-nodes" hidden></ul>
       <div id="runtime-drive-box" class="notice warning runtime-subbox" hidden>
-        <p class="hint" data-i18n="runtimeDetailDriveAuth"></p>
+        <p id="runtime-drive-text" class="hint" data-i18n="runtimeDetailDriveAuth"></p>
         <div class="button-row runtime-actions">
           <a id="runtime-drive-link" class="button secondary" target="_blank" rel="noopener noreferrer" data-i18n="runtimeOpenDriveAuth" hidden></a>
           <button id="runtime-drive-ack" type="button" class="button primary" data-i18n="runtimeConfirmDriveAuth"></button>

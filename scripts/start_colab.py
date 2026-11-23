@@ -45,6 +45,11 @@ SUPERVISOR_PID_FILE = Path("/tmp/comfy_supervisor.pid")
 COMFY_PID_FILE = Path("/tmp/comfyui.pid")
 SUPERVISOR_LOG_FILE = Path("/tmp/comfy_supervisor.log")
 NGROK_LOG_FILE = Path("/tmp/ngrok.log")
+CLOUDFLARED_LOG_FILE = Path("/tmp/cloudflared.log")
+CLOUDFLARED_URL_FILE = Path("/tmp/cloudflared_url.txt")
+CLOUDFLARED_BIN_LOCAL = Path("/tmp/cloudflared")
+CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+TRYCLOUDFLARE_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 COMFY_LOG_FILE = Path("/tmp/comfyui.log")
 
 MODEL_FILES = [
@@ -299,6 +304,66 @@ def _resolve_ngrok_domain() -> str:
     return _normalize_public_url(raw)
 
 
+def _tunnel_provider() -> str:
+    raw = os.environ.get("H3_TUNNEL_PROVIDER", "").strip().lower() or "ngrok"
+    if raw not in ("ngrok", "cloudflared"):
+        raise ValueError(f"H3_TUNNEL_PROVIDER={raw!r} (ngrok | cloudflared)")
+    return raw
+
+
+def _discover_cloudflared_public_url(
+    *,
+    log_file: Path | None = None,
+    url_file: Path | None = None,
+) -> str:
+    log_path = CLOUDFLARED_LOG_FILE if log_file is None else log_file
+    url_path = CLOUDFLARED_URL_FILE if url_file is None else url_file
+    if url_path.is_file():
+        saved = url_path.read_text(encoding="utf-8", errors="replace").strip().rstrip("/")
+        if TRYCLOUDFLARE_URL_RE.fullmatch(saved):
+            return saved
+    if not log_path.is_file():
+        return ""
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    matches = TRYCLOUDFLARE_URL_RE.findall(text)
+    if not matches:
+        return ""
+    found = matches[-1].rstrip("/")
+    try:
+        url_path.write_text(found + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return found
+
+
+def ensure_cloudflared() -> str:
+    existing = shutil.which("cloudflared")
+    if existing:
+        return existing
+    if CLOUDFLARED_BIN_LOCAL.is_file() and os.access(CLOUDFLARED_BIN_LOCAL, os.X_OK):
+        return str(CLOUDFLARED_BIN_LOCAL)
+    drive_cached = BASE / "bin" / "cloudflared"
+    if drive_cached.is_file() and drive_cached.stat().st_size > 0:
+        tmp = CLOUDFLARED_BIN_LOCAL.with_suffix(".tmp")
+        shutil.copyfile(drive_cached, tmp)
+        tmp.chmod(0o755)
+        tmp.replace(CLOUDFLARED_BIN_LOCAL)
+        return str(CLOUDFLARED_BIN_LOCAL)
+    print("[start_colab] Downloading cloudflared binary for ephemeral HTTPS tunnel...", flush=True)
+    _download_file_atomic(CLOUDFLARED_DOWNLOAD_URL, CLOUDFLARED_BIN_LOCAL, "bin/cloudflared")
+    CLOUDFLARED_BIN_LOCAL.chmod(0o755)
+    if BASE.exists():
+        try:
+            drive_cached.parent.mkdir(parents=True, exist_ok=True)
+            tmp_drive = drive_cached.with_suffix(".tmp")
+            shutil.copyfile(CLOUDFLARED_BIN_LOCAL, tmp_drive)
+            tmp_drive.chmod(0o755)
+            tmp_drive.replace(drive_cached)
+        except OSError:
+            pass
+    return str(CLOUDFLARED_BIN_LOCAL)
+
+
 def _discover_ngrok_public_url(*, timeout: float = 3.0) -> str:
     """Read the active HTTPS public_url from ngrok's local inspection API (127.0.0.1:4040)."""
     req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels", method="GET")
@@ -427,9 +492,10 @@ def _unassign_colab_runtime(log) -> bool:
 
 
 def run_supervisor(*, skip_comfy_check: bool = False) -> None:
+    provider = _tunnel_provider()
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
-    ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN")
-    public_url = _resolve_ngrok_domain()
+    ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN") if provider == "ngrok" else ""
+    public_url = _resolve_ngrok_domain() if provider == "ngrok" else ""
     idle_minutes = _idle_timeout_minutes()
     idle_seconds = idle_minutes * 60.0
 
@@ -563,29 +629,51 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log(f"[supervisor] Auth gateway listening on {COMFY_HOST}:{GATEWAY_PORT} -> {COMFY_HOST}:{COMFY_PORT}")
 
-    from pyngrok import conf, installer  # type: ignore
-    ngrok_bin = conf.get_default().ngrok_path
-    if not os.path.isfile(ngrok_bin):
-        installer.install_ngrok(ngrok_bin)
+    if provider == "cloudflared":
+        cloudflared_bin = ensure_cloudflared()
 
-    def spawn_ngrok() -> subprocess.Popen:
-        child_env = {**os.environ, "NGROK_AUTHTOKEN": ngrok_token}
-        cmd = [ngrok_bin, "http", f"{COMFY_HOST}:{GATEWAY_PORT}", "--log=stdout"]
-        if public_url:
-            cmd.insert(3, f"--url={public_url}")
-        with NGROK_LOG_FILE.open("a", encoding="utf-8") as ngrok_log:
-            return subprocess.Popen(
-                cmd,
-                env=child_env,
-                stdout=ngrok_log,
-                stderr=subprocess.STDOUT,
-            )
+        def spawn_tunnel() -> subprocess.Popen:
+            CLOUDFLARED_URL_FILE.unlink(missing_ok=True)
+            with CLOUDFLARED_LOG_FILE.open("w", encoding="utf-8") as cf_log:
+                return subprocess.Popen(
+                    [
+                        cloudflared_bin,
+                        "tunnel",
+                        "--no-autoupdate",
+                        "--url",
+                        f"http://{COMFY_HOST}:{GATEWAY_PORT}",
+                    ],
+                    env=dict(os.environ),
+                    stdout=cf_log,
+                    stderr=subprocess.STDOUT,
+                )
 
-    ngrok_proc = spawn_ngrok()
-    log(f"[supervisor] Spawned ngrok pid={ngrok_proc.pid} for {public_url or 'ephemeral-domain'} (idle_timeout={idle_minutes:g}m)")
+        tunnel_proc = spawn_tunnel()
+        log(f"[supervisor] Spawned cloudflared pid={tunnel_proc.pid} for ephemeral trycloudflare tunnel (idle_timeout={idle_minutes:g}m)")
+    else:
+        from pyngrok import conf, installer  # type: ignore
+        ngrok_bin = conf.get_default().ngrok_path
+        if not os.path.isfile(ngrok_bin):
+            installer.install_ngrok(ngrok_bin)
+
+        def spawn_tunnel() -> subprocess.Popen:
+            child_env = {**os.environ, "NGROK_AUTHTOKEN": ngrok_token}
+            cmd = [ngrok_bin, "http", f"{COMFY_HOST}:{GATEWAY_PORT}", "--log=stdout"]
+            if public_url:
+                cmd.insert(3, f"--url={public_url}")
+            with NGROK_LOG_FILE.open("a", encoding="utf-8") as ngrok_log:
+                return subprocess.Popen(
+                    cmd,
+                    env=child_env,
+                    stdout=ngrok_log,
+                    stderr=subprocess.STDOUT,
+                )
+
+        tunnel_proc = spawn_tunnel()
+        log(f"[supervisor] Spawned ngrok pid={tunnel_proc.pid} for {public_url or 'ephemeral-domain'} (idle_timeout={idle_minutes:g}m)")
 
     def handle_term(signum, frame):
-        ngrok_proc.terminate()
+        tunnel_proc.terminate()
         server.shutdown()
         SUPERVISOR_PID_FILE.unlink(missing_ok=True)
         sys.exit(0)
@@ -596,10 +684,10 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
     check_interval = min(30.0, max(1.0, idle_seconds / 4.0))
     while True:
         time.sleep(check_interval)
-        if ngrok_proc.poll() is not None:
+        if tunnel_proc.poll() is not None:
             if skip_comfy_check or _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
-                log(f"[supervisor] ngrok exited with {ngrok_proc.returncode}; restarting...")
-                ngrok_proc = spawn_ngrok()
+                log(f"[supervisor] {provider} exited with {tunnel_proc.returncode}; restarting...")
+                tunnel_proc = spawn_tunnel()
         if not skip_comfy_check and _queue_busy(progress_snapshot):
             touch_activity()
             continue
@@ -609,7 +697,7 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
                 continue
             log(f"[watchdog] Idle for >= {idle_minutes:g} min with empty queue. Unassigning runtime...")
             if _unassign_colab_runtime(log):
-                ngrok_proc.terminate()
+                tunnel_proc.terminate()
                 break
             log("[watchdog] Unassign did not succeed yet; keeping supervisor alive to retry.")
 
@@ -625,7 +713,10 @@ def ensure_comfyui_code() -> None:
             [sys.executable, "-m", "pip", "install", "-q", "-r", str(LOCAL / "requirements.txt")],
             check=True,
         )
-    ensure_pyngrok()
+    if _tunnel_provider() == "cloudflared":
+        ensure_cloudflared()
+    else:
+        ensure_pyngrok()
 
 
 def ensure_pyngrok() -> None:
@@ -1064,15 +1155,20 @@ def start_comfyui(*, use_sage_attention: bool | None = None, sage_detail: str = 
 
 
 def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
+    provider = _tunnel_provider()
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
-    ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN")
-    public_url = _resolve_ngrok_domain()
+    ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN") if provider == "ngrok" else ""
+    public_url = _resolve_ngrok_domain() if provider == "ngrok" else ""
     auth_headers = {
         "Authorization": f"Bearer {api_key}",
         "ngrok-skip-browser-warning": "1",
         "User-Agent": "h3-ref-video-colab-bootstrap/1.0",
     }
-    active_url = public_url or _discover_ngrok_public_url()
+    if provider == "cloudflared":
+        ensure_cloudflared()
+        active_url = _discover_cloudflared_public_url()
+    else:
+        active_url = public_url or _discover_ngrok_public_url()
     if (
         active_url
         and _pid_alive(SUPERVISOR_PID_FILE)
@@ -1089,7 +1185,12 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
             time.sleep(1)
         except OSError:
             pass
-    subprocess.run(["pkill", "-f", f"ngrok http {COMFY_HOST}:{GATEWAY_PORT}"], check=False)
+    if provider == "cloudflared":
+        subprocess.run(["pkill", "-f", f"cloudflared tunnel.*{COMFY_HOST}:{GATEWAY_PORT}"], check=False)
+        CLOUDFLARED_URL_FILE.unlink(missing_ok=True)
+        CLOUDFLARED_LOG_FILE.unlink(missing_ok=True)
+    else:
+        subprocess.run(["pkill", "-f", f"ngrok http {COMFY_HOST}:{GATEWAY_PORT}"], check=False)
     time.sleep(0.5)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "--daemon-supervisor"]
@@ -1106,21 +1207,26 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
         )
 
     expected_status = 502 if skip_comfy_check else 200
-    for _ in range(30):
+    for _ in range(35 if provider == "cloudflared" else 30):
         unauth = _http_status(f"http://{COMFY_HOST}:{GATEWAY_PORT}/system_stats")
-        resolved_url = public_url or _discover_ngrok_public_url()
+        resolved_url = (
+            _discover_cloudflared_public_url()
+            if provider == "cloudflared"
+            else (public_url or _discover_ngrok_public_url())
+        )
         authed = _http_status(f"{resolved_url}/system_stats", headers=auth_headers, timeout=6.0) if resolved_url else None
         if unauth == 401 and authed == expected_status:
             print(f"[start_colab] TUNNEL READY (AUTH PROTECTED): {resolved_url}", flush=True)
             return resolved_url
         time.sleep(2)
     sup_tail = SUPERVISOR_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1200:] if SUPERVISOR_LOG_FILE.exists() else ""
-    ng_tail = NGROK_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1200:] if NGROK_LOG_FILE.exists() else ""
-    combined = f"{sup_tail}\n{ng_tail}".strip()
+    tun_log = CLOUDFLARED_LOG_FILE if provider == "cloudflared" else NGROK_LOG_FILE
+    tun_tail = tun_log.read_text(encoding="utf-8", errors="replace")[-1200:] if tun_log.exists() else ""
+    combined = f"{sup_tail}\n{tun_tail}".strip()
     for secret in (ngrok_token, api_key):
         if secret:
             combined = combined.replace(secret, "[REDACTED]")
-    raise RuntimeError(f"Authenticated ngrok tunnel failed readiness check:\n{combined}")
+    raise RuntimeError(f"Authenticated {provider} tunnel failed readiness check:\n{combined}")
 
 
 def main() -> None:
@@ -1135,7 +1241,10 @@ def main() -> None:
         return
 
     if args.supervisor_only:
-        ensure_pyngrok()
+        if _tunnel_provider() == "cloudflared":
+            ensure_cloudflared()
+        else:
+            ensure_pyngrok()
         ensure_supervisor_and_tunnel(skip_comfy_check=args.skip_comfy_check)
         return
 

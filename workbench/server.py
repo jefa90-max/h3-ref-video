@@ -58,9 +58,13 @@ def create_app(storage=None, env_path=None):
     if env.get("COLAB_AUTO_START", "").strip().lower() not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
         env["COLAB_AUTO_START"] = "0"
     try:
-        env["COMFYUI_URL"] = config.format_endpoint_urls(config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL"))
+        parsed_comfy_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
     except ValueError:
-        env["COMFYUI_URL"] = ""
+        parsed_comfy_urls = []
+    for remembered_url in runtime.remembered_urls():
+        if remembered_url not in parsed_comfy_urls:
+            parsed_comfy_urls.append(remembered_url)
+    env["COMFYUI_URL"] = config.format_endpoint_urls(parsed_comfy_urls)
     raw_comfy_conc = env.get("COMFYUI_CONCURRENCY", "").strip()
     if raw_comfy_conc:
         try:
@@ -70,6 +74,22 @@ def create_app(storage=None, env_path=None):
     config.llm_settings(env)
     config.video_settings(env)
     jobs.remember_secrets(env)
+
+    def sync_ephemeral_url(slot, old_url, new_url):
+        with jobs.lock:
+            cur_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
+            merged = colab_runtime.merge_ephemeral_url(cur_urls, old_url, new_url)
+            formatted = config.format_endpoint_urls(merged)
+            if formatted == env.get("COMFYUI_URL", ""):
+                return
+            env["COMFYUI_URL"] = formatted
+            if env_path.is_file():
+                disk_file = config.read_env_file(env_path)
+                disk_urls = config.parse_endpoint_urls(disk_file.get("COMFYUI_URL", ""), "COMFYUI_URL")
+                disk_merged = colab_runtime.merge_ephemeral_url(disk_urls, old_url, new_url)
+                save_env(env_path, {"COMFYUI_URL": config.format_endpoint_urls(disk_merged)})
+
+    runtime.set_url_change_callback(sync_ephemeral_url)
 
     def current_runtime_env():
         with jobs.lock:
@@ -150,6 +170,8 @@ def create_app(storage=None, env_path=None):
             cleaned["logs"] = [jobs.redact(str(line)) for line in cleaned["logs"]]
         if isinstance(cleaned.get("status"), dict):
             cleaned["status"] = redact_runtime_payload(cleaned["status"])
+        if isinstance(cleaned.get("managed_nodes"), list):
+            cleaned["managed_nodes"] = [redact_runtime_payload(item) for item in cleaned["managed_nodes"]]
         return cleaned
 
     def settings():
@@ -364,6 +386,17 @@ def create_app(storage=None, env_path=None):
             jobs.remember_secrets(env)
         return jsonify(settings())
 
+    def _parse_runtime_slot(values):
+        raw_slot = values.get("slot") if isinstance(values, dict) else None
+        if raw_slot is None:
+            return "primary"
+        if not isinstance(raw_slot, str):
+            invalid("slot", raw_slot, "choice")
+        try:
+            return colab_runtime.normalize_slot(raw_slot)
+        except ValueError:
+            invalid("slot", raw_slot, "choice")
+
     @app.get("/api/runtime/status")
     def runtime_status():
         lang = language()
@@ -371,18 +404,30 @@ def create_app(storage=None, env_path=None):
             current_env = {**env, "H3_LANG": lang}
         with use_lang(lang):
             st = runtime.status(current_env)
-            if st.get("state") == "online":
+            if st.get("state") == "online" or any(
+                isinstance(m, dict) and m.get("state") in ("online", "provisioning", "awaiting_drive_auth", "starting_comfy")
+                for m in (st.get("managed_nodes") or [])
+            ):
                 ensure_keepalive_monitor()
+            with jobs.lock:
+                vcfg = config.video_settings(env)
+                st["effective_comfyui_concurrency"] = vcfg["comfyui_concurrency"]
             return jsonify(redact_runtime_payload(st))
 
     @app.post("/api/runtime/start")
     def runtime_start():
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            invalid("runtime", values, "object")
+        slot = _parse_runtime_slot(values)
         lang = language()
         with jobs.lock:
             current_env = {**env, "H3_LANG": lang}
         with use_lang(lang):
             try:
-                st = runtime.start_async(current_env)
+                st = runtime.start_async(current_env) if slot == "primary" else runtime.start_async(current_env, slot=slot)
             except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
                 raise InputError("comfy_runtime_action", detail=str(exc)) from exc
             ensure_keepalive_monitor()
@@ -390,11 +435,17 @@ def create_app(storage=None, env_path=None):
 
     @app.post("/api/runtime/drive-ack")
     def runtime_drive_ack():
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            invalid("runtime", values, "object")
+        slot = _parse_runtime_slot(values) if "slot" in values and values.get("slot") is not None else None
         lang = language()
         with jobs.lock:
             current_env = {**env, "H3_LANG": lang}
         with use_lang(lang):
-            ack = runtime.submit_drive_authorized()
+            ack = runtime.submit_drive_authorized() if slot is None else runtime.submit_drive_authorized(slot=slot)
             ack["status"] = runtime.status(current_env)
             return jsonify(redact_runtime_payload(ack))
 
@@ -408,13 +459,17 @@ def create_app(storage=None, env_path=None):
         force = values.get("force", False)
         if not isinstance(force, bool):
             invalid("force", force, "choice")
+        slot = _parse_runtime_slot(values)
         lang = language()
         with jobs.lock:
             current_env = {**env, "H3_LANG": lang}
             local_busy = jobs.has_active_video_work()
         with use_lang(lang):
             try:
-                res = runtime.stop(environ=current_env, force=force, local_busy=local_busy)
+                if slot == "primary":
+                    res = runtime.stop(environ=current_env, force=force, local_busy=local_busy)
+                else:
+                    res = runtime.stop(environ=current_env, force=force, local_busy=local_busy, slot=slot)
             except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, RuntimeError) as exc:
                 raise InputError("comfy_runtime_action", detail=str(exc)) from exc
             return jsonify(redact_runtime_payload(res))
