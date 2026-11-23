@@ -38,6 +38,10 @@ class HTTPResponseError(RuntimeError):
         super().__init__(detail)
 
 
+class TransportError(RuntimeError):
+    """Connection/TLS/proxy transport failure before an HTTP request was delivered."""
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         old_scheme = urlsplit(req.full_url).scheme.lower()
@@ -61,6 +65,7 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": config.UA, **(extra_headers or {})}
     last = None
+    last_is_transport = False
     for attempt in range(tries):
         req = urllib.request.Request(url, data=data, method=method or ("POST" if data else "GET"), headers=headers)
         open_fn = _OPENER.open if urllib.request.urlopen is _ORIG_URLOPEN else urllib.request.urlopen
@@ -69,6 +74,7 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
                 parsed_ok = json.loads(r.read().decode(errors="replace"))
                 return _scrub_json(parsed_ok, key)
         except urllib.error.HTTPError as exc:
+            last_is_transport = False
             raw_text = exc.read().decode(errors="replace")
             safe_text = _scrub(raw_text, key)
             if exc.code < 500:
@@ -85,9 +91,12 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
                 return parsed
             last = f"{exc.code}: {safe_text[:200]}"
         except Exception as exc:
+            last_is_transport = isinstance(exc, urllib.error.URLError)
             last = _scrub(f"{type(exc).__name__}: {exc}", key)
-        time.sleep(4 * (attempt + 1))
-    raise RuntimeError(f"{url}: {_scrub(str(last), key)[:300]}")
+        if attempt + 1 < tries:
+            time.sleep(4 * (attempt + 1))
+    error_cls = TransportError if last_is_transport else RuntimeError
+    raise error_cls(f"{url}: {_scrub(str(last), key)[:300]}")
 
 
 _NON_RETRYABLE_UPLOAD_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422}

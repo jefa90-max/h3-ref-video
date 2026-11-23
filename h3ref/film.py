@@ -425,6 +425,17 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                             for future in futures:
                                 future.result()
                             raise
+                        if isinstance(exc, http.TransportError) and not rec.get('task') and not rec.get('submission_unknown'):
+                            for future in futures:
+                                future.result()
+                            try:
+                                model_name = config.llm_settings()['composition_model']
+                            except ValueError:
+                                model_name = 'invalid-provider'
+                            err = http.TransportError(message('staging_plan_network_failed', frame_key=key,
+                                                              model=model_name, detail=str(exc)))
+                            job.log('staging abort', key, str(err))
+                            raise err from exc
                         try:
                             model_name = config.llm_settings()['composition_model']
                         except ValueError:
