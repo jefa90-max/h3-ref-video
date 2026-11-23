@@ -75,6 +75,9 @@ def create_app(storage=None, env_path=None):
         with jobs.lock:
             return dict(env)
 
+    def ensure_keepalive_monitor():
+        runtime.start_keepalive_monitor(current_runtime_env, local_busy_provider=jobs.has_active_work)
+
     orig_jobs_close = jobs.close
 
     def close_with_runtime():
@@ -91,7 +94,8 @@ def create_app(storage=None, env_path=None):
         with use_lang(lang):
             probe = colab_runtime.probe_comfyui(env_with_lang)
             if probe["online"]:
-                runtime.start_keepalive_monitor(current_runtime_env)
+                runtime.mark_local_activity()
+                ensure_keepalive_monitor()
                 runtime.trigger_keepalive_async(env_with_lang, force_busy=True)
                 return
             if probe.get("auth_failed"):
@@ -100,7 +104,7 @@ def create_app(storage=None, env_path=None):
             if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(env_with_lang):
                 try:
                     runtime.start_async(env_with_lang)
-                    runtime.start_keepalive_monitor(current_runtime_env)
+                    ensure_keepalive_monitor()
                 except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError):
                     pass
                 raise InputError("comfy_starting")
@@ -178,6 +182,8 @@ def create_app(storage=None, env_path=None):
             origin = request.headers.get("Origin")
             if request.headers.get("X-Workbench") != "1" or (origin and origin != request.host_url.rstrip("/")):
                 raise InputError("origin")
+            if request.path.startswith("/api/jobs") or request.path in ("/api/runtime/start", "/api/runtime/drive-ack"):
+                runtime.mark_local_activity()
 
     @app.after_request
     def headers(response):
@@ -366,7 +372,7 @@ def create_app(storage=None, env_path=None):
         with use_lang(lang):
             st = runtime.status(current_env)
             if st.get("state") == "online":
-                runtime.start_keepalive_monitor(current_runtime_env)
+                ensure_keepalive_monitor()
             return jsonify(redact_runtime_payload(st))
 
     @app.post("/api/runtime/start")
@@ -379,7 +385,7 @@ def create_app(storage=None, env_path=None):
                 st = runtime.start_async(current_env)
             except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
                 raise InputError("comfy_runtime_action", detail=str(exc)) from exc
-            runtime.start_keepalive_monitor(current_runtime_env)
+            ensure_keepalive_monitor()
             return jsonify(redact_runtime_payload(st))
 
     @app.post("/api/runtime/drive-ack")

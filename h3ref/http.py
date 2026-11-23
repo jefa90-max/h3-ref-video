@@ -1,6 +1,7 @@
 """Small JSON-over-HTTP helpers on the standard library; every error message has the key replaced by [key]."""
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -10,9 +11,25 @@ from urllib.parse import urlsplit
 
 from . import config
 
+_NGROK_CODE_RE = re.compile(r"ERR_NGROK_\d+")
+_NOSCRIPT_RE = re.compile(r"<noscript[^>]*>(.*?)</noscript>", re.IGNORECASE | re.DOTALL)
+
 
 def _scrub(text: str, key: str) -> str:
     return text.replace(key, "[key]") if key and len(key) >= 6 else text
+
+
+def _summarize_error_body(raw_body: str, key: str, *, limit: int = 240) -> str:
+    safe_text = _scrub(raw_body, key)
+    ngrok_match = _NGROK_CODE_RE.search(safe_text)
+    if ngrok_match:
+        noscript = _NOSCRIPT_RE.search(safe_text)
+        if noscript:
+            summary = " ".join(noscript.group(1).split())
+            if summary:
+                return summary[:limit]
+        return ngrok_match.group(0)
+    return safe_text[:limit]
 
 
 def _scrub_json(value, key: str):
@@ -76,20 +93,21 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
                 return _scrub_json(parsed_ok, key)
         except urllib.error.HTTPError as exc:
             raw_text = exc.read().decode(errors="replace")
-            safe_text = _scrub(raw_text, key)
+            exc.close()
+            summary = _summarize_error_body(raw_text, key, limit=300)
             if exc.code < 500:
                 try:
                     parsed = json.loads(raw_text)
                 except ValueError:
-                    raise HTTPResponseError(exc.code, f"{url} {exc.code}: {safe_text[:300]}") from None
+                    raise HTTPResponseError(exc.code, f"{url} {exc.code}: {summary}") from None
                 if not isinstance(parsed, dict):
                     low = raw_text.lower()
                     auth_code = 401 if exc.code == 400 and ("api_key_invalid" in low or "api key not valid" in low) else exc.code
-                    raise HTTPResponseError(auth_code, f"{url} {exc.code}: {safe_text[:300]}") from None
+                    raise HTTPResponseError(auth_code, f"{url} {exc.code}: {summary}") from None
                 parsed = _scrub_json(parsed, key)
                 parsed.setdefault("_http_status", exc.code)
                 return parsed
-            last = f"{exc.code}: {safe_text[:200]}"
+            last = f"{exc.code}: {_summarize_error_body(raw_text, key, limit=200)}"
         except Exception as exc:
             last = _scrub(f"{type(exc).__name__}: {exc}", key)
         time.sleep(4 * (attempt + 1))
@@ -145,9 +163,9 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
             head, tail = proc.stdout.rsplit("\n", 1)
             if len(tail.strip()) == 3 and tail.strip().isdigit():
                 raw_body, status_code = head, int(tail.strip())
-        safe_body = _scrub(raw_body, key)
+        safe_summary = _summarize_error_body(raw_body, key, limit=200)
         if status_code is not None and status_code >= 500:
-            last = f"{status_code}: {safe_body[:200]}"
+            last = f"{status_code}: {safe_summary}"
             time.sleep(5 * (attempt + 1))
             continue
         try:
@@ -157,9 +175,9 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
                 if status_code is not None and status_code >= 400:
                     parsed.setdefault("_http_status", status_code)
                 return parsed
-            last = safe_body[:200]
+            last = safe_summary
         except ValueError:
-            last = (safe_body or _scrub(proc.stderr, key))[:200]
+            last = safe_summary or _scrub(proc.stderr, key)[:200]
         if status_code in _NON_RETRYABLE_UPLOAD_STATUSES:
             raise HTTPResponseError(status_code, f"{url} {status_code}: {last}")
         time.sleep(5 * (attempt + 1))

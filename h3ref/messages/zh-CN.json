@@ -63,6 +63,7 @@
   "rewrite_exhausted": "改写成 H3 格式连续 {attempts} 次都没过检查：{detail}",
   "comfy_submission_rejected": "ComfyUI 拒绝了生成任务：{reason}",
   "comfy_submission_failed": "ComfyUI 提交失败：{reason}",
+  "comfy_tunnel_offline": "远端 ComfyUI 节点 {node} 隧道已离线（{detail}），Colab 实例可能已被回收或停止；请重新启动实例后继续。",
   "comfy_submission_unknown": "第 {number} 段上次向 ComfyUI 提交的结果未知，已停止自动重提。请核对远端队列或历史记录后再恢复：{path}",
   "comfy_prompt_lost": "远端 ComfyUI 队列与历史中均找不到任务 {task}（实例可能已重启或释放），请从卡片明确重新生成。",
   "colab_worker_forbidden": "工作台子进程不允许直接操控 Colab 实例生命周期，请从工作台页面启动云端实例。",

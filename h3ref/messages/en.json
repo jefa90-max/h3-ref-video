@@ -63,6 +63,7 @@
   "rewrite_exhausted": "H3 rewrite failed validation across all {attempts} attempts: {detail}",
   "comfy_submission_rejected": "ComfyUI rejected the task: {reason}",
   "comfy_submission_failed": "ComfyUI submission failed: {reason}",
+  "comfy_tunnel_offline": "Remote ComfyUI node {node} tunnel is offline ({detail}); the Colab runtime may have been reclaimed or stopped. Restart the runtime and resume.",
   "comfy_submission_unknown": "The previous ComfyUI submission result for segment {number} is unknown. Automatic resubmission is blocked. Check the remote queue/history before restoring the local record: {path}",
   "comfy_prompt_lost": "Task {task} is missing from both ComfyUI queue and history (the remote runtime may have restarted or unassigned); start a new generation explicitly.",
   "colab_worker_forbidden": "Workbench worker child processes cannot manage Colab lifecycle directly; start the runtime from the workbench UI.",

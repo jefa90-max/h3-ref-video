@@ -414,6 +414,14 @@ class Jobs:
             selected = newest[:limit] if limit else newest
             return [self.snapshot(record["id"], False) for record in selected]
 
+    def has_active_work(self):
+        with self.lock:
+            return any(
+                r.get("status") in ("queued", "running")
+                and not r.get("demo")
+                for r in self.records.values()
+            )
+
     def has_active_video_work(self):
         with self.lock:
             return any(

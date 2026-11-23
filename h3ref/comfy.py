@@ -133,6 +133,13 @@ def clear_upload_cache(base_url: str | None = None) -> None:
                 _UPLOADED_CACHE.pop(cache_key, None)
 
 
+def _is_ngrok_offline_error(exc: http.HTTPResponseError) -> bool:
+    if exc.status_code != 404:
+        return False
+    text = str(exc)
+    return "ERR_NGROK_3200" in text or ("ERR_NGROK_" in text and "offline" in text.lower())
+
+
 def upload(path: Path, *, force: bool = False, base_url: str | None = None, api_key: str | None = None) -> str:
     """Upload an input image to ComfyUI /upload/image under an ASCII content-hash filename."""
     base, key = _resolve_endpoint(base_url, api_key)
@@ -143,15 +150,23 @@ def upload(path: Path, *, force: bool = False, base_url: str | None = None, api_
             cached = _UPLOADED_CACHE.get(cache_key)
         if cached:
             return cached
-    out = http.upload(
-        f"{base}/upload/image",
-        key,
-        path,
-        {"type": "input", "overwrite": "true"},
-        file_field_name="image",
-        filename=ascii_name,
-        extra_headers=_headers(),
-    )
+    try:
+        out = http.upload(
+            f"{base}/upload/image",
+            key,
+            path,
+            {"type": "input", "overwrite": "true"},
+            file_field_name="image",
+            filename=ascii_name,
+            extra_headers=_headers(),
+        )
+    except http.HTTPResponseError as exc:
+        if _is_ngrok_offline_error(exc):
+            raise http.HTTPResponseError(
+                exc.status_code,
+                message("comfy_tunnel_offline", node=endpoint_label(base), detail=str(exc)),
+            ) from exc
+        raise
     status = out.get("_http_status")
     name = out.get("name") if isinstance(out, dict) else None
     if (isinstance(status, int) and status >= 400) or not isinstance(name, str) or not name.strip():
@@ -297,6 +312,11 @@ def submit(g: dict, *, base_url: str | None = None, api_key: str | None = None) 
             extra_headers=_headers(),
         )
     except http.HTTPResponseError as exc:
+        if _is_ngrok_offline_error(exc):
+            raise http.HTTPResponseError(
+                exc.status_code,
+                message("comfy_tunnel_offline", node=endpoint_label(base), detail=str(exc)),
+            ) from exc
         if exc.status_code in NON_RETRYABLE_STATUSES:
             if any(tok in str(exc) for tok in ("LoadImage", "invalid_image", "image_not_found")):
                 clear_upload_cache(base)
