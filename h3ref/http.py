@@ -57,6 +57,51 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 _ORIG_URLOPEN = urllib.request.urlopen
 _OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+_ENVIRON = os.environ
+
+
+def _split_curl_status(stdout: str) -> tuple[str, int | None]:
+    if "\n" in stdout:
+        head, tail = stdout.rsplit("\n", 1)
+        if len(tail.strip()) == 3 and tail.strip().isdigit():
+            return head, int(tail.strip())
+    return stdout, None
+
+
+def _normalize_curl_proxy(value: str) -> str:
+    raw = value.strip()
+    if raw.lower().startswith("socks://"):
+        return "socks5h://" + raw[8:]
+    return raw
+
+
+def _curl_proxy_env(url: str) -> dict[str, str] | None:
+    """Propagate OS/registry proxies (e.g. Windows Clash system proxy) to curl when env proxies are unset."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if not host or host in ("localhost", "127.0.0.1", "::1"):
+        return None
+    env_keys = {k.lower() for k, v in _ENVIRON.items() if v.strip()}
+    if "all_proxy" in env_keys or f"{scheme}_proxy" in env_keys:
+        return None
+    try:
+        if urllib.request.proxy_bypass(parts.netloc or host):
+            return None
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return None
+    fallback = proxies.get("all") or proxies.get("socks") or ""
+    added = {}
+    for proto in ("http", "https"):
+        if f"{proto}_proxy" in env_keys:
+            continue
+        val = (proxies.get(proto) or fallback).strip()
+        if val:
+            added[f"{proto.upper()}_PROXY"] = _normalize_curl_proxy(val)
+    if f"{scheme.upper()}_PROXY" not in added:
+        return None
+    return {**_ENVIRON, **added}
 
 
 def request(url: str, key: str, body: dict | None = None, method: str | None = None, timeout: float = 120, tries: int = 3,
@@ -121,30 +166,41 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
         field_pair = f"{k}={v}"
         lines.append(f'form-string = "{_curl_escape(field_pair)}"')
     cfg = "\n".join(lines) + "\n"
+    env = _curl_proxy_env(url)
+    run_kwargs = {"env": env} if env is not None else {}
     last = ""
     for attempt in range(4):
         try:
             proc = subprocess.run(
                 ["curl", "-sS", "-w", "\n%{http_code}", "--proto", "=http,https", "--proto-redir", "=http,https", "--config", "-"],
-                input=cfg, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                input=cfg, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **run_kwargs,
             )
         except Exception as exc:
             last = _scrub(f"{type(exc).__name__}: {exc}", key)[:200]
-            time.sleep(5 * (attempt + 1))
+            if attempt + 1 < 4:
+                time.sleep(5 * (attempt + 1))
             continue
         if proc.returncode != 0:
-            last = (_scrub(proc.stdout, key) or _scrub(proc.stderr, key) or f"curl exit {proc.returncode}")[:200]
-            time.sleep(5 * (attempt + 1))
+            stderr = _scrub((proc.stderr or "").strip(), key)
+            body, _ = _split_curl_status(proc.stdout or "")
+            safe_body = _scrub(body.strip(), key)
+            if stderr and safe_body:
+                last = f"{stderr} | {safe_body}"[:200]
+            elif stderr:
+                last = stderr[:200]
+            elif safe_body:
+                last = f"curl exit {proc.returncode}: {safe_body}"[:200]
+            else:
+                last = f"curl exit {proc.returncode}"
+            if attempt + 1 < 4:
+                time.sleep(5 * (attempt + 1))
             continue
-        raw_body, status_code = proc.stdout, None
-        if "\n" in proc.stdout:
-            head, tail = proc.stdout.rsplit("\n", 1)
-            if len(tail.strip()) == 3 and tail.strip().isdigit():
-                raw_body, status_code = head, int(tail.strip())
+        raw_body, status_code = _split_curl_status(proc.stdout)
         safe_body = _scrub(raw_body, key)
         if status_code is not None and status_code >= 500:
             last = f"{status_code}: {safe_body[:200]}"
-            time.sleep(5 * (attempt + 1))
+            if attempt + 1 < 4:
+                time.sleep(5 * (attempt + 1))
             continue
         try:
             parsed = json.loads(raw_body)
@@ -158,7 +214,8 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
             last = (safe_body or _scrub(proc.stderr, key))[:200]
         if status_code in _NON_RETRYABLE_UPLOAD_STATUSES:
             raise HTTPResponseError(status_code, f"{url} {status_code}: {last}")
-        time.sleep(5 * (attempt + 1))
+        if attempt + 1 < 4:
+            time.sleep(5 * (attempt + 1))
     raise RuntimeError(f"upload {path.name} failed: {last}")
 
 
@@ -166,13 +223,17 @@ def download(url: str, out: Path) -> Path:
     if urlsplit(url).scheme not in ("http", "https"):
         raise RuntimeError(f"download rejected unsafe url: {url[:120]}")
     tmp = out.with_suffix(out.suffix + ".part")
-    ok = subprocess.run(
+    env = _curl_proxy_env(url)
+    run_kwargs = {"env": env} if env is not None else {}
+    proc = subprocess.run(
         ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", "=http,https",
          "--retry", "6", "--retry-all-errors", "--retry-delay", "5", "-o", str(tmp), "--", url],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
-    ).returncode == 0
-    if not ok or not tmp.exists() or tmp.stat().st_size < 1000:
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, **run_kwargs,
+    )
+    if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 1000:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"download failed: {url[:120]}")
+        detail = (proc.stderr or "").strip() if isinstance(getattr(proc, "stderr", None), str) else ""
+        suffix = f" ({detail[:200]})" if detail else (f" (curl exit {proc.returncode})" if proc.returncode != 0 else "")
+        raise RuntimeError(f"download failed: {url[:120]}{suffix}")
     config.atomic_replace(tmp, out)
     return out
