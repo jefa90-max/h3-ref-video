@@ -2,11 +2,13 @@ import copy
 import importlib.util
 import json
 import os
+import ssl
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
@@ -651,6 +653,82 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
             result = rewrite.rewrite("中文提示词", 1, 8, "9:16")
         self.assertEqual(retry_req.call_count, 2)
         self.assertTrue(rewrite.is_rewritten(result))
+
+    def test_http_request_skips_trailing_sleep_and_raises_transport_error_on_urlerror(self):
+        eof = urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+        with patch("h3ref.http._OPENER.open", side_effect=eof), \
+             patch("h3ref.http.time.sleep") as sleep_mock:
+            with self.assertRaises(http.TransportError) as caught:
+                http.request("https://api.example/v1/chat/completions", "sk-secret", {"a": 1}, tries=1)
+        self.assertIn("URLError", str(caught.exception))
+        sleep_mock.assert_not_called()
+
+        with patch("h3ref.http._OPENER.open", side_effect=eof), \
+             patch("h3ref.http.time.sleep") as sleep_mock:
+            with self.assertRaises(http.TransportError):
+                http.request("https://api.example/v1/chat/completions", "sk-secret", {"a": 1}, tries=2)
+        self.assertEqual(sleep_mock.call_count, 1)
+        sleep_mock.assert_called_once_with(4)
+
+        # Post-send response read timeouts (non-URLError) stay plain RuntimeError so paid-request guards remain conservative
+        with patch("h3ref.http._OPENER.open", side_effect=TimeoutError("timed out")), \
+             patch("h3ref.http.time.sleep") as sleep_mock:
+            with self.assertRaises(RuntimeError) as caught_timeout:
+                http.request("https://api.example/v1/chat/completions", "sk-secret", {"a": 1}, tries=1)
+        self.assertNotIsInstance(caught_timeout.exception, http.TransportError)
+        sleep_mock.assert_not_called()
+
+    def test_stage_frames_aborts_on_transport_error_without_poisoning_state_and_preserves_in_flight_draws(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            script = copy.deepcopy(self.script)
+            script["shots"].append({"start": 8, "end": 12, "camera": "特写", "action": "唐僧低眉合十"})
+            for idx, c in enumerate(script["cast"]):
+                p = out / f"c{idx}.png"
+                p.write_bytes(b"img")
+                c["picture"] = str(p)
+            segs = film.plan(script["shots"])
+            pics = {s["idx"]: film.refs(script, s, "shot") for s in segs}
+            job = film.Job(out / "net-abort")
+
+            ok_resp = MagicMock()
+            ok_resp.__enter__.return_value.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": json.dumps(_sample_v3(), ensure_ascii=False)}}]}
+            ).encode("utf-8")
+            eof = urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+
+            with patch("h3ref.http._OPENER.open", side_effect=[ok_resp, eof]) as open_mock, \
+                 patch("h3ref.http.time.sleep") as sleep_mock, \
+                 patch.object(frames.config, "llm_key", return_value="sk-test"), \
+                 patch.object(frames, "draw", side_effect=lambda t, r, a, o, **k: (o.write_bytes(b"png") or 0.1)) as draw_mock:
+                with self.assertRaises(http.TransportError) as caught:
+                    film.stage_frames(job, script, segs, pics)
+
+            # Shot 1 succeeded and finished drawing; shot 2 aborted before shot 3 was ever attempted
+            self.assertEqual(open_mock.call_count, 2)
+            self.assertEqual(draw_mock.call_count, 1)
+            sleep_mock.assert_not_called()
+            self.assertTrue((job.dir / "frames" / "s1-1.png").is_file())
+            self.assertNotIn("s1-2", job.state["frames"])
+            self.assertNotIn("s1-3", job.state["frames"])
+            err_text = str(caught.exception)
+            self.assertIn("STAGING_PLAN_NETWORK_FAILED", err_text)
+            self.assertNotIn("可能已收费", err_text)
+            self.assertNotIn("may have been charged", err_text)
+            self.assertIn("staging abort s1-2", (job.dir / "run.log").read_text(encoding="utf-8"))
+
+            # Non-transport read timeouts still record per-shot STAGING_PLAN_FAILED and keep going
+            job_timeout = film.Job(out / "read-timeout")
+            with patch("h3ref.http._OPENER.open", side_effect=[TimeoutError("read timed out"), ok_resp, ok_resp]), \
+                 patch("h3ref.http.time.sleep") as sleep_timeout, \
+                 patch.object(frames.config, "llm_key", return_value="sk-test"), \
+                 patch.object(frames, "draw", side_effect=lambda t, r, a, o, **k: (o.write_bytes(b"png") or 0.1)):
+                failures = film.stage_frames(job_timeout, script, segs, pics)
+            sleep_timeout.assert_not_called()
+            self.assertEqual(failures, ["s1-1"])
+            self.assertIn("STAGING_PLAN_FAILED", job_timeout.state["frames"]["s1-1"]["error"])
+            self.assertTrue((job_timeout.dir / "frames" / "s1-2.png").is_file())
+            self.assertTrue((job_timeout.dir / "frames" / "s1-3.png").is_file())
 
 
 if __name__ == "__main__":
