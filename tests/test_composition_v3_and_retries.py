@@ -730,6 +730,74 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
             self.assertTrue((job_timeout.dir / "frames" / "s1-2.png").is_file())
             self.assertTrue((job_timeout.dir / "frames" / "s1-3.png").is_file())
 
+    def test_curl_upload_and_download_surface_stderr_propagate_system_proxy_and_skip_trailing_sleep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img = Path(tmp) / "ref0.jpg"
+            img.write_bytes(b"jpg")
+
+            # 1) Non-zero curl exit with "\n000" stdout must surface stderr (scrubbed) instead of "000", and sleep only 3 times
+            secret = "sk-upload-secret-12345"
+            captured_envs = []
+
+            def fake_fail_upload(cmd, **kwargs):
+                captured_envs.append(kwargs.get("env"))
+                return MagicMock(
+                    returncode=35,
+                    stdout="\n000",
+                    stderr=f"curl: (35) Recv failure: Connection was reset ({secret})\n",
+                )
+
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=fake_fail_upload), \
+                 patch("h3ref.http.time.sleep") as sleep_mock:
+                with self.assertRaises(RuntimeError) as caught:
+                    http.upload("https://api.apimart.ai/v1/uploads/images", secret, img)
+
+            msg = str(caught.exception)
+            self.assertIn("curl: (35) Recv failure", msg)
+            self.assertNotIn(secret, msg)
+            self.assertIn("[key]", msg)
+            self.assertNotEqual(msg.strip().splitlines()[-1], "000")
+            self.assertEqual(sleep_mock.call_count, 3)
+            self.assertEqual(captured_envs[0]["HTTPS_PROXY"], "http://127.0.0.1:7890")
+            self.assertEqual(captured_envs[0]["HTTP_PROXY"], "http://127.0.0.1:7890")
+
+            # 2) Explicit env proxy or proxy_bypass / localhost leaves subprocess env untouched
+            seen_bypass = []
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "HTTPS_PROXY": "http://127.0.0.1:9999"}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"https": "http://127.0.0.1:7890"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=lambda cmd, **kw: (seen_bypass.append(kw.get("env")), MagicMock(returncode=0, stdout='{"url":"https://ok"}\n200', stderr=""))[1]):
+                http.upload("https://api.apimart.ai/v1/uploads/images", secret, img)
+            self.assertEqual(seen_bypass, [None])
+
+            seen_local = []
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"http": "http://127.0.0.1:7890"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=lambda cmd, **kw: (seen_local.append(kw.get("env")), MagicMock(returncode=0, stdout='{"url":"http://ok"}\n200', stderr=""))[1]):
+                http.upload("http://127.0.0.1:8080/upload", secret, img)
+            self.assertEqual(seen_local, [None])
+
+            # 3) download propagates socks:// as socks5h:// and includes stderr in error message
+            dl_envs = []
+
+            def fake_fail_download(cmd, **kwargs):
+                dl_envs.append(kwargs.get("env"))
+                return MagicMock(returncode=7, stdout="", stderr="curl: (7) Failed to connect to cdn.example port 443")
+
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"socks": "socks://127.0.0.1:7891"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=fake_fail_download):
+                with self.assertRaises(RuntimeError) as caught_dl:
+                    http.download("https://cdn.example/frame.png", Path(tmp) / "frame.png")
+
+            self.assertEqual(dl_envs[0]["HTTPS_PROXY"], "socks5h://127.0.0.1:7891")
+            self.assertIn("curl: (7) Failed to connect", str(caught_dl.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
