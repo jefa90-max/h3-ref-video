@@ -977,12 +977,15 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             sup_log = root / "sup.log"
             ngrok_log = root / "ngrok.log"
 
+            probed_urls: list[str] = []
+
             def unauthed_public_status(url, *, headers=None, timeout=4.0):
+                probed_urls.append(url)
                 if "127.0.0.1:8189" in url:
                     return 401
                 return 200  # Simulates stale unauthenticated tunnel pointing straight to 8188
 
-            with mock.patch.dict(os.environ, {"H3_TUNNEL_PROVIDER": "ngrok", "NGROK_DOMAIN": "demo.ngrok-free.dev"}, clear=False), \
+            with mock.patch.dict(os.environ, {"H3_TUNNEL_PROVIDER": "ngrok", "H3_NGROK_DOMAIN": "demo.ngrok-free.dev"}, clear=False), \
                  mock.patch.object(start_colab, "BASE", drive_base), \
                  mock.patch.object(start_colab, "SUPERVISOR_PID_FILE", sup_pid), \
                  mock.patch.object(start_colab, "SUPERVISOR_LOG_FILE", sup_log), \
@@ -993,6 +996,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                  mock.patch.object(start_colab.time, "sleep"):
                 with self.assertRaises(RuntimeError):
                     start_colab.ensure_supervisor_and_tunnel()
+            self.assertIn("https://demo.ngrok-free.dev/system_stats", probed_urls)
 
             # 2. red-team#1 + adversarial-native#1: _queue_busy stops trusting _comfy_process_alive past grace window
             with mock.patch("urllib.request.urlopen", side_effect=OSError("hung port 8188")), \
@@ -1160,7 +1164,8 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             self.assertEqual(polled_urls, [new_cf])
             self.assertEqual(reloc_job.state["segs"]["0"]["comfyui_url"], new_cf)
 
-            # 7. outside-voice#2 + targeted#2: stop() rechecks local_busy_provider after probe and fails closed on 504 with active session
+            # 7. outside-voice#2 + targeted#2 + Pass 2 regressions: real _probe_slot & _query_sessions, 504/530 fail-closed,
+            #    404-stopped proceeds, force=True bypasses probes, and cancel_event clears on lock-recheck abort
             fake_bin = root / "colab"
             fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_bin.chmod(0o755)
@@ -1192,16 +1197,54 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             self.assertTrue(res_race["local_busy"])
             stop_cmd.assert_not_called()
 
-            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=None), \
-                 mock.patch.object(mgr_stop, "_probe_slot", return_value={"online": False, "auth_failed": False, "status_code": 504}), \
-                 mock.patch.object(mgr_stop, "_query_sessions", return_value={"named": [{"name": "comfy-a100", "endpoint": "m-1", "hardware": "G4"}], "orphans": [], "ok": True}), \
-                 mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}), \
-                 mock.patch.object(mgr_stop, "_run_cmd_for_slot") as stop_cmd2:
-                res_504 = mgr_stop.stop(environ=env_stop, force=False, local_busy=False)
-            self.assertFalse(res_504["stopped"])
-            self.assertTrue(res_504["confirmation_required"])
-            self.assertTrue(res_504["queue_unknown"])
-            stop_cmd2.assert_not_called()
+            # 7b. Lock-time local_busy recheck must clear st.cancel_event even if stop() had set it
+            st_pri = mgr_stop._slot("primary")
+            st_pri.cancel_event.set()
+            calls_busy = {"n": 0}
+
+            def busy_flips_on_second_call():
+                calls_busy["n"] += 1
+                return calls_busy["n"] >= 2
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "online", "logs": []}), \
+                 mock.patch.object(mgr_stop, "_run_cmd_for_slot") as stop_cmd_lock:
+                res_lock_race = mgr_stop.stop(
+                    environ=env_stop,
+                    force=False,
+                    local_busy=False,
+                    local_busy_provider=busy_flips_on_second_call,
+                )
+            self.assertFalse(res_lock_race["stopped"])
+            self.assertTrue(res_lock_race["confirmation_required"])
+            self.assertFalse(st_pri.cancel_event.is_set())
+            stop_cmd_lock.assert_not_called()
+
+            # 7c. Real _probe_slot + real _query_sessions (no _query_sessions mock): 504 & 530 with active session fail closed
+            for code in (504, 530):
+                with mock.patch.object(colab_runtime, "_probe_json", return_value=(code, None)), \
+                     mock.patch.object(mgr_stop, "_run_command", return_value=(0, "[comfy-a100] m-1 | Hardware: G4\n")) as run_cmd, \
+                     mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}):
+                    res_code = mgr_stop.stop(environ=env_stop, force=False, local_busy=False)
+                self.assertFalse(res_code["stopped"])
+                self.assertTrue(res_code["confirmation_required"])
+                self.assertTrue(res_code["queue_unknown"])
+                self.assertTrue(all("stop" not in c.args[2] for c in run_cmd.call_args_list))
+
+            # 7d. 404 with no active Colab session proceeds to stop cleanly; force=True bypasses queue/session probes
+            with mock.patch.object(colab_runtime, "_probe_json", return_value=(404, None)), \
+                 mock.patch.object(mgr_stop, "_run_command", side_effect=[(0, ""), (0, "stopped\n")]), \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}):
+                res_404_gone = mgr_stop.stop(environ=env_stop, force=False, local_busy=False)
+            self.assertTrue(res_404_gone["stopped"])
+            self.assertFalse(res_404_gone.get("queue_unknown", False))
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", side_effect=AssertionError("must skip on force")) , \
+                 mock.patch.object(mgr_stop, "_run_cmd_for_slot", return_value=(0, "stopped\n")) as force_cmd, \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}):
+                res_force = mgr_stop.stop(environ=env_stop, force=True, local_busy=False)
+            self.assertTrue(res_force["stopped"])
+            self.assertEqual(force_cmd.call_count, 1)
 
             # 8. outside-voice#4: keepalive still fires for resumed ComfyUI work when default VIDEO_PROVIDER=runninghub
             now_box = {"t": 1000.0}
@@ -1223,6 +1266,21 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                 # Monitor loop with local_busy=True and remote queue=1 MUST keep Colab warm
                 self.assertTrue(mgr_ka.maybe_send_kernel_keepalive(env_rh, local_busy=True, queue_count=1))
                 self.assertEqual(ka_cmd.call_count, 2)
+
+            # 9. Pass 2 direct tests: comfy.has_task() and strict trycloudflare hostname validation
+            with mock.patch.object(comfy.http, "request", return_value={"pid-h": {"status": {}}}):
+                self.assertTrue(comfy.has_task("pid-h", base_url=new_cf, api_key="k-secret-1234"))
+            with mock.patch.object(comfy.http, "request", side_effect=[{}, {"queue_running": [[0, "pid-r"]], "queue_pending": []}]):
+                self.assertTrue(comfy.has_task("pid-r", base_url=new_cf, api_key="k-secret-1234"))
+            with mock.patch.object(comfy.http, "request", side_effect=[{}, {"queue_running": [], "queue_pending": [[1, "pid-p"]]}]):
+                self.assertTrue(comfy.has_task("pid-p", base_url=new_cf, api_key="k-secret-1234"))
+            with mock.patch.object(comfy.http, "request", side_effect=[{}, {"queue_running": [], "queue_pending": []}]):
+                self.assertFalse(comfy.has_task("pid-missing", base_url=new_cf, api_key="k-secret-1234"))
+            with mock.patch.object(comfy.http, "request", side_effect=RuntimeError("502")):
+                self.assertFalse(comfy.has_task("pid-err", base_url=new_cf, api_key="k-secret-1234"))
+            self.assertFalse(film._is_trycloudflare_url("https://evil.example/foo.trycloudflare.com"))
+            self.assertFalse(film._is_trycloudflare_url("http://x.trycloudflare.com"))
+            self.assertTrue(film._is_trycloudflare_url(new_cf))
 
 
 if __name__ == "__main__":

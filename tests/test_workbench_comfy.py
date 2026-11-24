@@ -390,6 +390,26 @@ class WorkbenchComfyTest(unittest.TestCase):
                 self.assertEqual(start_res.status_code, 200)
             self.assertIsNotNone(runtime._last_activity_at)
 
+            # POST /api/runtime/stop must refuse unforced stop while a video launch probe is in flight
+            jobs._probing_launch = True
+            try:
+                fake_bin = root / "colab"
+                fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                fake_bin.chmod(0o755)
+                with mock.patch.object(server.colab_runtime, "find_colab_bin", return_value=str(fake_bin)), \
+                     mock.patch.object(server.colab_runtime, "probe_remote_queue_count", return_value=0), \
+                     mock.patch.object(runtime, "status", return_value={"state": "online", "logs": []}), \
+                     mock.patch.object(runtime, "_run_cmd_for_slot") as stop_cmd:
+                    stop_res = client.post("/api/runtime/stop", headers={"X-Workbench": "1"}, json={"force": False})
+                self.assertEqual(stop_res.status_code, 200)
+                stop_payload = stop_res.get_json()
+                self.assertFalse(stop_payload["stopped"])
+                self.assertTrue(stop_payload["confirmation_required"])
+                self.assertTrue(stop_payload["local_busy"])
+                stop_cmd.assert_not_called()
+            finally:
+                jobs._probing_launch = False
+
     def test_secondary_colab_node_endpoints_sync_env_and_auto_concurrency(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
