@@ -1302,14 +1302,17 @@ def _merge_missing_tree(src_dir: Path, dst_dir: Path) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     for item in src_dir.iterdir():
         dest = dst_dir / item.name
+        if dest.is_symlink():
+            continue
         if item.is_dir() and not item.is_symlink():
-            if dest.exists() and dest.is_dir():
+            if not dest.exists() or dest.is_dir():
                 _merge_missing_tree(item, dest)
-            elif not dest.exists() and not dest.is_symlink():
-                shutil.move(str(item), str(dest))
         else:
-            if not dest.exists() and not dest.is_symlink():
-                shutil.move(str(item), str(dest))
+            if not dest.exists():
+                try:
+                    shutil.move(str(item), str(dest))
+                except (FileExistsError, shutil.Error):
+                    pass
 
 
 def link_persistent_dirs() -> None:

@@ -379,14 +379,16 @@ def _is_terminal_cli_crash_line(
     saw_traceback: bool = False,
 ) -> tuple[bool, bool, bool]:
     stripped = line.strip()
-    if "Traceback (most recent call last)" in stripped:
-        saw_traceback = True
-    if "╰─" in stripped and "╯" in stripped:
-        return False, saw_traceback, saw_traceback
     if "Connection was lost." in stripped or "WebSocketConnectionClosedException" in stripped:
         return True, saw_rich_box_end, saw_traceback
+    if "╭─" in stripped and "Traceback (most recent call last)" in stripped:
+        return False, False, True
+    if "╰─" in stripped and "╯" in stripped:
+        return False, saw_traceback, saw_traceback
     if saw_rich_box_end and stripped:
         return True, False, False
+    if saw_traceback and stripped and not stripped.startswith(("│", "╭", "╰")):
+        saw_traceback = False
     return False, saw_rich_box_end, saw_traceback
 
 
@@ -616,6 +618,7 @@ class _SlotState:
         self.active_proc = None
         self.worker_thread: threading.Thread | None = None
         self.stopping = False
+        self.starting = False
         self.last_keepalive_at = float(now)
         self.last_keepalive_fail_at: float | None = None
         self.keepalive_in_flight = False
@@ -915,8 +918,9 @@ class ColabRuntimeManager:
                 return None, None
             data = self._load_saved_nodes()
             prev = data.get(slot_name)
-            old_url = str(prev.get("url") or "").strip().rstrip("/") if isinstance(prev, dict) else None
-            old_url = old_url or (str(replace_url or "").strip().rstrip("/") or None)
+            prev_url = str(prev.get("url") or "").strip().rstrip("/") if isinstance(prev, dict) else None
+            explicit_replace = str(replace_url or "").strip().rstrip("/") or None
+            old_url = explicit_replace or prev_url or None
             if record and record.get("url"):
                 new_url = config.validate_endpoint_url(str(record["url"]), "COMFYUI_URL") or None
                 data[slot_name] = {**record, "url": new_url}
@@ -1871,7 +1875,7 @@ class ColabRuntimeManager:
         with self._lock:
             if self._is_stopping(st):
                 raise RuntimeBusyError(message("colab_busy"))
-            if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
+            if st.starting or st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
         if already_active:
             return self.status(env_copy)
@@ -1880,33 +1884,50 @@ class ColabRuntimeManager:
         if not colab_bin:
             raise RuntimeUnavailableError(message("colab_cli_missing"))
 
+        owns_starting = False
         with self._lock:
-            keepalive_running = bool(st.keepalive_in_flight)
-            keepalive_proc = st.active_proc if keepalive_running else None
-            if keepalive_running:
-                st.cancel_event.set()
-        if keepalive_proc is not None:
-            _kill_process_tree(keepalive_proc)
-        if keepalive_running:
-            ka_deadline = time.monotonic() + 5.0
-            while time.monotonic() < ka_deadline:
-                with self._lock:
-                    if not st.keepalive_in_flight:
-                        break
-                time.sleep(0.02)
+            if self._is_stopping(st):
+                raise RuntimeBusyError(message("colab_busy"))
+            if st.starting or st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
+                already_active = True
+            else:
+                st.starting = True
+                owns_starting = True
+                keepalive_running = bool(st.keepalive_in_flight)
+                keepalive_proc = st.active_proc if keepalive_running else None
+                if keepalive_running:
+                    st.cancel_event.set()
+        if already_active:
+            return self.status(env_copy)
 
         lock_ctx = runtime_file_lock(self.storage, slot=slot_name)
-        lock_deadline = time.monotonic() + (3.0 if keepalive_running else 0.0)
-        while True:
-            try:
-                lock_ctx.__enter__()
-                break
-            except RuntimeBusyError:
-                if time.monotonic() >= lock_deadline:
-                    raise
-                time.sleep(0.05)
+        entered_lock = False
         set_active = False
         try:
+            if keepalive_proc is not None:
+                _kill_process_tree(keepalive_proc)
+            if keepalive_running:
+                ka_deadline = time.monotonic() + 5.0
+                while time.monotonic() < ka_deadline:
+                    with self._lock:
+                        if not st.keepalive_in_flight:
+                            break
+                        if st.active_proc is not None and st.active_proc is not keepalive_proc:
+                            keepalive_proc = st.active_proc
+                            _kill_process_tree(keepalive_proc)
+                    time.sleep(0.02)
+
+            lock_deadline = time.monotonic() + (3.0 if keepalive_running else 0.0)
+            while True:
+                try:
+                    lock_ctx.__enter__()
+                    entered_lock = True
+                    break
+                except RuntimeBusyError:
+                    if time.monotonic() >= lock_deadline:
+                        raise
+                    time.sleep(0.05)
+
             t = threading.Thread(
                 target=self._startup_worker,
                 args=(env_copy, colab_bin, lock_ctx),
@@ -1925,11 +1946,18 @@ class ColabRuntimeManager:
                 set_active = True
                 t.start()
         except BaseException:
-            if set_active:
-                with self._lock:
+            with self._lock:
+                if set_active:
                     st.active_state = None
-            lock_ctx.__exit__(None, None, None)
+                if keepalive_running and not self._is_stopping(st):
+                    st.cancel_event.clear()
+            if entered_lock:
+                lock_ctx.__exit__(None, None, None)
             raise
+        finally:
+            if owns_starting:
+                with self._lock:
+                    st.starting = False
         return self.status(env_copy)
 
     def ensure_started(self, environ=None, *, timeout: float = 2700.0, slot: str = "primary") -> dict:
@@ -1996,7 +2024,7 @@ class ColabRuntimeManager:
         with self._lock:
             if local_busy:
                 self._last_activity_at = current
-            if self._is_stopping(st) or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+            if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
                 return False
             if (current - st.last_keepalive_at) < self.keepalive_interval_sec:
                 return False
@@ -2030,53 +2058,52 @@ class ColabRuntimeManager:
                 return False
 
         session_name = self._session_name(settings, slot_name)
+        with self._lock:
+            if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+                return False
+            st.keepalive_in_flight = True
         try:
             with runtime_file_lock(self.storage, slot=slot_name):
                 with self._lock:
-                    if self._is_stopping(st) or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+                    if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None:
                         return False
                     st.cancel_event.clear()
-                    st.keepalive_in_flight = True
-                try:
-                    rc, out = self._run_cmd_for_slot(
-                        colab_bin,
-                        settings["colab_auth"],
-                        ["exec", "-s", session_name, "--timeout", str(KERNEL_KEEPALIVE_TIMEOUT_SEC)],
-                        environ=env_copy,
-                        stdin_text=KERNEL_KEEPALIVE_CODE,
-                        timeout=float(KERNEL_KEEPALIVE_TIMEOUT_SEC) + 15.0,
+                rc, out = self._run_cmd_for_slot(
+                    colab_bin,
+                    settings["colab_auth"],
+                    ["exec", "-s", session_name, "--timeout", str(KERNEL_KEEPALIVE_TIMEOUT_SEC)],
+                    environ=env_copy,
+                    stdin_text=KERNEL_KEEPALIVE_CODE,
+                    timeout=float(KERNEL_KEEPALIVE_TIMEOUT_SEC) + 15.0,
+                    slot=slot_name,
+                )
+                if rc == 0 and "Traceback (most recent call last)" not in out:
+                    with self._lock:
+                        st.last_keepalive_at = current
+                        if active_queue > 0 or local_busy:
+                            self._last_activity_at = current
+                        st.last_keepalive_fail_at = None
+                    self._append_log(
+                        f"[keepalive] Kernel keepalive sent (session={session_name}, {reason})",
                         slot=slot_name,
                     )
-                    if rc == 0 and "Traceback (most recent call last)" not in out:
-                        with self._lock:
-                            st.last_keepalive_at = current
-                            if active_queue > 0 or local_busy:
-                                self._last_activity_at = current
-                            st.last_keepalive_fail_at = None
-                        self._append_log(
-                            f"[keepalive] Kernel keepalive sent (session={session_name}, {reason})",
-                            slot=slot_name,
-                        )
-                        return True
-                    detail = (out.strip() or f"exit {rc}")[-200:]
-                    with self._lock:
-                        st.last_keepalive_fail_at = current
-                        if "appears to be lost" in out:
-                            self._sessions_cache = None
-                            if (
-                                slot_name == "primary"
-                                and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
-                                and not self._slots["secondary"].active_state
-                                and not self._is_stopping(self._slots["secondary"])
-                            ):
-                                self._last_activity_at = None
-                    if "appears to be lost" in out and slot_name == "secondary":
-                        self._set_remembered_node("secondary", None)
-                    self._append_log(f"[keepalive] Kernel keepalive failed (rc={rc}): {detail}", slot=slot_name)
-                    return False
-                finally:
-                    with self._lock:
-                        st.keepalive_in_flight = False
+                    return True
+                detail = (out.strip() or f"exit {rc}")[-200:]
+                with self._lock:
+                    st.last_keepalive_fail_at = current
+                    if "appears to be lost" in out:
+                        self._sessions_cache = None
+                        if (
+                            slot_name == "primary"
+                            and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
+                            and not self._slots["secondary"].active_state
+                            and not self._is_stopping(self._slots["secondary"])
+                        ):
+                            self._last_activity_at = None
+                if "appears to be lost" in out and slot_name == "secondary":
+                    self._set_remembered_node("secondary", None)
+                self._append_log(f"[keepalive] Kernel keepalive failed (rc={rc}): {detail}", slot=slot_name)
+                return False
         except RuntimeBusyError:
             return False
         except Exception as exc:
@@ -2084,6 +2111,9 @@ class ColabRuntimeManager:
                 st.last_keepalive_fail_at = current
             self._append_log(f"[keepalive] Kernel keepalive error: {type(exc).__name__}: {exc}", slot=slot_name)
             return False
+        finally:
+            with self._lock:
+                st.keepalive_in_flight = False
 
     def trigger_keepalive_async(self, environ=None, *, force_busy: bool = False) -> None:
         """Non-blocking keepalive check when launching a real ComfyUI video job."""
@@ -2097,7 +2127,7 @@ class ColabRuntimeManager:
         with self._lock:
             for slot_name in slots_to_check:
                 st = self._slots[slot_name]
-                if self._is_stopping(st) or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+                if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
                     continue
                 if (current - st.last_keepalive_at) >= self.keepalive_interval_sec:
                     due_slots.append(slot_name)
@@ -2283,6 +2313,7 @@ class ColabRuntimeManager:
                     if time.monotonic() >= lock_deadline:
                         raise
                     time.sleep(0.05)
+            confirm_result: dict | None = None
             try:
                 if not force:
                     local_busy_now = bool(callable(local_busy_provider) and local_busy_provider())
@@ -2295,41 +2326,44 @@ class ColabRuntimeManager:
                             st.cancel_event.clear()
                             st.stopping = False
                             owns_stopping = False
-                        return {
+                        confirm_result = {
                             "stopped": False,
                             "slot": slot_name,
                             "confirmation_required": True,
                             "local_busy": local_busy_now,
                             "remote_queue": rq_now,
                             "queue_unknown": qu_now,
-                            "status": self.status(env_copy),
                         }
-                with self._lock:
-                    st.cancel_event.clear()
-                    st.last_error = None
-                rc, out = self._run_cmd_for_slot(
-                    colab_bin,
-                    settings["colab_auth"],
-                    ["stop", "-s", session_name],
-                    environ=env_copy,
-                    timeout=45.0,
-                    slot=slot_name,
-                )
-                if rc != 0:
-                    raise RuntimeError(out.strip()[-240:] or f"colab stop exit {rc}")
-                stop_succeeded = True
-                if slot_name == "secondary":
-                    stopped_sec_old_url, _ = self._set_remembered_node("secondary", None)
-                else:
+                if confirm_result is None:
                     with self._lock:
-                        sec_st_chk = self._slots["secondary"]
-                        saved_sec_chk = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
-                        sec_running_chk = bool(saved_sec_chk or sec_st_chk.active_state or self._is_stopping(sec_st_chk))
-                    if not sec_running_chk:
-                        self.stop_keepalive_monitor()
+                        st.cancel_event.clear()
+                        st.last_error = None
+                    rc, out = self._run_cmd_for_slot(
+                        colab_bin,
+                        settings["colab_auth"],
+                        ["stop", "-s", session_name],
+                        environ=env_copy,
+                        timeout=45.0,
+                        slot=slot_name,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(out.strip()[-240:] or f"colab stop exit {rc}")
+                    stop_succeeded = True
+                    if slot_name == "secondary":
+                        stopped_sec_old_url, _ = self._set_remembered_node("secondary", None)
+                    else:
+                        with self._lock:
+                            sec_st_chk = self._slots["secondary"]
+                            saved_sec_chk = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
+                            sec_running_chk = bool(saved_sec_chk or sec_st_chk.active_state or self._is_stopping(sec_st_chk))
+                        if not sec_running_chk:
+                            self.stop_keepalive_monitor()
             finally:
                 if entered:
                     lock_ctx.__exit__(None, None, None)
+            if confirm_result is not None:
+                confirm_result["status"] = self.status(env_copy)
+                return confirm_result
         finally:
             if owns_stopping:
                 with self._lock:

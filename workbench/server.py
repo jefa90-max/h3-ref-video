@@ -60,14 +60,15 @@ def create_app(storage=None, env_path=None):
         parsed_comfy_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
     except ValueError:
         parsed_comfy_urls = []
-    saved_sec = runtime.remembered_node("secondary")
-    if saved_sec and saved_sec.get("url") and not colab_runtime.ColabRuntimeManager._node_key_matches(
-        saved_sec, env.get("COMFYUI_API_KEY", "")
-    ):
-        parsed_comfy_urls = colab_runtime.merge_ephemeral_url(parsed_comfy_urls, saved_sec["url"], None)
-    for remembered_url in runtime.remembered_urls(api_key=env.get("COMFYUI_API_KEY", "")):
-        if remembered_url not in parsed_comfy_urls:
-            parsed_comfy_urls.append(remembered_url)
+    for slot_name in colab_runtime.MANAGED_SLOTS:
+        saved_node = runtime.remembered_node(slot_name)
+        if saved_node and saved_node.get("url") and not colab_runtime.ColabRuntimeManager._node_key_matches(
+            saved_node, env.get("COMFYUI_API_KEY", "")
+        ):
+            parsed_comfy_urls = colab_runtime.merge_ephemeral_url(parsed_comfy_urls, saved_node["url"], None)
+    saved_sec_ok = runtime.remembered_node("secondary", api_key=env.get("COMFYUI_API_KEY", ""))
+    if saved_sec_ok and saved_sec_ok.get("url") and saved_sec_ok["url"] not in parsed_comfy_urls:
+        parsed_comfy_urls.append(saved_sec_ok["url"])
     env["COMFYUI_URL"] = config.format_endpoint_urls(parsed_comfy_urls)
     raw_comfy_conc = env.get("COMFYUI_CONCURRENCY", "").strip()
     if raw_comfy_conc:
@@ -153,6 +154,7 @@ def create_app(storage=None, env_path=None):
                     raise InputError("comfy_runtime_action", detail=colab_runtime.message("colab_busy"))
             _check_not_stopping()
             probe_env = env_with_lang
+            probe_urls = list(vcfg["comfyui_urls"])
             if not needs_pool_url and saved_resume_urls:
                 has_relocatable = any(film._is_trycloudflare_url(u) for u in saved_resume_urls)
                 reloc_candidates = [u for u in vcfg["comfyui_urls"] if film._is_trycloudflare_url(u)] if has_relocatable else []
@@ -167,12 +169,16 @@ def create_app(storage=None, env_path=None):
                 return
             if probe.get("auth_failed"):
                 raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))
-            if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(env_with_lang):
+            primary_url = runtime._primary_url(vcfg)
+            can_auto_start_primary = needs_pool_url or (bool(primary_url) and primary_url in probe_urls)
+            if can_auto_start_primary and vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(env_with_lang):
                 try:
-                    runtime.start_async(env_with_lang)
+                    start_st = runtime.start_async(env_with_lang)
                     ensure_keepalive_monitor()
                 except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, ValueError) as exc:
                     raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+                if isinstance(start_st, dict) and start_st.get("state") == "online":
+                    raise InputError("comfy_offline")
                 raise InputError("comfy_starting")
             raise InputError("comfy_offline")
 
@@ -430,37 +436,44 @@ def create_app(storage=None, env_path=None):
             new_comfy_key = (
                 "" if mem_updates["COMFYUI_API_KEY"] is None else mem_updates["COMFYUI_API_KEY"]
             ) if "COMFYUI_API_KEY" in mem_updates else old_comfy_key
-            saved_sec = runtime.remembered_node("secondary")
-            sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
-            mem_sec_key_mismatch = bool(saved_sec) and not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, new_comfy_key)
-            disk_sec_key_mismatch = False
-            if sec_url and mem_sec_key_mismatch:
-                try:
-                    base_mem_urls = config.parse_endpoint_urls(
-                        mem_updates.get("COMFYUI_URL", env.get("COMFYUI_URL", "")) or "", "COMFYUI_URL"
-                    )
-                except ValueError:
-                    base_mem_urls = []
-                if sec_url in base_mem_urls:
-                    stripped_mem = colab_runtime.merge_ephemeral_url(base_mem_urls, sec_url, None)
-                    mem_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_mem)
-            if sec_url and persist and "COMFYUI_API_KEY" in disk_updates:
-                effective_disk_key = "" if disk_updates["COMFYUI_API_KEY"] is None else disk_updates["COMFYUI_API_KEY"]
-                disk_sec_key_mismatch = not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, effective_disk_key)
-                if disk_sec_key_mismatch:
-                    disk_env = config.read_env_file(env_path) if env_path.is_file() else {}
-                    disk_src = (
-                        disk_updates["COMFYUI_URL"]
-                        if "COMFYUI_URL" in disk_updates
-                        else disk_env.get("COMFYUI_URL", "")
-                    )
+            saved_nodes = {slot_n: runtime.remembered_node(slot_n) for slot_n in colab_runtime.MANAGED_SLOTS}
+            slot_urls = {
+                slot_n: str((node or {}).get("url") or "").strip().rstrip("/")
+                for slot_n, node in saved_nodes.items()
+            }
+            disk_key_mismatches: dict[str, bool] = {}
+            for slot_n, saved_node in saved_nodes.items():
+                slot_url = slot_urls[slot_n]
+                mem_key_mismatch = bool(saved_node) and not colab_runtime.ColabRuntimeManager._node_key_matches(saved_node, new_comfy_key)
+                disk_key_mismatch = False
+                if slot_url and mem_key_mismatch:
                     try:
-                        base_disk_urls = config.parse_endpoint_urls(disk_src or "", "COMFYUI_URL")
+                        base_mem_urls = config.parse_endpoint_urls(
+                            mem_updates.get("COMFYUI_URL", env.get("COMFYUI_URL", "")) or "", "COMFYUI_URL"
+                        )
                     except ValueError:
-                        base_disk_urls = []
-                    if sec_url in base_disk_urls:
-                        stripped_disk = colab_runtime.merge_ephemeral_url(base_disk_urls, sec_url, None)
-                        disk_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_disk)
+                        base_mem_urls = []
+                    if slot_url in base_mem_urls:
+                        stripped_mem = colab_runtime.merge_ephemeral_url(base_mem_urls, slot_url, None)
+                        mem_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_mem)
+                if slot_url and persist and "COMFYUI_API_KEY" in disk_updates:
+                    effective_disk_key = "" if disk_updates["COMFYUI_API_KEY"] is None else disk_updates["COMFYUI_API_KEY"]
+                    disk_key_mismatch = not colab_runtime.ColabRuntimeManager._node_key_matches(saved_node, effective_disk_key)
+                    if disk_key_mismatch:
+                        disk_env = config.read_env_file(env_path) if env_path.is_file() else {}
+                        disk_src = (
+                            disk_updates["COMFYUI_URL"]
+                            if "COMFYUI_URL" in disk_updates
+                            else disk_env.get("COMFYUI_URL", "")
+                        )
+                        try:
+                            base_disk_urls = config.parse_endpoint_urls(disk_src or "", "COMFYUI_URL")
+                        except ValueError:
+                            base_disk_urls = []
+                        if slot_url in base_disk_urls:
+                            stripped_disk = colab_runtime.merge_ephemeral_url(base_disk_urls, slot_url, None)
+                            disk_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_disk)
+                disk_key_mismatches[slot_n] = disk_key_mismatch
             if persist:
                 save_env(env_path, disk_updates)
             for k, v in mem_updates.items():
@@ -471,8 +484,13 @@ def create_app(storage=None, env_path=None):
                 if persist and "COMFYUI_URL" in disk_updates
                 else None
             )
-        if sec_url and persist and (disk_sec_key_mismatch or (updated_disk_comfy_urls is not None and sec_url not in updated_disk_comfy_urls)):
-            runtime.forget_remembered_node("secondary", expected_url=sec_url)
+        for slot_n in colab_runtime.MANAGED_SLOTS:
+            slot_url = slot_urls[slot_n]
+            if slot_url and persist and (
+                disk_key_mismatches.get(slot_n)
+                or (updated_disk_comfy_urls is not None and slot_url not in updated_disk_comfy_urls)
+            ):
+                runtime.forget_remembered_node(slot_n, expected_url=slot_url)
         return jsonify(settings())
 
     def _parse_runtime_slot(values):

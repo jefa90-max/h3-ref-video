@@ -486,8 +486,12 @@ def preflight(job, env):
         check_env = env
         if provider == "comfyui":
             saved_urls, needs_pool = resumable_comfyui_state(job, env)
-            if saved_urls and not needs_pool and not env.get("COMFYUI_URL", "").strip():
-                check_env = {**env, "COMFYUI_URL": config.format_endpoint_urls(saved_urls)}
+            if saved_urls:
+                if not needs_pool:
+                    check_env = {**env, "COMFYUI_URL": config.format_endpoint_urls(saved_urls)}
+                elif env.get("COMFYUI_URL", "").strip():
+                    merged_urls = list(dict.fromkeys([*config.parse_endpoint_urls(env["COMFYUI_URL"], "COMFYUI_URL"), *saved_urls]))
+                    check_env = {**env, "COMFYUI_URL": config.format_endpoint_urls(merged_urls)}
         required.extend(video_provider_missing_keys(provider, check_env))
     if needs_rewrite or needs_composition:
         names = config.llm_settings(env)["key_names"]

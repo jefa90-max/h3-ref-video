@@ -774,7 +774,7 @@ def preflight(request, env):
     check_env = env
     if seg_provider == 'comfyui' and staged.get('task'):
         saved_urls, needs_pool = resumable_comfyui_state(request, env)
-        if saved_urls and not needs_pool and not env.get('COMFYUI_URL', '').strip():
+        if saved_urls and not needs_pool:
             check_env = {**env, 'COMFYUI_URL': config.format_endpoint_urls(saved_urls)}
     missing_video = video_provider_missing_keys(seg_provider, check_env)
     if missing_video:
