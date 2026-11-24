@@ -1810,16 +1810,26 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             self.assertFalse((one_zero / "clip.mp4").exists())
             self.assertNotIn("cny", json.loads((one_zero / "state.json").read_text(encoding="utf-8")))
 
-            # 7. p1/adversarial-native#1: _is_terminal_cli_crash_line ignores non-traceback Rich box borders
+            # 7. p1/adversarial-native#1 & p2/red-team#5: _is_terminal_cli_crash_line ignores non-traceback Rich boxes
+            #    and caught standard tracebacks, triggering only on Rich traceback panels
             saw_end, saw_tb = False, False
-            for benign in ("╭─ Status ─╮", "│ Starting │", "╰──────────╯", "All systems normal"):
+            for benign in (
+                "Traceback (most recent call last):",
+                "ValueError: caught pip fallback",
+                "╭─ Status ─╮",
+                "│ Starting │",
+                "╰──────────╯",
+                "All systems normal",
+            ):
                 crashed, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line(benign, saw_end, saw_tb)
-                self.assertFalse(crashed, f"Benign Rich box line triggered crash: {benign}")
+                self.assertFalse(crashed, f"Benign Rich box or caught traceback triggered crash: {benign}")
             saw_end, saw_tb = False, False
-            c1, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line("Traceback (most recent call last):", saw_end, saw_tb)
-            c2, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line("╰────────────────╯", saw_end, saw_tb)
+            c1, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line("╭──── Traceback (most recent call last) ────╮", saw_end, saw_tb)
+            c1b, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line("│ frame 1                                   │", saw_end, saw_tb)
+            c2, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line("╰───────────────────────────────────────────╯", saw_end, saw_tb)
             c3, saw_end, saw_tb = colab_runtime._is_terminal_cli_crash_line("RuntimeError: fatal", saw_end, saw_tb)
             self.assertFalse(c1)
+            self.assertFalse(c1b)
             self.assertFalse(c2)
             self.assertTrue(c3)
 
@@ -2029,6 +2039,253 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                     )
             self.assertEqual(ctx_nr.exception.key, "comfy_offline")
             self.assertEqual(seen_probe_urls[-1], [pri])
+
+    def test_ship_p2_review_regressions(self):
+        """Regression tests for Pass 2 review findings (primary resurrection, second rotation, resume auto-start, start_async/keepalive race, stop lock release, symlink merge, preflight HTTPS key check)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_bin.chmod(0o755)
+            pri_a = "https://pri-a.trycloudflare.com"
+            pri_b = "https://pri-b.trycloudflare.com"
+            pri_c = "https://pri-c.trycloudflare.com"
+            sec_a = "https://sec-a.trycloudflare.com"
+            fp = comfy.key_fingerprint("k-secret-1234")
+            pic = root / "actor-p2.png"
+            Image.new("RGB", (16, 16), "red").save(pic)
+
+            # 1. p2/specialist-batched#1 & p2/targeted#3: removed primary remembered node is forgotten and never resurrected on restart
+            env_path = root / ".env.p2"
+            env_path.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri_a}\nCOMFYUI_API_KEY=k-secret-1234\n",
+                encoding="utf-8",
+            )
+            storage = root / ".wb-p2"
+            app = server.create_app(storage=storage, env_path=env_path)
+            rt = app.extensions["colab_runtime"]
+            self.addCleanup(rt.stop_keepalive_monitor)
+            client = app.test_client()
+            rt._set_remembered_node("primary", {"session": "comfy-a100", "url": pri_a, "key_fp": fp})
+            resp_cfg = client.post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={"COMFYUI_URL": pri_b, "persist": True},
+            )
+            self.assertEqual(resp_cfg.status_code, 200)
+            self.assertIsNone(rt.remembered_node("primary"))
+            app_restarted = server.create_app(storage=storage, env_path=env_path)
+            self.addCleanup(app_restarted.extensions["colab_runtime"].stop_keepalive_monitor)
+            self.assertEqual(
+                app_restarted.test_client().get("/api/bootstrap").get_json()["config"]["COMFYUI_URLS"],
+                [pri_b],
+            )
+            # Even if primary remained in colab-nodes.json (e.g. hand-edited .env), boot must NOT resurrect it
+            app_restarted.extensions["colab_runtime"]._set_remembered_node(
+                "primary", {"session": "comfy-a100", "url": pri_a, "key_fp": fp}
+            )
+            env_path.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri_b}\nCOMFYUI_API_KEY=k-secret-1234\n",
+                encoding="utf-8",
+            )
+            app_restarted2 = server.create_app(storage=storage, env_path=env_path)
+            self.addCleanup(app_restarted2.extensions["colab_runtime"].stop_keepalive_monitor)
+            self.assertEqual(
+                app_restarted2.test_client().get("/api/bootstrap").get_json()["config"]["COMFYUI_URLS"],
+                [pri_b],
+            )
+
+            # 2. p2/specialist-batched#2: second primary rotation prefers explicit replace_url over stale prev['url']
+            rt2 = app_restarted2.extensions["colab_runtime"]
+            old_u, new_u = rt2._set_remembered_node(
+                "primary",
+                {"session": "comfy-a100", "url": pri_c, "key_fp": fp},
+                replace_url=pri_b,
+            )
+            self.assertEqual((old_u, new_u), (pri_b, pri_c))
+            self.assertEqual(
+                app_restarted2.test_client().get("/api/bootstrap").get_json()["config"]["COMFYUI_URLS"],
+                [pri_c],
+            )
+            self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], pri_c)
+
+            # 3. p2/red-team#1: resume-only job bound to offline non-primary endpoint raises comfy_offline (not comfy_starting loop / unused primary start)
+            from workbench.i18n import InputError as WbInputError
+            resume_sec_dir = root / "one-resume-offline-sec"
+            resume_sec_dir.mkdir()
+            (resume_sec_dir / "state.json").write_text(
+                json.dumps({
+                    "h3": "six section h3",
+                    "task": "pid-sec-offline",
+                    "provider": "comfyui",
+                    "comfyui_url": sec_a,
+                    "comfyui_key_fp": fp,
+                }),
+                encoding="utf-8",
+            )
+            req_sec_res = {
+                "kind": "one", "demo": False, "operation": "pipeline",
+                "prompt": "Picture 1 walks.", "seconds": 5, "aspect": "9:16",
+                "images": [str(pic)], "output_dir": str(resume_sec_dir), "lang": "en",
+            }
+            offline_probe = {"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe), \
+                 mock.patch.object(rt2, "start_async", side_effect=AssertionError("must not auto-start primary for non-primary resume")):
+                with self.assertRaises(WbInputError) as ctx_sec_off:
+                    app_restarted2.extensions["jobs"].before_video_launch(
+                        req_sec_res,
+                        {
+                            "VIDEO_PROVIDER": "comfyui",
+                            "COMFYUI_URL": "https://pri.ngrok-free.dev",
+                            "COMFYUI_API_KEY": "k-secret-1234",
+                            "COLAB_AUTO_START": "1",
+                            "COLAB_BIN": str(fake_bin),
+                        },
+                    )
+            self.assertEqual(ctx_sec_off.exception.key, "comfy_offline")
+
+            # 4. p2/red-team#2: start_async() serializes concurrent callers idempotently & preempts keepalive even across lock boundaries, clearing cancel_event on lock failure
+            mgr_race = colab_runtime.ColabRuntimeManager(root / "st-p2-race", clock=lambda: 2000.0)
+            st_r = mgr_race._slot("primary")
+            st_r.last_keepalive_at = 0.0
+            env_r = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://pri.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+            }
+            # 4a) Concurrent start_async while first is in starting phase returns idempotent status() instead of RuntimeBusyError
+            st_r.starting = True
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe), \
+                 mock.patch.object(mgr_race, "status", return_value={"state": "provisioning", "logs": []}):
+                res_idem = mgr_race.start_async(env_r, slot="primary")
+            self.assertEqual(res_idem["state"], "provisioning")
+            st_r.starting = False
+
+            # 4b) Keepalive entering runtime_file_lock already has keepalive_in_flight=True before lock entry and skips if st.starting=True
+            st_r.starting = True
+            with mock.patch.object(mgr_race, "_run_cmd_for_slot") as ka_skip_cmd:
+                self.assertFalse(mgr_race.maybe_send_kernel_keepalive(env_r, force_busy=True, slot="primary"))
+            ka_skip_cmd.assert_not_called()
+            st_r.starting = False
+
+            # 4c) External process holding lock during start_async clears st.starting and st.cancel_event on RuntimeBusyError
+            with colab_runtime.runtime_file_lock(mgr_race.storage, slot="primary"):
+                with mock.patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe):
+                    with self.assertRaises(colab_runtime.RuntimeBusyError):
+                        mgr_race.start_async(env_r, slot="primary")
+            self.assertFalse(st_r.starting)
+            self.assertFalse(st_r.cancel_event.is_set())
+
+            # 5. p2/red-team#3 & p2/specialist-batched#4:
+            #    (a) stop(force=False) releases runtime_file_lock BEFORE calling self.status() on confirmation_required
+            #    (b) stop() clears remembered secondary & stops keepalive monitor while st.stopping=True and file lock is held
+            mgr_st_lock = colab_runtime.ColabRuntimeManager(root / "st-p2-stop-lock")
+            lock_free_during_status = {"ok": False}
+            def check_lock_free(_env):
+                with colab_runtime.runtime_file_lock(mgr_st_lock.storage, slot="primary"):
+                    lock_free_during_status["ok"] = True
+                return {"state": "online", "logs": []}
+            q_seq = {"n": 0}
+            def q_flip(*a, **kw):
+                q_seq["n"] += 1
+                return 0 if q_seq["n"] == 1 else 1
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", side_effect=q_flip), \
+                 mock.patch.object(mgr_st_lock, "status", side_effect=check_lock_free):
+                res_conf = mgr_st_lock.stop(environ=env_r, force=False, local_busy=False)
+            self.assertTrue(res_conf["confirmation_required"])
+            self.assertTrue(lock_free_during_status["ok"], "runtime_file_lock must be released before calling status()")
+
+            # (b) Secondary stop clears remembered node while st.stopping=True and file lock held
+            sec_stop_observed = {}
+            def on_sec_clear(slot_n, old_u, new_u):
+                sec_stop_observed["stopping"] = mgr_st_lock._slot("secondary").stopping
+                try:
+                    with colab_runtime.runtime_file_lock(mgr_st_lock.storage, slot="secondary"):
+                        sec_stop_observed["lock_held"] = False
+                except colab_runtime.RuntimeBusyError:
+                    sec_stop_observed["lock_held"] = True
+            mgr_st_lock.set_url_change_callback(on_sec_clear)
+            mgr_st_lock._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_a, "key_fp": fp})
+            sec_stop_observed.clear()
+            with mock.patch.object(mgr_st_lock, "_run_cmd_for_slot", return_value=(0, "stopped\n")), \
+                 mock.patch.object(mgr_st_lock, "status", return_value={"state": "offline", "logs": []}):
+                res_sec_stop = mgr_st_lock.stop(environ=env_r, force=True, slot="secondary")
+            self.assertTrue(res_sec_stop["stopped"])
+            self.assertTrue(sec_stop_observed.get("stopping"))
+            self.assertTrue(sec_stop_observed.get("lock_held"))
+
+            # (b-ii) Primary stop calls stop_keepalive_monitor while st.stopping=True and file lock held
+            pri_stop_observed = {}
+            orig_stop_mon = mgr_st_lock.stop_keepalive_monitor
+            def wrapped_stop_mon():
+                pri_stop_observed["stopping"] = mgr_st_lock._slot("primary").stopping
+                try:
+                    with colab_runtime.runtime_file_lock(mgr_st_lock.storage, slot="primary"):
+                        pri_stop_observed["lock_held"] = False
+                except colab_runtime.RuntimeBusyError:
+                    pri_stop_observed["lock_held"] = True
+                return orig_stop_mon()
+            with mock.patch.object(mgr_st_lock, "stop_keepalive_monitor", side_effect=wrapped_stop_mon), \
+                 mock.patch.object(mgr_st_lock, "_run_cmd_for_slot", return_value=(0, "stopped\n")), \
+                 mock.patch.object(mgr_st_lock, "status", return_value={"state": "offline", "logs": []}):
+                res_pri_stop = mgr_st_lock.stop(environ=env_r, force=True, slot="primary")
+            self.assertTrue(res_pri_stop["stopped"])
+            self.assertTrue(pri_stop_observed.get("stopping"))
+            self.assertTrue(pri_stop_observed.get("lock_held"))
+
+            # 6. p2/specialist-batched#3 & p2/red-team#4: _merge_missing_tree skips dest dir symlinks and merges concurrently created subdirs without nesting
+            outside_dir = root / "outside"
+            outside_dir.mkdir()
+            src_tree = root / "src-user"
+            dst_tree = root / "dst-user"
+            (src_tree / "sub" / "nested").mkdir(parents=True)
+            (src_tree / "sub" / "nested" / "a.json").write_text("1", encoding="utf-8")
+            (src_tree / "fresh").mkdir(parents=True)
+            (src_tree / "fresh" / "wf.json").write_text("2", encoding="utf-8")
+            dst_tree.mkdir()
+            (dst_tree / "sub").symlink_to(outside_dir)
+            start_colab._merge_missing_tree(src_tree, dst_tree)
+            self.assertEqual(list(outside_dir.iterdir()), [], "must never traverse into destination symlink directory")
+            self.assertEqual((dst_tree / "fresh" / "wf.json").read_text(encoding="utf-8"), "2")
+
+            # 7. p2/targeted#1 & #2: preflight & segment preflight require COMFYUI_API_KEY for saved HTTPS task even when COMFYUI_URL is local HTTP
+            from workbench import inputs as wb_inputs
+            local_http_env = {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "http://127.0.0.1:8188", "COMFYUI_API_KEY": ""}
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                with self.assertRaises(WbInputError) as ctx_pf:
+                    wb_inputs.preflight(req_sec_res, local_http_env)
+            self.assertEqual(ctx_pf.exception.key, "keys")
+            self.assertIn("COMFYUI_API_KEY", ctx_pf.exception.values.get("names", ""))
+
+            seg_dir = root / "seg-https-resume"
+            (seg_dir / "inputs" / "segment-rev1").mkdir(parents=True)
+            (seg_dir / "inputs" / "segment-edit.json").write_text(
+                json.dumps({"revision": "rev1", "segment": 1, "applied": False, "generated": False}),
+                encoding="utf-8",
+            )
+            (seg_dir / "inputs" / "segment-rev1" / "state.json").write_text(
+                json.dumps({
+                    "segs": {
+                        "0": {
+                            "task": "pid-seg-https",
+                            "provider": "comfyui",
+                            "comfyui_url": sec_a,
+                            "comfyui_key_fp": fp,
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+            seg_req = {
+                "kind": "film", "demo": False, "operation": "segment", "segment": 1,
+                "film": {"shots": [{"id": "s1", "start": 0, "end": 10, "prompt": "Shot 1"}]},
+                "frames": {}, "output_dir": str(seg_dir), "lang": "en",
+            }
+            with self.assertRaises(WbInputError) as ctx_seg_pf:
+                segments.preflight(seg_req, local_http_env)
+            self.assertEqual(ctx_seg_pf.exception.key, "keys")
+            self.assertIn("COMFYUI_API_KEY", ctx_seg_pf.exception.values.get("names", ""))
 
 
 if __name__ == "__main__":
