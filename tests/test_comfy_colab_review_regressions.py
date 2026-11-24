@@ -1385,6 +1385,13 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             rt._set_remembered_node("secondary", None)
             self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], pri)
 
+            # 1d) Malformed .env COMFYUI_URL must skip disk write instead of wiping valid entries
+            malformed_raw = f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri},not-a-valid-url\nCOMFYUI_API_KEY=k-new-9999\n"
+            env_path.write_text(malformed_raw, encoding="utf-8")
+            rt._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_b, "key_fp": comfy.key_fingerprint("k-new-9999")})
+            self.assertEqual(env_path.read_text(encoding="utf-8"), malformed_raw)
+            rt._set_remembered_node("secondary", None)
+
             # 2) create_app() startup must strip key-mismatched (or legacy no-key_fp) secondary URL already written to .env
             env_path.write_text(
                 f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri},{sec_a}\nCOMFYUI_API_KEY=k-new-9999\n",
@@ -1444,8 +1451,60 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             self.assertFalse(res_race["stopped"])
             self.assertTrue(res_race["confirmation_required"])
             self.assertFalse(st_pri.cancel_event.is_set(), "force=False must not cancel startup before local_busy check")
-            self.assertEqual(st_pri.active_state, "starting_comfy", "active_state must roll back on confirmation_required")
-            st_pri.active_state = None
+            self.assertEqual(st_pri.active_state, "starting_comfy", "active_state must remain live on confirmation_required")
+            self.assertFalse(st_pri.stopping)
+
+            # 4a-ii. Worker finishing during local_busy_provider() must NOT be wedged back to stale starting_comfy,
+            #        worker phase transition during stop() must NOT break stopping_urls(), and exception must clear st.stopping
+            exit_calls = {"n": 0}
+            def worker_exits_during_busy():
+                exit_calls["n"] += 1
+                if exit_calls["n"] == 1:
+                    return False
+                # Second call runs inside the Dekker barrier while stop() has st.stopping=True
+                self.assertIn(pri, mgr_race.stopping_urls(env_stop))
+                st_pri.active_state = "awaiting_drive_auth"
+                self.assertIn(pri, mgr_race.stopping_urls(env_stop))
+                st_pri.active_state = None
+                return True
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(mgr_race, "status", return_value={"state": "online", "logs": []}):
+                res_exit = mgr_race.stop(environ=env_stop, force=False, local_busy=False, local_busy_provider=worker_exits_during_busy, slot="primary")
+            self.assertFalse(res_exit["stopped"])
+            self.assertIsNone(st_pri.active_state, "finished worker must not be wedged back to stale prev_state")
+            self.assertFalse(st_pri.stopping)
+
+            def exploding_busy():
+                if busy_calls["n"] == 2:
+                    busy_calls["n"] += 1
+                    return False
+                raise RuntimeError("boom")
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    mgr_race.stop(environ=env_stop, force=False, local_busy=False, local_busy_provider=exploding_busy, slot="primary")
+            self.assertFalse(st_pri.stopping, "exception from local_busy_provider must still clear st.stopping")
+
+            # 4a-iii. start_async() racing with stop() inside runtime_file_lock must raise RuntimeBusyError without clearing active_state
+            orig_lock_fn = colab_runtime.runtime_file_lock
+            def lock_sets_stopping(storage_dir, *, slot="primary"):
+                ctx = orig_lock_fn(storage_dir, slot=slot)
+                class _Wrap:
+                    def __enter__(self_inner):
+                        res = ctx.__enter__()
+                        st_pri.stopping = True
+                        return res
+                    def __exit__(self_inner, *a):
+                        return ctx.__exit__(*a)
+                return _Wrap()
+
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}), \
+                 mock.patch.object(colab_runtime, "runtime_file_lock", side_effect=lock_sets_stopping):
+                with self.assertRaises(colab_runtime.RuntimeBusyError):
+                    mgr_race.start_async(env_stop, slot="primary")
+            self.assertIsNone(st_pri.active_state)
+            st_pri.stopping = False
             st_pri.worker_thread = None
 
             # 4b. stop(force=True) retries lock acquisition after cancelling slow-unwinding startup worker and runs colab stop
@@ -1519,7 +1578,11 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
                 # preflight must NOT fail with missing COMFYUI_URL when resuming a saved ComfyUI task
                 from workbench import inputs as wb_inputs
+                from workbench.i18n import InputError as WbInputError
                 wb_inputs.preflight(req_resume, {"VIDEO_PROVIDER": "comfyui", "COMFYUI_API_KEY": "k-secret-1234"})
+                # Malformed COMFYUI_URL in resumable_comfyui_state raises InputError, not raw ValueError
+                with self.assertRaises(WbInputError):
+                    wb_inputs.resumable_comfyui_state(req_resume, {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "ftp://bad"})
                 probed_resume = []
                 def fake_probe_resume(e=None, *, timeout=12.0):
                     probed_resume.append(config.video_settings(e)["comfyui_urls"])
