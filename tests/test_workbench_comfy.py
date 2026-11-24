@@ -471,6 +471,7 @@ class WorkbenchComfyTest(unittest.TestCase):
                     "key_fp": server.colab_runtime.comfy.key_fingerprint("shared-comfy-key-1234"),
                 },
             )
+            # 1) persist=False rotates key in memory only (leaves .env and colab-nodes.json untouched)
             np_res = restarted_app.test_client().post(
                 "/api/config",
                 headers={"X-Workbench": "1"},
@@ -482,6 +483,26 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertEqual(
                 config.read_env_file(restart_env)["COMFYUI_URL"],
                 "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+            )
+            # 2) persist=True saving the SAME rotated key (omitting COMFYUI_URL) still strips sec_url from .env & forgets node
+            persist_same_res = restarted_app.test_client().post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={"COMFYUI_API_KEY": "comfy-secret-token-123", "persist": True},
+            )
+            self.assertEqual(persist_same_res.status_code, 200)
+            self.assertEqual(persist_same_res.get_json()["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+            self.assertIsNone(restarted_rt.remembered_node("secondary"))
+            self.assertEqual(config.read_env_file(restart_env)["COMFYUI_URL"], "https://node1.ngrok-free.dev")
+
+            # 3) UI FormData persist=True rotating key WHILE also submitting pre-filled COMFYUI_URL containing sec_url
+            restarted_rt._set_remembered_node(
+                "secondary",
+                {
+                    "session": "comfy-a100-2",
+                    "url": "https://live-sec-55.trycloudflare.com",
+                    "key_fp": server.colab_runtime.comfy.key_fingerprint("comfy-secret-token-123"),
+                },
             )
             rot_res = restarted_app.test_client().post(
                 "/api/config",
