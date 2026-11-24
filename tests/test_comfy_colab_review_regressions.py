@@ -1329,6 +1329,240 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             self.assertEqual(mgr_cancel.remembered_urls(api_key="k-secret-1234"), [])
             self.assertIsNone(mgr_cancel.remembered_node("secondary", api_key="k-secret-1234"))
 
+    def test_pass4_review_regressions_sync_startup_stopping_queue_resume_and_one_relocate(self):
+        import importlib.util
+        import types
+        spec = importlib.util.spec_from_file_location("h3ref_cli_entry", config.ROOT / "h3ref.py")
+        cli_entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_entry)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_bin.chmod(0o755)
+            pri = "https://pri.ngrok-free.dev"
+            sec_a = "https://sec-a.trycloudflare.com"
+            sec_b = "https://sec-b.trycloudflare.com"
+
+            # 1 & 2. sync_ephemeral_url key_fp gating, disk cleanup without early return, malformed .env guard, and create_app startup strip
+            env_path = root / ".env"
+            env_path.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri}\nCOMFYUI_API_KEY=k-old-1234\n",
+                encoding="utf-8",
+            )
+            storage = root / ".wb-sync"
+            app = server.create_app(storage=storage, env_path=env_path)
+            rt = app.extensions["colab_runtime"]
+            self.addCleanup(rt.stop_keepalive_monitor)
+            client = app.test_client()
+
+            # 1a) persist=False rotates memory to k-new-9999; secondary starting under k-new-9999 updates memory ONLY (not .env)
+            r_mem = client.post("/api/config", headers={"X-Workbench": "1"}, json={"COMFYUI_API_KEY": "k-new-9999", "persist": False})
+            self.assertEqual(r_mem.status_code, 200)
+            rt._set_remembered_node(
+                "secondary",
+                {"session": "comfy-a100-2", "url": sec_b, "key_fp": comfy.key_fingerprint("k-new-9999")},
+            )
+            self.assertEqual(client.get("/api/bootstrap").get_json()["config"]["COMFYUI_URLS"], [pri, sec_b])
+            self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], pri)
+
+            # 1b) In-flight stale startup finishing with k-old-1234 while memory + .env are on k-new-9999 must add to NEITHER
+            r_pers = client.post("/api/config", headers={"X-Workbench": "1"}, json={"COMFYUI_API_KEY": "k-new-9999", "persist": True})
+            self.assertEqual(r_pers.status_code, 200)
+            rt._set_remembered_node(
+                "secondary",
+                {"session": "comfy-a100-2", "url": sec_a, "key_fp": comfy.key_fingerprint("k-old-1234")},
+            )
+            self.assertEqual(client.get("/api/bootstrap").get_json()["config"]["COMFYUI_URLS"], [pri])
+            self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], pri)
+
+            # 1c) Removal (old_url -> None) must still strip old_url from .env even if memory already omitted it
+            env_path.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri},{sec_a}\nCOMFYUI_API_KEY=k-new-9999\n",
+                encoding="utf-8",
+            )
+            rt._set_remembered_node("secondary", None)
+            self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], pri)
+
+            # 2) create_app() startup must strip key-mismatched (or legacy no-key_fp) secondary URL already written to .env
+            env_path.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri},{sec_a}\nCOMFYUI_API_KEY=k-new-9999\n",
+                encoding="utf-8",
+            )
+            rt._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_a, "key_fp": comfy.key_fingerprint("k-old-1234")})
+            app_restart = server.create_app(storage=storage, env_path=env_path)
+            self.addCleanup(app_restart.extensions["colab_runtime"].stop_keepalive_monitor)
+            self.assertEqual(app_restart.test_client().get("/api/bootstrap").get_json()["config"]["COMFYUI_URLS"], [pri])
+            # Also verify forget_remembered_node(expected_url=...) won't erase a newer secondary record
+            app_restart.extensions["colab_runtime"].forget_remembered_node("secondary", expected_url=sec_b)
+            self.assertEqual(app_restart.extensions["colab_runtime"].remembered_node("secondary")["url"], sec_a)
+
+            # 3. stopping precedence over online probe in start_async() and status()
+            mgr_stop = colab_runtime.ColabRuntimeManager(root / "st-stopping")
+            env_stop = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": pri,
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_GPU": "G4",
+            }
+            online_probe = {
+                "online": True, "configured": True, "devices": [{"name": "L4"}],
+                "nodes": [{"url": pri, "online": True, "devices": [{"name": "L4"}]}],
+                "online_count": 1, "total_count": 1,
+            }
+            mgr_stop._slot("primary").active_state = "stopping"
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value=online_probe), \
+                 mock.patch.object(mgr_stop, "_query_sessions", return_value={"named": [{"name": "comfy-a100", "endpoint": "m-1", "hardware": "G4"}], "orphans": [], "ok": True}):
+                with self.assertRaises(colab_runtime.RuntimeBusyError):
+                    mgr_stop.start_async(env_stop, slot="primary")
+                st_stopping = mgr_stop.status(env_stop)
+            self.assertEqual(st_stopping["state"], "stopping")
+            pri_entry = next(m for m in st_stopping["managed_nodes"] if m["slot"] == "primary")
+            self.assertEqual(pri_entry["state"], "stopping")
+            self.assertFalse(pri_entry["online"])
+            mgr_stop._slot("primary").active_state = None
+
+            # 4a. stop(force=False) checks local_busy_provider AFTER reserving stopping and BEFORE killing active_worker
+            mgr_race = colab_runtime.ColabRuntimeManager(root / "st-race")
+            st_pri = mgr_race._slot("primary")
+            worker_stub = mock.MagicMock()
+            worker_stub.is_alive.return_value = True
+            st_pri.active_state = "starting_comfy"
+            st_pri.worker_thread = worker_stub
+            busy_calls = {"n": 0}
+
+            def racing_local_busy():
+                busy_calls["n"] += 1
+                # First call (pre-lock check) returns False; second call (after stopping barrier) returns True!
+                return busy_calls["n"] >= 2
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(mgr_race, "status", return_value={"state": "starting_comfy", "logs": []}):
+                res_race = mgr_race.stop(environ=env_stop, force=False, local_busy=False, local_busy_provider=racing_local_busy, slot="primary")
+            self.assertFalse(res_race["stopped"])
+            self.assertTrue(res_race["confirmation_required"])
+            self.assertFalse(st_pri.cancel_event.is_set(), "force=False must not cancel startup before local_busy check")
+            self.assertEqual(st_pri.active_state, "starting_comfy", "active_state must roll back on confirmation_required")
+            st_pri.active_state = None
+            st_pri.worker_thread = None
+
+            # 4b. stop(force=True) retries lock acquisition after cancelling slow-unwinding startup worker and runs colab stop
+            mgr_force = colab_runtime.ColabRuntimeManager(root / "st-force")
+            lock_held = threading.Event()
+            release_worker = threading.Event()
+
+            def slow_worker():
+                with colab_runtime.runtime_file_lock(mgr_force.storage, slot="primary"):
+                    lock_held.set()
+                    mgr_force._slot("primary").cancel_event.wait(timeout=2.0)
+                    time.sleep(0.15)  # simulate probe unwinding slightly after cancel
+                    release_worker.set()
+
+            wt = threading.Thread(target=slow_worker, daemon=True)
+            wt.start()
+            self.assertTrue(lock_held.wait(timeout=2.0))
+            mgr_force._slot("primary").active_state = "starting_comfy"
+            mgr_force._slot("primary").worker_thread = wt
+            with mock.patch.object(mgr_force, "_run_cmd_for_slot", return_value=(0, "stopped")) as stop_cmd, \
+                 mock.patch.object(mgr_force, "status", return_value={"state": "offline", "logs": []}):
+                res_force = mgr_force.stop(environ=env_stop, force=True, slot="primary")
+            self.assertTrue(res_force["stopped"])
+            self.assertTrue(any(c.args[2] == ["stop", "-s", "comfy-a100"] for c in stop_cmd.call_args_list))
+
+            # 5. probe_remote_queue_count(strict=True) fails closed on HTTP 200 {}, and primary stop checks ALL non-secondary URLs
+            with mock.patch.object(colab_runtime, "_probe_json", return_value=(200, {})):
+                self.assertIsNone(colab_runtime.probe_remote_queue_count(env_stop, strict=True))
+                self.assertEqual(colab_runtime.probe_remote_queue_count(env_stop, strict=False), 0)
+
+            self_hosted = "https://self.example.com"
+            env_two_pri = {**env_stop, "COMFYUI_URL": f"{self_hosted},{pri}"}
+            def queue_by_url(url, key, timeout=12.0):
+                if url.startswith(self_hosted):
+                    return 200, {"queue_running": [], "queue_pending": []}
+                return 200, {"queue_running": [[0, "busy-job"]], "queue_pending": []}
+            with mock.patch.object(colab_runtime, "_probe_json", side_effect=queue_by_url), \
+                 mock.patch.object(mgr_force, "status", return_value={"state": "online", "logs": []}):
+                res_two = mgr_force.stop(environ=env_two_pri, force=False, local_busy=False, slot="primary")
+            self.assertFalse(res_two["stopped"])
+            self.assertTrue(res_two["confirmation_required"])
+            self.assertEqual(res_two["remote_queue"], 1)
+
+            # 6. Workbench preflight & ensure_video_runtime allow resuming submitted ComfyUI task on saved URL when global pool is empty/offline
+            pic = root / "actor.png"
+            Image.new("RGB", (16, 16), "green").save(pic)
+            resume_out = root / "one-resume-saved"
+            resume_out.mkdir()
+            (resume_out / "state.json").write_text(
+                json.dumps({
+                    "h3": "six section h3",
+                    "task": "pid-saved-1",
+                    "provider": "comfyui",
+                    "comfyui_url": sec_a,
+                    "comfyui_key_fp": comfy.key_fingerprint("k-secret-1234"),
+                }),
+                encoding="utf-8",
+            )
+            env_empty_pool = root / ".env.empty-pool"
+            env_empty_pool.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_API_KEY=k-secret-1234\nAPIMART_API_KEY=a-123456\nLLM_API_KEY=l-123456\n",
+                encoding="utf-8",
+            )
+            app_res = server.create_app(storage=root / ".wb-resume", env_path=env_empty_pool)
+            self.addCleanup(app_res.extensions["colab_runtime"].stop_keepalive_monitor)
+            req_resume = {
+                "kind": "one", "demo": False, "operation": "pipeline",
+                "prompt": "Picture 1 walks.", "seconds": 5, "aspect": "9:16",
+                "images": [str(pic)], "output_dir": str(resume_out), "lang": "en",
+            }
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                # preflight must NOT fail with missing COMFYUI_URL when resuming a saved ComfyUI task
+                from workbench import inputs as wb_inputs
+                wb_inputs.preflight(req_resume, {"VIDEO_PROVIDER": "comfyui", "COMFYUI_API_KEY": "k-secret-1234"})
+                probed_resume = []
+                def fake_probe_resume(e=None, *, timeout=12.0):
+                    probed_resume.append(config.video_settings(e)["comfyui_urls"])
+                    return {"online": sec_a in config.video_settings(e)["comfyui_urls"], "configured": True, "devices": [], "nodes": [], "online_count": 1, "total_count": 1}
+                with mock.patch.object(colab_runtime, "probe_comfyui", side_effect=fake_probe_resume):
+                    app_res.extensions["jobs"].before_video_launch(
+                        req_resume,
+                        {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://offline-pool.example.com", "COMFYUI_API_KEY": "k-secret-1234"},
+                    )
+                self.assertIn(sec_a, probed_resume[-1])
+
+            # 7. cmd_one() relocates trycloudflare.com task to alternate configured trycloudflare URL via has_task()
+            one_dir = root / "one-relocate"
+            one_dir.mkdir()
+            prompt_file = root / "p.txt"
+            prompt_file.write_text("Picture 1 walks.", encoding="utf-8")
+            (one_dir / "state.json").write_text(
+                json.dumps({
+                    "h3": "six section h3",
+                    "task": "pid-one-cf",
+                    "provider": "comfyui",
+                    "comfyui_url": sec_a,
+                    "comfyui_key_fp": comfy.key_fingerprint("k-secret-1234"),
+                }),
+                encoding="utf-8",
+            )
+            polled_urls = []
+            def fake_poll_one(pid, **kw):
+                polled_urls.append(kw.get("base_url"))
+                return {"state": "done", "url": f"{kw.get('base_url')}/view?filename=out.mp4", "cny": 0.0, "run_seconds": 5.0}
+            args_one = types.SimpleNamespace(
+                out=str(one_dir), prompt=str(prompt_file), image=[str(pic)],
+                seconds=5, aspect="9:16", seed=None, check=False, no_rewrite=False,
+            )
+            with mock.patch.dict(os.environ, {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": f"{pri},{sec_b}", "COMFYUI_API_KEY": "k-secret-1234"}, clear=False), \
+                 mock.patch.object(comfy, "has_task", side_effect=lambda tid, base_url=None: base_url == sec_b), \
+                 mock.patch.object(comfy, "poll", side_effect=fake_poll_one), \
+                 mock.patch.object(comfy, "download", side_effect=lambda u, dst: Path(dst).write_bytes(b"mp4")), \
+                 mock.patch.object(cli_entry.media, "duration", return_value=5.0):
+                cli_entry.cmd_one(args_one)
+            self.assertEqual(polled_urls, [sec_b])
+            self.assertEqual(json.loads((one_dir / "state.json").read_text(encoding="utf-8"))["comfyui_url"], sec_b)
+
 
 if __name__ == "__main__":
     unittest.main()
