@@ -104,6 +104,22 @@ def cmd_one(a):
     else:
         if provider_name == "comfyui":
             endpoint_url = str(st.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+            if endpoint_url and film._is_trycloudflare_url(endpoint_url):
+                cur_urls = config.video_settings()["comfyui_urls"]
+                if endpoint_url not in cur_urls:
+                    for cand in cur_urls:
+                        if cand == endpoint_url or not film._is_trycloudflare_url(cand):
+                            continue
+                        try:
+                            comfy.assert_resume_endpoint_key_allowed(cand, expected_key_fp=st.get("comfyui_key_fp"))
+                        except RuntimeError:
+                            continue
+                        if comfy.has_task(st["task"], base_url=cand):
+                            print(f"重定位任务：{comfy.endpoint_label(endpoint_url)} -> {comfy.endpoint_label(cand)}", flush=True)
+                            endpoint_url = cand
+                            st["comfyui_url"] = cand
+                            save()
+                            break
             comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=st.get("comfyui_key_fp"))
     provider_name = str(st.get("provider") or "runninghub").strip().lower()
     backend = comfy if provider_name == "comfyui" else rh

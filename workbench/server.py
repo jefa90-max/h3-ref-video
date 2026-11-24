@@ -14,7 +14,7 @@ from werkzeug.exceptions import HTTPException
 from h3ref import colab_runtime, config, film
 from h3ref.i18n import use_lang
 from .i18n import InputError, message
-from .inputs import array, invalid, needed_video_providers, text, verify_image
+from .inputs import array, invalid, needed_video_providers, resumable_comfyui_state, text, verify_image
 from .jobs import ARTIFACT_TYPES, Jobs
 from .settings import save_env
 from .references import bind_references, describe_references
@@ -60,6 +60,11 @@ def create_app(storage=None, env_path=None):
         parsed_comfy_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
     except ValueError:
         parsed_comfy_urls = []
+    saved_sec = runtime.remembered_node("secondary")
+    if saved_sec and saved_sec.get("url") and not colab_runtime.ColabRuntimeManager._node_key_matches(
+        saved_sec, env.get("COMFYUI_API_KEY", "")
+    ):
+        parsed_comfy_urls = colab_runtime.merge_ephemeral_url(parsed_comfy_urls, saved_sec["url"], None)
     for remembered_url in runtime.remembered_urls(api_key=env.get("COMFYUI_API_KEY", "")):
         if remembered_url not in parsed_comfy_urls:
             parsed_comfy_urls.append(remembered_url)
@@ -75,18 +80,45 @@ def create_app(storage=None, env_path=None):
     jobs.remember_secrets(env)
 
     def sync_ephemeral_url(slot, old_url, new_url):
+        saved_node = runtime.remembered_node(slot) if new_url else None
+        norm_new = str(new_url or "").strip().rstrip("/")
+        saved_matches_new = bool(
+            norm_new
+            and saved_node
+            and str(saved_node.get("url") or "").strip().rstrip("/") == norm_new
+        )
         with jobs.lock:
-            cur_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
-            merged = colab_runtime.merge_ephemeral_url(cur_urls, old_url, new_url)
+            mem_add = new_url if (
+                saved_matches_new
+                and colab_runtime.ColabRuntimeManager._node_key_matches(saved_node, env.get("COMFYUI_API_KEY", ""))
+            ) else None
+            try:
+                cur_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
+            except ValueError:
+                cur_urls = []
+            merged = colab_runtime.merge_ephemeral_url(cur_urls, old_url, mem_add)
             formatted = config.format_endpoint_urls(merged)
-            if formatted == env.get("COMFYUI_URL", ""):
-                return
-            env["COMFYUI_URL"] = formatted
+            if formatted != env.get("COMFYUI_URL", ""):
+                env["COMFYUI_URL"] = formatted
             if env_path.is_file():
                 disk_file = config.read_env_file(env_path)
-                disk_urls = config.parse_endpoint_urls(disk_file.get("COMFYUI_URL", ""), "COMFYUI_URL")
-                disk_merged = colab_runtime.merge_ephemeral_url(disk_urls, old_url, new_url)
-                save_env(env_path, {"COMFYUI_URL": config.format_endpoint_urls(disk_merged)})
+                disk_key = (
+                    disk_file["COMFYUI_API_KEY"]
+                    if "COMFYUI_API_KEY" in disk_file
+                    else config.load_server_env(env_path).get("COMFYUI_API_KEY", "")
+                )
+                disk_add = new_url if (
+                    saved_matches_new
+                    and colab_runtime.ColabRuntimeManager._node_key_matches(saved_node, disk_key)
+                ) else None
+                try:
+                    disk_urls = config.parse_endpoint_urls(disk_file.get("COMFYUI_URL", ""), "COMFYUI_URL")
+                except ValueError:
+                    disk_urls = []
+                disk_merged = colab_runtime.merge_ephemeral_url(disk_urls, old_url, disk_add)
+                disk_formatted = config.format_endpoint_urls(disk_merged)
+                if disk_formatted != disk_file.get("COMFYUI_URL", ""):
+                    save_env(env_path, {"COMFYUI_URL": disk_formatted})
 
     runtime.set_url_change_callback(sync_ephemeral_url)
 
@@ -112,12 +144,18 @@ def create_app(storage=None, env_path=None):
         env_with_lang = {**job_env, "H3_LANG": lang}
         with use_lang(lang):
             vcfg = config.video_settings(env_with_lang)
+            saved_resume_urls, needs_pool_url = resumable_comfyui_state(job_request, env_with_lang)
+            check_urls = set(vcfg["comfyui_urls"]) | (set(saved_resume_urls) if not needs_pool_url else set())
             def _check_not_stopping():
                 stopping = runtime.stopping_urls(env_with_lang)
-                if stopping and (stopping & set(vcfg["comfyui_urls"])):
+                if stopping and (stopping & check_urls):
                     raise InputError("comfy_runtime_action", detail=colab_runtime.message("colab_busy"))
             _check_not_stopping()
-            probe = colab_runtime.probe_comfyui(env_with_lang)
+            probe_env = env_with_lang
+            if not needs_pool_url and saved_resume_urls:
+                probe_urls = list(dict.fromkeys([*saved_resume_urls, *vcfg["comfyui_urls"]]))
+                probe_env = {**env_with_lang, "COMFYUI_URL": config.format_endpoint_urls(probe_urls)}
+            probe = colab_runtime.probe_comfyui(probe_env)
             if probe["online"]:
                 _check_not_stopping()
                 runtime.mark_local_activity()
@@ -433,7 +471,7 @@ def create_app(storage=None, env_path=None):
                 else None
             )
         if sec_url and persist and (disk_sec_key_mismatch or (updated_disk_comfy_urls is not None and sec_url not in updated_disk_comfy_urls)):
-            runtime.forget_remembered_node("secondary")
+            runtime.forget_remembered_node("secondary", expected_url=sec_url)
         return jsonify(settings())
 
     def _parse_runtime_slot(values):

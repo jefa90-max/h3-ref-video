@@ -763,7 +763,7 @@ def preflight(request, env):
         raise InputError('segment_terminal', number=request['segment'])
     if staged.get('submission_unknown') and not staged.get('task'):
         raise InputError('segment_locked', number=request['segment'])
-    from .inputs import invalid, video_provider_missing_keys
+    from .inputs import invalid, resumable_comfyui_state, video_provider_missing_keys
     if staged.get('task'):
         seg_provider = staged.get('provider') or 'runninghub'
     else:
@@ -771,7 +771,12 @@ def preflight(request, env):
             seg_provider = config.video_settings(env)['provider']
         except ValueError:
             invalid('COMFYUI_URL', '[URL]', 'choice')
-    missing_video = video_provider_missing_keys(seg_provider, env)
+    check_env = env
+    if seg_provider == 'comfyui' and staged.get('task'):
+        saved_urls, needs_pool = resumable_comfyui_state(request, env)
+        if saved_urls and not needs_pool and not env.get('COMFYUI_URL', '').strip():
+            check_env = {**env, 'COMFYUI_URL': config.format_endpoint_urls(saved_urls)}
+    missing_video = video_provider_missing_keys(seg_provider, check_env)
     if missing_video:
         raise InputError('keys', names=', '.join(missing_video))
     if staged.get('task'):

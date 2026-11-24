@@ -556,8 +556,10 @@ def probe_remote_queue_count(environ=None, *, timeout: float = 12.0, strict: boo
         key = comfy.key_for_endpoint(url, shared_key)
         status_code, payload = _probe_json(f"{url}/queue", key, timeout=timeout)
         if status_code == 200 and isinstance(payload, dict):
-            running = payload.get("queue_running") or []
-            pending = payload.get("queue_pending") or []
+            running = payload.get("queue_running")
+            pending = payload.get("queue_pending")
+            if strict and (not isinstance(running, list) or not isinstance(pending, list)):
+                return None
             return (len(running) if isinstance(running, list) else 0) + (len(pending) if isinstance(pending, list) else 0)
         return None if strict else 0
 
@@ -828,12 +830,18 @@ class ColabRuntimeManager:
                 urls.add(pri_url)
         return urls
 
-    def forget_remembered_node(self, slot: str = "secondary") -> None:
+    def forget_remembered_node(self, slot: str = "secondary", *, expected_url: str | None = None) -> None:
         """Drop a saved node entry without triggering URL sync (used when /api/config removes it)."""
         slot_name = normalize_slot(slot)
+        expected = expected_url.strip().rstrip("/") if expected_url is not None else None
         with self._lock:
             data = self._load_saved_nodes()
-            if slot_name in data:
+            prev = data.get(slot_name)
+            if prev is not None:
+                if expected is not None:
+                    prev_url = str(prev.get("url") or "").strip().rstrip("/") if isinstance(prev, dict) else ""
+                    if prev_url != expected:
+                        return
                 data.pop(slot_name, None)
                 self._save_nodes_state(data)
 
@@ -1048,21 +1056,22 @@ class ColabRuntimeManager:
             return self._run_command(colab_bin, auth_mode, sub_args, environ=environ, stdin_text=stdin_text, timeout=timeout)
         return self._run_command(colab_bin, auth_mode, sub_args, environ=environ, stdin_text=stdin_text, timeout=timeout, slot=slot)
 
-    def _probe_slot(self, env_copy: dict, settings: dict, slot: str, target_url: str | None = None) -> dict:
+    def _probe_slot(self, env_copy: dict, settings: dict, slot: str, target_url: str | None = None, *, timeout: float | None = None) -> dict:
         slot_name = normalize_slot(slot)
+        probe_kw = {"timeout": timeout} if timeout is not None else {}
         if slot_name == "primary":
             if target_url:
-                return probe_comfyui({**env_copy, "COMFYUI_URL": target_url})
+                return probe_comfyui({**env_copy, "COMFYUI_URL": target_url}, **probe_kw)
             primary_url = self._primary_url(settings)
             if not primary_url:
                 return {"online": False, "configured": False, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}
             if len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url:
-                return probe_comfyui(env_copy)
-            return probe_comfyui({**env_copy, "COMFYUI_URL": primary_url})
+                return probe_comfyui(env_copy, **probe_kw)
+            return probe_comfyui({**env_copy, "COMFYUI_URL": primary_url}, **probe_kw)
         url = target_url or (self.remembered_node("secondary", api_key=settings["comfyui_api_key"]) or {}).get("url") or ""
         if not url:
             return {"online": False, "configured": False, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}
-        return probe_comfyui({**env_copy, "COMFYUI_URL": url})
+        return probe_comfyui({**env_copy, "COMFYUI_URL": url}, **probe_kw)
 
     def status(self, environ=None) -> dict:
         env_copy = dict(os.environ if environ is None else environ)
@@ -1145,11 +1154,11 @@ class ColabRuntimeManager:
                 sec_url = ""
                 s_node = None
 
-        if p_online:
+        if p_online and p_active != "stopping":
             with self._lock:
                 self._slots["primary"].last_error = None
             p_error = None
-        if s_online:
+        if s_online and s_active != "stopping":
             with self._lock:
                 self._slots["secondary"].last_error = None
             s_error = None
@@ -1167,7 +1176,11 @@ class ColabRuntimeManager:
             logs_tail: list[str],
             has_session: bool,
         ) -> dict:
-            if online:
+            if active == "stopping":
+                st = "stopping"
+                online = False
+                err = None
+            elif online:
                 st = "online"
                 err = None
             elif active in transitional_states:
@@ -1221,8 +1234,19 @@ class ColabRuntimeManager:
         )
         managed_nodes = [managed_primary, managed_secondary]
 
+        stopping_slot_urls = set()
+        if p_active == "stopping" and primary_url:
+            stopping_slot_urls.add(primary_url)
+        if s_active == "stopping" and sec_url:
+            stopping_slot_urls.add(sec_url)
+        if stopping_slot_urls:
+            for n in probed_nodes:
+                if n.get("url") in stopping_slot_urls:
+                    n["online"] = False
         online_nodes_list = [n for n in probed_nodes if n.get("online")]
-        any_online = bool(online_nodes_list) or bool(probe.get("online"))
+        any_online = bool(online_nodes_list) or (
+            bool(probe.get("online")) and not probed_nodes and p_active != "stopping" and s_active != "stopping"
+        )
         online_count = len(online_nodes_list) if probed_nodes else (probe.get("online_count", 1 if probe.get("online") else 0))
         total_count = len(probed_nodes) if probed_nodes else (probe.get("total_count", len(urls)))
         node_meta = {
@@ -1662,7 +1686,7 @@ class ColabRuntimeManager:
                         return
                     if attempt > 0:
                         cand_url = discovered_url or (self._primary_url(settings) if slot_name == "primary" else "")
-                        if cand_url and self._probe_slot(env_copy, settings, slot_name, target_url=cand_url if slot_name == "secondary" else None)["online"]:
+                        if cand_url and self._probe_slot(env_copy, settings, slot_name, target_url=cand_url if slot_name == "secondary" else None, timeout=4.0)["online"]:
                             rc = 0
                             exec_out = ""
                             break
@@ -1702,7 +1726,7 @@ class ColabRuntimeManager:
                 for _ in range(probe_limit):
                     if st.cancel_event.is_set():
                         return
-                    if self._probe_slot(env_copy, settings, slot_name, target_url=target_probe_url)["online"]:
+                    if self._probe_slot(env_copy, settings, slot_name, target_url=target_probe_url, timeout=4.0)["online"]:
                         if st.cancel_event.is_set():
                             return
                         now_ts = float(self._clock())
@@ -1736,12 +1760,13 @@ class ColabRuntimeManager:
             with self._lock:
                 if not st.cancel_event.is_set():
                     st.last_error = str(exc)
-                st.active_state = None
+                if st.active_state != "stopping":
+                    st.active_state = None
                 st.auth_url = None
                 self._sessions_cache = None
         finally:
             with self._lock:
-                if st.cancel_event.is_set():
+                if st.cancel_event.is_set() and st.active_state != "stopping":
                     st.active_state = None
                     st.auth_url = None
             lock_ctx.__exit__(None, None, None)
@@ -1752,9 +1777,22 @@ class ColabRuntimeManager:
             raise RuntimeUnavailableError(message("colab_worker_forbidden"))
         env_copy = dict(os.environ if environ is None else environ)
         settings = config.video_settings(env_copy)
+        st = self._slot(slot_name)
+        already_active = False
+        with self._lock:
+            if st.active_state == "stopping":
+                raise RuntimeBusyError(message("colab_busy"))
+            if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
+                already_active = True
+        if already_active:
+            return self.status(env_copy)
+
         if slot_name == "primary":
             probe = self._probe_slot(env_copy, settings, "primary")
             if probe["online"]:
+                with self._lock:
+                    if st.active_state == "stopping":
+                        raise RuntimeBusyError(message("colab_busy"))
                 return self.status(env_copy)
             if not self._primary_url(settings):
                 raise ValueError(message("colab_url_missing"))
@@ -1764,10 +1802,11 @@ class ColabRuntimeManager:
             saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
             if saved_sec and saved_sec.get("url"):
                 if self._probe_slot(env_copy, settings, "secondary", target_url=saved_sec["url"])["online"]:
+                    with self._lock:
+                        if st.active_state == "stopping":
+                            raise RuntimeBusyError(message("colab_busy"))
                     return self.status(env_copy)
 
-        st = self._slot(slot_name)
-        already_active = False
         with self._lock:
             if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
@@ -2051,11 +2090,14 @@ class ColabRuntimeManager:
                 sec_url = str((saved_sec or {}).get("url") or "").strip()
                 remote_queue = probe_remote_queue_count({**env_copy, "COMFYUI_URL": sec_url}, strict=True) if sec_url else None
             else:
-                primary_url = self._primary_url(settings)
-                if not primary_url:
+                saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
+                sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
+                primary_urls = [u for u in settings["comfyui_urls"] if not sec_url or u != sec_url]
+                if not primary_urls:
                     remote_queue = None
                 else:
-                    probe_env = env_copy if (len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url) else {**env_copy, "COMFYUI_URL": primary_url}
+                    formatted_pri = config.format_endpoint_urls(primary_urls)
+                    probe_env = env_copy if (len(primary_urls) == len(settings["comfyui_urls"]) and settings["comfyui_url"] == formatted_pri) else {**env_copy, "COMFYUI_URL": formatted_pri}
                     remote_queue = probe_remote_queue_count(probe_env, strict=True)
 
             if remote_queue is None:
@@ -2086,42 +2128,75 @@ class ColabRuntimeManager:
         with self._lock:
             if st.active_state == "stopping":
                 raise RuntimeBusyError(message("colab_busy"))
-            active_worker = st.worker_thread if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy") else None
-            keepalive_running = st.keepalive_in_flight
-            proc_to_cancel = st.active_proc if (active_worker is not None or keepalive_running) else None
-            if active_worker is not None or keepalive_running:
-                st.cancel_event.set()
-                st.drive_ack_event.set()
-        if proc_to_cancel is not None:
-            _kill_process_tree(proc_to_cancel)
-        if active_worker is not None and active_worker.is_alive():
-            active_worker.join(timeout=5.0)
-        if keepalive_running:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                with self._lock:
-                    if not st.keepalive_in_flight:
-                        break
-                time.sleep(0.02)
+            prev_state = st.active_state
+            st.active_state = "stopping"
+        # Dekker barrier: st.active_state is already "stopping" before re-checking local_busy_provider(),
+        # preventing a concurrent job launch from racing past _check_not_stopping() and avoiding killing
+        # an active startup worker before confirming local idleness on force=False.
+        if not force and callable(local_busy_provider) and local_busy_provider():
+            with self._lock:
+                st.active_state = prev_state
+                st.cancel_event.clear()
+            return {
+                "stopped": False,
+                "slot": slot_name,
+                "confirmation_required": True,
+                "local_busy": True,
+                "remote_queue": remote_queue,
+                "queue_unknown": queue_unknown,
+                "status": self.status(env_copy),
+            }
 
-        with runtime_file_lock(self.storage, slot=slot_name):
-            if not force and callable(local_busy_provider) and local_busy_provider():
+        stop_succeeded = False
+        try:
+            with self._lock:
+                active_worker = st.worker_thread if prev_state in ("provisioning", "awaiting_drive_auth", "starting_comfy") else None
+                keepalive_running = st.keepalive_in_flight
+                proc_to_cancel = st.active_proc if (active_worker is not None or keepalive_running) else None
+                if active_worker is not None or keepalive_running:
+                    st.cancel_event.set()
+                    st.drive_ack_event.set()
+            if proc_to_cancel is not None:
+                _kill_process_tree(proc_to_cancel)
+            if active_worker is not None and active_worker.is_alive():
+                active_worker.join(timeout=6.0)
+            if keepalive_running:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    with self._lock:
+                        if not st.keepalive_in_flight:
+                            break
+                    time.sleep(0.02)
+
+            lock_ctx = runtime_file_lock(self.storage, slot=slot_name)
+            entered = False
+            lock_deadline = time.monotonic() + (3.0 if (active_worker is not None or keepalive_running) else 0.0)
+            while True:
+                try:
+                    lock_ctx.__enter__()
+                    entered = True
+                    break
+                except RuntimeBusyError:
+                    if time.monotonic() >= lock_deadline:
+                        raise
+                    time.sleep(0.05)
+            try:
+                if not force and callable(local_busy_provider) and local_busy_provider():
+                    with self._lock:
+                        st.cancel_event.clear()
+                        st.active_state = None
+                    return {
+                        "stopped": False,
+                        "slot": slot_name,
+                        "confirmation_required": True,
+                        "local_busy": True,
+                        "remote_queue": remote_queue,
+                        "queue_unknown": queue_unknown,
+                        "status": self.status(env_copy),
+                    }
                 with self._lock:
                     st.cancel_event.clear()
-                return {
-                    "stopped": False,
-                    "slot": slot_name,
-                    "confirmation_required": True,
-                    "local_busy": True,
-                    "remote_queue": remote_queue,
-                    "queue_unknown": queue_unknown,
-                    "status": self.status(env_copy),
-                }
-            with self._lock:
-                st.cancel_event.clear()
-                st.active_state = "stopping"
-                st.last_error = None
-            try:
+                    st.last_error = None
                 rc, out = self._run_cmd_for_slot(
                     colab_bin,
                     settings["colab_auth"],
@@ -2132,17 +2207,22 @@ class ColabRuntimeManager:
                 )
                 if rc != 0:
                     raise RuntimeError(out.strip()[-240:] or f"colab stop exit {rc}")
+                stop_succeeded = True
             finally:
-                with self._lock:
-                    st.cancel_event.clear()
-                    st.active_state = None
-                    self._sessions_cache = None
-                    if (
-                        slot_name == "primary"
-                        and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
-                        and not self._slots["secondary"].active_state
-                    ):
-                        self._last_activity_at = None
+                if entered:
+                    lock_ctx.__exit__(None, None, None)
+        finally:
+            with self._lock:
+                st.cancel_event.clear()
+                st.active_state = None
+                self._sessions_cache = None
+                if (
+                    stop_succeeded
+                    and slot_name == "primary"
+                    and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
+                    and not self._slots["secondary"].active_state
+                ):
+                    self._last_activity_at = None
 
         if slot_name == "secondary":
             old_url, _ = self._set_remembered_node("secondary", None)

@@ -281,6 +281,129 @@ def needed_video_providers(job, env):
     return list(dict.fromkeys(providers))
 
 
+def resumable_comfyui_state(job, env):
+    """Return (saved_urls, needs_pool_url) for ComfyUI tasks already bound to a saved endpoint."""
+    if job.get("demo"):
+        return [], False
+    from h3ref import comfy
+    vcfg = config.video_settings(env)
+    default_provider = vcfg["provider"]
+    shared_key = vcfg["comfyui_api_key"]
+    operation = job.get("operation", "pipeline")
+    out = Path(job["output_dir"]) if job.get("output_dir") else None
+
+    def _valid_saved_url(rec):
+        raw = str((rec or {}).get("comfyui_url") or "").strip()
+        if not raw:
+            return None
+        try:
+            cleaned = config.validate_endpoint_url(raw, "COMFYUI_URL")
+        except ValueError:
+            return None
+        if not cleaned:
+            return None
+        try:
+            comfy.assert_resume_endpoint_key_allowed(
+                cleaned,
+                expected_key_fp=(rec or {}).get("comfyui_key_fp"),
+                environ=env,
+            )
+        except RuntimeError:
+            return None
+        return cleaned
+
+    if operation == "segment":
+        from .storyboard import read_json
+        segment_num = job.get("segment")
+        if not isinstance(segment_num, int) or segment_num < 1:
+            return [], default_provider == "comfyui"
+        pending = job.get("_segment_preparation") if "_segment_preparation" in job else (
+            read_json(out / "inputs" / "segment-edit.json", {}) if out else {}
+        )
+        if pending and (pending.get("applied") or pending.get("generated")):
+            return [], False
+        staged = (
+            read_json(out / "inputs" / f"segment-{pending.get('revision', '')}" / "state.json", {})
+            .get("segs", {})
+            .get(str(segment_num - 1), {})
+            if out and pending
+            else {}
+        )
+        if staged.get("task") and not staged.get("terminal_failed"):
+            if (staged.get("provider") or "runninghub") != "comfyui":
+                return [], False
+            url = _valid_saved_url(staged)
+            return ([url], False) if url else ([], True)
+        return [], default_provider == "comfyui"
+
+    if operation != "pipeline":
+        return [], False
+    state_file = out / "state.json" if out else None
+    state = json.loads(state_file.read_text(encoding="utf-8")) if state_file and state_file.exists() else {}
+    if job["kind"] == "one":
+        if state.get("task") and not state.get("terminal_failed"):
+            if (state.get("provider") or "runninghub") != "comfyui":
+                return [], False
+            url = _valid_saved_url(state)
+            return ([url], False) if url else ([], True)
+        if state.get("submission_unknown") and not state.get("task"):
+            return [], (state.get("provider") or default_provider) == "comfyui"
+        return [], default_provider == "comfyui"
+
+    from h3ref.i18n import use_lang
+    saved_urls = []
+    needs_pool = False
+    with use_lang(job.get("lang")):
+        segments = film.plan(job["film"]["shots"])
+        base_records = dict(job["_reconciled_segs"]) if "_reconciled_segs" in job else dict(state.get("segs", {}))
+        records = dict(base_records)
+        invalidated = set()
+        if not job.get("reset_applied"):
+            invalidated_map = film.invalidated_segment_records(records, job["frames"], job.get("redo"))
+            invalidated = {int(idx) for idx in invalidated_map}
+            records = {**records, **invalidated_map}
+        has_blocker = any(
+            not (out and s["idx"] not in invalidated and (out / "clips" / f"seg{s['idx'] + 1}.mp4").exists()
+                 and (records.get(str(s["idx"])) or {}).get("cny") is not None)
+            and (
+                (records.get(str(s["idx"])) or {}).get("terminal_failed")
+                or ((records.get(str(s["idx"])) or {}).get("submission_unknown") and not (records.get(str(s["idx"])) or {}).get("task"))
+                or (records.get(str(s["idx"])) or {}).get("attempt_blocked")
+            )
+            for s in segments
+        )
+        blocked_needs_comfy = False
+        inflight_any = False
+        for segment in segments:
+            rec = records.get(str(segment["idx"]), {})
+            clip_done = bool(
+                out and segment["idx"] not in invalidated
+                and (out / "clips" / f"seg{segment['idx'] + 1}.mp4").exists()
+                and rec.get("cny") is not None
+            )
+            if clip_done:
+                continue
+            if rec.get("task") and not rec.get("terminal_failed"):
+                inflight_any = True
+                if (rec.get("provider") or "runninghub") == "comfyui":
+                    url = _valid_saved_url(rec)
+                    if url:
+                        saved_urls.append(url)
+                    else:
+                        needs_pool = True
+            elif rec.get("terminal_failed") or (rec.get("submission_unknown") and not rec.get("task")):
+                fallback_prov = rec.get("provider") or ("runninghub" if rec.get("task") else default_provider)
+                if fallback_prov == "comfyui":
+                    blocked_needs_comfy = True
+            elif not has_blocker and default_provider == "comfyui":
+                needs_pool = True
+        if blocked_needs_comfy and not (has_blocker and inflight_any):
+            needs_pool = True
+    if job.get("redo") and not job.get("reset_applied") and not has_blocker and default_provider == "comfyui":
+        needs_pool = True
+    return list(dict.fromkeys(saved_urls)), needs_pool
+
+
 def preflight(job, env):
     if job.get("operation") in ("segment", "assemble", "rewrite_segment", "rewrite_prompts"):
         from .segments import preflight as segment_preflight
@@ -357,7 +480,12 @@ def preflight(job, env):
         # film.stage_check catches missing vision configuration and records it,
         # so the UI must not turn that optional check into a blocking key requirement.
     for provider in video_providers:
-        required.extend(video_provider_missing_keys(provider, env))
+        check_env = env
+        if provider == "comfyui":
+            saved_urls, needs_pool = resumable_comfyui_state(job, env)
+            if saved_urls and not needs_pool and not env.get("COMFYUI_URL", "").strip():
+                check_env = {**env, "COMFYUI_URL": config.format_endpoint_urls(saved_urls)}
+        required.extend(video_provider_missing_keys(provider, check_env))
     if needs_rewrite or needs_composition:
         names = config.llm_settings(env)["key_names"]
         if not any(env.get(name, "").strip() for name in names):
