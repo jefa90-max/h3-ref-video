@@ -1922,5 +1922,93 @@ test("common.js handles drive-ack rejection, stop cancel, transitional polling, 
   assert.equal($("runtime-confirm").hidden, true, "#runtime-cancel-stop must hide confirmation box");
 });
 
+test("common.js submitRuntimeStop hides stale confirm banner and preserves slot on failed secondary stop", async () => {
+  const { $ } = makeDom();
+  const stopRequests = [];
+  let stopCall = 0;
+  const currentStatus = {
+    state: "online",
+    cli_available: true,
+    comfyui_url: "https://pri.ngrok-free.dev",
+    comfyui_urls: ["https://pri.ngrok-free.dev", "https://sec.trycloudflare.com"],
+    online_count: 2,
+    total_count: 2,
+    managed_nodes: [
+      { slot: "primary", state: "online", online: true, url: "https://pri.ngrok-free.dev", session: "comfy-a100" },
+      { slot: "secondary", state: "online", online: true, url: "https://sec.trycloudflare.com", session: "comfy-a100-2" },
+    ],
+    devices: [{ name: "L4" }],
+    logs: [],
+  };
+  const comfyConfig = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://pri.ngrok-free.dev,https://sec.trycloudflare.com",
+    COMFYUI_URLS: ["https://pri.ngrok-free.dev", "https://sec.trycloudflare.com"],
+    COMFYUI_PRESET: "4step",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => currentStatus };
+      }
+      if (url === "/api/runtime/stop") {
+        stopCall += 1;
+        const body = JSON.parse(opts.body);
+        stopRequests.push(body);
+        if (stopCall === 1) {
+          return {
+            ok: true,
+            json: async () => ({
+              stopped: false,
+              confirmation_required: true,
+              local_busy: true,
+              remote_queue: 1,
+              status: currentStatus,
+            }),
+          };
+        }
+        return { ok: false, status: 500, json: async () => ({ error: "secondary stop failed" }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  // First: primary stop asks for confirmation -> sets runtimeStopSlot = "primary" and reveals #runtime-confirm
+  await context.submitRuntimeStop(false, "primary");
+  assert.equal($("runtime-confirm").hidden, false);
+  assert.equal(vm.runInContext("state.runtimeStopSlot", context), "primary");
+
+  // Second: secondary stop fails with 500 -> stale confirm banner must hide AND runtimeStopSlot must NOT be clobbered to "secondary"
+  await context.submitRuntimeStop(false, "secondary");
+  assert.equal($("runtime-confirm").hidden, true, "Failed stop on another slot must hide previous confirmation banner");
+  assert.equal(vm.runInContext("state.runtimeStopSlot", context), "primary", "Failed stop must not overwrite runtimeStopSlot");
+  assert.equal($("global-error").hidden, false);
+  assert.deepEqual(stopRequests.map((r) => r.slot), [undefined, "secondary"]);
+});
+
+
 
 
