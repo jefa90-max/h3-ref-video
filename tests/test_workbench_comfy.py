@@ -484,6 +484,18 @@ class WorkbenchComfyTest(unittest.TestCase):
                 config.read_env_file(restart_env)["COMFYUI_URL"],
                 "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
             )
+            # 1b) Unrelated persisted save (e.g. COLAB_GPU) after persist=False must NOT wipe .env secondary URL or colab-nodes.json
+            unrel_res = restarted_app.test_client().post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={"COLAB_GPU": "A100", "persist": True},
+            )
+            self.assertEqual(unrel_res.status_code, 200)
+            self.assertIsNotNone(restarted_rt.remembered_node("secondary"))
+            self.assertEqual(
+                config.read_env_file(restart_env)["COMFYUI_URL"],
+                "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+            )
             # 2) persist=True saving the SAME rotated key (omitting COMFYUI_URL) still strips sec_url from .env & forgets node
             persist_same_res = restarted_app.test_client().post(
                 "/api/config",
