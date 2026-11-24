@@ -578,6 +578,46 @@ class WorkbenchComfyTest(unittest.TestCase):
                     "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
                 )
 
+            # 5) ROOT/.env with stale process-env COMFYUI_API_KEY overridden by persisted UI key: unrelated persist=True preserves secondary
+            root_env_dir = root / "prod-root"
+            root_env_dir.mkdir()
+            prod_env = root_env_dir / ".env"
+            prod_env.write_text(
+                "VIDEO_PROVIDER=comfyui\n"
+                "COMFYUI_URL=https://node1.ngrok-free.dev\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(config, "ROOT", root_env_dir), \
+                 mock.patch.dict(os.environ, {"COMFYUI_API_KEY": "comfy-secret-token-123"}, clear=False):
+                prod_app = server.create_app(storage=root / ".workbench-prod-root", env_path=prod_env)
+                prod_rt = prod_app.extensions["colab_runtime"]
+                self.addCleanup(prod_rt.stop_keepalive_monitor)
+                rot_prod = prod_app.test_client().post(
+                    "/api/config",
+                    headers={"X-Workbench": "1"},
+                    json={"COMFYUI_API_KEY": "shared-pool-key-1234", "persist": True},
+                )
+                self.assertEqual(rot_prod.status_code, 200)
+                prod_rt._set_remembered_node(
+                    "secondary",
+                    {
+                        "session": "comfy-a100-2",
+                        "url": "https://live-sec-55.trycloudflare.com",
+                        "key_fp": server.colab_runtime.comfy.key_fingerprint("shared-pool-key-1234"),
+                    },
+                )
+                prod_unrel = prod_app.test_client().post(
+                    "/api/config",
+                    headers={"X-Workbench": "1"},
+                    json={"COLAB_GPU": "A100", "persist": True},
+                )
+                self.assertEqual(prod_unrel.status_code, 200)
+                self.assertIsNotNone(prod_rt.remembered_node("secondary"))
+                self.assertEqual(
+                    config.read_env_file(prod_env)["COMFYUI_URL"],
+                    "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+                )
+
     def test_secondary_colab_node_endpoints_sync_env_and_auto_concurrency(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
