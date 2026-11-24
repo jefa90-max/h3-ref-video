@@ -112,11 +112,14 @@ def create_app(storage=None, env_path=None):
         env_with_lang = {**job_env, "H3_LANG": lang}
         with use_lang(lang):
             vcfg = config.video_settings(env_with_lang)
-            stopping = runtime.stopping_urls(env_with_lang)
-            if stopping and (stopping & set(vcfg["comfyui_urls"])):
-                raise InputError("comfy_runtime_action", detail=colab_runtime.message("colab_busy"))
+            def _check_not_stopping():
+                stopping = runtime.stopping_urls(env_with_lang)
+                if stopping and (stopping & set(vcfg["comfyui_urls"])):
+                    raise InputError("comfy_runtime_action", detail=colab_runtime.message("colab_busy"))
+            _check_not_stopping()
             probe = colab_runtime.probe_comfyui(env_with_lang)
             if probe["online"]:
+                _check_not_stopping()
                 runtime.mark_local_activity()
                 ensure_keepalive_monitor()
                 runtime.trigger_keepalive_async(env_with_lang, force_busy=True)
@@ -399,8 +402,11 @@ def create_app(storage=None, env_path=None):
         if updated_comfy_urls is not None or comfy_key_changed:
             saved_sec = runtime.remembered_node("secondary")
             sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
-            if sec_url and (comfy_key_changed or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls)):
-                runtime.forget_remembered_node("secondary")
+            if sec_url:
+                if comfy_key_changed and updated_comfy_urls is None:
+                    runtime._set_remembered_node("secondary", None)
+                elif comfy_key_changed or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls):
+                    runtime.forget_remembered_node("secondary")
         return jsonify(settings())
 
     def _parse_runtime_slot(values):

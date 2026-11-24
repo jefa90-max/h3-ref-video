@@ -774,7 +774,7 @@ class ColabRuntimeManager:
 
     @staticmethod
     def _node_key_matches(item: dict, api_key: str | None) -> bool:
-        if api_key is None or "key_fp" not in item:
+        if api_key is None:
             return True
         saved_fp = str(item.get("key_fp") or "").strip()
         cur_fp = comfy.key_fingerprint(api_key)
@@ -1938,7 +1938,7 @@ class ColabRuntimeManager:
                             self._sessions_cache = None
                             if (
                                 slot_name == "primary"
-                                and not self.remembered_node("secondary")
+                                and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
                                 and not self._slots["secondary"].active_state
                             ):
                                 self._last_activity_at = None
@@ -1964,7 +1964,8 @@ class ColabRuntimeManager:
         env_copy = dict(os.environ if environ is None else environ)
         current = float(self._clock())
         due_slots: list[str] = []
-        slots_to_check = ["primary"] + (["secondary"] if self.remembered_node("secondary") else [])
+        cur_api_key = str(env_copy.get("COMFYUI_API_KEY") or "").strip()
+        slots_to_check = ["primary"] + (["secondary"] if self.remembered_node("secondary", api_key=cur_api_key) else [])
         with self._lock:
             for slot_name in slots_to_check:
                 st = self._slots[slot_name]
@@ -2004,7 +2005,8 @@ class ColabRuntimeManager:
                         current_env = provider()
                         local_busy = bool(busy_provider()) if callable(busy_provider) else False
                         self.maybe_send_kernel_keepalive(current_env, local_busy=local_busy, slot="primary")
-                        if self.remembered_node("secondary"):
+                        cur_api_key = str((current_env or {}).get("COMFYUI_API_KEY") or "").strip()
+                        if self.remembered_node("secondary", api_key=cur_api_key):
                             self.maybe_send_kernel_keepalive(current_env, local_busy=local_busy, slot="secondary")
                     except Exception as exc:
                         self._append_log(f"[keepalive] Monitor error: {type(exc).__name__}: {exc}")
@@ -2136,7 +2138,7 @@ class ColabRuntimeManager:
                     self._sessions_cache = None
                     if (
                         slot_name == "primary"
-                        and not self.remembered_node("secondary")
+                        and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
                         and not self._slots["secondary"].active_state
                     ):
                         self._last_activity_at = None
