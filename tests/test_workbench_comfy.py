@@ -410,6 +410,41 @@ class WorkbenchComfyTest(unittest.TestCase):
             finally:
                 jobs._probing_launch = False
 
+            # p3/red-team#1: ensure_video_runtime refuses video launch while managed slot is stopping
+            runtime._slots["primary"].active_state = "stopping"
+            try:
+                with mock.patch.object(server.colab_runtime, "probe_comfyui", return_value={"online": True}) as probe_mock:
+                    with self.assertRaises(InputError) as stop_ctx:
+                        jobs.before_video_launch(
+                            {"kind": "one", "operation": "pipeline", "demo": False, "output_dir": str(root / "out-stop"), "lang": "en"},
+                            {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://node1.ngrok-free.dev", "COMFYUI_API_KEY": "comfy-secret-token-123"},
+                        )
+                self.assertEqual(stop_ctx.exception.key, "comfy_runtime_action")
+                probe_mock.assert_not_called()
+            finally:
+                runtime._slots["primary"].active_state = None
+
+            # p3/red-team#3: rotating COMFYUI_API_KEY on restart does not resurrect stale remembered secondary URL
+            restart_storage = root / ".workbench-restart"
+            restart_env = root / ".env-restart"
+            restart_env.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://node1.ngrok-free.dev\nCOMFYUI_API_KEY=shared-comfy-key-1234\n",
+                encoding="utf-8",
+            )
+            seed_rt = server.colab_runtime.ColabRuntimeManager(restart_storage)
+            seed_rt._set_remembered_node(
+                "secondary",
+                {
+                    "session": "comfy-a100-2",
+                    "url": "https://stale-99.trycloudflare.com",
+                    "key_fp": server.colab_runtime.comfy.key_fingerprint("comfy-secret-token-123"),
+                },
+            )
+            restarted_app = server.create_app(storage=restart_storage, env_path=restart_env)
+            self.addCleanup(restarted_app.extensions["colab_runtime"].stop_keepalive_monitor)
+            restarted_cfg = restarted_app.test_client().get("/api/bootstrap").get_json()["config"]
+            self.assertEqual(restarted_cfg["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+
     def test_secondary_colab_node_endpoints_sync_env_and_auto_concurrency(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

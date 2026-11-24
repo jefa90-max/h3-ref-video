@@ -1282,6 +1282,49 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             self.assertFalse(film._is_trycloudflare_url("http://x.trycloudflare.com"))
             self.assertTrue(film._is_trycloudflare_url(new_cf))
 
+            # 10. Pass 3 regressions:
+            # 10a. p3/targeted#1: empty slot URL fails closed on unforced stop when Colab session is active
+            self.assertIsNone(colab_runtime.probe_remote_queue_count({"VIDEO_PROVIDER": "comfyui"}, strict=True))
+            self.assertEqual(colab_runtime.probe_remote_queue_count({"VIDEO_PROVIDER": "comfyui"}, strict=False), 0)
+            with mock.patch.object(mgr_stop, "_run_command", return_value=(0, "[comfy-a100-2] m-2 | Hardware: G4\n")) as run_sec_active, \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}):
+                res_sec_missing = mgr_stop.stop(environ=env_stop, force=False, local_busy=False, slot="secondary")
+            self.assertFalse(res_sec_missing["stopped"])
+            self.assertTrue(res_sec_missing["confirmation_required"])
+            self.assertTrue(res_sec_missing["queue_unknown"])
+            self.assertTrue(all("stop" not in c.args[2] for c in run_sec_active.call_args_list))
+
+            with mock.patch.object(mgr_stop, "_run_command", side_effect=[(0, ""), (0, "stopped\n")]), \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}):
+                res_sec_gone = mgr_stop.stop(environ=env_stop, force=False, local_busy=False, slot="secondary")
+            self.assertTrue(res_sec_gone["stopped"])
+
+            # 10b. p3/red-team#2: cancelled startup does not persist secondary URL and _query_sessions binds cancel_event
+            mgr_cancel = colab_runtime.ColabRuntimeManager(root / "st-cancel")
+            with mock.patch.object(mgr_cancel, "_run_command", return_value=(0, "")) as qs_cmd:
+                mgr_cancel._query_sessions(str(fake_bin), "browser", env_stop, force=True, cancel_slot="secondary")
+            self.assertFalse(qs_cmd.call_args.kwargs.get("record_slot"))
+            self.assertIs(qs_cmd.call_args.kwargs.get("cancel_event"), mgr_cancel._slot("secondary").cancel_event)
+
+            st_sec = mgr_cancel._slot("secondary")
+            st_sec.cancel_event.set()
+            mgr_cancel._set_remembered_node(
+                "secondary",
+                {"session": "comfy-a100-2", "url": new_cf, "key_fp": comfy.key_fingerprint("k-secret-1234")},
+                abort_if_cancelled=True,
+            )
+            self.assertIsNone(mgr_cancel.remembered_node("secondary"))
+
+            # 10c. p3/red-team#3: remembered secondary URL is scoped by COMFYUI_API_KEY fingerprint
+            st_sec.cancel_event.clear()
+            mgr_cancel._set_remembered_node(
+                "secondary",
+                {"session": "comfy-a100-2", "url": new_cf, "key_fp": comfy.key_fingerprint("k-old-1234")},
+            )
+            self.assertEqual(mgr_cancel.remembered_urls(api_key="k-old-1234"), [new_cf])
+            self.assertEqual(mgr_cancel.remembered_urls(api_key="k-secret-1234"), [])
+            self.assertIsNone(mgr_cancel.remembered_node("secondary", api_key="k-secret-1234"))
+
 
 if __name__ == "__main__":
     unittest.main()
