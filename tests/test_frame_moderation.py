@@ -44,6 +44,15 @@ class FrameModeration(unittest.TestCase):
         self.assertNotIn("参考图片3", prompt)
         self.assertEqual(json.dumps([script, shot, who], ensure_ascii=False), original)
 
+        violent_prompt = frames.prompt(
+            {"aspect": "9:16"},
+            {"action": "反派暴力殴打对手，又试图掐脖和刺伤对方"},
+            [],
+            False,
+        )
+        for word in ("暴力", "殴打", "掐脖", "刺伤"):
+            self.assertNotIn(word, violent_prompt)
+
     def test_submission_and_polling_rejections_preserve_classification(self):
         for response in ({"error": {"code": "content_policy_violation", "message": "Rejected"}},
                          {"code": 400, "message": "内容审核不通过"}):

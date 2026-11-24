@@ -2,11 +2,13 @@ import copy
 import importlib.util
 import json
 import os
+import ssl
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
@@ -138,6 +140,89 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
         # Historical v2 cached composition in s1-2 still renders via v2 branch
         self.assertIn(v2_fixture["world_frame"], compiled_v3)
 
+    def test_v3_video_prompt_deduplicates_looks_scenes_camera_and_anchors_first_frames(self):
+        script = copy.deepcopy(self.script)
+        script["shots"] = [
+            {"start": 0, "end": 3, "camera": "中景，缓慢右移", "action": "女王轻推婚书望向唐僧"},
+            {"start": 3, "end": 6, "camera": "近景，缓慢推进", "action": "唐僧低眉合十婉拒"},
+            {"start": 6, "end": 9, "camera": "", "action": "女王步入凉亭远望宫门"},
+            {"start": 9, "end": 12, "camera": "特写，手持微晃", "action": "女王轻叹一声收回视线"},
+        ]
+        segs = film.plan(script["shots"])
+        pics = film.refs(script, segs[0], "shot")
+        # board (1) + 3 cast (2,3,4) + 4 frames (5,6,7,8) = 8 pictures
+        queen_look = "头戴九凤朝阳金冠，身穿大红绣金凤袍，容貌端庄华贵"
+        monk_look = "头戴五佛宝冠，身披大红织金锦襕袈裟，内着白僧衣，面容白净"
+        comps = {
+            "s1-1": {
+                "version": 3,
+                "camera": "平视中景，镜头缓慢向右横移，对称构图",
+                "scene": "西梁女国金銮宝殿内部，红柱金砖，雕花长案摆在正中",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面左侧站着，右手轻按婚书"},
+                    {"name": "唐僧", "locked_look": monk_look, "placement_and_pose": "画面中央坐着，双手合十"},
+                ],
+            },
+            "s1-2": {
+                "version": 3,
+                "camera": "平视近景，缓慢向前推近",
+                "scene": "西梁女国金銮宝殿内部，红柱金砖与雕花长案前",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面左侧虚化站立"},
+                    {"name": "唐僧", "locked_look": monk_look, "placement_and_pose": "画面中央端坐低眉"},
+                ],
+            },
+            "s1-3": {
+                "version": 3,
+                "camera": "全景平视，缓摇跟随",
+                "scene": "御花园八角凉亭，石栏外垂柳拂风，远处可见朱红宫门",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面右侧凭栏而立"},
+                ],
+            },
+            "s1-4": {
+                "version": 3,
+                "camera": "人物特写，浅景深",
+                "scene": "御花园八角凉亭石栏旁，背景虚化的垂柳与宫门",
+                "characters": [
+                    {"name": "女王", "locked_look": queen_look, "placement_and_pose": "画面中央微侧脸"},
+                ],
+            },
+        }
+        prompt_text = film.compile_prompt(script, segs[0], pics, 1, compositions=comps)
+        header, storyboard_body = prompt_text.split("分镜：\n", 1)
+
+        # Locked look appears ONCE in the cast header, NEVER repeated across shots
+        # self.script has no board and only 女王 + 唐僧 appear -> pics are 女王(1), 唐僧(2), frames(3,4,5,6)
+        self.assertEqual(prompt_text.count(queen_look), 1)
+        self.assertEqual(prompt_text.count(monk_look), 1)
+        self.assertIn(f"参考图片1只约束女王身份：{queen_look}。", header)
+        self.assertIn(f"参考图片2只约束唐僧身份：{monk_look}。", header)
+        self.assertNotIn(queen_look, storyboard_body)
+
+        # Static first-frame placement prose is omitted when the shot already has a first-frame image
+        self.assertNotIn("画面左侧站着，右手轻按婚书", storyboard_body)
+        self.assertNotIn("画面右侧凭栏而立", storyboard_body)
+
+        # Scene is established once at segment level, omitted on same-scene s1-2 and s1-4,
+        # and re-stated only when s1-3 genuinely switches location to the garden pavilion
+        self.assertIn("场景基调：西梁女国金銮宝殿内部，红柱金砖，雕花长案摆在正中。", header)
+        self.assertEqual(storyboard_body.count("金銮宝殿"), 0)
+        self.assertEqual(storyboard_body.count("场景切换为：御花园八角凉亭"), 1)
+        self.assertEqual(storyboard_body.count("御花园八角凉亭"), 1)
+
+        # Camera is not double-concatenated; empty shot.camera falls back to composition.camera
+        self.assertIn("0–3秒：【中景，缓慢右移】从参考图片3开始。动作过程：女王轻推婚书望向唐僧。", storyboard_body)
+        self.assertNotIn("对称构图", storyboard_body)
+        self.assertIn("3–6秒：【近景，缓慢推进】切至参考图片4。动作过程：唐僧低眉合十婉拒。", storyboard_body)
+        self.assertIn("6–9秒：【全景平视，缓摇跟随】切至参考图片5。场景切换为：御花园八角凉亭", storyboard_body)
+        self.assertIn("9–12秒：【特写，手持微晃】切至参考图片6。动作过程：女王轻叹一声收回视线。", storyboard_body)
+
+        # Rewrite rules direct H3 to define appearance once and focus detailed_description on motion/camera
+        self.assertIn("00:04.000", rewrite.RULES)
+        self.assertIn("motion progression", rewrite.RULES)
+        self.assertIn("without re-reciting", rewrite.RULES)
+
     def test_programmatic_locked_look_persists_and_overrides_drift_across_shots_and_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -223,6 +308,11 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
             parsed = frames.describe_composition(self.script, self.script["shots"][0])
         self.assertEqual(parsed["version"], 3)
         self.assertEqual(req.call_count, 4)
+        # System prompt enforces safe non-violent, non-gory visual rewrites so image generation is not blocked
+        system_prompt = req.call_args_list[0].args[2]["messages"][0]["content"]
+        self.assertIn("暴力", system_prompt)
+        self.assertIn("血腥", system_prompt)
+        self.assertIn("内容安全", system_prompt)
         # Retry messages include feedback from prior validation error
         final_messages = req.call_args_list[3].args[2]["messages"]
         self.assertGreater(len(final_messages), 2)
@@ -563,6 +653,150 @@ class CompositionV3AndRetriesTest(unittest.TestCase):
             result = rewrite.rewrite("中文提示词", 1, 8, "9:16")
         self.assertEqual(retry_req.call_count, 2)
         self.assertTrue(rewrite.is_rewritten(result))
+
+    def test_http_request_skips_trailing_sleep_and_raises_transport_error_on_urlerror(self):
+        eof = urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+        with patch("h3ref.http._OPENER.open", side_effect=eof), \
+             patch("h3ref.http.time.sleep") as sleep_mock:
+            with self.assertRaises(http.TransportError) as caught:
+                http.request("https://api.example/v1/chat/completions", "sk-secret", {"a": 1}, tries=1)
+        self.assertIn("URLError", str(caught.exception))
+        sleep_mock.assert_not_called()
+
+        with patch("h3ref.http._OPENER.open", side_effect=eof), \
+             patch("h3ref.http.time.sleep") as sleep_mock:
+            with self.assertRaises(http.TransportError):
+                http.request("https://api.example/v1/chat/completions", "sk-secret", {"a": 1}, tries=2)
+        self.assertEqual(sleep_mock.call_count, 1)
+        sleep_mock.assert_called_once_with(4)
+
+        # Post-send response read timeouts (non-URLError) stay plain RuntimeError so paid-request guards remain conservative
+        with patch("h3ref.http._OPENER.open", side_effect=TimeoutError("timed out")), \
+             patch("h3ref.http.time.sleep") as sleep_mock:
+            with self.assertRaises(RuntimeError) as caught_timeout:
+                http.request("https://api.example/v1/chat/completions", "sk-secret", {"a": 1}, tries=1)
+        self.assertNotIsInstance(caught_timeout.exception, http.TransportError)
+        sleep_mock.assert_not_called()
+
+    def test_stage_frames_aborts_on_transport_error_without_poisoning_state_and_preserves_in_flight_draws(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            script = copy.deepcopy(self.script)
+            script["shots"].append({"start": 8, "end": 12, "camera": "特写", "action": "唐僧低眉合十"})
+            for idx, c in enumerate(script["cast"]):
+                p = out / f"c{idx}.png"
+                p.write_bytes(b"img")
+                c["picture"] = str(p)
+            segs = film.plan(script["shots"])
+            pics = {s["idx"]: film.refs(script, s, "shot") for s in segs}
+            job = film.Job(out / "net-abort")
+
+            ok_resp = MagicMock()
+            ok_resp.__enter__.return_value.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": json.dumps(_sample_v3(), ensure_ascii=False)}}]}
+            ).encode("utf-8")
+            eof = urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+
+            with patch("h3ref.http._OPENER.open", side_effect=[ok_resp, eof]) as open_mock, \
+                 patch("h3ref.http.time.sleep") as sleep_mock, \
+                 patch.object(frames.config, "llm_key", return_value="sk-test"), \
+                 patch.object(frames, "draw", side_effect=lambda t, r, a, o, **k: (o.write_bytes(b"png") or 0.1)) as draw_mock:
+                with self.assertRaises(http.TransportError) as caught:
+                    film.stage_frames(job, script, segs, pics)
+
+            # Shot 1 succeeded and finished drawing; shot 2 aborted before shot 3 was ever attempted
+            self.assertEqual(open_mock.call_count, 2)
+            self.assertEqual(draw_mock.call_count, 1)
+            sleep_mock.assert_not_called()
+            self.assertTrue((job.dir / "frames" / "s1-1.png").is_file())
+            self.assertNotIn("s1-2", job.state["frames"])
+            self.assertNotIn("s1-3", job.state["frames"])
+            err_text = str(caught.exception)
+            self.assertIn("STAGING_PLAN_NETWORK_FAILED", err_text)
+            self.assertNotIn("可能已收费", err_text)
+            self.assertNotIn("may have been charged", err_text)
+            self.assertIn("staging abort s1-2", (job.dir / "run.log").read_text(encoding="utf-8"))
+
+            # Non-transport read timeouts still record per-shot STAGING_PLAN_FAILED and keep going
+            job_timeout = film.Job(out / "read-timeout")
+            with patch("h3ref.http._OPENER.open", side_effect=[TimeoutError("read timed out"), ok_resp, ok_resp]), \
+                 patch("h3ref.http.time.sleep") as sleep_timeout, \
+                 patch.object(frames.config, "llm_key", return_value="sk-test"), \
+                 patch.object(frames, "draw", side_effect=lambda t, r, a, o, **k: (o.write_bytes(b"png") or 0.1)):
+                failures = film.stage_frames(job_timeout, script, segs, pics)
+            sleep_timeout.assert_not_called()
+            self.assertEqual(failures, ["s1-1"])
+            self.assertIn("STAGING_PLAN_FAILED", job_timeout.state["frames"]["s1-1"]["error"])
+            self.assertTrue((job_timeout.dir / "frames" / "s1-2.png").is_file())
+            self.assertTrue((job_timeout.dir / "frames" / "s1-3.png").is_file())
+
+    def test_curl_upload_and_download_surface_stderr_propagate_system_proxy_and_skip_trailing_sleep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img = Path(tmp) / "ref0.jpg"
+            img.write_bytes(b"jpg")
+
+            # 1) Non-zero curl exit with "\n000" stdout must surface stderr (scrubbed) instead of "000", and sleep only 3 times
+            secret = "sk-upload-secret-12345"
+            captured_envs = []
+
+            def fake_fail_upload(cmd, **kwargs):
+                captured_envs.append(kwargs.get("env"))
+                return MagicMock(
+                    returncode=35,
+                    stdout="\n000",
+                    stderr=f"curl: (35) Recv failure: Connection was reset ({secret})\n",
+                )
+
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=fake_fail_upload), \
+                 patch("h3ref.http.time.sleep") as sleep_mock:
+                with self.assertRaises(RuntimeError) as caught:
+                    http.upload("https://api.apimart.ai/v1/uploads/images", secret, img)
+
+            msg = str(caught.exception)
+            self.assertIn("curl: (35) Recv failure", msg)
+            self.assertNotIn(secret, msg)
+            self.assertIn("[key]", msg)
+            self.assertNotEqual(msg.strip().splitlines()[-1], "000")
+            self.assertEqual(sleep_mock.call_count, 3)
+            self.assertEqual(captured_envs[0]["HTTPS_PROXY"], "http://127.0.0.1:7890")
+            self.assertEqual(captured_envs[0]["HTTP_PROXY"], "http://127.0.0.1:7890")
+
+            # 2) Explicit env proxy or proxy_bypass / localhost leaves subprocess env untouched
+            seen_bypass = []
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "HTTPS_PROXY": "http://127.0.0.1:9999"}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"https": "http://127.0.0.1:7890"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=lambda cmd, **kw: (seen_bypass.append(kw.get("env")), MagicMock(returncode=0, stdout='{"url":"https://ok"}\n200', stderr=""))[1]):
+                http.upload("https://api.apimart.ai/v1/uploads/images", secret, img)
+            self.assertEqual(seen_bypass, [None])
+
+            seen_local = []
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"http": "http://127.0.0.1:7890"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=lambda cmd, **kw: (seen_local.append(kw.get("env")), MagicMock(returncode=0, stdout='{"url":"http://ok"}\n200', stderr=""))[1]):
+                http.upload("http://127.0.0.1:8080/upload", secret, img)
+            self.assertEqual(seen_local, [None])
+
+            # 3) download propagates socks:// as socks5h:// and includes stderr in error message
+            dl_envs = []
+
+            def fake_fail_download(cmd, **kwargs):
+                dl_envs.append(kwargs.get("env"))
+                return MagicMock(returncode=7, stdout="", stderr="curl: (7) Failed to connect to cdn.example port 443")
+
+            with patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), \
+                 patch("urllib.request.getproxies", return_value={"socks": "socks://127.0.0.1:7891"}), \
+                 patch("urllib.request.proxy_bypass", return_value=False), \
+                 patch("subprocess.run", side_effect=fake_fail_download):
+                with self.assertRaises(RuntimeError) as caught_dl:
+                    http.download("https://cdn.example/frame.png", Path(tmp) / "frame.png")
+
+            self.assertEqual(dl_envs[0]["HTTPS_PROXY"], "socks5h://127.0.0.1:7891")
+            self.assertIn("curl: (7) Failed to connect", str(caught_dl.exception))
 
 
 if __name__ == "__main__":

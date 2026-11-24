@@ -15,6 +15,7 @@ import json
 import math
 import os
 import random
+import re
 import stat
 import threading
 import time
@@ -129,16 +130,47 @@ def refs(film: dict, seg: dict, mode: str, *, resolve_cache: dict[str, str] | No
     return out
 
 
+def _scene_tokens(scene: str) -> set[str]:
+    head = re.split(r"[，,。；;\n]", scene.strip(), maxsplit=1)[0].strip().lower()
+    words = set(re.findall(r"[a-z0-9]{2,}", head))
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", head))
+    bigrams = {cjk[i:i + 2] for i in range(len(cjk) - 1)}
+    return words | bigrams
+
+
+def _is_same_scene(prev_scene: str, cur_scene: str) -> bool:
+    if not prev_scene or not cur_scene:
+        return False
+    if prev_scene.strip() == cur_scene.strip():
+        return True
+    a, b = _scene_tokens(prev_scene), _scene_tokens(cur_scene)
+    if not a or not b:
+        return False
+    overlap = len(a & b)
+    return overlap >= 2 or overlap / min(len(a), len(b)) >= 0.4
+
+
+def _clean_scene_text(scene: str) -> str:
+    return re.sub(r"^场景(?:为|是|：|:)\s*", "", scene.strip()).rstrip("。；; ")
+
+
 def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compositions: dict[str, dict] | None = None) -> str:
     """The segment's prompt in Chinese, written the way you would for Seedance; rewrite.py turns it into H3's format."""
+    frame_pic_numbers = {p["shot"]: idx for idx, p in enumerate(pics, 1) if p["kind"] == "frame"}
     compositions = {key: value for key, value in (compositions or {}).items()
                     if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
-    covered = {c['name'] for comp in compositions.values() for c in comp['characters']}
+    v2_covered = {c['name'] for comp in compositions.values() if comp.get('version') == 2 for c in comp['characters']}
+    v3_looks: dict[str, str] = {}
     comp_looks: dict[str, str] = {}
     for comp in compositions.values():
+        is_v3 = comp.get('version') == 3
         for ch in comp.get('characters') or []:
             if ch.get('name'):
-                comp_looks.setdefault(ch['name'], (ch.get('locked_look') or ch.get('appearance') or '').strip().rstrip('。；; '))
+                lk = (ch.get('locked_look') or ch.get('appearance') or '').strip().rstrip('。；; ')
+                if lk:
+                    comp_looks.setdefault(ch['name'], lk)
+                    if is_v3:
+                        v3_looks.setdefault(ch['name'], lk)
     aspect = film["aspect"]
     head = (f"根据下面文字分镜生成一段{seg['seconds']}秒{ORIENT[aspect]}视频，{aspect}。"
             + (f"这是一条连续短片的第{seg['idx'] + 1}段。" if count > 1 else "")
@@ -155,7 +187,12 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
             all_list = p.get("all_cast") or active_list
             if len(all_list) <= 1 and len(active_list) == 1 and not absent_list:
                 c = active_list[0]
-                look = "" if c["name"] in covered else (c.get("look") or "").strip().rstrip("。")
+                if c["name"] in v3_looks:
+                    look = v3_looks[c["name"]]
+                elif c["name"] in v2_covered:
+                    look = ""
+                else:
+                    look = (c.get("look") or "").strip().rstrip("。")
                 lines.append(f"参考图片{k}只约束{c['name']}身份" + (f"：{look}。" if look else "。"))
             else:
                 parts = []
@@ -179,22 +216,45 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     n = sum(len(p.get("active_cast") or [p["cast"]]) for p in pics if p["kind"] == "cast")
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
-    out = [head, "".join(lines)]
+    out = [head, "\n".join(lines)]
+    first_v3_scene = next(
+        (_clean_scene_text(compositions[_frame_key(seg["idx"], j)]["scene"])
+         for j in range(len(seg["shots"]))
+         if (compositions.get(_frame_key(seg["idx"], j)) or {}).get("version") == 3
+         and compositions[_frame_key(seg["idx"], j)].get("scene")),
+        "",
+    )
     if not compositions and (film.get("setting") or "").strip():
         out.append("场景与关键道具（全片统一）：" + film["setting"].strip())
+    elif first_v3_scene:
+        out.append(f"场景基调：{first_v3_scene}。")
     speech = film.get("speech") or ""
     shot_lines = []
+    last_v3_scene = first_v3_scene
     for j, s in enumerate(seg["shots"]):
         composition = compositions.get(_frame_key(seg["idx"], j))
         cam = (s.get("camera") or "").strip().strip("【】")
+        frame_num = frame_pic_numbers.get(j)
+        frame_anchor = (f"从参考图片{frame_num}开始。" if j == 0 else f"切至参考图片{frame_num}。") if frame_num else ""
         if composition and composition.get("version") == 3:
             comp_cam = composition["camera"].strip().strip("【】").rstrip("。；; ")
-            cam_label = f"{cam}，{comp_cam}" if cam and cam not in comp_cam else (comp_cam or cam)
+            cam_label = cam or comp_cam
+            cur_scene = _clean_scene_text(composition.get("scene") or "")
+            scene_cut = ""
+            if cur_scene and last_v3_scene and not _is_same_scene(last_v3_scene, cur_scene):
+                scene_cut = f"场景切换为：{cur_scene}。"
+            if cur_scene:
+                last_v3_scene = cur_scene
             act = (s.get("action") or "").strip().rstrip("。；; ")
-            text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：【{cam_label}】{staging.render_scene_and_characters(composition)}动作过程：{act}。"
+            text = (f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒："
+                    + (f"【{cam_label}】" if cam_label else "")
+                    + frame_anchor + scene_cut + f"动作过程：{act}。")
         else:
-            text = f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒：" + (f"【{cam}】" if cam else "") \
-                + (staging.render_motion(composition) if composition else (s.get("action") or "").strip().rstrip("。")) + "。"
+            text = (f"{_num(float(s['start']) - offset)}–{_num(float(s['end']) - offset)}秒："
+                    + (f"【{cam}】" if cam else "")
+                    + (staging.render_motion(composition) if composition
+                       else frame_anchor + (s.get("action") or "").strip().rstrip("。"))
+                    + "。")
         if compositions and not composition and (film.get("setting") or "").strip():
             text += "场景参考：" + film["setting"].strip()
         if speech and (s.get("line") or "").strip():
@@ -365,6 +425,17 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                             for future in futures:
                                 future.result()
                             raise
+                        if isinstance(exc, http.TransportError) and not rec.get('task') and not rec.get('submission_unknown'):
+                            for future in futures:
+                                future.result()
+                            try:
+                                model_name = config.llm_settings()['composition_model']
+                            except ValueError:
+                                model_name = 'invalid-provider'
+                            err = http.TransportError(message('staging_plan_network_failed', frame_key=key,
+                                                              model=model_name, detail=str(exc)))
+                            job.log('staging abort', key, str(err))
+                            raise err from exc
                         try:
                             model_name = config.llm_settings()['composition_model']
                         except ValueError:

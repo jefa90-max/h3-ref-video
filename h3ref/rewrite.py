@@ -33,11 +33,11 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
    - a multi-character group sheet (多角色合图) maps a single <Picture N> to multiple distinct <Subject> entries — match each active character by the exact outfit, hair and facial features specified in the input so identities never swap, and if the input mentions absent sheet-mates (未出场角色), omit those absent characters completely from subject_definitions and every shot;
    - a key-frame image (「…」这个画面的样子) is the composition reference for the matching shot when that shot is in this segment,
      otherwise say it maps to no shot in this part;
-   - a shot's first frame (第N个镜头…的首帧) is the first frame of that [Shot N]: use its opening composition as guidance, not as a hard timed keyframe;
+   - a shot's first frame (第N个镜头…的首帧 / 从参考图片K开始 / 切至参考图片K) is the opening frame of that [Shot N]: explicitly start [Shot N] from `<Picture K>` as its opening composition guidance (not a hard timed keyframe), then move straight into the motion progression;
    - the previous segment's last frame (上一段的最后一个画面) is the first frame of [Shot 1] when [Shot 1] continues the same
      place and moment, otherwise a continuity reference for the set, light and characters' state.
-3. Keep every storyboard beat, in order, with its camera and action. The first shot has no timestamp; each later beat
-   starts `[Shot N] At MM:SS.mmm, the camera cuts to …` at the beat's start second. Add no beats, drop none, stay inside
+3. Keep every storyboard beat, in order, with its exact camera movement (angle, framing, pan/push-in/tracking/handheld shake) and action. The first shot has no timestamp; each later beat
+   starts `[Shot N] At MM:SS.mmm, the camera cuts to …` with two-digit minutes and seconds (e.g. `00:04.000`). Add no beats, drop none, stay inside
    the duration.
 4. Spoken lines: exactly the lines the input gives, in the language it names, as `<Subject N> (S1) … says …, <d>[Language] …</d>`.
    Speaker ids count in order of first speech. With no lines in a segment, write no <d> at all.
@@ -50,11 +50,7 @@ RULES = """Rules learned on this workflow (they override nothing in the guide, t
    specific details: eyes snapping wide, jaw dropping, wincing with a hand on the cheek, doubled over laughing.
 8. Open detailed_description with one or two sentences of style taken from the input's style sentence, including the
    aspect ratio, then [Shot 1].
-9. Preserve each shot's world frame and fixed objects independently of camera reversals and screen cropping. Keep body facing,
-   gaze, pose and visible appearance separate; identity references cannot replace shot-specific posture or held objects.
-   Keep prop opening direction, base direction and knot position on the object distinct from screen position/visibility.
-   Preserve the full transfer contact chain, release and landing order. Expected ends are textual plans, not generated evidence.
-   ReferenceToVideo images are composition references, not guaranteed hard timed keyframes."""
+9. Define each character's full appearance once in subject_definitions; inside detailed_description, refer to them by `<Subject N>` without re-reciting their full outfit/hair or static background furniture in every shot. When a shot opens from a first-frame `<Picture N>`, spend the detail budget on motion progression (cause -> contact -> release/landing), camera movement, concrete facial/body reactions, gaze shifts, and synchronized diegetic sounds. Keep body facing, gaze, pose and visible appearance separate, and keep prop opening direction/orientation distinct from screen cropping. ReferenceToVideo images are composition references, not guaranteed hard timed keyframes."""
 
 NEGATIVE = re.compile(r"\b(no|not|without|never|avoid|don't|do not|free of)\b[^.\n]{0,40}\b(music|soundtrack|score|subtitles?|captions?|"
                       r"on-screen text|text overlays?|watermarks?|logos?|brands?|narration|voice-?over|singing)\b", re.I)

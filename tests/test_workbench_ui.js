@@ -591,22 +591,27 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
     return [node, ...(node.children || []).flatMap(allDescendants)];
   }
   let tree = allDescendants($("film-reference-list"));
-  const checkboxes = tree.filter((n) => n.className.includes("film-cast-select"));
-  assert.equal(checkboxes.length, 3);
-  checkboxes[0].checked = true;
-  checkboxes[0].events.change();
-  checkboxes[2].checked = true;
-  checkboxes[2].events.change();
+  assert.equal(tree.filter((n) => n.classList.contains("film-cast-select")).length, 0, "Solo character cards must not render legacy merge checkboxes");
+  const openBuilder = tree.find((n) => n.classList.contains("cast-group-builder-toggle"));
+  assert.ok(openBuilder);
+  openBuilder.events.click();
 
   tree = allDescendants($("film-reference-list"));
-  const mergeBtn = tree.find((n) => n.className.includes("merge-cast-button"));
+  const chips = tree.filter((n) => n.classList.contains("cast-group-chip"));
+  assert.equal(chips.length, 3);
+  chips[0].events.click();
+  chips[2].events.click();
+
+  tree = allDescendants($("film-reference-list"));
+  const mergeBtn = tree.find((n) => n.classList.contains("merge-cast-button"));
   assert.ok(mergeBtn && !mergeBtn.disabled);
   mergeBtn.events.click();
 
   // Now there is 1 grouped card ("Queen / Monkey") + 1 solo card ("Monk") = 2 upload inputs
   tree = allDescendants($("film-reference-list"));
-  assert.equal(tree.filter((n) => n.className.includes("film-cast-select")).length, 0, "Lone remaining ungrouped character must not render dead-end merge checkbox");
-  assert.equal(tree.find((n) => n.className.includes("merge-cast-button")), undefined, "Merge button must hide when <2 ungrouped characters remain");
+  assert.equal(tree.filter((n) => n.classList.contains("film-cast-select")).length, 0);
+  assert.equal(tree.find((n) => n.classList.contains("cast-group-builder-toggle")), undefined, "Builder toggle must hide when <2 ungrouped characters remain");
+  assert.equal(tree.find((n) => n.classList.contains("merge-cast-button")), undefined, "Merge button must hide when <2 ungrouped characters remain");
   const uploads = tree.filter((n) => n.className.includes("film-reference-upload"));
   assert.equal(uploads.length, 2);
   uploads[0].files = [{ name: "queen-monkey.png" }];
@@ -643,13 +648,13 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
   assert.equal(context.state.filmBindings.has("cast:1"), false);
 
   tree = allDescendants($("film-reference-list"));
-  const soloChecks = tree.filter((n) => n.className.includes("film-cast-select"));
-  soloChecks[0].checked = true;
-  soloChecks[0].events.change();
-  soloChecks[1].checked = true;
-  soloChecks[1].events.change();
+  tree.find((n) => n.classList.contains("cast-group-builder-toggle")).events.click();
   tree = allDescendants($("film-reference-list"));
-  tree.find((n) => n.className.includes("merge-cast-button")).events.click();
+  const soloChips = tree.filter((n) => n.classList.contains("cast-group-chip"));
+  soloChips[0].events.click();
+  soloChips[1].events.click();
+  tree = allDescendants($("film-reference-list"));
+  tree.find((n) => n.classList.contains("merge-cast-button")).events.click();
   assert.equal(context.state.filmBindings.has("cast:0"), false, "Solo image must not carry over to newly merged multi-role group");
   assert.equal(context.state.filmBindings.has("cast:1"), false);
 
@@ -667,12 +672,13 @@ test("create.js supports optimize_storyboard toggle and merging/splitting multi-
   assert.equal(context.state.filmGroups.length, 0);
   assert.equal(context.state.filmBindings.has("cast:0"), false, "Dissolved 2-role group sheet must not stay bound to the surviving solo role");
 
-  // Toggling a cast merge checkbox updates merge button in place without destroying/recreating card DOM
+  // Toggling a builder chip updates merge button in place without destroying/recreating DOM
   tree = allDescendants($("film-reference-list"));
-  const firstCheck = tree.find((n) => n.className.includes("film-cast-select"));
-  firstCheck.checked = true;
-  firstCheck.events.change();
-  assert.equal(allDescendants($("film-reference-list")).includes(firstCheck), true, "Checkbox toggle must not tear down card DOM");
+  tree.find((n) => n.classList.contains("cast-group-builder-toggle")).events.click();
+  tree = allDescendants($("film-reference-list"));
+  const firstChip = tree.find((n) => n.classList.contains("cast-group-chip"));
+  firstChip.events.click();
+  assert.equal(allDescendants($("film-reference-list")).includes(firstChip), true, "Chip toggle must not tear down card DOM");
 
   // 9-image limit hint accounts for frames="first" (+2 frame + prev on seg 2+) and per-segment cast subsets in "shot" mode
   const sevenCast = Array.from({ length: 7 }, (_, i) => ({ name: `Role${i + 1}`, look: "look" }));
@@ -1573,6 +1579,171 @@ test("common.js supports starting, Drive-authorizing, syncing ephemeral URL, and
   await $("runtime-stop").events.click();
   assert.equal($("runtime-confirm").hidden, false);
   assert.ok($("runtime-confirm-text").textContent.includes(zhFresh.runtimeQueueUnknown), "queue_unknown=true must display localized unknown text instead of 0");
+});
+
+test("create.js supports creating multiple combined cast sheets and adding/removing individual group members", async () => {
+  const { $, element } = makeDom();
+  const posted = [];
+  let uploadCounter = 0;
+  $("output-dir").value = "/tmp/out-root";
+  $("frames").value = "shot";
+
+  const context = vm.createContext({
+    state: { language: "en", config: { output_root: "/tmp/out-root", keys: {} }, jobs: [], ready: true },
+    $, element, renderPage: null,
+    FormData: class { append() {} },
+    window: { location: { assign() {} } },
+    document: { addEventListener() {}, querySelector: () => element("div"), querySelectorAll: () => [] },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => String(v[n] ?? "")),
+    running: () => false,
+    busy: () => false,
+    renderConfig() {},
+    showError(e) { throw e; },
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    loadLanguage: async () => {},
+    request: async (url) => {
+      if (url === "/api/uploads") {
+        uploadCounter += 1;
+        return { files: [{ id: `sheet-${uploadCounter}.png`, name: `s${uploadCounter}.png`, path: `/tmp/s${uploadCounter}.png`, url: `/u/s${uploadCounter}` }] };
+      }
+      return { config: { output_root: "/tmp/out-root", keys: {} }, jobs: [] };
+    },
+    post: async (url, body) => {
+      posted.push({ url, body: structuredClone(body) });
+      if (url === "/api/film/references") {
+        const cast = body.film.cast || [];
+        return {
+          film: body.film,
+          slots: cast.map((c, idx) => ({ id: `cast:${idx}`, kind: "cast", name: c.name, description: c.look || "", required: true })),
+        };
+      }
+      return { id: "job-multi-groups" };
+    },
+    setTimeout: () => 1,
+    clearTimeout() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "create.js"), "utf8"), context);
+  await new Promise((r) => setImmediate(r));
+
+  function allDescendants(node) {
+    return [node, ...(node.children || []).flatMap(allDescendants)];
+  }
+
+  $("film-json").value = JSON.stringify({
+    cast: [
+      { name: "Alice", look: "blue coat" },
+      { name: "Bob", look: "gray hat" },
+      { name: "Carol", look: "red scarf" },
+      { name: "Dave", look: "green vest" },
+      { name: "Eve", look: "black glasses" },
+      { name: "Frank", look: "yellow hood" },
+    ],
+    shots: [{ action: "Alice, Bob, Carol, Dave, Eve and Frank meet" }],
+  });
+  await context.refreshFilmReferences();
+
+  // Open builder for combined sheet #1 and select Alice + Bob via builder chips
+  let tree = allDescendants($("film-reference-list"));
+  const openBuilder1 = tree.find((n) => n.className.includes("cast-group-builder-toggle"));
+  assert.ok(openBuilder1);
+  openBuilder1.events.click();
+
+  tree = allDescendants($("film-reference-list"));
+  const chips1 = tree.filter((n) => n.classList.contains("cast-group-chip"));
+  assert.equal(chips1.length, 6);
+  assert.equal(tree.filter((n) => n.classList.contains("film-cast-select")).length, 0);
+
+  chips1[0].events.click();
+  chips1[1].events.click();
+  assert.equal(chips1[0].attributes["aria-pressed"], "true");
+  assert.equal(chips1[1].attributes["aria-pressed"], "true");
+  assert.equal(allDescendants($("film-reference-list")).includes(chips1[0]), true, "Chip selection must not tear down DOM");
+
+  const confirm1 = tree.find((n) => n.classList.contains("merge-cast-button"));
+  assert.equal(confirm1.disabled, false);
+  confirm1.events.click();
+
+  // Builder closes and 4 ungrouped characters remain; open builder for combined sheet #2 and select Carol + Dave + Eve
+  tree = allDescendants($("film-reference-list"));
+  assert.equal(tree.filter((n) => n.classList.contains("film-group-card")).length, 1);
+  const openBuilder2 = tree.find((n) => n.classList.contains("cast-group-builder-toggle"));
+  assert.ok(openBuilder2, "Builder toggle must stay available to create a second combined sheet");
+  openBuilder2.events.click();
+
+  tree = allDescendants($("film-reference-list"));
+  const chips2 = tree.filter((n) => n.classList.contains("cast-group-chip"));
+  assert.equal(chips2.length, 4);
+  chips2[0].events.click(); // Carol
+  chips2[1].events.click(); // Dave
+  chips2[2].events.click(); // Eve
+  tree.find((n) => n.className.includes("merge-cast-button")).events.click();
+
+  // Now we have 2 combined sheet cards (#1 Alice/Bob, #2 Carol/Dave/Eve) + 1 solo card (Frank)
+  tree = allDescendants($("film-reference-list"));
+  const groupCards = tree.filter((n) => n.className.includes("film-group-card"));
+  assert.equal(groupCards.length, 2);
+  const uploads = tree.filter((n) => n.className.includes("film-reference-upload"));
+  assert.equal(uploads.length, 3);
+  uploads[0].files = [{ name: "ab.png" }];
+  await uploads[0].events.change();
+  uploads[1].files = [{ name: "cde.png" }];
+  await uploads[1].events.change();
+  uploads[2].files = [{ name: "frank.png" }];
+  await uploads[2].events.change();
+
+  await $("job-form").events.submit({ preventDefault() {} });
+  const multiPost = posted.filter((p) => p.url === "/api/jobs").at(-1);
+  assert.deepEqual(multiPost.body.reference_groups, [
+    ["cast:0", "cast:1"],
+    ["cast:2", "cast:3", "cast:4"],
+  ]);
+  assert.deepEqual(multiPost.body.reference_bindings, {
+    "cast:0": "sheet-1.png",
+    "cast:1": "sheet-1.png",
+    "cast:2": "sheet-2.png",
+    "cast:3": "sheet-2.png",
+    "cast:4": "sheet-2.png",
+    "cast:5": "sheet-3.png",
+  });
+
+  // Add Frank to combined sheet #1 -> clears sheet #1 and Frank's stale bindings while keeping sheet #2 intact
+  tree = allDescendants($("film-reference-list"));
+  const addToggles = tree.filter((n) => n.className.includes("cast-group-add-toggle"));
+  assert.equal(addToggles.length, 2);
+  addToggles[0].events.click();
+  tree = allDescendants($("film-reference-list"));
+  const addFrank = tree.find((n) => n.className.includes("cast-group-add-option"));
+  assert.ok(addFrank && addFrank.textContent === "Frank");
+  addFrank.events.click();
+
+  assert.deepEqual(Array.from(context.state.filmGroups, (g) => Array.from(g.slotIds)), [
+    ["cast:0", "cast:1", "cast:5"],
+    ["cast:2", "cast:3", "cast:4"],
+  ]);
+  assert.equal(context.state.filmBindings.has("cast:0"), false, "Adding a member must clear stale binding on that group");
+  assert.equal(context.state.filmBindings.has("cast:5"), false, "Adding a member must clear stale solo binding");
+  assert.equal(context.state.filmBindings.get("cast:2").file.id, "sheet-2.png", "Other combined sheets must remain intact");
+
+  // Remove Bob from sheet #1 -> shrinks to 2 members (Alice + Frank); remove Alice -> auto-dissolves sheet #1, keeping sheet #2
+  tree = allDescendants($("film-reference-list"));
+  const firstGroupCard = tree.filter((n) => n.classList.contains("film-group-card"))[0];
+  const firstGroupRemoves = allDescendants(firstGroupCard).filter((n) => n.classList.contains("cast-group-member-remove"));
+  assert.equal(firstGroupRemoves.length, 3);
+  firstGroupRemoves[1].events.click(); // Remove Bob
+  assert.deepEqual(Array.from(context.state.filmGroups, (g) => Array.from(g.slotIds)), [
+    ["cast:0", "cast:5"],
+    ["cast:2", "cast:3", "cast:4"],
+  ]);
+
+  tree = allDescendants($("film-reference-list"));
+  const shrunkenGroupCard = tree.filter((n) => n.classList.contains("film-group-card"))[0];
+  allDescendants(shrunkenGroupCard).filter((n) => n.classList.contains("cast-group-member-remove"))[0].events.click(); // Remove Alice -> dissolves #1
+  assert.deepEqual(Array.from(context.state.filmGroups, (g) => Array.from(g.slotIds)), [
+    ["cast:2", "cast:3", "cast:4"],
+  ]);
+  assert.equal(context.state.filmBindings.get("cast:2").file.id, "sheet-2.png", "Dissolving sheet #1 must not disturb sheet #2");
 });
 
 

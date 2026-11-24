@@ -48,6 +48,7 @@
   "staging_invalid": "调度字段 {path}={value}；要求 {expected}。",
   "staging_known_layout": "逐字复用场景 {scene_id} 的已知固定布局",
   "staging_plan_failed": "STAGING_PLAN_FAILED {frame_key} model={model}，记录 {path}：{detail}。文字规划请求可能已收费；请手动修改此图提示词后仅重生成图片，不要自动重试规划。",
+  "staging_plan_network_failed": "STAGING_PLAN_NETWORK_FAILED {frame_key} model={model}：{detail}。请求未送达服务器（未产生费用），已暂停剩余分镜规划；请检查网络或代理设置后直接续跑此任务。",
   "frame_composition_fallback": "分镜 {frame_key} 构图优化连续失败，已回退使用原始剧本分镜提示词：{detail}",
   "optimize_storyboard_help": "跳过语言模型分镜提示词优化，直接使用原始剧本分镜词生图",
   "frames_cli_incomplete": "FRAME_BATCH_INCOMPLETE {keys}；记录 {path}。其它镜头已处理；请在工作台手动修复失败图后继续。",
