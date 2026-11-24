@@ -393,8 +393,9 @@ def create_app(storage=None, env_path=None):
             ) if "COMFYUI_API_KEY" in mem_updates else old_comfy_key
             saved_sec = runtime.remembered_node("secondary")
             sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
-            sec_key_mismatch = bool(saved_sec) and not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, new_comfy_key)
-            if sec_url and sec_key_mismatch:
+            mem_sec_key_mismatch = bool(saved_sec) and not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, new_comfy_key)
+            disk_sec_key_mismatch = False
+            if sec_url and mem_sec_key_mismatch:
                 try:
                     base_mem_urls = config.parse_endpoint_urls(
                         mem_updates.get("COMFYUI_URL", env.get("COMFYUI_URL", "")) or "", "COMFYUI_URL"
@@ -404,11 +405,17 @@ def create_app(storage=None, env_path=None):
                 if sec_url in base_mem_urls:
                     stripped_mem = colab_runtime.merge_ephemeral_url(base_mem_urls, sec_url, None)
                     mem_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_mem)
-                if persist:
+            if sec_url and persist:
+                disk_env = config.read_env_file(env_path) if env_path.is_file() else {}
+                effective_disk_key = (
+                    "" if disk_updates["COMFYUI_API_KEY"] is None else disk_updates["COMFYUI_API_KEY"]
+                ) if "COMFYUI_API_KEY" in disk_updates else disk_env.get("COMFYUI_API_KEY", "")
+                disk_sec_key_mismatch = not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, effective_disk_key)
+                if disk_sec_key_mismatch:
                     disk_src = (
                         disk_updates["COMFYUI_URL"]
                         if "COMFYUI_URL" in disk_updates
-                        else (config.read_env_file(env_path).get("COMFYUI_URL", "") if env_path.is_file() else "")
+                        else disk_env.get("COMFYUI_URL", "")
                     )
                     try:
                         base_disk_urls = config.parse_endpoint_urls(disk_src or "", "COMFYUI_URL")
@@ -424,10 +431,10 @@ def create_app(storage=None, env_path=None):
             jobs.remember_secrets(env)
             updated_comfy_urls = (
                 config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
-                if "COMFYUI_URL" in mem_updates
+                if "COMFYUI_URL" in updates
                 else None
             )
-        if sec_url and persist and (sec_key_mismatch or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls)):
+        if sec_url and persist and (disk_sec_key_mismatch or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls)):
             runtime.forget_remembered_node("secondary")
         return jsonify(settings())
 
