@@ -60,7 +60,7 @@ def create_app(storage=None, env_path=None):
         parsed_comfy_urls = config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
     except ValueError:
         parsed_comfy_urls = []
-    for remembered_url in runtime.remembered_urls():
+    for remembered_url in runtime.remembered_urls(api_key=env.get("COMFYUI_API_KEY", "")):
         if remembered_url not in parsed_comfy_urls:
             parsed_comfy_urls.append(remembered_url)
     env["COMFYUI_URL"] = config.format_endpoint_urls(parsed_comfy_urls)
@@ -111,6 +111,10 @@ def create_app(storage=None, env_path=None):
         lang = job_request.get("lang") or language()
         env_with_lang = {**job_env, "H3_LANG": lang}
         with use_lang(lang):
+            vcfg = config.video_settings(env_with_lang)
+            stopping = runtime.stopping_urls(env_with_lang)
+            if stopping and (stopping & set(vcfg["comfyui_urls"])):
+                raise InputError("comfy_runtime_action", detail=colab_runtime.message("colab_busy"))
             probe = colab_runtime.probe_comfyui(env_with_lang)
             if probe["online"]:
                 runtime.mark_local_activity()
@@ -119,7 +123,6 @@ def create_app(storage=None, env_path=None):
                 return
             if probe.get("auth_failed"):
                 raise InputError("comfy_auth_failed", code=probe.get("status_code", 401))
-            vcfg = config.video_settings(env_with_lang)
             if vcfg["colab_auto_start"] and colab_runtime.find_colab_bin(env_with_lang):
                 try:
                     runtime.start_async(env_with_lang)
@@ -381,20 +384,22 @@ def create_app(storage=None, env_path=None):
                     comfy_disk_changed = bool(disk_comfy_origins) and not (new_comfy_origins & disk_comfy_origins)
                     if comfy_disk_changed or comfy_mem_changed or (not env.get("COMFYUI_API_KEY", "").strip() and "COMFYUI_API_KEY" in disk_file):
                         disk_updates["COMFYUI_API_KEY"] = None
+            old_comfy_key = env.get("COMFYUI_API_KEY", "")
             if persist:
                 save_env(env_path, disk_updates)
             for k, v in mem_updates.items():
                 env[k] = "" if v is None else v
             jobs.remember_secrets(env)
+            comfy_key_changed = env.get("COMFYUI_API_KEY", "") != old_comfy_key
             updated_comfy_urls = (
                 config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
                 if "COMFYUI_URL" in updates
                 else None
             )
-        if updated_comfy_urls is not None:
+        if updated_comfy_urls is not None or comfy_key_changed:
             saved_sec = runtime.remembered_node("secondary")
             sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
-            if sec_url and sec_url not in updated_comfy_urls:
+            if sec_url and (comfy_key_changed or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls)):
                 runtime.forget_remembered_node("secondary")
         return jsonify(settings())
 

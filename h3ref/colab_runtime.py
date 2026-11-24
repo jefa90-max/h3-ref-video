@@ -549,7 +549,7 @@ def probe_remote_queue_count(environ=None, *, timeout: float = 12.0, strict: boo
     settings = config.video_settings(environ)
     urls = settings["comfyui_urls"]
     if not urls:
-        return 0
+        return None if strict else 0
     shared_key = settings["comfyui_api_key"]
 
     def count_one(url: str) -> int | None:
@@ -772,25 +772,60 @@ class ColabRuntimeManager:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         config.atomic_replace(tmp, path)
 
-    def remembered_node(self, slot: str = "secondary") -> dict | None:
+    @staticmethod
+    def _node_key_matches(item: dict, api_key: str | None) -> bool:
+        if api_key is None or "key_fp" not in item:
+            return True
+        saved_fp = str(item.get("key_fp") or "").strip()
+        cur_fp = comfy.key_fingerprint(api_key)
+        return bool(saved_fp) and cur_fp == saved_fp
+
+    def remembered_node(self, slot: str = "secondary", *, api_key: str | None = None) -> dict | None:
         slot_name = normalize_slot(slot)
         with self._lock:
             item = self._load_saved_nodes().get(slot_name)
-        return dict(item) if isinstance(item, dict) and item.get("url") else None
+        if not (isinstance(item, dict) and item.get("url")):
+            return None
+        if not self._node_key_matches(item, api_key):
+            return None
+        return dict(item)
 
-    def remembered_urls(self) -> list[str]:
+    def remembered_urls(self, *, api_key: str | None = None) -> list[str]:
         with self._lock:
             data = self._load_saved_nodes()
         urls: list[str] = []
         for slot_name in MANAGED_SLOTS:
             item = data.get(slot_name)
-            if isinstance(item, dict) and item.get("url"):
+            if isinstance(item, dict) and item.get("url") and self._node_key_matches(item, api_key):
                 try:
                     cleaned = config.validate_endpoint_url(str(item["url"]), "COMFYUI_URL")
                     if cleaned and cleaned not in urls:
                         urls.append(cleaned)
                 except ValueError:
                     continue
+        return urls
+
+    def stopping_urls(self, environ=None) -> set[str]:
+        """Return normalized ComfyUI endpoint URLs belonging to managed slots currently stopping."""
+        env_copy = dict(os.environ if environ is None else environ)
+        try:
+            settings = config.video_settings(env_copy)
+        except ValueError:
+            return set()
+        with self._lock:
+            p_stopping = self._slots["primary"].active_state == "stopping"
+            s_stopping = self._slots["secondary"].active_state == "stopping"
+        if not p_stopping and not s_stopping:
+            return set()
+        saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
+        sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
+        urls: set[str] = set()
+        if s_stopping and sec_url:
+            urls.add(sec_url)
+        if p_stopping:
+            pri_url = self._primary_url(settings, sec_url)
+            if pri_url:
+                urls.add(pri_url)
         return urls
 
     def forget_remembered_node(self, slot: str = "secondary") -> None:
@@ -831,19 +866,22 @@ class ColabRuntimeManager:
         resolved_sec = (
             sec_url
             if sec_url is not None
-            else str((self.remembered_node("secondary") or {}).get("url") or "").strip().rstrip("/")
+            else str((self.remembered_node("secondary", api_key=settings["comfyui_api_key"]) or {}).get("url") or "").strip().rstrip("/")
         )
         for u in settings["comfyui_urls"]:
             if not resolved_sec or u != resolved_sec:
                 return u
         return ""
 
-    def _set_remembered_node(self, slot: str, record: dict | None) -> tuple[str | None, str | None]:
+    def _set_remembered_node(self, slot: str, record: dict | None, *, abort_if_cancelled: bool = False) -> tuple[str | None, str | None]:
         slot_name = normalize_slot(slot)
+        st = self._slot(slot_name)
         callback = None
         old_url: str | None = None
         new_url: str | None = None
         with self._lock:
+            if abort_if_cancelled and (st.cancel_event.is_set() or st.active_state == "stopping"):
+                return None, None
             data = self._load_saved_nodes()
             prev = data.get(slot_name)
             old_url = str(prev.get("url") or "").strip().rstrip("/") if isinstance(prev, dict) else None
@@ -880,7 +918,8 @@ class ColabRuntimeManager:
 
     def _run_command(self, colab_bin: str, auth_mode: str, sub_args: list[str], *,
                      environ=None, stdin_text: str | None = None, timeout: float = 60.0,
-                     slot: str = "primary", record_slot: bool = True) -> tuple[int, str]:
+                     slot: str = "primary", record_slot: bool = True,
+                     cancel_event: threading.Event | None = None) -> tuple[int, str]:
         st = self._slot(slot)
         argv = _build_argv(colab_bin, auth_mode, sub_args)
         kwargs = _popen_kwargs(environ)
@@ -924,7 +963,7 @@ class ColabRuntimeManager:
         try:
             deadline = time.monotonic() + timeout
             while proc.poll() is None:
-                if record_slot and st.cancel_event.is_set():
+                if (record_slot and st.cancel_event.is_set()) or (cancel_event is not None and cancel_event.is_set()):
                     _kill_process_tree(proc)
                     break
                 now = time.monotonic()
@@ -963,12 +1002,31 @@ class ColabRuntimeManager:
                     pass
         return rc, "".join(collected)
 
-    def _query_sessions(self, colab_bin: str, auth_mode: str, environ=None, *, force: bool = False) -> dict:
+    def _query_sessions(
+        self,
+        colab_bin: str,
+        auth_mode: str,
+        environ=None,
+        *,
+        force: bool = False,
+        cancel_slot: str | None = None,
+    ) -> dict:
         now = time.monotonic()
         with self._lock:
             if not force and self._sessions_cache and (now - self._sessions_cache[0]) < SESSION_CACHE_TTL_SEC:
                 return self._sessions_cache[1]
-        rc, out = self._run_command(colab_bin, auth_mode, ["sessions"], environ=environ, timeout=25.0, record_slot=False)
+        if cancel_slot is not None:
+            rc, out = self._run_command(
+                colab_bin,
+                auth_mode,
+                ["sessions"],
+                environ=environ,
+                timeout=25.0,
+                record_slot=False,
+                cancel_event=self._slot(normalize_slot(cancel_slot)).cancel_event,
+            )
+        else:
+            rc, out = self._run_command(colab_bin, auth_mode, ["sessions"], environ=environ, timeout=25.0, record_slot=False)
         if rc != 0:
             return {"named": [], "orphans": [], "ok": False}
         parsed = {**parse_sessions_output(out), "ok": True}
@@ -1001,7 +1059,7 @@ class ColabRuntimeManager:
             if len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url:
                 return probe_comfyui(env_copy)
             return probe_comfyui({**env_copy, "COMFYUI_URL": primary_url})
-        url = target_url or (self.remembered_node("secondary") or {}).get("url") or ""
+        url = target_url or (self.remembered_node("secondary", api_key=settings["comfyui_api_key"]) or {}).get("url") or ""
         if not url:
             return {"online": False, "configured": False, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}
         return probe_comfyui({**env_copy, "COMFYUI_URL": url})
@@ -1016,7 +1074,7 @@ class ColabRuntimeManager:
         probed_by_url = {n["url"]: n for n in probed_nodes if n.get("url")}
         urls = list(settings["comfyui_urls"])
 
-        saved_sec = self.remembered_node("secondary")
+        saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
         sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
         if sec_url and sec_url not in probed_by_url:
             sec_extra = probe_comfyui({**env_copy, "COMFYUI_URL": sec_url})
@@ -1453,7 +1511,7 @@ class ColabRuntimeManager:
         auth_mode = settings["colab_auth"]
         try:
             with use_lang(env_copy.get("H3_LANG")):
-                sessions = self._query_sessions(colab_bin, auth_mode, environ=env_copy, force=True)
+                sessions = self._query_sessions(colab_bin, auth_mode, environ=env_copy, force=True, cancel_slot=slot_name)
                 if st.cancel_event.is_set():
                     return
                 if sessions.get("ok") is False:
@@ -1499,7 +1557,7 @@ class ColabRuntimeManager:
                             if st.cancel_event.wait(timeout=delay):
                                 return
                             if rc == -9 or "ReadTimeout" in out:
-                                check_sessions = self._query_sessions(colab_bin, auth_mode, environ=env_copy, force=True)
+                                check_sessions = self._query_sessions(colab_bin, auth_mode, environ=env_copy, force=True, cancel_slot=slot_name)
                                 if st.cancel_event.is_set():
                                     return
                                 if check_sessions.get("ok") is False:
@@ -1645,6 +1703,8 @@ class ColabRuntimeManager:
                     if st.cancel_event.is_set():
                         return
                     if self._probe_slot(env_copy, settings, slot_name, target_url=target_probe_url)["online"]:
+                        if st.cancel_event.is_set():
+                            return
                         now_ts = float(self._clock())
                         if slot_name == "secondary":
                             self._set_remembered_node(
@@ -1654,10 +1714,14 @@ class ColabRuntimeManager:
                                     "url": discovered_url,
                                     "gpu": settings["colab_gpu"],
                                     "tunnel": tunnel_provider,
+                                    "key_fp": comfy.key_fingerprint(settings["comfyui_api_key"]),
                                     "updated_at": round(time.time(), 1),
                                 },
+                                abort_if_cancelled=True,
                             )
                         with self._lock:
+                            if st.cancel_event.is_set() or st.active_state == "stopping":
+                                return
                             st.last_error = None
                             st.active_state = None
                             self._sessions_cache = None
@@ -1697,7 +1761,7 @@ class ColabRuntimeManager:
         else:
             if not settings["comfyui_api_key"]:
                 raise ValueError(message("colab_key_missing"))
-            saved_sec = self.remembered_node("secondary")
+            saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
             if saved_sec and saved_sec.get("url"):
                 if self._probe_slot(env_copy, settings, "secondary", target_url=saved_sec["url"])["online"]:
                     return self.status(env_copy)
@@ -1796,7 +1860,7 @@ class ColabRuntimeManager:
         if slot_name == "primary":
             target_url = self._primary_url(settings)
         else:
-            saved_sec = self.remembered_node("secondary")
+            saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
             target_url = str((saved_sec or {}).get("url") or "").strip()
         if not target_url:
             return False
@@ -1980,13 +2044,13 @@ class ColabRuntimeManager:
         queue_unknown = False
         if not force:
             if slot_name == "secondary":
-                saved_sec = self.remembered_node("secondary")
+                saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
                 sec_url = str((saved_sec or {}).get("url") or "").strip()
-                remote_queue = probe_remote_queue_count({**env_copy, "COMFYUI_URL": sec_url}, strict=True) if sec_url else 0
+                remote_queue = probe_remote_queue_count({**env_copy, "COMFYUI_URL": sec_url}, strict=True) if sec_url else None
             else:
                 primary_url = self._primary_url(settings)
                 if not primary_url:
-                    remote_queue = 0
+                    remote_queue = None
                 else:
                     probe_env = env_copy if (len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url) else {**env_copy, "COMFYUI_URL": primary_url}
                     remote_queue = probe_remote_queue_count(probe_env, strict=True)
@@ -2092,7 +2156,7 @@ class ColabRuntimeManager:
             }
 
         with self._lock:
-            saved_sec = self.remembered_node("secondary")
+            saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
             sec_st = self._slots["secondary"]
             sec_running = bool(saved_sec or sec_st.active_state)
             sec_slot_active = bool(sec_st.active_state or sec_st.last_error)
