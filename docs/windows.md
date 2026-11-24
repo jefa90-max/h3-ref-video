@@ -14,8 +14,8 @@
 
 ## ComfyUI / Colab 模式说明（Windows 零额外依赖出片）
 
-- **直连远端或本机 ComfyUI（无需额外安装任何 CLI）**：只要远端 Colab 或自建机器上的 ComfyUI 隧道已开启，在工作台环境配置中选择 `ComfyUI`，填写 `COMFYUI_URL`（如 `https://xxx.ngrok-free.dev`）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填；本机 `http://127.0.0.1:8188` 可留空），保存后即可直接上传参考图、生成 768p 视频（`4step` / `8step` / `full20`）并自动下载成片。发布包内置的 Python 与专用 curl 已完整支持中文/空格路径参考图上传（自动转为 ASCII 哈希文件名）及隧道鉴权下载。
-- **可选：在 Windows 上启用 Colab 一键启停按钮**：如需直接在工作台顶部卡片点击「一键启动 Colab A100 / 终止实例」，可在项目虚拟环境中额外安装 `.venv\Scripts\pip install google-colab-cli` 并完成一次 `colab auth login`。若本机遇到 Windows 凭据管理器（Credential Locker）OAuth JSON 长度限制报错，可在 `.env` 中设置 `COLAB_AUTH=adc` 改用 Google Cloud Application Default Credentials，或直接在浏览器手动运行 Colab 中的 `scripts/start_colab.py` 后由 Windows 工作台直连隧道。
+- **直连远端或本机 ComfyUI（无需额外安装任何 CLI）**：只要远端 Colab 或自建机器上的 ComfyUI 隧道已开启，在工作台环境配置中选择 `ComfyUI`，填写 `COMFYUI_URL`（如 `https://xxx.ngrok-free.dev`，支持英文逗号/换行填写多节点并行出片）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填；本机 `http://127.0.0.1:8188` 可留空），按需选择采样预设（默认 `full20`，可选 `8step` / `4step`）、分辨率档位（默认 `768p`，可选 `544p`）与 2× 超分（默认关闭），保存后即可直接上传参考图、生成视频并自动下载成片。发布包内置的 Python 与专用 curl 已完整支持中文/空格路径参考图上传（自动转为 ASCII 哈希文件名）及隧道鉴权下载。
+- **可选：在 Windows 上启用 Colab 一键启停按钮**：如需直接在工作台顶部卡片点击「一键启动 Colab GPU（默认 G4，可选 A100 / H100） / + 启动第 2 节点 / 终止实例」，可在项目虚拟环境中额外安装 `.venv\Scripts\pip install google-colab-cli` 并完成一次 `colab auth login`。若本机遇到 Windows 凭据管理器（Credential Locker）OAuth JSON 长度限制报错，可在 `.env` 中设置 `COLAB_AUTH=adc` 改用 Google Cloud Application Default Credentials，或直接在浏览器手动运行 Colab 中的 `scripts/start_colab.py` 后由 Windows 工作台直连隧道。
 
 ## 安装位置与失败处理
 

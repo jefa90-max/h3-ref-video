@@ -11,6 +11,6 @@
 
 `comfy-h3-ref2va.json` 整理自 Comfy-Org 官方内置模板
 [`video_minimax_h3_r2v`](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json)
-的 API 节点图（移除示例图片名与示例提示词，保留 1–9 张参考图槽位与 4 步 / 8 步 / 20 步预设切换节点），由 `h3ref/comfy.py` 在提交前按实际参考图张数动态裁剪未使用的 `LoadImage` 节点。
+的 API 节点图（移除示例图片名与示例提示词，保留 1–9 张参考图槽位、4 步 / 8 步 / 20 步预设切换以及可选 EasyCache、BlockSparseAttention 与 2× 超分节点），由 `h3ref/comfy.py` 在提交前按预设、超分开关与实际参考图张数动态裁剪未使用的节点。
 
 模型本身是 MiniMax H3，遵守 [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)。
