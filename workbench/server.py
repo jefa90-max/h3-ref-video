@@ -391,24 +391,32 @@ def create_app(storage=None, env_path=None):
             new_comfy_key = (
                 "" if mem_updates["COMFYUI_API_KEY"] is None else mem_updates["COMFYUI_API_KEY"]
             ) if "COMFYUI_API_KEY" in mem_updates else old_comfy_key
-            comfy_key_changed = new_comfy_key != old_comfy_key
             saved_sec = runtime.remembered_node("secondary")
             sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
-            if comfy_key_changed and sec_url:
-                base_mem_urls = config.parse_endpoint_urls(
-                    mem_updates.get("COMFYUI_URL", env.get("COMFYUI_URL", "")) or "", "COMFYUI_URL"
-                )
-                stripped_mem = colab_runtime.merge_ephemeral_url(base_mem_urls, sec_url, None)
-                mem_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_mem)
+            sec_key_mismatch = bool(saved_sec) and not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, new_comfy_key)
+            if sec_url and sec_key_mismatch:
+                try:
+                    base_mem_urls = config.parse_endpoint_urls(
+                        mem_updates.get("COMFYUI_URL", env.get("COMFYUI_URL", "")) or "", "COMFYUI_URL"
+                    )
+                except ValueError:
+                    base_mem_urls = []
+                if sec_url in base_mem_urls:
+                    stripped_mem = colab_runtime.merge_ephemeral_url(base_mem_urls, sec_url, None)
+                    mem_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_mem)
                 if persist:
                     disk_src = (
                         disk_updates["COMFYUI_URL"]
                         if "COMFYUI_URL" in disk_updates
                         else (config.read_env_file(env_path).get("COMFYUI_URL", "") if env_path.is_file() else "")
                     )
-                    base_disk_urls = config.parse_endpoint_urls(disk_src or "", "COMFYUI_URL")
-                    stripped_disk = colab_runtime.merge_ephemeral_url(base_disk_urls, sec_url, None)
-                    disk_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_disk)
+                    try:
+                        base_disk_urls = config.parse_endpoint_urls(disk_src or "", "COMFYUI_URL")
+                    except ValueError:
+                        base_disk_urls = []
+                    if sec_url in base_disk_urls:
+                        stripped_disk = colab_runtime.merge_ephemeral_url(base_disk_urls, sec_url, None)
+                        disk_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_disk)
             if persist:
                 save_env(env_path, disk_updates)
             for k, v in mem_updates.items():
@@ -419,7 +427,7 @@ def create_app(storage=None, env_path=None):
                 if "COMFYUI_URL" in mem_updates
                 else None
             )
-        if sec_url and persist and (comfy_key_changed or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls)):
+        if sec_url and persist and (sec_key_mismatch or (updated_comfy_urls is not None and sec_url not in updated_comfy_urls)):
             runtime.forget_remembered_node("secondary")
         return jsonify(settings())
 
