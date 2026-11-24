@@ -405,14 +405,11 @@ def create_app(storage=None, env_path=None):
                 if sec_url in base_mem_urls:
                     stripped_mem = colab_runtime.merge_ephemeral_url(base_mem_urls, sec_url, None)
                     mem_updates["COMFYUI_URL"] = config.format_endpoint_urls(stripped_mem)
-            if sec_url and persist:
-                disk_env = config.read_env_file(env_path) if env_path.is_file() else {}
-                effective_disk_env = config.load_server_env(env_path)
-                effective_disk_key = (
-                    "" if disk_updates["COMFYUI_API_KEY"] is None else disk_updates["COMFYUI_API_KEY"]
-                ) if "COMFYUI_API_KEY" in disk_updates else effective_disk_env.get("COMFYUI_API_KEY", "")
+            if sec_url and persist and "COMFYUI_API_KEY" in disk_updates:
+                effective_disk_key = "" if disk_updates["COMFYUI_API_KEY"] is None else disk_updates["COMFYUI_API_KEY"]
                 disk_sec_key_mismatch = not colab_runtime.ColabRuntimeManager._node_key_matches(saved_sec, effective_disk_key)
                 if disk_sec_key_mismatch:
+                    disk_env = config.read_env_file(env_path) if env_path.is_file() else {}
                     disk_src = (
                         disk_updates["COMFYUI_URL"]
                         if "COMFYUI_URL" in disk_updates
