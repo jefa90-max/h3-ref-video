@@ -7,7 +7,6 @@ import shutil
 import threading
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
@@ -125,12 +124,15 @@ def create_app(storage=None, env_path=None):
                 try:
                     runtime.start_async(env_with_lang)
                     ensure_keepalive_monitor()
-                except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError):
+                except colab_runtime.RuntimeBusyError:
                     pass
+                except (colab_runtime.RuntimeUnavailableError, ValueError) as exc:
+                    raise InputError("comfy_runtime_action", detail=str(exc)) from exc
                 raise InputError("comfy_starting")
             raise InputError("comfy_offline")
 
     jobs.before_video_launch = ensure_video_runtime
+    jobs.env_provider = current_runtime_env
 
     verified_images = set()
 
@@ -384,6 +386,16 @@ def create_app(storage=None, env_path=None):
             for k, v in mem_updates.items():
                 env[k] = "" if v is None else v
             jobs.remember_secrets(env)
+            updated_comfy_urls = (
+                config.parse_endpoint_urls(env.get("COMFYUI_URL", ""), "COMFYUI_URL")
+                if "COMFYUI_URL" in updates
+                else None
+            )
+        if updated_comfy_urls is not None:
+            saved_sec = runtime.remembered_node("secondary")
+            sec_url = str((saved_sec or {}).get("url") or "").strip().rstrip("/")
+            if sec_url and sec_url not in updated_comfy_urls:
+                runtime.forget_remembered_node("secondary")
         return jsonify(settings())
 
     def _parse_runtime_slot(values):
@@ -522,13 +534,15 @@ def create_app(storage=None, env_path=None):
 
     @app.post("/api/jobs")
     def create_job():
+        payload = request.get_json()
+        lang = language()
         with jobs.lock:
-            payload = request.get_json()
             if isinstance(payload, dict) and not payload.get("output_dir"):
-                payload.setdefault("output_root", str(saved_output_root(root, storage)))
+                payload = {**payload, "output_root": payload.get("output_root") or str(saved_output_root(root, storage))}
             if isinstance(payload, dict) and payload.get("kind") == "film" and "reference_bindings" in payload:
-                payload = bind_references(payload, storage / "uploads", language())
-            return jsonify(jobs.create(payload, dict(env), language())), 201
+                payload = bind_references(payload, storage / "uploads", lang)
+            env_snapshot = dict(env)
+        return jsonify(jobs.create(payload, env_snapshot, lang)), 201
 
     @app.post("/api/film/references")
     def film_references():
@@ -544,7 +558,8 @@ def create_app(storage=None, env_path=None):
     @app.post("/api/jobs/<identifier>/resume")
     def resume_job(identifier):
         with jobs.lock:
-            return jsonify(jobs.resume(identifier, dict(env)))
+            env_snapshot = dict(env)
+        return jsonify(jobs.resume(identifier, env_snapshot))
 
     @app.post("/api/jobs/<identifier>/frames/<key>")
     def regenerate_frame(identifier, key):
@@ -617,7 +632,8 @@ def create_app(storage=None, env_path=None):
         if not isinstance(confirmation, dict):
             raise InputError("review_request")
         with jobs.lock:
-            return jsonify(jobs.continue_film(identifier, dict(env), confirmation))
+            env_snapshot = dict(env)
+        return jsonify(jobs.continue_film(identifier, env_snapshot, confirmation))
 
     @app.post("/api/jobs/<identifier>/segments/<int:number>/regenerate")
     def regenerate_segment(identifier, number):
@@ -625,10 +641,11 @@ def create_app(storage=None, env_path=None):
         if not isinstance(values, dict):
             invalid("segment", values, "object")
         with jobs.lock:
-            edited = any(key in values for key in ('prompt', 'prompt_format', 'prompt_version'))
-            return jsonify(jobs.start_video_operation(identifier, 'segment', dict(env), values.get('version'), number,
-                prompt=values.get('prompt'), prompt_format=values.get('prompt_format', '') if edited else None,
-                prompt_version=values.get('prompt_version', '') if edited else None))
+            env_snapshot = dict(env)
+        edited = any(key in values for key in ('prompt', 'prompt_format', 'prompt_version'))
+        return jsonify(jobs.start_video_operation(identifier, 'segment', env_snapshot, values.get('version'), number,
+            prompt=values.get('prompt'), prompt_format=values.get('prompt_format', '') if edited else None,
+            prompt_version=values.get('prompt_version', '') if edited else None))
 
     @app.post("/api/jobs/<identifier>/segments/<int:number>/rewrite")
     def rewrite_segment(identifier, number):

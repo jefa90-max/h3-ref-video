@@ -81,6 +81,9 @@ def cmd_one(a):
             st["provider"] = provider_name
             if provider_name == "comfyui" and endpoint_url:
                 st["comfyui_url"] = endpoint_url
+                key_fp = comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+                if key_fp:
+                    st["comfyui_key_fp"] = key_fp
             st["submission_unknown"] = unknown
             save()
         st["task"] = backend.submit_with_retry(
@@ -92,9 +95,16 @@ def cmd_one(a):
         st["provider"] = provider_name
         if provider_name == "comfyui" and endpoint_url:
             st["comfyui_url"] = endpoint_url
+            key_fp = comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+            if key_fp:
+                st["comfyui_key_fp"] = key_fp
         st["submission_unknown"] = False
         save()
         print(f"已提交，预计 ¥{backend.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
+    else:
+        if provider_name == "comfyui":
+            endpoint_url = str(st.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+            comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=st.get("comfyui_key_fp"))
     provider_name = str(st.get("provider") or "runninghub").strip().lower()
     backend = comfy if provider_name == "comfyui" else rh
     if provider_name == "comfyui" and not endpoint_url:

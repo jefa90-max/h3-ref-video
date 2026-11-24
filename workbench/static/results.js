@@ -314,9 +314,9 @@ function renderLiveProgress(job) {
   const fill = $("live-progress-fill");
   if (pct !== null) {
     fill.classList?.remove?.("indeterminate");
-    if (fill.style) fill.style.width = `${pct}%`;
+    if (fill.style) fill.style.transform = `scaleX(${pct / 100})`;
   } else {
-    if (fill.style) fill.style.width = "";
+    if (fill.style) fill.style.transform = "";
     fill.classList?.add?.("indeterminate");
   }
 }

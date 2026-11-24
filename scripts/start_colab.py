@@ -31,9 +31,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE = Path(os.environ.get("COMFY_DRIVE_BASE", "/content/drive/MyDrive/MiniMax_ComfyUI"))
 LOCAL = Path(os.environ.get("COMFY_LOCAL_DIR", "/content/ComfyUI_local"))
@@ -57,7 +59,6 @@ MODEL_FILES = [
     "vae/minimax_h3_video_vae_fp16.safetensors",
     "vae/minimax_h3_audio_vae_fp32.safetensors",
     "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
-    "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
     "upscale_models/RealESRGAN_x2plus.pth",
     "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
 ]
@@ -137,6 +138,11 @@ def _apply_comfy_ws_event(state: dict, msg: dict, *, now: float | None = None) -
     elif event_type in ("execution_success", "execution_error", "execution_interrupted"):
         if not prompt_id or state.get("prompt_id") == prompt_id:
             state.update(status=event_type.removeprefix("execution_"), node=None, updated_at=ts)
+    elif event_type == "status":
+        status_info = data.get("status")
+        exec_info = status_info.get("exec_info") if isinstance(status_info, dict) else None
+        if isinstance(exec_info, dict) and exec_info.get("queue_remaining") == 0 and state.get("status") == "running":
+            state.update(status="finished", node=None, updated_at=ts)
 
 
 def _recv_exact(sock: socket.socket, rx_buf: bytearray, n: int) -> bytes:
@@ -256,10 +262,11 @@ def _start_comfy_progress_tracker(log):
                             frag_opcode = None
                             frag_buf.clear()
             except Exception:
-                if not _comfy_process_alive():
-                    with lock:
-                        if state.get("status") == "running":
-                            state.clear()
+                # Always drop stale running state on WS disconnect so a missed terminal event
+                # during the reconnect window can never keep the idle watchdog busy forever.
+                with lock:
+                    if state.get("status") == "running":
+                        state.clear()
                 time.sleep(3.0)
             finally:
                 if sock is not None:
@@ -350,17 +357,17 @@ def ensure_cloudflared() -> str:
         tmp.replace(CLOUDFLARED_BIN_LOCAL)
         return str(CLOUDFLARED_BIN_LOCAL)
     print("[start_colab] Downloading cloudflared binary for ephemeral HTTPS tunnel...", flush=True)
-    _download_file_atomic(CLOUDFLARED_DOWNLOAD_URL, CLOUDFLARED_BIN_LOCAL, "bin/cloudflared")
+    _download_file_atomic(CLOUDFLARED_DOWNLOAD_URL, CLOUDFLARED_BIN_LOCAL, "bin/cloudflared", description="cloudflared binary")
     CLOUDFLARED_BIN_LOCAL.chmod(0o755)
     if BASE.exists():
+        tmp_drive = _unique_tmp_path(drive_cached)
         try:
             drive_cached.parent.mkdir(parents=True, exist_ok=True)
-            tmp_drive = drive_cached.with_suffix(".tmp")
             shutil.copyfile(CLOUDFLARED_BIN_LOCAL, tmp_drive)
             tmp_drive.chmod(0o755)
             tmp_drive.replace(drive_cached)
         except OSError:
-            pass
+            tmp_drive.unlink(missing_ok=True)
     return str(CLOUDFLARED_BIN_LOCAL)
 
 
@@ -388,14 +395,48 @@ def _idle_timeout_minutes() -> float:
     return minutes
 
 
+def _unique_tmp_path(dst: Path) -> Path:
+    return dst.with_name(f"{dst.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parts = urlsplit(url.strip())
+    scheme = parts.scheme.lower()
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    try:
+        port = parts.port or default_port
+    except ValueError:
+        port = None
+    return (scheme, (parts.hostname or "").lower(), port)
+
+
+class _StrictProbeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_origin = _url_origin(req.full_url)
+        new_origin = _url_origin(newurl)
+        if new_origin[0] not in ("http", "https") or (old_origin[0] == "https" and new_origin[0] != "https"):
+            raise urllib.error.URLError(f"Blocked unsafe redirect to {new_origin[0] or 'unknown'}")
+        has_auth = any(k.lower() == "authorization" for k in (*req.headers, *req.unredirected_hdrs))
+        if has_auth and new_origin != old_origin:
+            raise urllib.error.URLError("Blocked cross-origin redirect on authenticated probe")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_ORIG_URLOPEN = urllib.request.urlopen
+_PROBE_OPENER = urllib.request.build_opener(_StrictProbeRedirectHandler())
+
+
 def _http_status(url: str, *, headers: dict[str, str] | None = None, timeout: float = 4.0) -> int | None:
     req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    open_fn = _PROBE_OPENER.open if urllib.request.urlopen is _ORIG_URLOPEN else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_fn(req, timeout=timeout) as resp:
             resp.read(256)
             return resp.status
     except urllib.error.HTTPError as exc:
-        return exc.code
+        code = exc.code
+        exc.close()
+        return code
     except Exception:
         return None
 
@@ -418,7 +459,7 @@ def _check_authorization(header_value: str | None, expected_key: str) -> bool:
     scheme_low = scheme.lower()
     credential = credential.strip()
     if scheme_low == "bearer":
-        return hmac.compare_digest(credential, expected_key)
+        return hmac.compare_digest(credential.encode("utf-8"), expected_key.encode("utf-8"))
     if scheme_low == "basic":
         try:
             decoded = base64.b64decode(credential, validate=True).decode("utf-8")
@@ -426,7 +467,7 @@ def _check_authorization(header_value: str | None, expected_key: str) -> bool:
             return False
         _, sep, password = decoded.partition(":")
         candidate = password if sep else decoded
-        return hmac.compare_digest(candidate, expected_key)
+        return hmac.compare_digest(candidate.encode("utf-8"), expected_key.encode("utf-8"))
     return False
 
 
@@ -453,16 +494,20 @@ def _is_passive_probe(method: str, path: str) -> bool:
 
 
 def _queue_busy(progress_snapshot=None) -> bool:
-    snap = progress_snapshot() if callable(progress_snapshot) else progress_snapshot
-    if isinstance(snap, dict) and snap.get("status") == "running":
-        return True
     req = urllib.request.Request(f"http://{COMFY_HOST}:{COMFY_PORT}/queue", method="GET")
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-        return bool(payload.get("queue_running") or payload.get("queue_pending"))
+        if isinstance(payload, dict):
+            return bool(payload.get("queue_running") or payload.get("queue_pending"))
     except Exception:
+        snap = progress_snapshot() if callable(progress_snapshot) else progress_snapshot
+        if isinstance(snap, dict) and snap.get("status") == "running":
+            updated_at = snap.get("updated_at")
+            if not isinstance(updated_at, (int, float)) or (time.time() - float(updated_at)) <= 120.0:
+                return True
         return _comfy_process_alive()
+    return False
 
 
 def _unassign_colab_runtime(log) -> bool:
@@ -491,6 +536,193 @@ def _unassign_colab_runtime(log) -> bool:
     return False
 
 
+_HOP_BY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+}
+
+
+def _make_auth_proxy_handler(
+    api_key: str,
+    progress_snapshot,
+    touch_activity,
+    *,
+    comfy_host: str | None = None,
+    comfy_port: int | None = None,
+):
+    target_host = COMFY_HOST if comfy_host is None else comfy_host
+    target_port = COMFY_PORT if comfy_port is None else comfy_port
+
+    class AuthReverseProxy(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+        def _send_json_error(self, status: int, message: str) -> None:
+            self.close_connection = True
+            body = (json.dumps({"error": message}) + "\n").encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _reject(self) -> None:
+            self.close_connection = True
+            body = b'{"error":"Unauthorized"}\n'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("WWW-Authenticate", 'Bearer realm="ComfyUI"')
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_chunked_body(self) -> bytes:
+            buf = bytearray()
+            while True:
+                line = self.rfile.readline(65536)
+                if not line:
+                    raise EOFError("Unexpected EOF reading chunk size")
+                size_token = line.split(b";", 1)[0].strip()
+                chunk_size = int(size_token, 16)
+                if chunk_size < 0:
+                    raise ValueError("Negative chunk size")
+                if chunk_size == 0:
+                    while True:
+                        trailer = self.rfile.readline(65536)
+                        if not trailer or trailer in (b"\r\n", b"\n"):
+                            break
+                    break
+                remaining = chunk_size
+                while remaining > 0:
+                    part = self.rfile.read(min(65536, remaining))
+                    if not part:
+                        raise EOFError("Unexpected EOF reading chunk payload")
+                    buf.extend(part)
+                    remaining -= len(part)
+                crlf = self.rfile.readline(16)
+                if crlf not in (b"\r\n", b"\n"):
+                    raise ValueError("Invalid chunk terminator")
+            return bytes(buf)
+
+        def _proxy(self) -> None:
+            self.close_connection = True
+            if not _check_authorization(self.headers.get("Authorization"), api_key):
+                self._reject()
+                return
+            path_only = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if self.command == "GET" and path_only == "/h3_progress":
+                body = json.dumps(progress_snapshot()).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            is_work = not _is_passive_probe(self.command, self.path)
+            if is_work:
+                touch_activity()
+            te_header = (self.headers.get("Transfer-Encoding") or "").lower()
+            is_chunked = "chunked" in te_header
+            raw_cl = self.headers.get("Content-Length")
+            content_len = 0
+            chunked_body: bytes | None = None
+            if is_chunked:
+                try:
+                    chunked_body = self._read_chunked_body()
+                except (ValueError, EOFError):
+                    self._send_json_error(400, "Invalid chunked request body")
+                    return
+                content_len = len(chunked_body)
+            elif raw_cl is not None:
+                try:
+                    content_len = int(raw_cl.strip())
+                except ValueError:
+                    self._send_json_error(400, "Invalid Content-Length")
+                    return
+                if content_len < 0:
+                    self._send_json_error(400, "Invalid Content-Length")
+                    return
+            forward_headers = {
+                k: v for k, v in self.headers.items()
+                if k.lower() not in _HOP_BY_HOP_HEADERS and k.lower() not in ("host", "authorization", "content-length")
+            }
+            if chunked_body is not None or raw_cl is not None:
+                forward_headers["Content-Length"] = str(content_len)
+            forward_headers["Host"] = f"{target_host}:{target_port}"
+            forward_headers["Connection"] = "close"
+            conn = http.client.HTTPConnection(target_host, target_port, timeout=600)
+            headers_sent = False
+            try:
+                conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+                for k, v in forward_headers.items():
+                    conn.putheader(k, v)
+                conn.endheaders()
+                if chunked_body is not None:
+                    if chunked_body:
+                        conn.send(chunked_body)
+                        if is_work:
+                            touch_activity()
+                else:
+                    remaining = content_len
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        conn.send(chunk)
+                        remaining -= len(chunk)
+                        if is_work:
+                            touch_activity()
+                upstream = conn.getresponse()
+                resp_headers = [
+                    (k, v) for k, v in upstream.getheaders()
+                    if k.lower() not in _HOP_BY_HOP_HEADERS
+                ]
+                has_len = any(k.lower() == "content-length" for k, _ in resp_headers)
+                buffered = None if has_len or self.command == "HEAD" else upstream.read()
+                self.send_response(upstream.status, upstream.reason)
+                for k, v in resp_headers:
+                    self.send_header(k, v)
+                if buffered is not None:
+                    self.send_header("Content-Length", str(len(buffered)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                headers_sent = True
+                if self.command != "HEAD":
+                    if buffered is not None:
+                        if buffered:
+                            self.wfile.write(buffered)
+                    else:
+                        while True:
+                            data = upstream.read(65536)
+                            if not data:
+                                break
+                            self.wfile.write(data)
+                            if is_work:
+                                touch_activity()
+            except Exception as exc:
+                if not headers_sent:
+                    try:
+                        self._send_json_error(502, f"Upstream error: {type(exc).__name__}")
+                    except Exception:
+                        pass
+            finally:
+                conn.close()
+
+        do_GET = _proxy
+        do_POST = _proxy
+        do_PUT = _proxy
+        do_DELETE = _proxy
+        do_HEAD = _proxy
+        do_OPTIONS = _proxy
+
+    return AuthReverseProxy
+
+
 def run_supervisor(*, skip_comfy_check: bool = False) -> None:
     provider = _tunnel_provider()
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
@@ -517,113 +749,7 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
         print(f"{stamp} {msg}", flush=True)
 
     progress_snapshot = _start_comfy_progress_tracker(log)
-
-    HopByHop = {
-        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-        "te", "trailers", "transfer-encoding", "upgrade",
-    }
-
-    class AuthReverseProxy(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, fmt: str, *args) -> None:
-            return
-
-        def _reject(self) -> None:
-            body = b'{"error":"Unauthorized"}\n'
-            self.send_response(401)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("WWW-Authenticate", 'Bearer realm="ComfyUI"')
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _proxy(self) -> None:
-            if not _check_authorization(self.headers.get("Authorization"), api_key):
-                self._reject()
-                return
-            path_only = self.path.split("?", 1)[0].rstrip("/") or "/"
-            if self.command == "GET" and path_only == "/h3_progress":
-                body = json.dumps(progress_snapshot()).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            is_work = not _is_passive_probe(self.command, self.path)
-            if is_work:
-                touch_activity()
-            content_len = int(self.headers.get("Content-Length") or 0)
-            forward_headers = {
-                k: v for k, v in self.headers.items()
-                if k.lower() not in HopByHop and k.lower() not in ("host", "authorization")
-            }
-            forward_headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
-            forward_headers["Connection"] = "close"
-            conn = http.client.HTTPConnection(COMFY_HOST, COMFY_PORT, timeout=600)
-            try:
-                conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
-                for k, v in forward_headers.items():
-                    conn.putheader(k, v)
-                conn.endheaders()
-                remaining = content_len
-                while remaining > 0:
-                    chunk = self.rfile.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    conn.send(chunk)
-                    remaining -= len(chunk)
-                    if is_work:
-                        touch_activity()
-                upstream = conn.getresponse()
-                resp_headers = [
-                    (k, v) for k, v in upstream.getheaders()
-                    if k.lower() not in HopByHop
-                ]
-                has_len = any(k.lower() == "content-length" for k, _ in resp_headers)
-                buffered = None if has_len or self.command == "HEAD" else upstream.read()
-                self.send_response(upstream.status, upstream.reason)
-                for k, v in resp_headers:
-                    self.send_header(k, v)
-                if buffered is not None:
-                    self.send_header("Content-Length", str(len(buffered)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                if self.command != "HEAD":
-                    if buffered is not None:
-                        if buffered:
-                            self.wfile.write(buffered)
-                    else:
-                        while True:
-                            data = upstream.read(65536)
-                            if not data:
-                                break
-                            self.wfile.write(data)
-                            if is_work:
-                                touch_activity()
-            except Exception as exc:
-                err = json.dumps({"error": f"Upstream error: {type(exc).__name__}"}).encode("utf-8")
-                try:
-                    self.send_response(502)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(err)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(err)
-                except Exception:
-                    pass
-            finally:
-                conn.close()
-
-        do_GET = _proxy
-        do_POST = _proxy
-        do_PUT = _proxy
-        do_DELETE = _proxy
-        do_HEAD = _proxy
-        do_OPTIONS = _proxy
+    AuthReverseProxy = _make_auth_proxy_handler(api_key, progress_snapshot, touch_activity)
 
     server = ThreadingHTTPServer((COMFY_HOST, GATEWAY_PORT), AuthReverseProxy)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -703,16 +829,19 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
 
 
 def ensure_comfyui_code() -> None:
+    reqs_marker = LOCAL / ".h3_reqs_installed"
     if not (LOCAL / "main.py").exists():
         print("[start_colab] Cloning ComfyUI to local SSD...", flush=True)
         subprocess.run(
             ["git", "clone", "--depth", "1", "https://github.com/Comfy-Org/ComfyUI.git", str(LOCAL)],
             check=True,
         )
+    if not reqs_marker.exists() and (LOCAL / "requirements.txt").is_file():
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "-r", str(LOCAL / "requirements.txt")],
             check=True,
         )
+        reqs_marker.write_text("ok\n", encoding="utf-8")
     if _tunnel_provider() == "cloudflared":
         ensure_cloudflared()
     else:
@@ -887,14 +1016,15 @@ def ensure_sageattention() -> tuple[bool, str]:
                 if built_wheels:
                     built_whl = built_wheels[0]
                     if BASE.exists():
+                        dst_whl = cache_dir / built_whl.name
+                        tmp_dst = _unique_tmp_path(dst_whl)
                         try:
                             cache_dir.mkdir(parents=True, exist_ok=True)
-                            dst_whl = cache_dir / built_whl.name
-                            tmp_dst = dst_whl.with_suffix(".whl.tmp")
                             shutil.copyfile(built_whl, tmp_dst)
                             tmp_dst.replace(dst_whl)
                             print(f"[start_colab] Cached SageAttention wheel to Drive: {dst_whl.name}", flush=True)
                         except OSError as cache_exc:
+                            tmp_dst.unlink(missing_ok=True)
                             print(f"[start_colab] Warning: failed to cache SageAttention wheel: {cache_exc}", flush=True)
                     inst = subprocess.run(
                         [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", str(built_whl)],
@@ -1012,11 +1142,10 @@ def _parallel_copy_file(src: Path, dst: Path, src_size: int, rel: str) -> None:
     print(f"[start_colab] Copied {rel} in {time.time() - t0:.1f}s", flush=True)
 
 
-def _download_file_atomic(url: str, dst: Path, rel: str) -> None:
+def _download_file_atomic(url: str, dst: Path, rel: str, *, description: str = "missing model to Drive") -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-    tmp.unlink(missing_ok=True)
-    print(f"[start_colab] Downloading missing model to Drive: {rel}", flush=True)
+    tmp = _unique_tmp_path(dst)
+    print(f"[start_colab] Downloading {description}: {rel}", flush=True)
     t0 = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": "h3-ref-video-colab-bootstrap/1.0"}, method="GET")
     total_bytes = 0
@@ -1109,7 +1238,15 @@ def link_persistent_dirs() -> None:
     if user_dst.is_symlink():
         user_dst.unlink()
     elif user_dst.exists():
-        shutil.rmtree(user_dst)
+        if user_dst.is_dir():
+            for item in user_dst.iterdir():
+                dest = user_target / item.name
+                if dest.exists():
+                    continue
+                shutil.move(str(item), str(dest))
+            shutil.rmtree(user_dst)
+        else:
+            user_dst.unlink()
     user_dst.symlink_to(user_target)
     for sub in ("input", "output"):
         local_dir = LOCAL / sub

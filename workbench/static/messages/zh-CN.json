@@ -465,6 +465,7 @@
   "runtimeOpenDriveAuth": "1. 打开 Google Drive 授权页面 ↗",
   "runtimeConfirmDriveAuth": "2. 我已完成授权，继续启动",
   "runtimeStopConfirmWarning": "当前仍有正在执行或排队的视频任务（本地任务进行中：{local}，远端队列：{queue}）。强制终止会中断在途生成，确认继续吗？",
+  "runtimeQueueUnknown": "未知（队列探测失败）",
   "runtimeBoolYes": "是",
   "runtimeBoolNo": "否",
   "runtimeConfirmForceStop": "确认强制终止",

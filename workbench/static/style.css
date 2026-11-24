@@ -148,8 +148,8 @@ h3{font-size:14px;font-weight:650}
 .live-progress-header strong{font-size:13px;font-weight:600;color:var(--ink)}
 .live-progress-meta{font-family:var(--mono);font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
 .live-progress-track{height:6px;border-radius:999px;background:#dce6dd;overflow:hidden}
-.live-progress-fill{height:100%;width:0%;border-radius:999px;background:var(--accent);transition:width .3s ease-out}
-.live-progress-fill.indeterminate{width:35%;animation:h3-progress-slide 1.8s ease-in-out infinite}
+.live-progress-fill{height:100%;width:100%;border-radius:999px;background:var(--accent);transform-origin:left center;transform:scaleX(0);transition:transform .3s ease-out}
+.live-progress-fill.indeterminate{width:35%;transform:none;animation:h3-progress-slide 1.8s ease-in-out infinite}
 @keyframes h3-progress-slide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
 .log-output{font-family:var(--mono);font-size:12px;line-height:1.8;min-height:115px;max-height:240px;overflow:auto;background:#263c30;color:#d0dfcd;border:1px solid #263c30;border-radius:7px;padding:13px;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
 .resume-button{margin-top:14px}
@@ -189,7 +189,7 @@ h3{font-size:14px;font-weight:650}
 .runtime-actions{flex-wrap:wrap}
 .runtime-nodes{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
 .runtime-node-item{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
-.runtime-node-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.runtime-node-url{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere;min-width:0}
 .runtime-node-meta{margin:0}
 .runtime-node-action{margin-left:auto;padding:2px 8px;font-size:12px}
 .runtime-subbox{margin:12px 0 0}
@@ -281,7 +281,7 @@ a.history-row:hover{background:#eef4ea;border-color:#d4e2d2}
 .back-link{display:inline-block;font-size:12px;margin-bottom:12px;text-decoration:none}
 .back-link:hover{text-decoration:underline;color:#1b634d}
 .result-summary,.review-section,.result-video,.result-details{padding:25px;margin-bottom:24px}
-:is(.editor-card,.config-body,.result-summary,.review-section,.segments-section,.result-video,.result-details) :is(p.hint,#stage-hint,#resume-hint,#progress-note):not(.empty-review,.frame-placeholder,.segment-placeholder){max-width:68ch}
+:is(.editor-card,.config-body,.runtime-card,.result-summary,.review-section,.segments-section,.result-video,.result-details) :is(p.hint,#stage-hint,#resume-hint,#progress-note):not(.empty-review,.frame-placeholder,.segment-placeholder){max-width:68ch}
 .result-summary h2{margin:16px 0 5px}
 .result-summary .progress-stats{max-width:640px}
 .review-section>.section-heading{margin-bottom:16px}
@@ -385,7 +385,7 @@ a.history-row:hover{background:#eef4ea;border-color:#d4e2d2}
 .segment-card h3{font-size:14px;margin:0}
 .segment-card .artifact{margin:14px 0}
 .segment-card .artifact .plyr video{max-height:320px}
-.segment-placeholder{display:flex;align-items:center;justify-content:center;min-height:200px;background:var(--wash);border-radius:6px;margin:14px 0}
+.segment-placeholder{display:flex;align-items:center;justify-content:center;min-height:200px;padding:16px;text-align:center;overflow-wrap:anywhere;background:var(--wash);border-radius:6px;margin:14px 0}
 .segment-actions{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 8px}
 .segment-actions .button{font-size:12px;text-decoration:none}
 .segment-seam{color:#81612a;margin-top:8px}

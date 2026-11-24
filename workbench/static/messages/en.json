@@ -465,6 +465,7 @@
   "runtimeOpenDriveAuth": "1. Open Google Drive consent page ↗",
   "runtimeConfirmDriveAuth": "2. I have authorized, continue",
   "runtimeStopConfirmWarning": "Video tasks are still active or queued (local active: {local}, remote queue: {queue}). Force-stopping will interrupt in-flight generation. Stop anyway?",
+  "runtimeQueueUnknown": "unknown (queue probe failed)",
   "runtimeBoolYes": "yes",
   "runtimeBoolNo": "no",
   "runtimeConfirmForceStop": "Force stop anyway",

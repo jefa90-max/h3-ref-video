@@ -498,9 +498,12 @@ def gen_segment(
     *,
     reference_paths: list[Path] | None = None,
     node_pool: comfy.ComfyNodePool | None = None,
+    abort: threading.Event | None = None,
 ) -> dict:
     try:
-        return _generate_segment(job, film, seg, pics, reference_paths=reference_paths, node_pool=node_pool)
+        return _generate_segment(job, film, seg, pics, reference_paths=reference_paths, node_pool=node_pool, abort=abort)
+    except comfy.DispatchAbortedError:
+        raise
     except (Exception, SystemExit) as exc:
         rec = job.state['segs'].get(str(seg['idx']), {})
         if not rec.get('terminal_failed'):
@@ -543,7 +546,10 @@ def _is_auth_rejection(exc: Exception) -> bool:
     if isinstance(cause, http.HTTPResponseError) and cause.status_code in (401, 403):
         return True
     text = str(exc)
-    return any(tok in text for tok in ("HTTP 401", "HTTP 403", "Unauthorized", "Forbidden"))
+    return any(
+        tok in text
+        for tok in ("HTTP 401", "HTTP 403", "Unauthorized", "Forbidden", '"_http_status": 401', '"_http_status": 403')
+    )
 
 
 def _terminal_failed_message(number: int, path: Path, error: object = None) -> str:
@@ -561,6 +567,7 @@ def _generate_segment(
     *,
     reference_paths: list[Path] | None = None,
     node_pool: comfy.ComfyNodePool | None = None,
+    abort: threading.Event | None = None,
 ) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
@@ -589,7 +596,7 @@ def _generate_segment(
             if provider_name == "comfyui" and node_pool is not None:
                 tried: set[str] = set()
                 while True:
-                    cand = node_pool.acquire(exclude=tried)
+                    cand = node_pool.acquire(exclude=tried, abort=abort)
                     tried.add(cand)
                     leased_endpoint = cand
                     endpoint_url = cand
@@ -606,7 +613,12 @@ def _generate_segment(
                         raise
                     g = comfy.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
                     job.put("segs", str(i), phase="submit")
-                    extra_with_ep = {**extra_provider, "comfyui_url": endpoint_url}
+                    key_fp = comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+                    extra_with_ep = {
+                        **extra_provider,
+                        "comfyui_url": endpoint_url,
+                        **({"comfyui_key_fp": key_fp} if key_fp else {}),
+                    }
                     try:
                         task = comfy.submit_with_retry(
                             g,
@@ -616,13 +628,17 @@ def _generate_segment(
                             ),
                             **ep_kw,
                         )
-                    except comfy.SubmissionRejected as exc:
-                        if _is_auth_rejection(exc):
-                            node_pool.mark_unhealthy(cand, str(exc)[:120])
+                    except Exception as exc:
+                        can_failover = (
+                            (isinstance(exc, comfy.SubmissionRejected) and _is_auth_rejection(exc))
+                            or comfy._is_tunnel_offline_error(exc)
+                        )
+                        if can_failover or not isinstance(exc, comfy.SubmissionRejected):
+                            node_pool.mark_unhealthy(cand, f"{type(exc).__name__}: {str(exc)[:120]}")
                             leased_endpoint = None
-                            if node_pool.healthy_count() > 0 and any(u not in tried for u in node_pool.healthy_urls()):
-                                job.log("pool", message("comfy_node_failover", number=i + 1, node=comfy.endpoint_label(cand)))
-                                continue
+                        if can_failover and node_pool.healthy_count() > 0 and any(u not in tried for u in node_pool.healthy_urls()):
+                            job.log("pool", message("comfy_node_failover", number=i + 1, node=comfy.endpoint_label(cand)))
+                            continue
                         raise
                     job.put(
                         "segs", str(i), task=task, seed=seed, submitted=time.time(),
@@ -638,7 +654,16 @@ def _generate_segment(
                 if provider_name == "comfyui":
                     endpoint_url = _select_single_comfy_endpoint(log=lambda detail: job.log("pool", detail))
                 ep_kw = _comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
-                extra_with_ep = {**extra_provider, **({"comfyui_url": endpoint_url} if provider_name == "comfyui" and endpoint_url else {})}
+                key_fp = (
+                    comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+                    if provider_name == "comfyui" and endpoint_url
+                    else ""
+                )
+                extra_with_ep = {
+                    **extra_provider,
+                    **({"comfyui_url": endpoint_url} if provider_name == "comfyui" and endpoint_url else {}),
+                    **({"comfyui_key_fp": key_fp} if key_fp else {}),
+                }
                 job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
                 if provider_name == "comfyui":
                     names = comfy.upload_many(paths, **ep_kw)
@@ -657,6 +682,7 @@ def _generate_segment(
                 rec = job.state["segs"][str(i)]
         elif provider_name == "comfyui":
             endpoint_url = str(rec.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+            comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=rec.get("comfyui_key_fp"))
             if node_pool is not None and endpoint_url:
                 node_pool.reserve_inflight(endpoint_url)
                 reserved_inflight_endpoint = endpoint_url
@@ -827,22 +853,34 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                 if pending_new:
                     node_pool.probe_all(fail_if_all_offline=not inflight_segs)
         abort = threading.Event()
+        configured_concurrency = max(1, vcfg["concurrency"])
+        new_seg_sem = threading.Semaphore(configured_concurrency)
+
         def run_inflight(seg):
             if node_pool is not None:
                 return gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool)
             return gen_segment(job, film, seg, pics[seg["idx"]])
+
         def run_other(seg):
             if abort.is_set():
                 return
-            try:
-                if node_pool is not None:
-                    gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool)
-                else:
-                    gen_segment(job, film, seg, pics[seg["idx"]])
-            except BaseException:
-                abort.set()
-                raise
-        effective_workers = max(1, vcfg["concurrency"])
+            with new_seg_sem:
+                if abort.is_set():
+                    return
+                try:
+                    if node_pool is not None:
+                        gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool, abort=abort)
+                    else:
+                        gen_segment(job, film, seg, pics[seg["idx"]])
+                except comfy.DispatchAbortedError:
+                    return
+                except BaseException:
+                    abort.set()
+                    if node_pool is not None:
+                        node_pool.notify_all()
+                    raise
+
+        effective_workers = configured_concurrency
         if node_pool is not None:
             effective_workers = max(
                 len(inflight_segs),
@@ -851,15 +889,20 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
         pool = ThreadPoolExecutor(effective_workers)
         first_error = None
         try:
-            # Pre-reserve inflight endpoints before dispatching new work so new segments never crowd inflight nodes.
-            pre_reserved: list[str] = []
-            if node_pool is not None:
-                for s in inflight_segs:
+            # Pre-reserve ComfyUI inflight endpoints before dispatching new work so new segments never crowd inflight nodes.
+            inflight_pairs: list[tuple[dict, str | None]] = []
+            unsubmitted_reserved: list[str] = []
+            for s in inflight_segs:
+                res_ep: str | None = None
+                if node_pool is not None:
                     rec_s = job.state["segs"].get(str(s["idx"])) or {}
-                    ep_s = str(rec_s.get("comfyui_url") or "").strip() or (vcfg["comfyui_url"] or "")
-                    if ep_s:
-                        node_pool.reserve_inflight(ep_s)
-                        pre_reserved.append(ep_s)
+                    if _video_provider_name(rec_s) == "comfyui":
+                        ep_s = str(rec_s.get("comfyui_url") or "").strip() or (vcfg["comfyui_url"] or "")
+                        if ep_s:
+                            node_pool.reserve_inflight(ep_s)
+                            res_ep = ep_s
+                            unsubmitted_reserved.append(ep_s)
+                inflight_pairs.append((s, res_ep))
             try:
                 def run_inflight_releasing(seg, reserved_ep: str | None):
                     try:
@@ -867,15 +910,17 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                     finally:
                         if node_pool is not None and reserved_ep:
                             node_pool.release_inflight(reserved_ep)
+
                 inflight_futures = []
-                for idx_f, s in enumerate(inflight_segs):
-                    res_ep = pre_reserved[idx_f] if idx_f < len(pre_reserved) else None
-                    inflight_futures.append(pool.submit(run_inflight_releasing, s, res_ep))
-                pre_reserved.clear()
+                for s, res_ep in inflight_pairs:
+                    fut = pool.submit(run_inflight_releasing, s, res_ep)
+                    if res_ep and res_ep in unsubmitted_reserved:
+                        unsubmitted_reserved.remove(res_ep)
+                    inflight_futures.append(fut)
                 other_futures = [pool.submit(run_other, s) for s in other_segs]
             finally:
                 if node_pool is not None:
-                    for leftover_ep in pre_reserved:
+                    for leftover_ep in unsubmitted_reserved:
                         node_pool.release_inflight(leftover_ep)
             for future in inflight_futures:
                 try:
@@ -890,6 +935,8 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                     if first_error is None:
                         first_error = exc
                     abort.set()
+                    if node_pool is not None:
+                        node_pool.notify_all()
                     for pending_future in other_futures:
                         pending_future.cancel()
             if first_error is not None:

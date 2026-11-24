@@ -185,9 +185,15 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                     rec['provider'] = staged['provider']
                 else:
                     rec.pop('provider', None)
+                if staged.get('comfyui_url'):
+                    rec['comfyui_url'] = staged['comfyui_url']
+                else:
+                    rec.pop('comfyui_url', None)
+                rec.pop('live_progress', None)
                 changed = True
             elif not staged.get('task') and not staged.get('submission_unknown'):
-                for stale_key in ('task', 'provider', 'terminal_failed', 'submission_unknown', 'submitted',
+                for stale_key in ('task', 'provider', 'comfyui_url', 'comfyui_key_fp', 'live_progress',
+                                  'terminal_failed', 'submission_unknown', 'submitted',
                                   'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                                   'error_code', 'attempt_blocked'):
                     if rec.pop(stale_key, None) is not None:
@@ -1141,6 +1147,11 @@ def prepare_rewrite_segment(request, number, *, prompt=None, prompt_format=None,
                         cur_rec['provider'] = staged_rec['provider']
                     else:
                         cur_rec.pop('provider', None)
+                    if staged_rec.get('comfyui_url'):
+                        cur_rec['comfyui_url'] = staged_rec['comfyui_url']
+                    else:
+                        cur_rec.pop('comfyui_url', None)
+                    cur_rec.pop('live_progress', None)
                     fjob.state['segs'][idx_str] = cur_rec
                     fjob.save()
             (out / 'inputs' / 'segment-edit.json').unlink(missing_ok=True)
@@ -1299,8 +1310,14 @@ def _execute_rewrite_targets(request):
                             rec['provider'] = staged_rec['provider']
                         else:
                             rec.pop('provider', None)
+                        if staged_rec.get('comfyui_url'):
+                            rec['comfyui_url'] = staged_rec['comfyui_url']
+                        else:
+                            rec.pop('comfyui_url', None)
+                        rec.pop('live_progress', None)
                     elif not staged_rec.get('task') and not staged_rec.get('submission_unknown'):
-                        for stale_key in ('task', 'provider', 'terminal_failed', 'submission_unknown', 'submitted',
+                        for stale_key in ('task', 'provider', 'comfyui_url', 'comfyui_key_fp', 'live_progress',
+                                          'terminal_failed', 'submission_unknown', 'submitted',
                                           'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                                           'error_code', 'attempt_blocked'):
                             rec.pop(stale_key, None)

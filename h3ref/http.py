@@ -23,12 +23,16 @@ def _summarize_error_body(raw_body: str, key: str, *, limit: int = 240) -> str:
     safe_text = _scrub(raw_body, key)
     ngrok_match = _NGROK_CODE_RE.search(safe_text)
     if ngrok_match:
+        code = ngrok_match.group(0)
         noscript = _NOSCRIPT_RE.search(safe_text)
         if noscript:
             summary = " ".join(noscript.group(1).split())
             if summary:
-                return summary[:limit]
-        return ngrok_match.group(0)
+                clipped = summary[:limit]
+                if code not in clipped:
+                    return f"{code}: {summary}"[:limit]
+                return clipped
+        return code
     return safe_text[:limit]
 
 
@@ -185,8 +189,10 @@ def upload(url: str, key: str, path: Path, fields: dict | None = None, timeout: 
 
 
 def download(url: str, out: Path, *, key: str = "", extra_headers: dict | None = None) -> Path:
-    if urlsplit(url).scheme not in ("http", "https"):
+    scheme = urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
         raise RuntimeError(f"download rejected unsafe url: {url[:120]}")
+    proto_redir = "=https" if scheme == "https" else "=http,https"
     tmp = out.with_suffix(out.suffix + ".part")
     if key or extra_headers:
         cfg_lines = []
@@ -196,13 +202,13 @@ def download(url: str, out: Path, *, key: str = "", extra_headers: dict | None =
             cfg_lines.append(f'header = "{_curl_escape(f"{hk}: {hv}")}"')
         cfg = "\n".join(cfg_lines) + "\n"
         ok = subprocess.run(
-            ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", "=http,https",
+            ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", proto_redir,
              "--retry", "6", "--retry-all-errors", "--retry-delay", "5", "--config", "-", "-o", str(tmp), "--", url],
             input=cfg, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
         ).returncode == 0
     else:
         ok = subprocess.run(
-            ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", "=http,https",
+            ["curl", "-f", "-sS", "-L", "--proto", "=http,https", "--proto-redir", proto_redir,
              "--retry", "6", "--retry-all-errors", "--retry-delay", "5", "-o", str(tmp), "--", url],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
         ).returncode == 0

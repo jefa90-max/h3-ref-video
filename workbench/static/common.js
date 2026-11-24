@@ -12,6 +12,7 @@ let renderPage = () => {};
 let llmProvider = null;
 let llmDrafts = {};
 let runtimePollTimer = null;
+let runtimeRefreshInFlight = null;
 
 function t(key, values = {}) {
   return (state.messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
@@ -135,7 +136,11 @@ function scheduleRuntimePoll(statusObj) {
   }
   if (typeof setTimeout === "function") {
     runtimePollTimer = setTimeout(() => {
-      refreshRuntimeStatus().catch(() => {});
+      refreshRuntimeStatus().catch(() => {
+        if ((state.config?.VIDEO_PROVIDER || "runninghub") === "comfyui") {
+          scheduleRuntimePoll(state.runtimeStatus);
+        }
+      });
     }, 2500);
   }
 }
@@ -330,6 +335,7 @@ function renderRuntimeStatus() {
   $("runtime-refresh").disabled = state.runtimeBusy;
   $("runtime-start").disabled = state.runtimeBusy || !cliReady || primaryOnline || primaryTransitional || !configuredUrl;
   $("runtime-stop").disabled = state.runtimeBusy || !cliReady || primaryState === "stopping" || (!primaryOnline && !primaryTransitional && !(primary?.has_session ?? statusObj.has_session));
+  if ($("runtime-confirm-stop")) $("runtime-confirm-stop").disabled = state.runtimeBusy;
 
   const startSecBtn = $("runtime-start-secondary");
   if (startSecBtn) {
@@ -349,10 +355,18 @@ function renderRuntimeStatus() {
 
 async function refreshRuntimeStatus() {
   if ((state.config?.VIDEO_PROVIDER || "runninghub") !== "comfyui") return;
-  const statusObj = await request("/api/runtime/status");
-  state.runtimeStatus = statusObj;
-  renderRuntimeStatus();
-  scheduleRuntimePoll(statusObj);
+  if (runtimeRefreshInFlight) return runtimeRefreshInFlight;
+  runtimeRefreshInFlight = (async () => {
+    const statusObj = await request("/api/runtime/status");
+    state.runtimeStatus = statusObj;
+    renderRuntimeStatus();
+    scheduleRuntimePoll(statusObj);
+  })();
+  try {
+    await runtimeRefreshInFlight;
+  } finally {
+    runtimeRefreshInFlight = null;
+  }
 }
 
 async function loadLanguage(language) {
@@ -533,6 +547,9 @@ $("runtime-drive-ack").addEventListener("click", async () => {
     const payload = state.runtimeAuthSlot === "secondary" ? { slot: "secondary" } : {};
     const res = await post("/api/runtime/drive-ack", payload);
     if (res.status) state.runtimeStatus = res.status;
+    if (res.accepted === false) {
+      showError(t("runtimeDetailError", { error: res.state || "drive_ack_rejected" }));
+    }
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
   } catch (error) {
@@ -555,7 +572,7 @@ async function submitRuntimeStop(force, slot = "primary") {
     if (res.confirmation_required) {
       $("runtime-confirm-text").textContent = t("runtimeStopConfirmWarning", {
         local: t(res.local_busy ? "runtimeBoolYes" : "runtimeBoolNo"),
-        queue: res.remote_queue ?? 0,
+        queue: res.queue_unknown ? t("runtimeQueueUnknown") : (res.remote_queue ?? 0),
       });
       $("runtime-confirm").hidden = false;
     } else {

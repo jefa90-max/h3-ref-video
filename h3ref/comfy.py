@@ -80,6 +80,10 @@ class NoHealthyNodeError(RuntimeError):
     """Raised when no healthy ComfyUI endpoints remain available in the node pool."""
 
 
+class DispatchAbortedError(RuntimeError):
+    """Raised by ComfyNodePool.acquire() when another segment already triggered abort."""
+
+
 def _headers() -> dict[str, str]:
     return {"ngrok-skip-browser-warning": "1", "User-Agent": "h3-ref-video/1.0"}
 
@@ -101,10 +105,55 @@ def endpoint_label(base_url: str) -> str:
     return host
 
 
+def key_fingerprint(api_key: str) -> str:
+    cleaned = str(api_key or "").strip()
+    if not cleaned:
+        return ""
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
+def is_plaintext_remote_http(url: str) -> bool:
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme.lower() != "http":
+        return False
+    host = (parts.hostname or "").lower()
+    return host not in ("127.0.0.1", "localhost", "::1")
+
+
+def key_for_endpoint(base_url: str, api_key: str) -> str:
+    """Never send Bearer secrets over plaintext non-loopback HTTP."""
+    if not api_key or is_plaintext_remote_http(base_url):
+        return ""
+    return api_key
+
+
+def assert_resume_endpoint_key_allowed(
+    endpoint_url: str | None,
+    *,
+    expected_key_fp: str | None = None,
+    environ=None,
+) -> None:
+    """Block sending a rotated/new COMFYUI_API_KEY to a previously removed remote endpoint."""
+    if not endpoint_url:
+        return
+    vcfg = config.video_settings(environ)
+    key = key_for_endpoint(endpoint_url, vcfg["comfyui_api_key"])
+    if not key:
+        return
+    configured_origins = {config.url_origin(u) for u in vcfg["comfyui_urls"]}
+    if config.url_origin(endpoint_url) in configured_origins:
+        return
+    if expected_key_fp and expected_key_fp == key_fingerprint(key):
+        return
+    raise RuntimeError(
+        f"Refusing to send current COMFYUI_API_KEY to removed ComfyUI endpoint {endpoint_label(endpoint_url)}"
+    )
+
+
 def _resolve_endpoint(base_url: str | None = None, api_key: str | None = None) -> tuple[str, str]:
     base = config.validate_endpoint_url(base_url, "COMFYUI_URL") if base_url else config.comfy_url()
-    key = api_key.strip() if api_key is not None else config.comfy_key()
-    return base, key
+    raw_key = api_key.strip() if api_key is not None else config.comfy_key()
+    return base, key_for_endpoint(base, raw_key)
 
 
 def base_graph() -> dict:
@@ -133,11 +182,20 @@ def clear_upload_cache(base_url: str | None = None) -> None:
                 _UPLOADED_CACHE.pop(cache_key, None)
 
 
-def _is_ngrok_offline_error(exc: http.HTTPResponseError) -> bool:
-    if exc.status_code != 404:
+def _is_ngrok_offline_error(exc: Exception) -> bool:
+    if isinstance(exc, http.HTTPResponseError) and exc.status_code != 404:
         return False
     text = str(exc)
     return "ERR_NGROK_3200" in text or ("ERR_NGROK_" in text and "offline" in text.lower())
+
+
+def _is_tunnel_offline_error(exc: Exception) -> bool:
+    if _is_ngrok_offline_error(exc):
+        return True
+    text = str(exc)
+    if isinstance(exc, http.HTTPResponseError) and exc.status_code == 530:
+        return True
+    return ": 530:" in text or "error 1033" in text.lower() or "argo tunnel error" in text.lower()
 
 
 def upload(path: Path, *, force: bool = False, base_url: str | None = None, api_key: str | None = None) -> str:
@@ -355,7 +413,7 @@ def submit_with_retry(
             return submit(g)
         return submit(g, base_url=base_url, api_key=api_key)
     except RuntimeError as exc:
-        if isinstance(exc, SubmissionRejected) and record_submission:
+        if (isinstance(exc, SubmissionRejected) or _is_tunnel_offline_error(exc)) and record_submission:
             record_submission(False)
         log(message("comfy_submission_failed", reason=exc))
         raise
@@ -497,7 +555,7 @@ def live_progress(
 
 
 def progress_payload(status: dict, *, elapsed_s: float | None = None, endpoint: str | None = None) -> dict:
-    ep = str(endpoint or status.get("endpoint") or "").strip()
+    ep = str(endpoint or "").strip()
     payload = {
         "stage": status.get("stage") or ("queued" if status.get("queued") else "running"),
         "queued": bool(status.get("queued")),
@@ -564,6 +622,12 @@ _TRANSIENT_NETWORK_MARKERS = (
     "timed out",
     "URLError",
     "EOFError",
+    ": 502:",
+    ": 503:",
+    ": 504:",
+    "502 Bad Gateway",
+    "503 Service Unavailable",
+    "504 Gateway Timeout",
 )
 
 
@@ -661,8 +725,8 @@ def poll(task: str, *, base_url: str | None = None, api_key: str | None = None) 
 
 
 def download(url: str, out: Path, *, api_key: str | None = None) -> Path:
-    key = api_key.strip() if api_key is not None else config.comfy_key()
-    return http.download(url, out, key=key, extra_headers=_headers())
+    raw_key = api_key.strip() if api_key is not None else config.comfy_key()
+    return http.download(url, out, key=key_for_endpoint(url, raw_key), extra_headers=_headers())
 
 
 def probe_endpoint(base_url: str, api_key: str | None = None, *, timeout: float = 12.0) -> dict:
@@ -854,10 +918,16 @@ class ComfyNodePool:
                 self._inflight[base_url] = cur - 1
             self._cond.notify_all()
 
-    def acquire(self, *, exclude: set[str] | None = None) -> str:
+    def notify_all(self) -> None:
+        with self._cond:
+            self._cond.notify_all()
+
+    def acquire(self, *, exclude: set[str] | None = None, abort: threading.Event | None = None) -> str:
         excluded = set(exclude or ())
         with self._cond:
             while True:
+                if abort is not None and abort.is_set():
+                    raise DispatchAbortedError("Segment dispatch aborted")
                 candidates = [u for u in self._order if u not in self._unhealthy and u not in excluded]
                 if not candidates:
                     raise NoHealthyNodeError(message("comfy_pool_all_offline", count=len(self.urls)))
@@ -868,7 +938,7 @@ class ComfyNodePool:
                         self._busy.add(cand)
                         self._rr_index = (self._rr_index + offset + 1) % max(1, n)
                         return cand
-                self._cond.wait()
+                self._cond.wait(timeout=0.5 if abort is not None else None)
 
     def release(self, base_url: str) -> None:
         if not base_url:
