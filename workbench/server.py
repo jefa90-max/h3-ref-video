@@ -114,11 +114,12 @@ def create_app(storage=None, env_path=None):
                 try:
                     disk_urls = config.parse_endpoint_urls(disk_file.get("COMFYUI_URL", ""), "COMFYUI_URL")
                 except ValueError:
-                    disk_urls = []
-                disk_merged = colab_runtime.merge_ephemeral_url(disk_urls, old_url, disk_add)
-                disk_formatted = config.format_endpoint_urls(disk_merged)
-                if disk_formatted != disk_file.get("COMFYUI_URL", ""):
-                    save_env(env_path, {"COMFYUI_URL": disk_formatted})
+                    disk_urls = None
+                if disk_urls is not None:
+                    disk_merged = colab_runtime.merge_ephemeral_url(disk_urls, old_url, disk_add)
+                    disk_formatted = config.format_endpoint_urls(disk_merged)
+                    if disk_formatted != disk_file.get("COMFYUI_URL", ""):
+                        save_env(env_path, {"COMFYUI_URL": disk_formatted})
 
     runtime.set_url_change_callback(sync_ephemeral_url)
 

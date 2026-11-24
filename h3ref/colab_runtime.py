@@ -604,6 +604,7 @@ class _SlotState:
         self.drive_proc = None
         self.active_proc = None
         self.worker_thread: threading.Thread | None = None
+        self.stopping = False
         self.last_keepalive_at = float(now)
         self.last_keepalive_fail_at: float | None = None
         self.keepalive_in_flight = False
@@ -807,6 +808,10 @@ class ColabRuntimeManager:
                     continue
         return urls
 
+    @staticmethod
+    def _is_stopping(st: _SlotState) -> bool:
+        return bool(st.stopping or st.active_state == "stopping")
+
     def stopping_urls(self, environ=None) -> set[str]:
         """Return normalized ComfyUI endpoint URLs belonging to managed slots currently stopping."""
         env_copy = dict(os.environ if environ is None else environ)
@@ -815,8 +820,8 @@ class ColabRuntimeManager:
         except ValueError:
             return set()
         with self._lock:
-            p_stopping = self._slots["primary"].active_state == "stopping"
-            s_stopping = self._slots["secondary"].active_state == "stopping"
+            p_stopping = self._is_stopping(self._slots["primary"])
+            s_stopping = self._is_stopping(self._slots["secondary"])
         if not p_stopping and not s_stopping:
             return set()
         saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
@@ -853,7 +858,7 @@ class ColabRuntimeManager:
         transitional = ("provisioning", "awaiting_drive_auth", "starting_comfy", "stopping")
         callback = None
         with self._lock:
-            if self._slots[slot_name].active_state in transitional:
+            if self._is_stopping(self._slots[slot_name]) or self._slots[slot_name].active_state in transitional:
                 return False
             data = self._load_saved_nodes()
             prev = data.get(slot_name)
@@ -888,7 +893,7 @@ class ColabRuntimeManager:
         old_url: str | None = None
         new_url: str | None = None
         with self._lock:
-            if abort_if_cancelled and (st.cancel_event.is_set() or st.active_state == "stopping"):
+            if abort_if_cancelled and st.cancel_event.is_set():
                 return None, None
             data = self._load_saved_nodes()
             prev = data.get(slot_name)
@@ -1112,8 +1117,10 @@ class ColabRuntimeManager:
         with self._lock:
             p_slot = self._slots["primary"]
             s_slot = self._slots["secondary"]
-            p_active, p_auth_url, p_error, p_logs = p_slot.active_state, p_slot.auth_url, p_slot.last_error, list(p_slot.logs[-15:])
-            s_active, s_auth_url, s_error, s_logs = s_slot.active_state, s_slot.auth_url, s_slot.last_error, list(s_slot.logs[-15:])
+            p_active = "stopping" if self._is_stopping(p_slot) else p_slot.active_state
+            s_active = "stopping" if self._is_stopping(s_slot) else s_slot.active_state
+            p_auth_url, p_error, p_logs = p_slot.auth_url, p_slot.last_error, list(p_slot.logs[-15:])
+            s_auth_url, s_error, s_logs = s_slot.auth_url, s_slot.last_error, list(s_slot.logs[-15:])
 
         primary_url = self._primary_url(settings, sec_url)
         p_node = probed_by_url.get(primary_url) if primary_url else None
@@ -1744,7 +1751,7 @@ class ColabRuntimeManager:
                                 abort_if_cancelled=True,
                             )
                         with self._lock:
-                            if st.cancel_event.is_set() or st.active_state == "stopping":
+                            if st.cancel_event.is_set():
                                 return
                             st.last_error = None
                             st.active_state = None
@@ -1760,13 +1767,12 @@ class ColabRuntimeManager:
             with self._lock:
                 if not st.cancel_event.is_set():
                     st.last_error = str(exc)
-                if st.active_state != "stopping":
-                    st.active_state = None
+                st.active_state = None
                 st.auth_url = None
                 self._sessions_cache = None
         finally:
             with self._lock:
-                if st.cancel_event.is_set() and st.active_state != "stopping":
+                if st.cancel_event.is_set():
                     st.active_state = None
                     st.auth_url = None
             lock_ctx.__exit__(None, None, None)
@@ -1780,7 +1786,7 @@ class ColabRuntimeManager:
         st = self._slot(slot_name)
         already_active = False
         with self._lock:
-            if st.active_state == "stopping":
+            if self._is_stopping(st):
                 raise RuntimeBusyError(message("colab_busy"))
             if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
@@ -1791,7 +1797,7 @@ class ColabRuntimeManager:
             probe = self._probe_slot(env_copy, settings, "primary")
             if probe["online"]:
                 with self._lock:
-                    if st.active_state == "stopping":
+                    if self._is_stopping(st):
                         raise RuntimeBusyError(message("colab_busy"))
                 return self.status(env_copy)
             if not self._primary_url(settings):
@@ -1803,15 +1809,15 @@ class ColabRuntimeManager:
             if saved_sec and saved_sec.get("url"):
                 if self._probe_slot(env_copy, settings, "secondary", target_url=saved_sec["url"])["online"]:
                     with self._lock:
-                        if st.active_state == "stopping":
+                        if self._is_stopping(st):
                             raise RuntimeBusyError(message("colab_busy"))
                     return self.status(env_copy)
 
         with self._lock:
+            if self._is_stopping(st):
+                raise RuntimeBusyError(message("colab_busy"))
             if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
-            elif st.active_state == "stopping":
-                raise RuntimeBusyError(message("colab_busy"))
         if already_active:
             return self.status(env_copy)
 
@@ -1821,13 +1827,8 @@ class ColabRuntimeManager:
 
         lock_ctx = runtime_file_lock(self.storage, slot=slot_name)
         lock_ctx.__enter__()
+        set_active = False
         try:
-            with self._lock:
-                st.cancel_event.clear()
-                st.last_error = None
-                st.auth_url = None
-                st.logs.clear()
-                st.active_state = "provisioning"
             t = threading.Thread(
                 target=self._startup_worker,
                 args=(env_copy, colab_bin, lock_ctx),
@@ -1835,11 +1836,20 @@ class ColabRuntimeManager:
                 daemon=True,
             )
             with self._lock:
+                if self._is_stopping(st):
+                    raise RuntimeBusyError(message("colab_busy"))
+                st.cancel_event.clear()
+                st.last_error = None
+                st.auth_url = None
+                st.logs.clear()
+                st.active_state = "provisioning"
                 st.worker_thread = t
-            t.start()
+                set_active = True
+                t.start()
         except BaseException:
-            with self._lock:
-                st.active_state = None
+            if set_active:
+                with self._lock:
+                    st.active_state = None
             lock_ctx.__exit__(None, None, None)
             raise
         return self.status(env_copy)
@@ -1908,7 +1918,7 @@ class ColabRuntimeManager:
         with self._lock:
             if local_busy:
                 self._last_activity_at = current
-            if st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+            if self._is_stopping(st) or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
                 return False
             if (current - st.last_keepalive_at) < self.keepalive_interval_sec:
                 return False
@@ -2008,7 +2018,7 @@ class ColabRuntimeManager:
         with self._lock:
             for slot_name in slots_to_check:
                 st = self._slots[slot_name]
-                if st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+                if self._is_stopping(st) or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
                     continue
                 if (current - st.last_keepalive_at) >= self.keepalive_interval_sec:
                     due_slots.append(slot_name)
@@ -2126,31 +2136,32 @@ class ColabRuntimeManager:
 
         st = self._slot(slot_name)
         with self._lock:
-            if st.active_state == "stopping":
+            if self._is_stopping(st):
                 raise RuntimeBusyError(message("colab_busy"))
-            prev_state = st.active_state
-            st.active_state = "stopping"
-        # Dekker barrier: st.active_state is already "stopping" before re-checking local_busy_provider(),
-        # preventing a concurrent job launch from racing past _check_not_stopping() and avoiding killing
-        # an active startup worker before confirming local idleness on force=False.
-        if not force and callable(local_busy_provider) and local_busy_provider():
-            with self._lock:
-                st.active_state = prev_state
-                st.cancel_event.clear()
-            return {
-                "stopped": False,
-                "slot": slot_name,
-                "confirmation_required": True,
-                "local_busy": True,
-                "remote_queue": remote_queue,
-                "queue_unknown": queue_unknown,
-                "status": self.status(env_copy),
-            }
+            st.stopping = True
 
         stop_succeeded = False
         try:
+            # Dekker barrier: st.stopping is True before re-checking local_busy_provider(),
+            # preventing a concurrent job launch or start_async() from racing without
+            # clobbering st.active_state or killing an active startup worker on force=False.
+            if not force and callable(local_busy_provider) and local_busy_provider():
+                with self._lock:
+                    st.stopping = False
+                    if st.active_state is None:
+                        st.cancel_event.clear()
+                return {
+                    "stopped": False,
+                    "slot": slot_name,
+                    "confirmation_required": True,
+                    "local_busy": True,
+                    "remote_queue": remote_queue,
+                    "queue_unknown": queue_unknown,
+                    "status": self.status(env_copy),
+                }
+
             with self._lock:
-                active_worker = st.worker_thread if prev_state in ("provisioning", "awaiting_drive_auth", "starting_comfy") else None
+                active_worker = st.worker_thread if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy") else None
                 keepalive_running = st.keepalive_in_flight
                 proc_to_cancel = st.active_proc if (active_worker is not None or keepalive_running) else None
                 if active_worker is not None or keepalive_running:
@@ -2184,7 +2195,7 @@ class ColabRuntimeManager:
                 if not force and callable(local_busy_provider) and local_busy_provider():
                     with self._lock:
                         st.cancel_event.clear()
-                        st.active_state = None
+                        st.stopping = False
                     return {
                         "stopped": False,
                         "slot": slot_name,
@@ -2213,14 +2224,16 @@ class ColabRuntimeManager:
                     lock_ctx.__exit__(None, None, None)
         finally:
             with self._lock:
-                st.cancel_event.clear()
-                st.active_state = None
+                if stop_succeeded or st.active_state is None:
+                    st.cancel_event.clear()
+                st.stopping = False
                 self._sessions_cache = None
                 if (
                     stop_succeeded
                     and slot_name == "primary"
                     and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
                     and not self._slots["secondary"].active_state
+                    and not self._slots["secondary"].stopping
                 ):
                     self._last_activity_at = None
 

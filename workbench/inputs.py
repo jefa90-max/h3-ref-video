@@ -286,7 +286,10 @@ def resumable_comfyui_state(job, env):
     if job.get("demo"):
         return [], False
     from h3ref import comfy
-    vcfg = config.video_settings(env)
+    try:
+        vcfg = config.video_settings(env)
+    except ValueError:
+        invalid("COMFYUI_URL", "[URL]", "choice")
     default_provider = vcfg["provider"]
     shared_key = vcfg["comfyui_api_key"]
     operation = job.get("operation", "pipeline")
