@@ -286,5 +286,11 @@ def download(url: str, out: Path, *, key: str = "", extra_headers: dict | None =
         detail = _scrub(raw_detail, key)
         suffix = f" ({detail[:200]})" if detail else (f" (curl exit {proc.returncode})" if proc.returncode != 0 else "")
         raise RuntimeError(f"download failed: {_scrub(url, key)[:120]}{suffix}")
+    if out.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv", ".png", ".jpg", ".jpeg", ".webp"}:
+        with tmp.open("rb") as fh:
+            head = fh.read(512).lstrip().lower()
+        if head.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"<?xml", b"{", b"[")):
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"download returned non-media response: {_scrub(url, key)[:120]}")
     config.atomic_replace(tmp, out)
     return out

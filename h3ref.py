@@ -165,11 +165,15 @@ def cmd_one(a):
         comfy.download(res["url"], clip)
     else:
         http.download(res["url"], clip)
+    dur = media.duration(clip)
+    if dur <= 0:
+        clip.unlink(missing_ok=True)
+        raise RuntimeError(f"下载的成片无效（时长 {dur:.1f}s）：{clip}")
     st.update(cny=res["cny"], run_s=res.get("run_seconds"), wall_s=round(time.time() - t0))
     if config.SUBTITLE_CHECKS_ENABLED and (any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check):
         st["subtitles"] = check.subtitles(clip)
     save()
-    print(f"成片 {clip}，{media.duration(clip):.1f} 秒，¥{res['cny']:.3f}，GPU {res.get('run_seconds')} 秒")
+    print(f"成片 {clip}，{dur:.1f} 秒，¥{res['cny']:.3f}，GPU {res.get('run_seconds')} 秒")
     if (st.get("subtitles") or {}).get("burned_text"):
         print("注意：画面里烧了字幕/文字：", st["subtitles"].get("text"), "—— 换个种子（--seed）重跑，或者删掉那句台词")
 

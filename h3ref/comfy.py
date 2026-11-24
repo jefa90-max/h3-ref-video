@@ -183,7 +183,7 @@ def clear_upload_cache(base_url: str | None = None) -> None:
 
 
 def _is_ngrok_offline_error(exc: Exception) -> bool:
-    if isinstance(exc, http.HTTPResponseError) and exc.status_code != 404:
+    if not isinstance(exc, http.HTTPResponseError) or exc.status_code != 404:
         return False
     text = str(exc)
     return "ERR_NGROK_3200" in text or ("ERR_NGROK_" in text and "offline" in text.lower())
@@ -192,10 +192,9 @@ def _is_ngrok_offline_error(exc: Exception) -> bool:
 def _is_tunnel_offline_error(exc: Exception) -> bool:
     if _is_ngrok_offline_error(exc):
         return True
-    text = str(exc)
     if isinstance(exc, http.HTTPResponseError) and exc.status_code == 530:
         return True
-    return ": 530:" in text or "error 1033" in text.lower() or "argo tunnel error" in text.lower()
+    return ": 530:" in str(exc)
 
 
 def upload(path: Path, *, force: bool = False, base_url: str | None = None, api_key: str | None = None) -> str:
@@ -724,15 +723,19 @@ def poll(task: str, *, base_url: str | None = None, api_key: str | None = None) 
     q_status = q.get("_http_status")
     if isinstance(q_status, int) and q_status >= 400:
         raise RuntimeError(f"ComfyUI queue HTTP {q_status}: {json.dumps(q, ensure_ascii=False)[:240]}")
+    q_running = q.get("queue_running")
+    q_pending = q.get("queue_pending")
+    if not isinstance(q_running, list) or not isinstance(q_pending, list):
+        raise RuntimeError(f"ComfyUI /queue returned malformed queue lists: {json.dumps(q, ensure_ascii=False)[:240]}")
 
     with _MISSING_LOCK:
         _TRANSIENT_COUNTS.pop((base, task), None)
 
-    if _task_in_queue_list(q.get("queue_running"), task):
+    if _task_in_queue_list(q_running, task):
         with _MISSING_LOCK:
             _MISSING_COUNTS.pop((base, task), None)
         return {"state": "running", "queued": False}
-    if _task_in_queue_list(q.get("queue_pending"), task):
+    if _task_in_queue_list(q_pending, task):
         with _MISSING_LOCK:
             _MISSING_COUNTS.pop((base, task), None)
         return {"state": "running", "queued": True}

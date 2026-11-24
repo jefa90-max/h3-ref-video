@@ -146,7 +146,7 @@ def create_app(storage=None, env_path=None):
         with use_lang(lang):
             vcfg = config.video_settings(env_with_lang)
             saved_resume_urls, needs_pool_url = resumable_comfyui_state(job_request, env_with_lang)
-            check_urls = set(vcfg["comfyui_urls"]) | (set(saved_resume_urls) if not needs_pool_url else set())
+            check_urls = set(vcfg["comfyui_urls"]) | set(saved_resume_urls)
             def _check_not_stopping():
                 stopping = runtime.stopping_urls(env_with_lang)
                 if stopping and (stopping & check_urls):
@@ -154,7 +154,9 @@ def create_app(storage=None, env_path=None):
             _check_not_stopping()
             probe_env = env_with_lang
             if not needs_pool_url and saved_resume_urls:
-                probe_urls = list(dict.fromkeys([*saved_resume_urls, *vcfg["comfyui_urls"]]))
+                has_relocatable = any(film._is_trycloudflare_url(u) for u in saved_resume_urls)
+                reloc_candidates = [u for u in vcfg["comfyui_urls"] if film._is_trycloudflare_url(u)] if has_relocatable else []
+                probe_urls = list(dict.fromkeys([*saved_resume_urls, *reloc_candidates]))
                 probe_env = {**env_with_lang, "COMFYUI_URL": config.format_endpoint_urls(probe_urls)}
             probe = colab_runtime.probe_comfyui(probe_env)
             if probe["online"]:
@@ -169,9 +171,7 @@ def create_app(storage=None, env_path=None):
                 try:
                     runtime.start_async(env_with_lang)
                     ensure_keepalive_monitor()
-                except colab_runtime.RuntimeBusyError:
-                    pass
-                except (colab_runtime.RuntimeUnavailableError, ValueError) as exc:
+                except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, ValueError) as exc:
                     raise InputError("comfy_runtime_action", detail=str(exc)) from exc
                 raise InputError("comfy_starting")
             raise InputError("comfy_offline")

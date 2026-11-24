@@ -1298,6 +1298,20 @@ def stage_models_to_local_ssd() -> None:
         _parallel_copy_file(src, dst, src_size, rel)
 
 
+def _merge_missing_tree(src_dir: Path, dst_dir: Path) -> None:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in src_dir.iterdir():
+        dest = dst_dir / item.name
+        if item.is_dir() and not item.is_symlink():
+            if dest.exists() and dest.is_dir():
+                _merge_missing_tree(item, dest)
+            elif not dest.exists() and not dest.is_symlink():
+                shutil.move(str(item), str(dest))
+        else:
+            if not dest.exists() and not dest.is_symlink():
+                shutil.move(str(item), str(dest))
+
+
 def link_persistent_dirs() -> None:
     # Keep user settings on Drive, but isolate per-instance input/output on local SSD so
     # concurrent Colab runtimes never collide on shared Drive filenames or FUSE sync lag.
@@ -1308,11 +1322,7 @@ def link_persistent_dirs() -> None:
         user_dst.unlink()
     elif user_dst.exists():
         if user_dst.is_dir():
-            for item in user_dst.iterdir():
-                dest = user_target / item.name
-                if dest.exists():
-                    continue
-                shutil.move(str(item), str(dest))
+            _merge_missing_tree(user_dst, user_target)
             shutil.rmtree(user_dst)
         else:
             user_dst.unlink()
@@ -1355,6 +1365,10 @@ def start_comfyui(*, use_sage_attention: bool | None = None, sage_detail: str = 
         if _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
             print(f"[start_colab] ComfyUI UP in {i * 2}s", flush=True)
             return
+        exit_code = proc.poll() if hasattr(proc, "poll") else None
+        if exit_code is not None:
+            tail = COMFY_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-2500:] if COMFY_LOG_FILE.exists() else ""
+            raise RuntimeError(f"ComfyUI exited early (code {exit_code}):\n{tail}")
         time.sleep(2)
     tail = COMFY_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-2500:] if COMFY_LOG_FILE.exists() else ""
     raise RuntimeError(f"ComfyUI failed to start:\n{tail}")

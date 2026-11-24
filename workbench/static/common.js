@@ -569,7 +569,7 @@ $("runtime-drive-ack").addEventListener("click", async () => {
 
 async function submitRuntimeStop(force, slot = "primary") {
   state.runtimeBusy = true;
-  state.runtimeStopSlot = slot;
+  $("runtime-confirm").hidden = true;
   clearNotices();
   renderRuntimeStatus();
   try {
@@ -577,6 +577,7 @@ async function submitRuntimeStop(force, slot = "primary") {
     const res = await post("/api/runtime/stop", payload);
     if (res.status) state.runtimeStatus = res.status;
     if (res.confirmation_required) {
+      state.runtimeStopSlot = slot;
       $("runtime-confirm-text").textContent = t("runtimeStopConfirmWarning", {
         local: t(res.local_busy ? "runtimeBoolYes" : "runtimeBoolNo"),
         queue: res.queue_unknown ? t("runtimeQueueUnknown") : (res.remote_queue ?? 0),
