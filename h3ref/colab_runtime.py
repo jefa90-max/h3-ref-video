@@ -1388,12 +1388,13 @@ class ColabRuntimeManager:
             target_slot = None
             for cand in candidates:
                 st = self._slots[cand]
-                if st.active_state == "awaiting_drive_auth" and st.drive_proc is not None and st.drive_proc.stdin is not None:
+                if not self._is_stopping(st) and st.active_state == "awaiting_drive_auth" and st.drive_proc is not None and st.drive_proc.stdin is not None:
                     target_slot = cand
                     break
             if target_slot is None:
                 fallback = self._slots[candidates[0]]
-                return {"accepted": False, "slot": candidates[0], "state": fallback.active_state or "offline"}
+                fb_state = "stopping" if self._is_stopping(fallback) else (fallback.active_state or "offline")
+                return {"accepted": False, "slot": candidates[0], "state": fb_state}
             st = self._slots[target_slot]
             try:
                 st.drive_proc.stdin.write("\n")
@@ -1955,7 +1956,7 @@ class ColabRuntimeManager:
         try:
             with runtime_file_lock(self.storage, slot=slot_name):
                 with self._lock:
-                    if st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+                    if self._is_stopping(st) or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
                         return False
                     st.cancel_event.clear()
                     st.keepalive_in_flight = True
@@ -1989,6 +1990,7 @@ class ColabRuntimeManager:
                                 slot_name == "primary"
                                 and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
                                 and not self._slots["secondary"].active_state
+                                and not self._is_stopping(self._slots["secondary"])
                             ):
                                 self._last_activity_at = None
                     if "appears to be lost" in out and slot_name == "secondary":
@@ -2140,6 +2142,7 @@ class ColabRuntimeManager:
                 raise RuntimeBusyError(message("colab_busy"))
             st.stopping = True
 
+        owns_stopping = True
         stop_succeeded = False
         try:
             # Dekker barrier: st.stopping is True before re-checking local_busy_provider(),
@@ -2148,6 +2151,7 @@ class ColabRuntimeManager:
             if not force and callable(local_busy_provider) and local_busy_provider():
                 with self._lock:
                     st.stopping = False
+                    owns_stopping = False
                     if st.active_state is None:
                         st.cancel_event.clear()
                 return {
@@ -2196,6 +2200,7 @@ class ColabRuntimeManager:
                     with self._lock:
                         st.cancel_event.clear()
                         st.stopping = False
+                        owns_stopping = False
                     return {
                         "stopped": False,
                         "slot": slot_name,
@@ -2223,19 +2228,20 @@ class ColabRuntimeManager:
                 if entered:
                     lock_ctx.__exit__(None, None, None)
         finally:
-            with self._lock:
-                if stop_succeeded or st.active_state is None:
-                    st.cancel_event.clear()
-                st.stopping = False
-                self._sessions_cache = None
-                if (
-                    stop_succeeded
-                    and slot_name == "primary"
-                    and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
-                    and not self._slots["secondary"].active_state
-                    and not self._slots["secondary"].stopping
-                ):
-                    self._last_activity_at = None
+            if owns_stopping:
+                with self._lock:
+                    if stop_succeeded or st.active_state is None:
+                        st.cancel_event.clear()
+                    st.stopping = False
+                    self._sessions_cache = None
+                    if (
+                        stop_succeeded
+                        and slot_name == "primary"
+                        and not self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
+                        and not self._slots["secondary"].active_state
+                        and not self._is_stopping(self._slots["secondary"])
+                    ):
+                        self._last_activity_at = None
 
         if slot_name == "secondary":
             old_url, _ = self._set_remembered_node("secondary", None)
@@ -2254,8 +2260,8 @@ class ColabRuntimeManager:
         with self._lock:
             saved_sec = self.remembered_node("secondary", api_key=settings["comfyui_api_key"])
             sec_st = self._slots["secondary"]
-            sec_running = bool(saved_sec or sec_st.active_state)
-            sec_slot_active = bool(sec_st.active_state or sec_st.last_error)
+            sec_running = bool(saved_sec or sec_st.active_state or self._is_stopping(sec_st))
+            sec_slot_active = bool(sec_st.active_state or sec_st.last_error or self._is_stopping(sec_st))
         if not sec_running:
             self.stop_keepalive_monitor()
         primary_url = self._primary_url(settings)
