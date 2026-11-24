@@ -1,6 +1,6 @@
 # 工作台与 CLI 对照
 
-核对范围：`h3ref.py`、`h3ref/*`、`workbench/*`、`SKILL.md`、`prompts/h3_examples.md`、`examples/film.example.json`。核对日期：2026-11-17。
+核对范围：`h3ref.py`、`h3ref/*`、`workbench/*`、`scripts/start_colab.py`、`workflows/comfy-h3-ref2va.json`、`SKILL.md`、`prompts/h3_examples.md`、`examples/film.example.json`。核对日期：2026-11-24。
 
 | 步骤 | 原仓库实现 | 工作台行为与修正 |
 | --- | --- | --- |
