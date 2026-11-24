@@ -480,7 +480,10 @@ class ComfyMultiNodePoolExecutionTest(unittest.TestCase):
                 if "127.0.0.1:8189" in url:
                     return 401
                 if url.startswith("https://gentle-breeze-42.trycloudflare.com/system_stats"):
-                    self.assertEqual((headers or {}).get("Authorization"), "Bearer cf-shared-key")
+                    auth = (headers or {}).get("Authorization")
+                    if not auth:
+                        return 401
+                    self.assertEqual(auth, "Bearer cf-shared-key")
                     return 200
                 return None
 
@@ -524,6 +527,133 @@ class ComfyMultiNodePoolExecutionTest(unittest.TestCase):
             self.assertEqual((local_dir / "user").resolve(), (drive_base / "user").resolve())
             self.assertTrue((local_dir / "input").is_dir() and not (local_dir / "input").is_symlink())
             self.assertTrue((local_dir / "output").is_dir() and not (local_dir / "output").is_symlink())
+
+    # Value: protects=multi-node idle-first ordering, inflight reservation anti-crowding, and submit failover boundaries; fails_when=busy node is chosen over idle node, all-offline pool fails to raise NoHealthyNodeError, new segment crowds an in-pool inflight node, or non-auth 400 workflow rejection fails over instead of failing fast; why_new=existing pool tests only exercised equal-load probes, removed-node resume, upload failover, and ambiguous timeout; seam=none; no_claim=does not verify remote ComfyUI GPU scheduling internals
+    def test_pool_idle_priority_all_offline_inflight_reservation_and_submit_failover_rules(self):
+        node_a = "https://node-a.example.com"
+        node_b = "https://node-b.example.com"
+
+        # 1. probe_all() orders idle online node ahead of busy online node, and raises NoHealthyNodeError when all offline
+        pool = comfy.ComfyNodePool(
+            [node_a, node_b],
+            api_key="shared-secret",
+            probe_fn=lambda u: {
+                "url": u,
+                "label": comfy.endpoint_label(u),
+                "online": True,
+                "auth_failed": False,
+                "queue_running": 1 if u == node_a else 0,
+                "queue_pending": 1 if u == node_a else 0,
+                "devices": [],
+            },
+        )
+        pool.probe_all(fail_if_all_offline=True)
+        self.assertEqual(pool.healthy_urls(), [node_b, node_a])
+
+        dead_pool = comfy.ComfyNodePool(
+            [node_a, node_b],
+            api_key="shared-secret",
+            probe_fn=lambda u: {
+                "url": u,
+                "label": comfy.endpoint_label(u),
+                "online": False,
+                "auth_failed": False,
+                "queue_running": 0,
+                "queue_pending": 0,
+                "devices": [],
+            },
+        )
+        with self.assertRaises(comfy.NoHealthyNodeError):
+            dead_pool.probe_all(fail_if_all_offline=True)
+
+        # 2. stage_generate() pre-reserves an in-pool inflight node so new segment routes to the idle sibling node
+        with tempfile.TemporaryDirectory() as tmp:
+            job, film_obj, segs, pics = _build_three_segment_job(Path(tmp))
+            segs = segs[:2]
+            job.put(
+                "segs", "0", provider="comfyui", comfyui_url=node_a,
+                comfyui_key_fp=comfy.key_fingerprint("shared-secret"),
+                task="pid-inflight-a", seed=111, submitted=time.time(),
+            )
+            seg1_submitted = threading.Event()
+            new_submit_nodes: list[str | None] = []
+
+            def fake_probe_both(url, api_key=None, timeout=12.0):
+                return {"url": url, "label": comfy.endpoint_label(url), "online": True, "auth_failed": False, "queue_running": 0, "queue_pending": 0, "devices": []}
+
+            def fake_submit_new(g, log, *, record_submission=None, base_url=None, api_key=None):
+                if record_submission:
+                    record_submission(True)
+                new_submit_nodes.append(base_url)
+                seg1_submitted.set()
+                return "pid-new-b"
+
+            def fake_poll_wait(task, *, base_url=None, api_key=None):
+                if task == "pid-inflight-a":
+                    seg1_submitted.wait(timeout=3.0)
+                return {"state": "done", "url": f"{base_url}/view?filename={task}.mp4", "cny": 0.0, "coins": 0.0, "run_seconds": 5.0}
+
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": f"{node_a},{node_b}",
+                "COMFYUI_API_KEY": "shared-secret",
+            }
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(comfy, "probe_endpoint", side_effect=fake_probe_both), \
+                 mock.patch.object(comfy, "upload_many", return_value=["a.png", "b.png"]), \
+                 mock.patch.object(comfy, "submit_with_retry", side_effect=fake_submit_new), \
+                 mock.patch.object(comfy, "poll", side_effect=fake_poll_wait), \
+                 mock.patch.object(comfy, "download", side_effect=lambda u, out: out.write_bytes(b"mp4") or out), \
+                 mock.patch.object(film.media, "last_frame", side_effect=lambda src, dst: dst.write_bytes(b"jpg")):
+                film.stage_generate(job, film_obj, segs, pics, "shot")
+
+            self.assertTrue(seg1_submitted.is_set())
+            self.assertEqual(new_submit_nodes, [node_b], "New segment must avoid the reserved inflight node_a and dispatch to node_b")
+
+        # 3. Submit failover: HTTP 401 auth rejection fails over to node_b; non-auth 400 workflow rejection fails fast without failover
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": f"{node_a},{node_b}",
+                "COMFYUI_API_KEY": "shared-secret",
+            }
+            job_auth, film_obj, segs, pics = _build_three_segment_job(root / "auth")
+            auth_pool = comfy.ComfyNodePool([node_a, node_b], api_key="shared-secret")
+            auth_submit_nodes: list[str | None] = []
+
+            def submit_401_on_a(g, log, *, record_submission=None, base_url=None, api_key=None):
+                auth_submit_nodes.append(base_url)
+                if base_url == node_a:
+                    raise comfy.SubmissionRejected('{"error":"Unauthorized","_http_status": 401}')
+                return "pid-after-401-failover"
+
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(comfy, "upload_many", return_value=["a.png", "b.png"]), \
+                 mock.patch.object(comfy, "submit_with_retry", side_effect=submit_401_on_a), \
+                 mock.patch.object(comfy, "poll", return_value={"state": "done", "url": f"{node_b}/view?filename=ok.mp4", "cny": 0.0, "coins": 0.0, "run_seconds": 6.0}), \
+                 mock.patch.object(comfy, "download", side_effect=lambda u, out: out.write_bytes(b"mp4") or out), \
+                 mock.patch.object(film.media, "last_frame", side_effect=lambda src, dst: dst.write_bytes(b"jpg")):
+                rec = film._generate_segment(job_auth, film_obj, segs[0], pics[0], node_pool=auth_pool)
+            self.assertEqual(auth_submit_nodes, [node_a, node_b])
+            self.assertEqual(rec["comfyui_url"], node_b)
+            self.assertEqual(auth_pool.healthy_urls(), [node_b])
+
+            job_400, film_obj2, segs2, pics2 = _build_three_segment_job(root / "bad400")
+            wf_pool = comfy.ComfyNodePool([node_a, node_b], api_key="shared-secret")
+            wf_submit_nodes: list[str | None] = []
+
+            def submit_400_workflow(g, log, *, record_submission=None, base_url=None, api_key=None):
+                wf_submit_nodes.append(base_url)
+                raise comfy.SubmissionRejected('{"error":"invalid workflow node","node_errors":{"136":"bad size"}}')
+
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(comfy, "upload_many", return_value=["a.png", "b.png"]), \
+                 mock.patch.object(comfy, "submit_with_retry", side_effect=submit_400_workflow):
+                with self.assertRaises(comfy.SubmissionRejected):
+                    film._generate_segment(job_400, film_obj2, segs2[0], pics2[0], node_pool=wf_pool)
+            self.assertEqual(wf_submit_nodes, [node_a], "Non-auth workflow 400 rejection must not fail over to another node")
+            self.assertEqual(wf_pool.healthy_urls(), [node_a, node_b], "Non-auth workflow 400 must not isolate healthy node_a")
 
 
 if __name__ == "__main__":

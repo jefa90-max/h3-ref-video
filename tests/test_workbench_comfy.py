@@ -468,6 +468,114 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertIn(expected, files)
             self.assertTrue(files[expected].is_file())
 
+    # Value: protects=workbench live_progress projection and ComfyUI segment metadata cleanup on reconciliation; fails_when=Jobs.snapshot leaks live_progress after completion, segments.view exposes non-pending live_progress, or preview_reconciled_segments drops provider/comfyui_url on terminal failure or leaves stale comfyui_key_fp/comfyui_url on reset; why_new=no Python workbench test previously asserted live_progress projection or ComfyUI metadata reconciliation; seam=none; no_claim=does not test browser DOM rendering
+    def test_workbench_snapshot_and_segment_reconcile_live_progress_and_comfy_metadata(self):
+        from workbench.jobs import Jobs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pic = _make_png(root / "actor.png")
+            manager = Jobs(config.ROOT, root / ".workbench")
+            self.addCleanup(manager.close)
+
+            # 1. Single-clip ("one") job exposes live_progress only while running
+            one_out = root / "one-live"
+            one_out.mkdir(parents=True)
+            one_progress = {"stage": "sampling", "step": 5, "max_steps": 20, "vram_used_gb": 30.0, "vram_total_gb": 80.0}
+            (one_out / "state.json").write_text(json.dumps({"task": "pid-one", "live_progress": one_progress}), encoding="utf-8")
+            manager.records["one-1"] = {
+                "id": "one-1", "kind": "one", "demo": False, "operation": "pipeline",
+                "status": "running", "output_dir": str(one_out), "created_at": "2026-11-23T00:00:00+0000",
+            }
+            self.assertEqual(manager.snapshot("one-1")["live_progress"], one_progress)
+            manager.records["one-1"]["status"] = "succeeded"
+            self.assertIsNone(manager.snapshot("one-1")["live_progress"])
+
+            # 2. Film job surfaces active segment live_progress in snapshot + segments.view only while task_pending & running
+            film_out = root / "film-live"
+            (film_out / "inputs").mkdir(parents=True)
+            seg_progress = {"stage": "sampling", "step": 8, "max_steps": 20, "node_label": "node-b.example.com"}
+            film_req = {
+                "kind": "film", "demo": False, "operation": "pipeline", "frames": "none",
+                "output_dir": str(film_out), "lang": "en",
+                "film": {
+                    "aspect": "9:16",
+                    "cast": [{"name": "A", "look": "tall", "aliases": [], "picture": str(pic)}],
+                    "shots": [{"start": 0.0, "end": 5.0, "action": "A waves", "camera": "wide", "line": ""}],
+                },
+            }
+            (film_out / "inputs" / "request.json").write_text(json.dumps(film_req), encoding="utf-8")
+            (film_out / "inputs" / "film.json").write_text(json.dumps(film_req["film"]), encoding="utf-8")
+            (film_out / "state.json").write_text(json.dumps({
+                "frames": {},
+                "segs": {
+                    "0": {
+                        "h3": "six section h3", "task": "pid-seg-1", "provider": "comfyui",
+                        "comfyui_url": "https://node-b.example.com", "live_progress": seg_progress,
+                    },
+                },
+            }), encoding="utf-8")
+            manager.records["film-1"] = {
+                "id": "film-1", "kind": "film", "demo": False, "operation": "pipeline",
+                "status": "running", "output_dir": str(film_out), "created_at": "2026-11-23T00:00:00+0000",
+            }
+            snap_running = manager.snapshot("film-1")
+            self.assertEqual(snap_running["live_progress"], {"segment": 1, **seg_progress})
+            self.assertEqual(snap_running["segments"][0]["live_progress"], seg_progress)
+
+            manager.records["film-1"]["status"] = "succeeded"
+            self.assertIsNone(manager.snapshot("film-1")["live_progress"])
+
+            # Non-pending segment (no task) must not expose stale live_progress in segments.view
+            (film_out / "state.json").write_text(json.dumps({
+                "frames": {},
+                "segs": {"0": {"h3": "six section h3", "live_progress": seg_progress}},
+            }), encoding="utf-8")
+            cards_no_task = segments.view(film_req, [], True)
+            self.assertIsNone(cards_no_task[0]["live_progress"])
+
+            # 3. preview_reconciled_segments preserves provider/comfyui_url and drops live_progress on terminal_failed,
+            #    and strips stale provider/comfyui_url/comfyui_key_fp/live_progress on reset
+            rec_out = root / "film-reconcile"
+            staged_dir = rec_out / "inputs" / "segment-rev1"
+            staged_dir.mkdir(parents=True)
+            (rec_out / "inputs" / "segment-edit.json").write_text(json.dumps({
+                "number": 1, "revision": "rev1", "applied": False, "generated": False,
+            }), encoding="utf-8")
+            (staged_dir / "state.json").write_text(json.dumps({
+                "segs": {
+                    "0": {
+                        "task": "pid-dead", "terminal_failed": True, "error": "OOM",
+                        "provider": "comfyui", "comfyui_url": "https://node-a.example.com",
+                        "live_progress": seg_progress,
+                    },
+                },
+            }), encoding="utf-8")
+            base_records = {"0": {"h3": "old", "live_progress": seg_progress}}
+            reconciled_fail, changed_fail, _ = segments.preview_reconciled_segments(rec_out, base_records)
+            self.assertTrue(changed_fail)
+            self.assertEqual(reconciled_fail["0"]["provider"], "comfyui")
+            self.assertEqual(reconciled_fail["0"]["comfyui_url"], "https://node-a.example.com")
+            self.assertNotIn("live_progress", reconciled_fail["0"])
+
+            # Abandoned unsubmitted staged attempt resets stale ComfyUI fields when reconciling
+            (staged_dir / "state.json").write_text(json.dumps({"segs": {"0": {}}}), encoding="utf-8")
+            stale_records = {
+                "0": {
+                    "h3": "old", "task": "pid-old", "terminal_failed": True, "provider": "comfyui",
+                    "comfyui_url": "https://node-old.example.com", "comfyui_key_fp": "deadbeef12345678",
+                    "live_progress": seg_progress,
+                },
+            }
+            (rec_out / "inputs" / "segment-edit.json").write_text(json.dumps({
+                "number": 1, "revision": "rev1", "applied": False, "generated": False,
+                "previous": stale_records["0"],
+            }), encoding="utf-8")
+            reconciled_reset, changed_reset, _ = segments.preview_reconciled_segments(rec_out, stale_records)
+            self.assertTrue(changed_reset)
+            for cleared_key in ("task", "provider", "comfyui_url", "comfyui_key_fp", "live_progress", "terminal_failed"):
+                self.assertNotIn(cleared_key, reconciled_reset["0"])
+
 
 if __name__ == "__main__":
     unittest.main()

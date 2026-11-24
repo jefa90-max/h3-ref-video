@@ -12,6 +12,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -962,6 +963,266 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                     },
                 )
             self.assertEqual(r_sec.status_code, 400, f"Expected 400 not 500, got {r_sec.status_code}: {r_sec.get_data(as_text=True)}")
+
+    def test_ship_review_regressions_public_401_watchdog_grace_inflight_abort_relocate_stop_keepalive_and_elf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 1. targeted#1: ensure_supervisor_and_tunnel must reject public tunnel returning 200 without Authorization
+            drive_base = root / "drive-auth"
+            drive_base.mkdir()
+            (drive_base / ".comfyui_api_key").write_text("k-secret-1234\n", encoding="utf-8")
+            (drive_base / ".ngrok_token").write_text("ng-tok\n", encoding="utf-8")
+            sup_pid = root / "sup.pid"
+            sup_log = root / "sup.log"
+            ngrok_log = root / "ngrok.log"
+
+            def unauthed_public_status(url, *, headers=None, timeout=4.0):
+                if "127.0.0.1:8189" in url:
+                    return 401
+                return 200  # Simulates stale unauthenticated tunnel pointing straight to 8188
+
+            with mock.patch.dict(os.environ, {"H3_TUNNEL_PROVIDER": "ngrok", "NGROK_DOMAIN": "demo.ngrok-free.dev"}, clear=False), \
+                 mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "SUPERVISOR_PID_FILE", sup_pid), \
+                 mock.patch.object(start_colab, "SUPERVISOR_LOG_FILE", sup_log), \
+                 mock.patch.object(start_colab, "NGROK_LOG_FILE", ngrok_log), \
+                 mock.patch.object(start_colab.subprocess, "run"), \
+                 mock.patch.object(start_colab.subprocess, "Popen", return_value=mock.MagicMock(pid=8888)), \
+                 mock.patch.object(start_colab, "_http_status", side_effect=unauthed_public_status), \
+                 mock.patch.object(start_colab.time, "sleep"):
+                with self.assertRaises(RuntimeError):
+                    start_colab.ensure_supervisor_and_tunnel()
+
+            # 2. red-team#1 + adversarial-native#1: _queue_busy stops trusting _comfy_process_alive past grace window
+            with mock.patch("urllib.request.urlopen", side_effect=OSError("hung port 8188")), \
+                 mock.patch.object(start_colab, "_comfy_process_alive", return_value=True):
+                self.assertTrue(start_colab._queue_busy({"status": "idle"}, queue_error_elapsed=60.0))
+                self.assertFalse(
+                    start_colab._queue_busy(
+                        {"status": "idle"},
+                        queue_error_elapsed=start_colab.QUEUE_UNREACHABLE_GRACE_SEC + 1.0,
+                    )
+                )
+
+            # 3. adversarial-native#4: ensure_cloudflared rejects corrupt non-ELF Drive cache and downloaded HTML
+            cf_local = root / "cf-local"
+            drive_cf = drive_base / "bin" / "cloudflared"
+            drive_cf.parent.mkdir(parents=True, exist_ok=True)
+            drive_cf.write_bytes(b"<html>502 Bad Gateway</html>")
+
+            def fake_bad_download(url, dst, rel, description=""):
+                dst.write_bytes(b"<html>still bad</html>")
+
+            with mock.patch("shutil.which", return_value=None), \
+                 mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "CLOUDFLARED_BIN_LOCAL", cf_local), \
+                 mock.patch.object(start_colab, "_download_file_atomic", side_effect=fake_bad_download):
+                with self.assertRaises(RuntimeError):
+                    start_colab.ensure_cloudflared()
+            self.assertFalse(cf_local.exists())
+
+            # 4. adversarial-native#3: AuthReverseProxy strips Expect header and aborts on truncated Content-Length body
+            upstream_seen_headers: list[dict] = []
+            upstream_body_wait_aborted = threading.Event()
+
+            class UpstreamHandler(BaseHTTPRequestHandler):
+                def log_message(self, fmt, *args):
+                    return
+
+                def do_POST(self):
+                    upstream_seen_headers.append({k.lower(): v for k, v in self.headers.items()})
+                    cl = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(cl)
+                    if len(data) < cl:
+                        upstream_body_wait_aborted.set()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+
+            up_srv = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+            up_port = up_srv.server_address[1]
+            threading.Thread(target=up_srv.serve_forever, daemon=True).start()
+            self.addCleanup(up_srv.shutdown)
+            self.addCleanup(up_srv.server_close)
+
+            ProxyCls = start_colab._make_auth_proxy_handler(
+                "k-secret-1234",
+                lambda: {},
+                lambda: None,
+                comfy_host="127.0.0.1",
+                comfy_port=up_port,
+            )
+            self.assertEqual(ProxyCls.timeout, 60)
+            px_srv = ThreadingHTTPServer(("127.0.0.1", 0), ProxyCls)
+            px_port = px_srv.server_address[1]
+            threading.Thread(target=px_srv.serve_forever, daemon=True).start()
+            self.addCleanup(px_srv.shutdown)
+            self.addCleanup(px_srv.server_close)
+
+            # Normal POST with Expect: 100-continue succeeds and strips Expect before forwarding
+            req_ok = urllib.request.Request(
+                f"http://127.0.0.1:{px_port}/upload/image",
+                data=b"hello",
+                headers={"Authorization": "Bearer k-secret-1234", "Expect": "100-continue"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_ok, timeout=5) as resp_ok:
+                self.assertEqual(resp_ok.status, 200)
+            self.assertNotIn("expect", upstream_seen_headers[0])
+
+            # Truncated Content-Length body closes upstream cleanly without blocking 600s
+            sock = socket.create_connection(("127.0.0.1", px_port), timeout=5)
+            sock.sendall(
+                b"POST /upload/image HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Authorization: Bearer k-secret-1234\r\n"
+                b"Content-Length: 100\r\n"
+                b"\r\n"
+                b"short"
+            )
+            sock.shutdown(socket.SHUT_WR)
+            sock.recv(1024)
+            sock.close()
+            self.assertTrue(upstream_body_wait_aborted.wait(timeout=3.0))
+
+            # 5. red-team#2: parallel stage_generate aborts & cancels queued other_segs when an inflight resumed segment fails
+            job_dir = root / "film-abort"
+            job_dir.mkdir()
+            job = film.Job(job_dir)
+            job.state["segs"] = {
+                "0": {"h3": "seg1 prompt", "task": "dead-inflight-task", "provider": "comfyui", "comfyui_url": "https://n1.example.com"},
+                "1": {"h3": "seg2 prompt"},
+                "2": {"h3": "seg3 prompt"},
+            }
+            job.save()
+            segs = [
+                {"idx": 0, "seconds": 5, "start": 0, "end": 5, "shots": []},
+                {"idx": 1, "seconds": 5, "start": 5, "end": 10, "shots": []},
+                {"idx": 2, "seconds": 5, "start": 10, "end": 15, "shots": []},
+            ]
+            pics = {0: [], 1: [], 2: []}
+            dispatched_other: list[int] = []
+
+            def fake_gen_seg(j, f_obj, seg, p_list, node_pool=None, abort=None):
+                if seg["idx"] == 0:
+                    raise RuntimeError("inflight seg1 prompt_lost")
+                dispatched_other.append(seg["idx"])
+                return None
+
+            with mock.patch.dict(
+                os.environ,
+                {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://n1.example.com", "COMFYUI_CONCURRENCY": "1"},
+                clear=False,
+            ), mock.patch.object(film, "gen_segment", side_effect=fake_gen_seg):
+                with self.assertRaisesRegex(RuntimeError, "inflight seg1 prompt_lost"):
+                    film.stage_generate(job, {"aspect": "9:16", "shots": []}, segs, pics, "shot")
+            self.assertEqual(dispatched_other, [])
+
+            # 6. outside-voice#3: rotated *.trycloudflare.com URL relocates via comfy.has_task on resume
+            reloc_dir = root / "film-reloc"
+            (reloc_dir / "clips").mkdir(parents=True)
+            reloc_job = film.Job(reloc_dir)
+            old_cf = "https://old-dead-11.trycloudflare.com"
+            new_cf = "https://new-live-22.trycloudflare.com"
+            key_fp = comfy.key_fingerprint("k-secret-1234")
+            reloc_job.state["segs"] = {
+                "0": {
+                    "h3": "seg1 prompt",
+                    "task": "uuid-reloc-99",
+                    "provider": "comfyui",
+                    "comfyui_url": old_cf,
+                    "comfyui_key_fp": key_fp,
+                }
+            }
+            reloc_job.save()
+            polled_urls: list[str] = []
+
+            def fake_poll(task_id, *, base_url=None, api_key=None):
+                polled_urls.append(base_url)
+                return {"state": "done", "url": f"{base_url}/view?filename=out.mp4", "cny": 0.0, "run_seconds": 9.0}
+
+            def fake_download(url, out, **kw):
+                out.write_bytes(b"mp4" * 500)
+                return out
+
+            with mock.patch.dict(
+                os.environ,
+                {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": f"https://pri.ngrok-free.dev,{new_cf}", "COMFYUI_API_KEY": "k-secret-1234"},
+                clear=False,
+            ), mock.patch.object(comfy, "has_task", side_effect=lambda tid, *, base_url, api_key=None: base_url == new_cf and tid == "uuid-reloc-99"), \
+                 mock.patch.object(comfy, "poll", side_effect=fake_poll), \
+                 mock.patch.object(comfy, "download", side_effect=fake_download), \
+                 mock.patch.object(film.media, "last_frame", return_value=None):
+                film.gen_segment(reloc_job, {"aspect": "9:16"}, {"idx": 0, "seconds": 5}, [])
+            self.assertEqual(polled_urls, [new_cf])
+            self.assertEqual(reloc_job.state["segs"]["0"]["comfyui_url"], new_cf)
+
+            # 7. outside-voice#2 + targeted#2: stop() rechecks local_busy_provider after probe and fails closed on 504 with active session
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_bin.chmod(0o755)
+            mgr_stop = colab_runtime.ColabRuntimeManager(root / "st-stop")
+            env_stop = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://pri.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_SESSION": "comfy-a100",
+            }
+            busy_flag = {"active": False}
+
+            def queue_probe_flips_busy(*args, **kwargs):
+                busy_flag["active"] = True
+                return 0
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", side_effect=queue_probe_flips_busy), \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "online", "logs": []}), \
+                 mock.patch.object(mgr_stop, "_run_cmd_for_slot") as stop_cmd:
+                res_race = mgr_stop.stop(
+                    environ=env_stop,
+                    force=False,
+                    local_busy=False,
+                    local_busy_provider=lambda: busy_flag["active"],
+                )
+            self.assertFalse(res_race["stopped"])
+            self.assertTrue(res_race["confirmation_required"])
+            self.assertTrue(res_race["local_busy"])
+            stop_cmd.assert_not_called()
+
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=None), \
+                 mock.patch.object(mgr_stop, "_probe_slot", return_value={"online": False, "auth_failed": False, "status_code": 504}), \
+                 mock.patch.object(mgr_stop, "_query_sessions", return_value={"named": [{"name": "comfy-a100", "endpoint": "m-1", "hardware": "G4"}], "orphans": [], "ok": True}), \
+                 mock.patch.object(mgr_stop, "status", return_value={"state": "offline", "logs": []}), \
+                 mock.patch.object(mgr_stop, "_run_cmd_for_slot") as stop_cmd2:
+                res_504 = mgr_stop.stop(environ=env_stop, force=False, local_busy=False)
+            self.assertFalse(res_504["stopped"])
+            self.assertTrue(res_504["confirmation_required"])
+            self.assertTrue(res_504["queue_unknown"])
+            stop_cmd2.assert_not_called()
+
+            # 8. outside-voice#4: keepalive still fires for resumed ComfyUI work when default VIDEO_PROVIDER=runninghub
+            now_box = {"t": 1000.0}
+            mgr_ka = colab_runtime.ColabRuntimeManager(root / "st-ka", clock=lambda: now_box["t"])
+            now_box["t"] += 600.0
+            env_rh = {
+                "VIDEO_PROVIDER": "runninghub",
+                "COMFYUI_URL": "https://pri.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_SESSION": "comfy-a100",
+            }
+            with mock.patch.object(mgr_ka, "_run_cmd_for_slot", return_value=(0, "keepalive\n")) as ka_cmd:
+                self.assertTrue(mgr_ka.maybe_send_kernel_keepalive(env_rh, force_busy=True))
+                self.assertEqual(ka_cmd.call_count, 1)
+                now_box["t"] += 600.0
+                # Monitor loop with local_busy=True but remote queue=0 must NOT keep idle Colab warm under runninghub default
+                self.assertFalse(mgr_ka.maybe_send_kernel_keepalive(env_rh, local_busy=True, queue_count=0))
+                # Monitor loop with local_busy=True and remote queue=1 MUST keep Colab warm
+                self.assertTrue(mgr_ka.maybe_send_kernel_keepalive(env_rh, local_busy=True, queue_count=1))
+                self.assertEqual(ka_cmd.call_count, 2)
 
 
 if __name__ == "__main__":

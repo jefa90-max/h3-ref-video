@@ -471,3 +471,39 @@ for (const language of ['zh-CN','en']) {
     assert.equal(c.rewriteH3.disabled, false, 'rewriteH3 stays enabled without phantom H3 draft');
   });
 }
+
+// Value: protects=in-place live_progress placeholder rendering on pending video segment cards; fails_when=segmentPlaceholderText ignores live_progress or updateSegmentMedia recreates the placeholder DOM node on each poll tick or keeps stale progress after job stops; why_new=video-segments.js live_progress placeholder branch had zero JS test coverage; seam=none; no_claim=does not test real browser layout or CSS animations
+test("video-segments.js updates pending segment placeholder with live_progress in place and reverts when idle", () => {
+  const h = harness("en");
+  h.state.selectedJob.status = "running";
+  const seg = h.state.selectedJob.segments[0];
+  seg.url = null;
+  seg.task_pending = true;
+  seg.live_progress = {
+    stage: "sampling",
+    step: 4,
+    max_steps: 20,
+    node_label: "node-b.example.com",
+    vram_used_gb: 30.0,
+    vram_total_gb: 80.0,
+    elapsed_s: 65,
+  };
+  h.render();
+
+  const card1 = h.card(1);
+  const placeholderNode = card1.media.children[0];
+  assert.ok(placeholderNode, "Pending segment must render placeholder element");
+  assert.match(placeholderNode.textContent, /4\/20 \(20%\)/, "Placeholder must show live step progress");
+  assert.match(placeholderNode.textContent, /node-b\.example\.com/, "Placeholder must show active node label");
+
+  // Updating live_progress mutates the existing placeholder text in place without replacing DOM nodes
+  seg.live_progress = { ...seg.live_progress, step: 10, elapsed_s: 120 };
+  h.render();
+  assert.strictEqual(card1.media.children[0], placeholderNode, "Placeholder element must update in place");
+  assert.match(placeholderNode.textContent, /10\/20 \(50%\)/);
+
+  // Once job is no longer running, placeholder reverts to generic waiting label
+  h.state.selectedJob.status = "failed";
+  h.render();
+  assert.equal(placeholderNode.textContent, h.state.messages.segmentWaiting);
+});

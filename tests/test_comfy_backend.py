@@ -759,6 +759,55 @@ class ComfyBackendTest(unittest.TestCase):
                 st = comfy.poll("pid-ngrok-html")
                 self.assertEqual(st["state"], "running")
 
+    # Value: protects=HTTPS authenticated download downgrade prevention and Bearer key scrubbing; fails_when=--proto-redir allows http downgrade on https downloads or curl failure leaks COMFYUI_API_KEY; why_new=existing download test only covers loopback HTTP 200 success; seam=none; no_claim=does not test live TLS handshake
+    def test_https_download_enforces_https_only_redirects_and_scrubs_bearer_key_on_error(self):
+        secret = "h3c_dl_secret_token_888"
+        captured = {}
+
+        def fake_ok_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["input"] = kwargs.get("input", "")
+            out_path = Path(cmd[cmd.index("-o") + 1])
+            out_path.write_bytes(b"V" * 2048)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = Path(tmp) / "clip.mp4"
+            with patch("subprocess.run", side_effect=fake_ok_run):
+                http.download(
+                    "https://node-a.ngrok-free.dev/view?filename=out.mp4",
+                    dst,
+                    key=secret,
+                    extra_headers={"ngrok-skip-browser-warning": "1"},
+                )
+            self.assertEqual(dst.read_bytes(), b"V" * 2048)
+            self.assertEqual(captured["cmd"][captured["cmd"].index("--proto-redir") + 1], "=https")
+            self.assertIn("--config", captured["cmd"])
+            self.assertFalse(any(secret in str(arg) for arg in captured["cmd"]), "Bearer key must never appear in curl argv")
+            self.assertIn(f"Authorization: Bearer {secret}", captured["input"])
+            self.assertIn("ngrok-skip-browser-warning: 1", captured["input"])
+
+            dst_fail = Path(tmp) / "fail.mp4"
+
+            def fake_fail_run(cmd, **kwargs):
+                Path(cmd[cmd.index("-o") + 1]).write_bytes(b"partial")
+                return MagicMock(
+                    returncode=22,
+                    stdout="",
+                    stderr=f"curl: (22) failed with Bearer {secret} on upstream",
+                )
+
+            with patch("subprocess.run", side_effect=fake_fail_run):
+                with self.assertRaises(RuntimeError) as err_ctx:
+                    http.download(
+                        f"https://node-a.ngrok-free.dev/view?token={secret}",
+                        dst_fail,
+                        key=secret,
+                    )
+            self.assertNotIn(secret, str(err_ctx.exception))
+            self.assertIn("[key]", str(err_ctx.exception))
+            self.assertFalse(dst_fail.with_suffix(".mp4.part").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

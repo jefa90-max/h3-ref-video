@@ -1746,4 +1746,83 @@ test("create.js supports creating multiple combined cast sheets and adding/remov
   assert.equal(context.state.filmBindings.get("cast:2").file.id, "sheet-2.png", "Dissolving sheet #1 must not disturb sheet #2");
 });
 
+test("common.js renders primary node error/transitional state when secondary is online and disables primary start without primary URL", async () => {
+  const { $ } = makeDom();
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  const cfg = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node1.ngrok-free.dev,https://sec-live.trycloudflare.com",
+    COMFYUI_URLS: ["https://node1.ngrok-free.dev", "https://sec-live.trycloudflare.com"],
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+  let runtimeStatus = {
+    state: "online",
+    gpu: "G4",
+    cli_available: true,
+    comfyui_url: "https://node1.ngrok-free.dev",
+    comfyui_urls: ["https://node1.ngrok-free.dev", "https://sec-live.trycloudflare.com"],
+    online_count: 1,
+    total_count: 2,
+    nodes: [
+      { url: "https://node1.ngrok-free.dev", label: "node1.ngrok-free.dev", online: false, auth_failed: false, devices: [], queue_running: 0, queue_pending: 0 },
+      { url: "https://sec-live.trycloudflare.com", label: "sec-live.trycloudflare.com", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 0, queue_pending: 0 },
+    ],
+    managed_nodes: [
+      { slot: "primary", session: "comfy-a100", url: "https://node1.ngrok-free.dev", state: "error", online: false, has_session: false, error: "503 quota exhausted", logs: [] },
+      { slot: "secondary", session: "comfy-a100-2", url: "https://sec-live.trycloudflare.com", state: "online", online: true, has_session: true, logs: [] },
+    ],
+    logs: [],
+  };
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "zh-CN" },
+      title: "",
+    },
+    localStorage: { getItem: () => "zh-CN", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url) => {
+      if (url === "/api/runtime/status") return { ok: true, json: async () => runtimeStatus };
+      return { ok: true, json: async () => zhFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(zhFresh)}; state.config = ${JSON.stringify(cfg)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  const priRow = $("runtime-nodes").children[0];
+  const priText = priRow.children.map((c) => c.textContent).join(" ");
+  assert.ok(priText.includes(zhFresh.runtimeState_error), `Primary row must show error badge when secondary is online: ${priText}`);
+  assert.ok(priText.includes("503 quota exhausted"), `Primary row must show primary error detail: ${priText}`);
+
+  // When primary has no configured URL and only secondary is online, #runtime-start must be disabled
+  runtimeStatus = {
+    ...runtimeStatus,
+    comfyui_url: "https://sec-live.trycloudflare.com",
+    comfyui_urls: ["https://sec-live.trycloudflare.com"],
+    online_count: 1,
+    total_count: 1,
+    nodes: [runtimeStatus.nodes[1]],
+    managed_nodes: [
+      { slot: "primary", session: "comfy-a100", url: "", state: "offline", online: false, has_session: false, logs: [] },
+      runtimeStatus.managed_nodes[1],
+    ],
+  };
+  await context.refreshRuntimeStatus();
+  assert.equal($("runtime-start").disabled, true, "#runtime-start must be disabled when primary URL is empty even if secondary is online");
+});
+
 
