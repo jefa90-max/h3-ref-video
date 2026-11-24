@@ -496,6 +496,22 @@ class WorkbenchComfyTest(unittest.TestCase):
                 config.read_env_file(restart_env)["COMFYUI_URL"],
                 "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
             )
+            # 1b) persist=True submitting COMFYUI_URL with sec_url (no key) after persist=False keeps .env & remembered node in sync
+            sync_url_res = restarted_app.test_client().post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={
+                    "COMFYUI_URL": "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+                    "persist": True,
+                },
+            )
+            self.assertEqual(sync_url_res.status_code, 200)
+            self.assertEqual(sync_url_res.get_json()["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+            self.assertIsNotNone(restarted_rt.remembered_node("secondary"))
+            self.assertEqual(
+                config.read_env_file(restart_env)["COMFYUI_URL"],
+                "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+            )
             # 2) persist=True saving the SAME rotated key (omitting COMFYUI_URL) still strips sec_url from .env & forgets node
             persist_same_res = restarted_app.test_client().post(
                 "/api/config",
@@ -529,6 +545,38 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertEqual(rot_res.get_json()["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
             self.assertIsNone(restarted_rt.remembered_node("secondary"))
             self.assertEqual(config.read_env_file(restart_env)["COMFYUI_URL"], "https://node1.ngrok-free.dev")
+
+            # 4) Process-env COMFYUI_API_KEY (not in .env): unrelated persist=True must preserve .env URL & remembered node
+            env_key_env = root / ".env-process-key"
+            env_key_env.write_text(
+                "VIDEO_PROVIDER=comfyui\n"
+                "COMFYUI_URL=https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com\n",
+                encoding="utf-8",
+            )
+            env_key_storage = root / ".workbench-process-key"
+            with mock.patch.dict(os.environ, {"COMFYUI_API_KEY": "shared-pool-key-1234"}, clear=False):
+                env_app = server.create_app(storage=env_key_storage, env_path=env_key_env)
+                env_rt = env_app.extensions["colab_runtime"]
+                self.addCleanup(env_rt.stop_keepalive_monitor)
+                env_rt._set_remembered_node(
+                    "secondary",
+                    {
+                        "session": "comfy-a100-2",
+                        "url": "https://live-sec-55.trycloudflare.com",
+                        "key_fp": server.colab_runtime.comfy.key_fingerprint("shared-pool-key-1234"),
+                    },
+                )
+                env_unrel = env_app.test_client().post(
+                    "/api/config",
+                    headers={"X-Workbench": "1"},
+                    json={"COLAB_GPU": "A100", "persist": True},
+                )
+                self.assertEqual(env_unrel.status_code, 200)
+                self.assertIsNotNone(env_rt.remembered_node("secondary"))
+                self.assertEqual(
+                    config.read_env_file(env_key_env)["COMFYUI_URL"],
+                    "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+                )
 
     def test_secondary_colab_node_endpoints_sync_env_and_auto_concurrency(self):
         with tempfile.TemporaryDirectory() as tmp:
