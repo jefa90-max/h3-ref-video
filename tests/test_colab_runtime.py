@@ -379,6 +379,7 @@ class ColabRuntimeTest(unittest.TestCase):
                 return self._make_pipe_proc(["[colab] No active sessions found on server.\n"])
 
             with patch.object(colab_runtime, "probe_remote_queue_count", return_value=2), \
+                 patch.object(colab_runtime, "probe_comfyui", return_value={"online": True, "configured": True, "devices": [], "nodes": [], "online_count": 1, "total_count": 1}), \
                  patch("subprocess.Popen", side_effect=fake_stop_popen):
                 blocked = mgr.stop(environ=env, force=False, local_busy=True)
                 self.assertFalse(blocked["stopped"])
@@ -583,9 +584,10 @@ class ColabRuntimeTest(unittest.TestCase):
                     self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(len(calls), 1)
 
-                # 5. Another 8 min passes, queue becomes empty -> stops keepalive immediately
-                clock_state["now"] += 300.0
-                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                # 5. Once idle grace window expires with empty queue -> stops keepalive even while ComfyUI is online
+                clock_state["now"] += mgr.keepalive_idle_grace_sec
+                with patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                     patch.object(colab_runtime, "probe_comfyui", return_value={"online": True, "configured": True, "devices": [], "nodes": [], "online_count": 1, "total_count": 1}):
                     self.assertFalse(mgr.maybe_send_kernel_keepalive(env))
                 self.assertEqual(len(calls), 1)
 

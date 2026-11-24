@@ -1281,7 +1281,7 @@ test("results.js renders live ComfyUI stage, step bar, VRAM, and elapsed progres
   assert.match($("live-progress-label").textContent, /2\/4/, "Progress label must show live step ratio");
   assert.match($("live-progress-meta").textContent, /31\.4\/40(\.0)? GB/, "Progress meta must show VRAM usage");
   assert.match($("live-progress-meta").textContent, /2:15|02:15/, "Progress meta must show elapsed time");
-  assert.equal($("live-progress-fill").style.width, "50%", "Progress fill width must reflect 2/4 = 50%");
+  assert.equal($("live-progress-fill").style.transform, "scaleX(0.5)", "Progress fill scaleX must reflect 2/4 = 50%");
 
   currentJob = {
     ...currentJob,
@@ -1292,7 +1292,7 @@ test("results.js renders live ComfyUI stage, step bar, VRAM, and elapsed progres
   };
   await context.refreshJob();
   assert.match($("live-progress-label").textContent, /Upscaling video/, "Progress label must render upscale_video stage copy");
-  assert.equal($("live-progress-fill").style.width, "50%");
+  assert.equal($("live-progress-fill").style.transform, "scaleX(0.5)");
 
   currentJob = { ...currentJob, status: "succeeded", segments: [{ ...currentJob.segments[0], url: "/clip.mp4", task_pending: false, live_progress: null }] };
   await context.refreshJob();
@@ -1550,6 +1550,29 @@ test("common.js supports starting, Drive-authorizing, syncing ephemeral URL, and
   assert.deepEqual(calls.find((c) => c.url === "/api/runtime/stop").body, { force: false, slot: "secondary" });
   assert.equal($("comfy-url").value, "https://node1.ngrok-free.dev");
   assert.equal($("runtime-start-secondary").hidden, false);
+
+  // Stop confirmation when queue_unknown=true renders localized unknown label instead of misleading "0"
+  const origFetch = context.fetch;
+  context.fetch = async (url, opts) => {
+    if (url === "/api/runtime/stop") {
+      return {
+        ok: true,
+        json: async () => ({
+          stopped: false,
+          slot: "primary",
+          confirmation_required: true,
+          local_busy: false,
+          remote_queue: 0,
+          queue_unknown: true,
+          status: makeStatus(),
+        }),
+      };
+    }
+    return origFetch(url, opts);
+  };
+  await $("runtime-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, false);
+  assert.ok($("runtime-confirm-text").textContent.includes(zhFresh.runtimeQueueUnknown), "queue_unknown=true must display localized unknown text instead of 0");
 });
 
 

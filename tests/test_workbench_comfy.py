@@ -291,6 +291,7 @@ class WorkbenchComfyTest(unittest.TestCase):
             client = app.test_client()
             headers = {"X-Workbench": "1"}
             runtime = app.extensions["colab_runtime"]
+            self.addCleanup(runtime.stop_keepalive_monitor)
 
             one_payload = {
                 "kind": "one",

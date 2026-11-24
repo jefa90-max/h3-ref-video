@@ -1,0 +1,968 @@
+"""Regression tests for Pre-Landing Review findings on ComfyUI / Colab runtime & reverse proxy."""
+from __future__ import annotations
+
+import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import json
+import os
+import socket
+import tempfile
+import threading
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from PIL import Image
+
+from h3ref import colab_runtime, comfy, config, film, http
+from scripts import start_colab
+from workbench import segments, server
+
+
+class _BlockingPipeProc:
+    """Fake subprocess that emits lines on demand and blocks until stdin or kill()."""
+
+    def __init__(self, initial_lines: list[str], *, after_ack_lines: list[str] | None = None, exit_code: int = 0):
+        self.pid = 99901
+        self._after_ack_lines = list(after_ack_lines or [])
+        self._exit_code = exit_code
+        self._done = threading.Event()
+        self._killed = False
+        self._r_fd, self._w_fd = os.pipe()
+        self.stdout = os.fdopen(self._r_fd, "r", encoding="utf-8", errors="replace", buffering=1)
+        self._w = os.fdopen(self._w_fd, "w", encoding="utf-8", buffering=1)
+        self.stdin = _AckWriter(self)
+        for line in initial_lines:
+            self._w.write(line)
+        self._w.flush()
+
+    def _on_ack(self) -> None:
+        if self._killed or self._done.is_set():
+            raise BrokenPipeError("process closed")
+        for line in self._after_ack_lines:
+            self._w.write(line)
+        self._w.flush()
+        self._finish(self._exit_code)
+
+    def _finish(self, rc: int) -> None:
+        self._exit_code = rc
+        self._done.set()
+        try:
+            self._w.close()
+        except OSError:
+            pass
+
+    def poll(self):
+        return self._exit_code if self._done.is_set() else None
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout=timeout)
+        return self._exit_code
+
+    def kill(self):
+        self._killed = True
+        self._finish(-9)
+
+
+class _AckWriter:
+    def __init__(self, proc: _BlockingPipeProc):
+        self._proc = proc
+        self.closed = False
+
+    def write(self, data: str):
+        if self.closed or self._proc.poll() is not None:
+            raise BrokenPipeError("broken pipe")
+        if "\n" in data:
+            self._proc._on_ack()
+        return len(data)
+
+    def flush(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class ComfyColabReviewRegressionsTest(unittest.TestCase):
+    def test_query_sessions_failure_never_caches_wipes_secondary_or_double_provisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp) / ".workbench"
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            synced = []
+            mgr = colab_runtime.ColabRuntimeManager(
+                storage,
+                on_ephemeral_url_change=lambda slot, old, new: synced.append((slot, old, new)),
+            )
+            sec_url = "https://alive-sec.trycloudflare.com"
+            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared"})
+            synced.clear()
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": f"https://pri.ngrok-free.dev,{sec_url}",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_GPU": "G4",
+            }
+            calls = []
+
+            def fail_then_ok(colab_bin, auth_mode, sub_args, **kw):
+                calls.append(list(sub_args))
+                if len(calls) == 1:
+                    return 1, "503 Service Unavailable"
+                return 0, "[comfy-a100-2] m-s-2 | Hardware: G4\n"
+
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "nodes": [], "online_count": 0, "total_count": 2}), \
+                 mock.patch.object(mgr, "_run_command", side_effect=fail_then_ok):
+                # 1. Transient `colab sessions` failure must NOT wipe remembered secondary or cache empty list
+                mgr.status(env)
+                self.assertEqual(mgr.remembered_node("secondary")["url"], sec_url)
+                self.assertEqual(synced, [])
+                # Next status call must re-query sessions (not hit 5s cache of failed result)
+                st2 = mgr.status(env)
+                self.assertEqual(len(calls), 2)
+                sec_entry = next(m for m in st2["managed_nodes"] if m["slot"] == "secondary")
+                self.assertTrue(sec_entry["has_session"])
+
+            # 2. _startup_worker must abort instead of calling `colab new` when `colab sessions` fails
+            new_calls = []
+
+            def fake_start_cmd(colab_bin, auth_mode, sub_args, **kw):
+                if sub_args == ["sessions"]:
+                    return 1, "ConnectionError"
+                if sub_args and sub_args[0] == "new":
+                    new_calls.append(sub_args)
+                return 0, ""
+
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "nodes": [], "online_count": 0, "total_count": 1}), \
+                 mock.patch.object(mgr, "_run_command", side_effect=fake_start_cmd):
+                mgr.start_async(env, slot="primary")
+                mgr._slots["primary"].worker_thread.join(timeout=5.0)
+            self.assertEqual(new_calls, [], "Must never run `colab new` when session enumeration failed")
+            self.assertIsNotNone(mgr._slots["primary"].last_error)
+
+    def test_stop_primary_preserves_online_secondary_and_rejects_concurrent_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp) / ".workbench"
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            mgr = colab_runtime.ColabRuntimeManager(storage)
+            pri_url = "https://pri.ngrok-free.dev"
+            sec_url = "https://sec-live.trycloudflare.com"
+            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared"})
+            mgr.mark_local_activity(now=500.0)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": f"{pri_url},{sec_url}",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_GPU": "G4",
+            }
+
+            def fake_probe(e=None, *, timeout=12.0):
+                urls = config.video_settings(e)["comfyui_urls"]
+                nodes = []
+                for u in urls:
+                    is_sec = u == sec_url
+                    nodes.append({
+                        "url": u,
+                        "label": comfy.endpoint_label(u),
+                        "online": is_sec,
+                        "auth_failed": False,
+                        "status_code": 200 if is_sec else None,
+                        "devices": [{"name": "NVIDIA G4"}] if is_sec else [],
+                        "comfyui_version": "0.3.0" if is_sec else None,
+                        "queue_running": 0,
+                        "queue_pending": 0,
+                    })
+                online = [n for n in nodes if n["online"]]
+                return {
+                    "online": bool(online),
+                    "configured": bool(urls),
+                    "devices": [d for n in online for d in n["devices"]],
+                    "nodes": nodes,
+                    "online_count": len(online),
+                    "total_count": len(nodes),
+                }
+
+            with mock.patch.object(colab_runtime, "probe_comfyui", side_effect=fake_probe), \
+                 mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(mgr, "_run_cmd_for_slot", return_value=(0, "stopped")):
+                res = mgr.stop(environ=env, force=True, local_busy=False, slot="primary")
+            st = res["status"]
+            self.assertEqual(st["state"], "online")
+            self.assertEqual(st["online_count"], 1)
+            self.assertEqual(st["total_count"], 2)
+            self.assertIn("managed_nodes", st)
+            by_slot = {m["slot"]: m for m in st["managed_nodes"]}
+            self.assertEqual(by_slot["primary"]["state"], "offline")
+            self.assertEqual(by_slot["secondary"]["state"], "online")
+            self.assertIsNotNone(mgr._last_activity_at, "Stopping primary must not clear keepalive activity while secondary lives")
+
+            # Concurrent stop while active_state == 'stopping' must raise RuntimeBusyError without killing active_proc
+            killed = []
+            dummy_proc = object()
+            mgr._slots["primary"].active_state = "stopping"
+            mgr._slots["primary"].active_proc = dummy_proc
+            try:
+                with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                     mock.patch.object(colab_runtime, "_kill_process_tree", side_effect=lambda p: killed.append(p)):
+                    with self.assertRaises(colab_runtime.RuntimeBusyError):
+                        mgr.stop(environ=env, force=True, slot="primary")
+                self.assertEqual(killed, [], "Concurrent stop() must not kill the in-flight `colab stop` process")
+            finally:
+                mgr._slots["primary"].active_state = None
+                mgr._slots["primary"].active_proc = None
+
+    def test_primary_secondary_url_isolation_and_ensure_started_primary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp) / ".workbench"
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            mgr = colab_runtime.ColabRuntimeManager(storage)
+            sec_url = "https://only-sec.trycloudflare.com"
+            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared"})
+            env_only_sec = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": sec_url,
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+            }
+            probe_payload = {
+                "online": True,
+                "configured": True,
+                "devices": [{"name": "G4"}],
+                "nodes": [{"url": sec_url, "label": "only-sec.trycloudflare.com", "online": True, "auth_failed": False, "devices": [{"name": "G4"}], "queue_running": 0, "queue_pending": 0}],
+                "online_count": 1,
+                "total_count": 1,
+            }
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value=probe_payload), \
+                 mock.patch.object(mgr, "_query_sessions", return_value={"named": [{"name": "comfy-a100-2", "endpoint": "m-2", "hardware": "G4"}], "orphans": [], "ok": True}):
+                st = mgr.status(env_only_sec)
+            by_slot = {m["slot"]: m for m in st["managed_nodes"]}
+            self.assertEqual(by_slot["primary"]["url"], "")
+            self.assertFalse(by_slot["primary"]["online"])
+            self.assertTrue(by_slot["secondary"]["online"])
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value=probe_payload):
+                with self.assertRaises(ValueError):
+                    mgr.start_async(env_only_sec, slot="primary")
+
+            # ensure_started(slot="primary") must check primary managed_node, not top-level online (from secondary)
+            seq = iter([
+                {
+                    "state": "online",
+                    "managed_nodes": [
+                        {"slot": "primary", "state": "provisioning", "error": None},
+                        {"slot": "secondary", "state": "online", "error": None},
+                    ],
+                },
+                {
+                    "state": "online",
+                    "managed_nodes": [
+                        {"slot": "primary", "state": "error", "error": "primary boot failed"},
+                        {"slot": "secondary", "state": "online", "error": None},
+                    ],
+                },
+            ])
+            with mock.patch.object(mgr, "start_async", side_effect=lambda *a, **kw: next(seq)), \
+                 mock.patch.object(mgr, "status", side_effect=lambda *a, **kw: next(seq)), \
+                 mock.patch("h3ref.colab_runtime.time.sleep"):
+                with self.assertRaisesRegex(RuntimeError, "primary boot failed"):
+                    mgr.ensure_started(env_only_sec, timeout=5.0, slot="primary")
+
+    def test_secondary_drive_ack_and_cancel_during_auth_and_crash_unwedge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp) / ".workbench"
+            fake_bin = Path(tmp) / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://pri.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+            }
+
+            # 1. State-matrix cell: secondary x drive_ack while primary remains online
+            mgr = colab_runtime.ColabRuntimeManager(storage, drive_auth_timeout=10.0)
+            sec_proc = _BlockingPipeProc(
+                ["Visit https://accounts.google.com/o/oauth2/auth?sec=1\nPress Enter after you have granted access"],
+                after_ack_lines=["Mounted at /content/drive\n"],
+            )
+            sec_ready = {"up": False}
+
+            def fake_cmd(cb, am, args, **kw):
+                if args == ["sessions"]:
+                    return 0, "[comfy-a100-2] m-2 | Hardware: G4\n"
+                if args[:2] == ["ls", "/content/drive"]:
+                    return 1, "not mounted"
+                if args[:2] == ["exec", "-s"]:
+                    sec_ready["up"] = True
+                    return 0, "[start_colab] TUNNEL READY (AUTH PROTECTED): https://sec-ack.trycloudflare.com\n"
+                return 0, ""
+
+            def fake_probe(e=None, *, timeout=12.0):
+                urls = config.video_settings(e)["comfyui_urls"]
+                nodes = []
+                for u in urls:
+                    online = (u == "https://pri.ngrok-free.dev") or (u == "https://sec-ack.trycloudflare.com" and sec_ready["up"])
+                    nodes.append({"url": u, "label": comfy.endpoint_label(u), "online": online, "auth_failed": False, "devices": [], "queue_running": 0, "queue_pending": 0})
+                on = [n for n in nodes if n["online"]]
+                return {"online": bool(on), "configured": bool(urls), "devices": [], "nodes": nodes, "online_count": len(on), "total_count": len(nodes)}
+
+            with mock.patch.object(colab_runtime, "probe_comfyui", side_effect=fake_probe), \
+                 mock.patch.object(mgr, "_run_command", side_effect=fake_cmd), \
+                 mock.patch("subprocess.Popen", return_value=sec_proc):
+                mgr.start_async(env, slot="secondary")
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if mgr._slots["secondary"].active_state == "awaiting_drive_auth":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(mgr._slots["secondary"].active_state, "awaiting_drive_auth")
+                ack = mgr.submit_drive_authorized(slot="secondary")
+                self.assertTrue(ack["accepted"])
+                self.assertEqual(ack["slot"], "secondary")
+                mgr._slots["secondary"].worker_thread.join(timeout=5.0)
+            self.assertIsNone(mgr._slots["secondary"].last_error)
+            self.assertEqual(mgr.remembered_node("secondary")["url"], "https://sec-ack.trycloudflare.com")
+
+            # 2. State-matrix cell: secondary x cancel_during_auth leaves primary untouched
+            mgr2 = colab_runtime.ColabRuntimeManager(storage / "m2", drive_auth_timeout=10.0)
+            sec_proc2 = _BlockingPipeProc(
+                ["Visit https://accounts.google.com/o/oauth2/auth?sec=2\nPress Enter after you have granted access"],
+            )
+            stopped_sessions = []
+
+            def fake_cmd2(cb, am, args, **kw):
+                if args == ["sessions"]:
+                    return 0, "[comfy-a100-2] m-2 | Hardware: G4\n"
+                if args[:2] == ["ls", "/content/drive"]:
+                    return 1, "not mounted"
+                if args[:2] == ["stop", "-s"]:
+                    stopped_sessions.append(args[2])
+                    return 0, "Stopped\n"
+                return 0, ""
+
+            with mock.patch.object(colab_runtime, "probe_comfyui", side_effect=fake_probe), \
+                 mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(mgr2, "_run_command", side_effect=fake_cmd2), \
+                 mock.patch("subprocess.Popen", return_value=sec_proc2), \
+                 mock.patch.object(colab_runtime, "_kill_process_tree", side_effect=lambda p: p.kill()):
+                mgr2.start_async(env, slot="secondary")
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and mgr2._slots["secondary"].active_state != "awaiting_drive_auth":
+                    time.sleep(0.02)
+                self.assertEqual(mgr2._slots["secondary"].active_state, "awaiting_drive_auth")
+                stop_res = mgr2.stop(environ=env, force=True, slot="secondary")
+            self.assertTrue(stop_res["stopped"])
+            self.assertEqual(stopped_sessions, ["comfy-a100-2"])
+            self.assertIsNone(mgr2._slots["secondary"].active_state)
+            self.assertTrue(any(m["slot"] == "primary" and m["online"] for m in stop_res["status"]["managed_nodes"]))
+
+            # 3. drivemount process exiting/crashing after printing URL must exit promptly (not wedge for 600s)
+            mgr3 = colab_runtime.ColabRuntimeManager(storage / "m3", drive_auth_timeout=600.0)
+            dying_proc = _BlockingPipeProc(
+                ["Visit https://accounts.google.com/o/oauth2/auth?dying=1\nPress Enter after you have granted access"],
+            )
+
+            def kill_shortly():
+                time.sleep(0.15)
+                dying_proc._finish(1)
+
+            threading.Thread(target=kill_shortly, daemon=True).start()
+            t0 = time.monotonic()
+            with mock.patch("subprocess.Popen", return_value=dying_proc):
+                rc, _, timed_out = mgr3._run_drivemount_once(str(fake_bin), "", "comfy-a100", env)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(rc, 1)
+            self.assertFalse(timed_out)
+            self.assertLess(elapsed, 3.0, "_run_drivemount_once must exit immediately when subprocess dies")
+
+    def test_parse_tunnel_ready_url_whitelist_and_config_forgets_removed_secondary(self):
+        # Secondary ephemeral parsing rejects arbitrary domains and paths, accepts only *.trycloudflare.com
+        poisoned = (
+            "[start_colab] TUNNEL READY (AUTH PROTECTED): https://good-node-42.trycloudflare.com\n"
+            "[start_colab] TUNNEL READY (AUTH PROTECTED): https://evil.attacker.example/steal\n"
+        )
+        self.assertEqual(
+            colab_runtime.parse_tunnel_ready_url(poisoned, ephemeral_only=True),
+            "https://good-node-42.trycloudflare.com",
+        )
+        self.assertEqual(
+            colab_runtime.parse_tunnel_ready_url(
+                "[start_colab] TUNNEL READY (AUTH PROTECTED): https://evil.attacker.example\n",
+                ephemeral_only=True,
+            ),
+            "",
+        )
+
+        # Removing secondary URL via /api/config clears colab-nodes.json so status() does not resurrect it
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_path = root / ".env"
+            pri = "https://pri.ngrok-free.dev"
+            sec = "https://sec-old.trycloudflare.com"
+            env_path.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={pri},{sec}\nCOMFYUI_API_KEY=old-key-1234\n",
+                encoding="utf-8",
+            )
+            app = server.create_app(storage=root / ".workbench", env_path=env_path)
+            runtime = app.extensions["colab_runtime"]
+            self.addCleanup(runtime.stop_keepalive_monitor)
+            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec, "gpu": "G4", "tunnel": "cloudflared"})
+            client = app.test_client()
+            res = client.post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={"COMFYUI_URL": pri, "persist": True},
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertIsNone(runtime.remembered_node("secondary"))
+
+    def test_start_colab_watchdog_queue_authority_and_ws_status_clear(self):
+        # 1. WS status event with queue_remaining=0 clears stale running state
+        state = {"prompt_id": "p1", "status": "running", "node": "125"}
+        start_colab._apply_comfy_ws_event(state, {"type": "status", "data": {"status": {"exec_info": {"queue_remaining": 0}}}}, now=100.0)
+        self.assertEqual(state["status"], "finished")
+
+        # 2. _queue_busy trusts /queue == empty even if progress_snapshot is stuck at running
+        class _FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"queue_running": [], "queue_pending": []}'
+
+        stuck_snap = lambda: {"status": "running", "prompt_id": "p-stuck", "updated_at": time.time()}
+        with mock.patch("urllib.request.urlopen", return_value=_FakeResp()):
+            self.assertFalse(start_colab._queue_busy(stuck_snap))
+
+        # 3. Unused fl2v LoRA is no longer required in MODEL_FILES
+        self.assertFalse(any("fl2v" in m for m in start_colab.MODEL_FILES))
+
+    def test_start_colab_auth_reverse_proxy_security_chunked_and_stream_error(self):
+        # Check non-ASCII auth header never raises TypeError
+        self.assertFalse(start_colab._check_authorization("Bearer 密钥", "secret-123"))
+        b64_utf8 = base64.b64encode("user:密钥".encode("utf-8")).decode("ascii")
+        self.assertFalse(start_colab._check_authorization(f"Basic {b64_utf8}", "secret-123"))
+
+        upstream_seen = []
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, *a): return
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                upstream_seen.append({
+                    "path": self.path,
+                    "auth": self.headers.get("Authorization"),
+                    "body": body,
+                })
+                resp = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(resp)
+
+            def do_GET(self):
+                if self.path == "/drop-midstream":
+                    # Promise 100 bytes but close after 10 bytes to trigger mid-stream error
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", "100")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b"0123456789")
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        up_srv = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, daemon=True).start()
+        self.addCleanup(up_srv.shutdown)
+        self.addCleanup(up_srv.server_close)
+
+        proxy_cls = start_colab._make_auth_proxy_handler(
+            "secret-xyz",
+            lambda: {"status": "idle"},
+            lambda: None,
+            comfy_host="127.0.0.1",
+            comfy_port=up_port,
+        )
+        px_srv = ThreadingHTTPServer(("127.0.0.1", 0), proxy_cls)
+        px_port = px_srv.server_address[1]
+        threading.Thread(target=px_srv.serve_forever, daemon=True).start()
+        self.addCleanup(px_srv.shutdown)
+        self.addCleanup(px_srv.server_close)
+
+        def raw_exchange(raw_req: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", px_port), timeout=5.0) as s:
+                s.sendall(raw_req)
+                chunks = []
+                while True:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    chunks.append(d)
+                return b"".join(chunks)
+
+        # 1. Missing auth -> 401 and closes connection cleanly
+        r_unauth = raw_exchange(b"GET /h3_progress HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        self.assertTrue(r_unauth.startswith(b"HTTP/1.1 401"))
+
+        # 2. Invalid/negative Content-Length -> 400 (no crash)
+        r_bad_cl = raw_exchange(
+            b"POST /prompt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-xyz\r\nContent-Length: -5\r\n\r\n"
+        )
+        self.assertTrue(r_bad_cl.startswith(b"HTTP/1.1 400"))
+
+        # 3. Chunked POST forwards full decoded body and strips Authorization header upstream
+        r_chunked = raw_exchange(
+            b"POST /prompt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-xyz\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+        )
+        self.assertTrue(r_chunked.startswith(b"HTTP/1.1 200"))
+        self.assertEqual(upstream_seen[-1]["body"], b"hello world")
+        self.assertIsNone(upstream_seen[-1]["auth"])
+
+        # 4. Mid-stream upstream abort after 200 headers must NOT inject a 502 response into body
+        r_drop = raw_exchange(
+            b"GET /drop-midstream HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-xyz\r\n\r\n"
+        )
+        self.assertTrue(r_drop.startswith(b"HTTP/1.1 200"))
+        self.assertNotIn(b"502", r_drop)
+        self.assertNotIn(b"Upstream error", r_drop)
+
+    def test_start_colab_http_status_blocks_cross_origin_auth_redirect_and_preserves_user_dir(self):
+        # Cross-origin redirect with Authorization header must be blocked by _http_status
+        seen_auth_on_target = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a): return
+            def do_GET(self):
+                seen_auth_on_target.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+        tgt = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        tgt_port = tgt.server_address[1]
+        threading.Thread(target=tgt.serve_forever, daemon=True).start()
+        self.addCleanup(tgt.shutdown)
+        self.addCleanup(tgt.server_close)
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a): return
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{tgt_port}/stolen")
+                self.end_headers()
+
+        redir = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        redir_port = redir.server_address[1]
+        threading.Thread(target=redir.serve_forever, daemon=True).start()
+        self.addCleanup(redir.shutdown)
+        self.addCleanup(redir.server_close)
+
+        code = start_colab._http_status(
+            f"http://127.0.0.1:{redir_port}/system_stats",
+            headers={"Authorization": "Bearer top-secret"},
+            timeout=3.0,
+        )
+        self.assertIsNone(code)
+        self.assertEqual(seen_auth_on_target, [])
+
+        # link_persistent_dirs migrates existing LOCAL/user files instead of deleting them
+        with tempfile.TemporaryDirectory() as tmp:
+            drive_base = Path(tmp) / "drive"
+            local_dir = Path(tmp) / "local"
+            (local_dir / "user").mkdir(parents=True)
+            (local_dir / "user" / "saved.json").write_text('{"keep":true}', encoding="utf-8")
+            with mock.patch.object(start_colab, "BASE", drive_base), \
+                 mock.patch.object(start_colab, "LOCAL", local_dir):
+                start_colab.link_persistent_dirs()
+            self.assertTrue((local_dir / "user").is_symlink())
+            self.assertEqual((drive_base / "user" / "saved.json").read_text(encoding="utf-8"), '{"keep":true}')
+
+    def test_comfy_tunnel_offline_clears_submission_unknown_503_transient_and_key_boundaries(self):
+        # 1. submit_with_retry clears submission_unknown=False on ngrok 404 and Cloudflare 530
+        for exc in (
+            http.HTTPResponseError(404, "ERR_NGROK_3200 offline"),
+            RuntimeError("https://dead.trycloudflare.com/prompt: 530: error 1033"),
+        ):
+            recorded = []
+            with mock.patch.object(comfy, "submit", side_effect=exc):
+                with self.assertRaises(RuntimeError):
+                    comfy.submit_with_retry({"1": {}}, log=lambda m: None, record_submission=recorded.append)
+            self.assertEqual(recorded, [True, False])
+
+        # 2. _is_transient_tunnel_error recognizes plain RuntimeError 502/503/504 from http.request
+        self.assertTrue(comfy._is_transient_tunnel_error(RuntimeError("https://n.example/history/1: 503: Service Unavailable")))
+        self.assertTrue(comfy._is_transient_tunnel_error(RuntimeError("https://n.example/queue: 502: Bad Gateway")))
+        self.assertTrue(comfy._is_transient_tunnel_error(RuntimeError("https://n.example/queue: 504: Gateway Timeout")))
+
+        # 3. _is_auth_rejection recognizes JSON 401/403 bodies
+        self.assertTrue(film._is_auth_rejection(comfy.SubmissionRejected('{"error":"bad key","_http_status": 401}')))
+
+        # 4. Non-loopback plaintext HTTP suppresses Bearer key; loopback retains it
+        self.assertEqual(comfy.key_for_endpoint("http://192.168.1.10:8188", "secret"), "")
+        self.assertEqual(comfy.key_for_endpoint("http://127.0.0.1:8188", "secret"), "secret")
+        self.assertEqual(comfy.key_for_endpoint("https://node.ngrok-free.dev", "secret"), "secret")
+
+        # 5. Resume rejects sending rotated/new COMFYUI_API_KEY to a removed endpoint
+        env_rotated = {
+            "VIDEO_PROVIDER": "comfyui",
+            "COMFYUI_URL": "https://node-b.example.com",
+            "COMFYUI_API_KEY": "new-secret-key",
+        }
+        with self.assertRaises(RuntimeError):
+            comfy.assert_resume_endpoint_key_allowed(
+                "https://node-a.example.com",
+                expected_key_fp=comfy.key_fingerprint("old-secret-key"),
+                environ=env_rotated,
+            )
+        # Same key fingerprint on removed endpoint is allowed
+        comfy.assert_resume_endpoint_key_allowed(
+            "https://node-a.example.com",
+            expected_key_fp=comfy.key_fingerprint("new-secret-key"),
+            environ=env_rotated,
+        )
+
+        # 6. Single-node progress_payload omits endpoint/node_label when endpoint=None
+        payload = comfy.progress_payload({"stage": "sampling", "endpoint": "https://node-a.example.com", "node_label": "node-a.example.com"}, endpoint=None)
+        self.assertNotIn("endpoint", payload)
+        self.assertNotIn("node_label", payload)
+
+    def test_jobs_before_video_launch_runs_outside_jobs_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pic = root / "pic.png"
+            Image.new("RGB", (16, 16), "red").save(pic)
+            env_path = root / ".env"
+            env_path.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://pri.ngrok-free.dev\n"
+                "COMFYUI_API_KEY=k-123456\nAPIMART_API_KEY=a-123456\nLLM_API_KEY=l-123456\n",
+                encoding="utf-8",
+            )
+            app = server.create_app(storage=root / ".workbench", env_path=env_path)
+            jobs = app.extensions["jobs"]
+            runtime = app.extensions["colab_runtime"]
+            self.addCleanup(runtime.stop_keepalive_monitor)
+            client = app.test_client()
+
+            lock_free_during_probe = []
+
+            def check_lock_probe(env=None, *, timeout=12.0):
+                # Attempt acquiring jobs.lock from another thread — must succeed immediately if unlocked!
+                acquired = []
+                def try_lock():
+                    got = jobs.lock.acquire(blocking=False)
+                    if got:
+                        jobs.lock.release()
+                    acquired.append(got)
+                t = threading.Thread(target=try_lock)
+                t.start()
+                t.join(timeout=2.0)
+                lock_free_during_probe.append(acquired[0])
+                return {"online": True, "configured": True, "devices": [], "nodes": [], "online_count": 1, "total_count": 1}
+
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", side_effect=check_lock_probe), \
+                 mock.patch.object(jobs, "launch"):
+                res = client.post(
+                    "/api/jobs",
+                    headers={"X-Workbench": "1"},
+                    json={
+                        "kind": "one",
+                        "demo": False,
+                        "prompt": "Picture 1 moves.",
+                        "seconds": 5,
+                        "aspect": "9:16",
+                        "images": [str(pic)],
+                        "output_dir": str(root / "one-out"),
+                    },
+                )
+            self.assertEqual(res.status_code, 201)
+            self.assertEqual(lock_free_during_probe, [True], "before_video_launch probe must not hold jobs.lock")
+
+    def test_post_fix_adversarial_regressions_all_six_invariants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            storage = root / ".workbench"
+            fake_bin = root / "colab"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            # 1. submit_drive_authorized gracefully handles closed stdin (ValueError) without 500
+            mgr = colab_runtime.ColabRuntimeManager(storage / "r1")
+            closed_stdin = io.StringIO()
+            closed_stdin.close()
+            mgr._slots["primary"].active_state = "awaiting_drive_auth"
+            mgr._slots["primary"].drive_proc = types.SimpleNamespace(stdin=closed_stdin)
+            ack = mgr.submit_drive_authorized(slot="primary")
+            self.assertFalse(ack["accepted"])
+            self.assertEqual(ack["slot"], "primary")
+
+            # 2. DispatchAbortedError does not pollute state.json or mask the real root-cause error
+            job_dir = root / "film-abort"
+            job_dir.mkdir()
+            job = film.Job(job_dir)
+            job.put("segs", "1", h3="Test H3 prompt", seed=7)
+            pool = comfy.ComfyNodePool(["https://n1.example.com"], api_key="k-1")
+            pool._order = ["https://n1.example.com"]
+            pool._busy.add("https://n1.example.com")  # keep node busy so seg 1 blocks in acquire()
+            abort_ev = threading.Event()
+            abort_ev.set()
+            env_single = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://n1.example.com",
+                "COMFYUI_API_KEY": "k-1",
+            }
+            with mock.patch.dict(os.environ, env_single, clear=False):
+                with self.assertRaises(comfy.DispatchAbortedError):
+                    film.gen_segment(
+                        job,
+                        {"shots": [], "aspect": "16:9"},
+                        {"idx": 1, "shots": [{"action": "walk", "start": 0, "end": 5}], "seconds": 5},
+                        [],
+                        node_pool=pool,
+                        abort=abort_ev,
+                    )
+            self.assertNotIn("error", job.state["segs"]["1"], "DispatchAbortedError must not write error to state.json")
+            self.assertNotIn("error_code", job.state["segs"]["1"], "DispatchAbortedError must not write SEGMENT_GENERATION_FAILED")
+
+            # In stage_generate, seg 0 (aborted while waiting for node) must not mask seg 1's real error
+            job2_dir = root / "film-abort-stage"
+            job2_dir.mkdir()
+            job2 = film.Job(job2_dir)
+            seg0 = {"idx": 0, "shots": [{"action": "a", "start": 0, "end": 5}], "seconds": 5}
+            seg1 = {"idx": 1, "shots": [{"action": "b", "start": 5, "end": 10}], "seconds": 5}
+            waiting_entered = threading.Event()
+
+            def fake_gen_segment(j, f, seg, p, *, reference_paths=None, node_pool=None, abort=None):
+                if seg["idx"] == 0:
+                    waiting_entered.set()
+                    # Block in real acquire() until seg 1 fails and sets abort
+                    node_pool.acquire(abort=abort)
+                waiting_entered.wait(timeout=2.0)
+                raise RuntimeError("REAL_UPSTREAM_OOM")
+
+            pool_stub = comfy.ComfyNodePool(["https://n1.example.com", "https://n2.example.com"], api_key="k-1")
+            pool_stub._order = ["https://n1.example.com", "https://n2.example.com"]
+            pool_stub._busy.update(pool_stub._order)  # force seg 0 to wait in acquire()
+            env_multi = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://n1.example.com,https://n2.example.com",
+                "COMFYUI_API_KEY": "k-1",
+                "COMFYUI_CONCURRENCY": "2",
+            }
+            with mock.patch.dict(os.environ, env_multi, clear=False), \
+                 mock.patch.object(comfy, "ComfyNodePool", return_value=pool_stub), \
+                 mock.patch.object(pool_stub, "probe_all", return_value=[]), \
+                 mock.patch.object(film, "gen_segment", side_effect=fake_gen_segment):
+                with self.assertRaisesRegex(RuntimeError, "REAL_UPSTREAM_OOM"):
+                    film.stage_generate(job2, {"shots": [], "aspect": "16:9"}, [seg0, seg1], {0: [], 1: []}, "shot")
+
+            # 3. Stopping primary while secondary is in awaiting_drive_auth preserves secondary auth box & keepalive
+            mgr3 = colab_runtime.ColabRuntimeManager(storage / "r3")
+            mgr3.mark_local_activity(now=900.0)
+            mgr3._slots["secondary"].active_state = "awaiting_drive_auth"
+            mgr3._slots["secondary"].auth_url = "https://accounts.google.com/o/oauth2/auth?sec-live=1"
+            env_pri = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://pri.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_GPU": "G4",
+            }
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": False, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}), \
+                 mock.patch.object(mgr3, "_query_sessions", return_value={"named": [], "orphans": [], "ok": True}), \
+                 mock.patch.object(mgr3, "_run_cmd_for_slot", return_value=(0, "stopped")), \
+                 mock.patch.object(mgr3, "stop_keepalive_monitor") as stop_mon:
+                stop_res = mgr3.stop(environ=env_pri, force=True, slot="primary")
+            stop_mon.assert_not_called()
+            self.assertIsNotNone(mgr3._last_activity_at)
+            by_slot = {m["slot"]: m for m in stop_res["status"]["managed_nodes"]}
+            self.assertEqual(by_slot["primary"]["state"], "offline")
+            self.assertEqual(by_slot["secondary"]["state"], "awaiting_drive_auth")
+            self.assertEqual(by_slot["secondary"]["auth_url"], "https://accounts.google.com/o/oauth2/auth?sec-live=1")
+
+            # 4. maybe_send_kernel_keepalive lost primary must NOT clear _last_activity_at while secondary lives
+            now_box = {"t": 3000.0}
+            mgr4 = colab_runtime.ColabRuntimeManager(storage / "r4", clock=lambda: now_box["t"])
+            mgr4._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": "https://sec-alive.trycloudflare.com", "gpu": "G4", "tunnel": "cloudflared"})
+            mgr4.mark_local_activity(now=2900.0)
+            with mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": True, "configured": True, "nodes": [], "online_count": 1, "total_count": 1}), \
+                 mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=1), \
+                 mock.patch.object(mgr4, "_run_cmd_for_slot", return_value=(1, "Session comfy-a100 appears to be lost")):
+                sent = mgr4.maybe_send_kernel_keepalive(env_pri, slot="primary")
+            self.assertFalse(sent)
+            self.assertEqual(mgr4._last_activity_at, 2900.0, "Primary loss must not wipe keepalive activity while secondary lives")
+
+            # 5. Jobs._probing_launch blocks concurrent job launches and /api/config mid-probe changes are re-validated
+            pic = root / "p2.png"
+            Image.new("RGB", (16, 16), "blue").save(pic)
+            env_path = root / ".env"
+            env_path.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://pri.ngrok-free.dev\n"
+                "COMFYUI_API_KEY=k-old-1234\nAPIMART_API_KEY=a-123456\nLLM_API_KEY=l-123456\n",
+                encoding="utf-8",
+            )
+            app = server.create_app(storage=storage / "srv-toctou", env_path=env_path)
+            jobs = app.extensions["jobs"]
+            runtime = app.extensions["colab_runtime"]
+            self.addCleanup(runtime.stop_keepalive_monitor)
+            client = app.test_client()
+            probed_urls = []
+            concurrent_status = []
+
+            def racing_probe(e=None, *, timeout=12.0):
+                url = config.video_settings(e)["comfyui_url"]
+                probed_urls.append(url)
+                if len(probed_urls) == 1:
+                    # While request 1 is probing, a concurrent /api/jobs MUST be rejected as busy (InputError -> 400)
+                    r_busy = client.post(
+                        "/api/jobs",
+                        headers={"X-Workbench": "1"},
+                        json={
+                            "kind": "one", "demo": False, "prompt": "Picture 1 jumps.",
+                            "seconds": 5, "aspect": "9:16", "images": [str(pic)],
+                            "output_dir": str(root / "one-busy"),
+                        },
+                    )
+                    concurrent_status.append((r_busy.status_code, (r_busy.get_json() or {}).get("error", "")))
+                    # And a concurrent /api/config rotates COMFYUI_URL -> triggers fresh re-probe with new URL!
+                    r_cfg = client.post(
+                        "/api/config",
+                        headers={"X-Workbench": "1"},
+                        json={"COMFYUI_URL": "https://new-node.ngrok-free.dev", "COMFYUI_API_KEY": "k-new-9999"},
+                    )
+                    self.assertEqual(r_cfg.status_code, 200)
+                return {"online": True, "configured": True, "devices": [], "nodes": [], "online_count": 1, "total_count": 1}
+
+            launched_envs = []
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", side_effect=racing_probe), \
+                 mock.patch.object(jobs, "launch", side_effect=lambda rec, req, e: launched_envs.append(dict(e))):
+                r_ok = client.post(
+                    "/api/jobs",
+                    headers={"X-Workbench": "1"},
+                    json={
+                        "kind": "one", "demo": False, "prompt": "Picture 1 walks.",
+                        "seconds": 5, "aspect": "9:16", "images": [str(pic)],
+                        "output_dir": str(root / "one-reprobed"),
+                    },
+                )
+            self.assertEqual(r_ok.status_code, 201)
+            self.assertEqual(len(concurrent_status), 1)
+            self.assertEqual(concurrent_status[0][0], 400, "Concurrent launch during probe must fail with InputError('busy')")
+            self.assertTrue(concurrent_status[0][1], "Busy rejection must include localized error message")
+            self.assertEqual(probed_urls, ["https://pri.ngrok-free.dev", "https://new-node.ngrok-free.dev"])
+            self.assertEqual(launched_envs[-1]["COMFYUI_URL"], "https://new-node.ngrok-free.dev")
+            self.assertEqual(launched_envs[-1]["COMFYUI_API_KEY"], "k-new-9999")
+
+            # 6. Mid-probe non-video config change (e.g. switching LLM_PROVIDER to gemini without key) triggers preflight failure
+            env_path_llm = root / ".env.llm"
+            env_path_llm.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://pri.ngrok-free.dev\n"
+                "COMFYUI_API_KEY=k-old-1234\nAPIMART_API_KEY=a-123456\nLLM_API_KEY=l-123456\n",
+                encoding="utf-8",
+            )
+            app_llm = server.create_app(storage=storage / "srv-llm-toctou", env_path=env_path_llm)
+            jobs_llm = app_llm.extensions["jobs"]
+            self.addCleanup(app_llm.extensions["colab_runtime"].stop_keepalive_monitor)
+            client_llm = app_llm.test_client()
+
+            def switch_llm_during_probe(e=None, *, timeout=12.0):
+                r_cfg = client_llm.post(
+                    "/api/config",
+                    headers={"X-Workbench": "1"},
+                    json={"LLM_PROVIDER": "gemini"},
+                )
+                self.assertEqual(r_cfg.status_code, 200)
+                return {"online": True, "configured": True, "devices": [], "nodes": [], "online_count": 1, "total_count": 1}
+
+            launched_llm = []
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", side_effect=switch_llm_during_probe), \
+                 mock.patch.object(jobs_llm, "launch", side_effect=lambda *a: launched_llm.append(a)):
+                r_fail = client_llm.post(
+                    "/api/jobs",
+                    headers={"X-Workbench": "1"},
+                    json={
+                        "kind": "one", "demo": False, "prompt": "参考图片1在雨中走路。",
+                        "seconds": 5, "aspect": "9:16", "images": [str(pic)],
+                        "output_dir": str(root / "one-llm-fail"),
+                    },
+                )
+            self.assertEqual(r_fail.status_code, 400, "Switching LLM_PROVIDER to unconfigured gemini mid-probe must fail preflight")
+            self.assertEqual(launched_llm, [])
+
+            # 7. stop("primary") drops cleared dead secondary URL from status_payload["comfyui_urls"] and stops monitor on error-only secondary
+            mgr5 = colab_runtime.ColabRuntimeManager(storage / "r5")
+            dead_sec = "https://dead-sec.trycloudflare.com"
+            mgr5._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": dead_sec, "gpu": "G4", "tunnel": "cloudflared"})
+            env_dead = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": f"https://pri.ngrok-free.dev,{dead_sec}",
+                "COMFYUI_API_KEY": "k-secret-1234",
+                "COLAB_BIN": str(fake_bin),
+                "COLAB_GPU": "G4",
+            }
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}), \
+                 mock.patch.object(mgr5, "_query_sessions", return_value={"named": [], "orphans": [], "ok": True}), \
+                 mock.patch.object(mgr5, "_run_cmd_for_slot", return_value=(0, "stopped")):
+                res_dead = mgr5.stop(environ=env_dead, force=True, slot="primary")
+            self.assertEqual(res_dead["status"]["comfyui_urls"], ["https://pri.ngrok-free.dev"])
+
+            mgr6 = colab_runtime.ColabRuntimeManager(storage / "r6")
+            mgr6._slots["secondary"].last_error = "stale boot error"
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": False, "devices": [], "nodes": [], "online_count": 0, "total_count": 0}), \
+                 mock.patch.object(mgr6, "_query_sessions", return_value={"named": [], "orphans": [], "ok": True}), \
+                 mock.patch.object(mgr6, "_run_cmd_for_slot", return_value=(0, "stopped")), \
+                 mock.patch.object(mgr6, "stop_keepalive_monitor") as stop_mon6:
+                res_err_only = mgr6.stop(environ=env_pri, force=True, slot="primary")
+            stop_mon6.assert_called_once()
+            sec6 = next(m for m in res_err_only["status"]["managed_nodes"] if m["slot"] == "secondary")
+            self.assertEqual(sec6["state"], "error")
+
+            # 8. Auto-start with only secondary URL configured must return HTTP 400 (not 500 ValueError)
+            env_path_sec = root / ".env.sec_only"
+            sec_only_url = "https://only-sec-auto.trycloudflare.com"
+            env_path_sec.write_text(
+                f"VIDEO_PROVIDER=comfyui\nCOMFYUI_URL={sec_only_url}\nCOMFYUI_API_KEY=k-sec-1234\n"
+                f"APIMART_API_KEY=a-123456\nLLM_API_KEY=l-123456\nCOLAB_AUTO_START=1\nCOLAB_BIN={fake_bin}\n",
+                encoding="utf-8",
+            )
+            app_sec = server.create_app(storage=storage / "srv-sec-only", env_path=env_path_sec)
+            rt_sec = app_sec.extensions["colab_runtime"]
+            self.addCleanup(rt_sec.stop_keepalive_monitor)
+            rt_sec._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_only_url, "gpu": "G4", "tunnel": "cloudflared"})
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}):
+                r_sec = app_sec.test_client().post(
+                    "/api/jobs",
+                    headers={"X-Workbench": "1"},
+                    json={
+                        "kind": "one", "demo": False, "prompt": "Picture 1 waves.",
+                        "seconds": 5, "aspect": "9:16", "images": [str(pic)],
+                        "output_dir": str(root / "one-sec-only"),
+                    },
+                )
+            self.assertEqual(r_sec.status_code, 400, f"Expected 400 not 500, got {r_sec.status_code}: {r_sec.get_data(as_text=True)}")
+
+
+if __name__ == "__main__":
+    unittest.main()

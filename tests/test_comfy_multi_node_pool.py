@@ -202,8 +202,12 @@ class ComfyMultiNodePoolExecutionTest(unittest.TestCase):
             node_a = "https://node-a.example.com"
             node_b = "https://node-b.example.com"
             node_c = "https://node-c.example.com"
-            # seg1 was previously submitted to node_b (which is no longer even in COMFYUI_URL!)
-            job.put("segs", "0", provider="comfyui", comfyui_url=node_b, task="pid-on-b", seed=123, submitted=time.time())
+            # seg1 was previously submitted to node_b with the same shared key (now removed from COMFYUI_URL)
+            job.put(
+                "segs", "0", provider="comfyui", comfyui_url=node_b,
+                comfyui_key_fp=comfy.key_fingerprint("shared-secret"),
+                task="pid-on-b", seed=123, submitted=time.time(),
+            )
 
             poll_calls: list[tuple[str, str | None]] = []
             download_urls: list[str] = []
