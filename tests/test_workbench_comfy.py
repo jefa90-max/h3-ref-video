@@ -460,7 +460,8 @@ class WorkbenchComfyTest(unittest.TestCase):
             restarted_cfg = restarted_app.test_client().get("/api/bootstrap").get_json()["config"]
             self.assertEqual(restarted_cfg["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
 
-            # POST /api/config rotating COMFYUI_API_KEY without touching COMFYUI_URL strips remembered secondary URL from env and .env
+            # POST /api/config rotating COMFYUI_API_KEY (including UI FormData that also submits pre-filled COMFYUI_URL)
+            # strips remembered secondary URL from env and .env, while persist=False leaves .env and colab-nodes.json untouched
             restarted_rt = restarted_app.extensions["colab_runtime"]
             restarted_rt._set_remembered_node(
                 "secondary",
@@ -470,10 +471,26 @@ class WorkbenchComfyTest(unittest.TestCase):
                     "key_fp": server.colab_runtime.comfy.key_fingerprint("shared-comfy-key-1234"),
                 },
             )
+            np_res = restarted_app.test_client().post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={"COMFYUI_API_KEY": "comfy-secret-token-123", "persist": False},
+            )
+            self.assertEqual(np_res.status_code, 200)
+            self.assertEqual(np_res.get_json()["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+            self.assertIsNotNone(restarted_rt.remembered_node("secondary"))
+            self.assertEqual(
+                config.read_env_file(restart_env)["COMFYUI_URL"],
+                "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+            )
             rot_res = restarted_app.test_client().post(
                 "/api/config",
                 headers={"X-Workbench": "1"},
-                json={"COMFYUI_API_KEY": "comfy-secret-token-123", "persist": True},
+                json={
+                    "COMFYUI_URL": "https://node1.ngrok-free.dev,https://live-sec-55.trycloudflare.com",
+                    "COMFYUI_API_KEY": "shared-pool-key-1234",
+                    "persist": True,
+                },
             )
             self.assertEqual(rot_res.status_code, 200)
             self.assertEqual(rot_res.get_json()["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
