@@ -21,6 +21,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import check, comfy, config, frames, http, media, rewrite, rh, staging
 from .i18n import message
@@ -32,6 +33,38 @@ ORIENT = {"9:16": "竖屏", "16:9": "横屏", "1:1": "方形"}
 RULES = ("完整表现动作的原因、接触和结果，动作真实连续，不要静态立绘晃动；角色不互换外观，道具不凭空出现或消失，不增加额外人物。"
          "画风全片统一为上面写的风格；每个角色全片是同一位演员，长相、发型、妆容和服装前后一致；"
          "画面里不出现字幕和文字，包装和道具上不印可读的字，只用图案和颜色区分；不出现任何真实品牌的标志。")
+
+
+def _is_trycloudflare_url(url: str | None) -> bool:
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    return parts.scheme.lower() == "https" and host.endswith(".trycloudflare.com") and len(host) > len(".trycloudflare.com")
+
+
+def _relocate_trycloudflare_endpoint(job, seg_idx: int, rec: dict, endpoint_url: str | None) -> str | None:
+    if not endpoint_url or not _is_trycloudflare_url(endpoint_url):
+        return endpoint_url
+    task_id = str(rec.get("task") or "").strip()
+    if not task_id:
+        return endpoint_url
+    cur_urls = config.video_settings()["comfyui_urls"]
+    if endpoint_url in cur_urls:
+        return endpoint_url
+    for cand in cur_urls:
+        if cand == endpoint_url or not _is_trycloudflare_url(cand):
+            continue
+        try:
+            comfy.assert_resume_endpoint_key_allowed(cand, expected_key_fp=rec.get("comfyui_key_fp"))
+        except RuntimeError:
+            continue
+        if comfy.has_task(task_id, base_url=cand):
+            job.log("relocate", f"seg{seg_idx + 1}", f"{comfy.endpoint_label(endpoint_url)} -> {comfy.endpoint_label(cand)}")
+            job.put("segs", str(seg_idx), comfyui_url=cand)
+            return cand
+    return endpoint_url
 
 
 def _num(x) -> str:
@@ -753,21 +786,7 @@ def _generate_segment(
                 rec = job.state["segs"][str(i)]
         elif provider_name == "comfyui":
             endpoint_url = str(rec.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
-            if endpoint_url and endpoint_url.lower().endswith(".trycloudflare.com"):
-                cur_urls = config.video_settings()["comfyui_urls"]
-                if endpoint_url not in cur_urls:
-                    for cand in cur_urls:
-                        if cand == endpoint_url or not cand.lower().endswith(".trycloudflare.com"):
-                            continue
-                        try:
-                            comfy.assert_resume_endpoint_key_allowed(cand, expected_key_fp=rec.get("comfyui_key_fp"))
-                        except RuntimeError:
-                            continue
-                        if comfy.has_task(rec["task"], base_url=cand):
-                            job.log("relocate", f"seg{i + 1}", f"{comfy.endpoint_label(endpoint_url)} -> {comfy.endpoint_label(cand)}")
-                            endpoint_url = cand
-                            job.put("segs", str(i), comfyui_url=cand)
-                            break
+            endpoint_url = _relocate_trycloudflare_endpoint(job, i, rec, endpoint_url)
             comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=rec.get("comfyui_key_fp"))
             if node_pool is not None and endpoint_url:
                 node_pool.reserve_inflight(endpoint_url)
@@ -990,6 +1009,7 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                     rec_s = job.state["segs"].get(str(s["idx"])) or {}
                     if _video_provider_name(rec_s) == "comfyui":
                         ep_s = str(rec_s.get("comfyui_url") or "").strip() or (vcfg["comfyui_url"] or "")
+                        ep_s = _relocate_trycloudflare_endpoint(job, s["idx"], rec_s, ep_s) or ""
                         if ep_s:
                             node_pool.reserve_inflight(ep_s)
                             res_ep = ep_s

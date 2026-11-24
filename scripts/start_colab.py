@@ -509,6 +509,17 @@ def _is_passive_probe(method: str, path: str) -> bool:
 QUEUE_UNREACHABLE_GRACE_SEC = 10 * 60.0
 
 
+def _queue_busy_on_error(progress_snapshot=None, *, queue_error_elapsed: float = 0.0) -> bool:
+    snap = progress_snapshot() if callable(progress_snapshot) else progress_snapshot
+    if isinstance(snap, dict) and snap.get("status") == "running":
+        updated_at = snap.get("updated_at")
+        if not isinstance(updated_at, (int, float)) or (time.time() - float(updated_at)) <= 120.0:
+            return True
+    if queue_error_elapsed <= QUEUE_UNREACHABLE_GRACE_SEC:
+        return _comfy_process_alive()
+    return False
+
+
 def _queue_busy(progress_snapshot=None, *, queue_error_elapsed: float = 0.0) -> bool:
     req = urllib.request.Request(f"http://{COMFY_HOST}:{COMFY_PORT}/queue", method="GET")
     try:
@@ -517,14 +528,7 @@ def _queue_busy(progress_snapshot=None, *, queue_error_elapsed: float = 0.0) -> 
         if isinstance(payload, dict):
             return bool(payload.get("queue_running") or payload.get("queue_pending"))
     except Exception:
-        snap = progress_snapshot() if callable(progress_snapshot) else progress_snapshot
-        if isinstance(snap, dict) and snap.get("status") == "running":
-            updated_at = snap.get("updated_at")
-            if not isinstance(updated_at, (int, float)) or (time.time() - float(updated_at)) <= 120.0:
-                return True
-        if queue_error_elapsed <= QUEUE_UNREACHABLE_GRACE_SEC:
-            return _comfy_process_alive()
-        return False
+        return _queue_busy_on_error(progress_snapshot, queue_error_elapsed=queue_error_elapsed)
     return False
 
 
@@ -818,7 +822,7 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
         log(f"[supervisor] Spawned ngrok pid={tunnel_proc.pid} for {public_url or 'ephemeral-domain'} (idle_timeout={idle_minutes:g}m)")
 
     my_pid = str(os.getpid())
-    stop_event = threading.Event()
+    stop_requested = False
 
     def _cleanup_pid_file() -> None:
         try:
@@ -828,7 +832,8 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
             pass
 
     def handle_term(signum, frame):
-        stop_event.set()
+        nonlocal stop_requested
+        stop_requested = True
 
     signal.signal(signal.SIGTERM, handle_term)
     signal.signal(signal.SIGINT, handle_term)
@@ -850,10 +855,19 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
             now_m = time.monotonic()
             if queue_err_since is None:
                 queue_err_since = now_m
-            return _queue_busy(progress_snapshot, queue_error_elapsed=now_m - queue_err_since)
+            return _queue_busy_on_error(progress_snapshot, queue_error_elapsed=now_m - queue_err_since)
+
+    def _sleep_interruptible(seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while not stop_requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.25, remaining))
+        return True
 
     try:
-        while not stop_event.wait(timeout=check_interval):
+        while not _sleep_interruptible(check_interval):
             if tunnel_proc.poll() is not None:
                 if skip_comfy_check or _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
                     log(f"[supervisor] {provider} exited with {tunnel_proc.returncode}; restarting...")
@@ -1390,7 +1404,7 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
             except OSError:
                 pass
     if provider == "cloudflared":
-        subprocess.run(["pkill", "-f", f"cloudflared tunnel.*{COMFY_HOST}:{GATEWAY_PORT}"], check=False)
+        subprocess.run(["pkill", "-f", "cloudflared tunnel"], check=False)
         CLOUDFLARED_URL_FILE.unlink(missing_ok=True)
         CLOUDFLARED_LOG_FILE.unlink(missing_ok=True)
     else:

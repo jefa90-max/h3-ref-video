@@ -1844,6 +1844,7 @@ class ColabRuntimeManager:
                 with self._lock:
                     if st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
                         return False
+                    st.cancel_event.clear()
                     st.keepalive_in_flight = True
                 try:
                     rc, out = self._run_cmd_for_slot(
@@ -1974,43 +1975,45 @@ class ColabRuntimeManager:
         if not colab_bin:
             raise RuntimeUnavailableError(message("colab_cli_missing"))
 
-        if slot_name == "secondary":
-            saved_sec = self.remembered_node("secondary")
-            sec_url = str((saved_sec or {}).get("url") or "").strip()
-            remote_queue = probe_remote_queue_count({**env_copy, "COMFYUI_URL": sec_url}, strict=True) if sec_url else 0
-        else:
-            primary_url = self._primary_url(settings)
-            if not primary_url:
-                remote_queue = 0
-            else:
-                probe_env = env_copy if (len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url) else {**env_copy, "COMFYUI_URL": primary_url}
-                remote_queue = probe_remote_queue_count(probe_env, strict=True)
-
         session_name = self._session_name(settings, slot_name)
+        remote_queue = 0
         queue_unknown = False
-        if remote_queue is None:
-            slot_probe = self._probe_slot(env_copy, settings, slot_name)
-            if slot_probe.get("online") or slot_probe.get("auth_failed"):
-                queue_unknown = True
-            elif slot_probe.get("status_code") in (None, 500, 502, 503, 504):
-                sess = self._query_sessions(colab_bin, settings["colab_auth"], env_copy, use_cache=False)
-                has_active_session = any(item["name"] == session_name for item in sess.get("named", []))
-                queue_unknown = (not sess.get("ok")) or has_active_session
-            remote_queue = 0
+        if not force:
+            if slot_name == "secondary":
+                saved_sec = self.remembered_node("secondary")
+                sec_url = str((saved_sec or {}).get("url") or "").strip()
+                remote_queue = probe_remote_queue_count({**env_copy, "COMFYUI_URL": sec_url}, strict=True) if sec_url else 0
+            else:
+                primary_url = self._primary_url(settings)
+                if not primary_url:
+                    remote_queue = 0
+                else:
+                    probe_env = env_copy if (len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url) else {**env_copy, "COMFYUI_URL": primary_url}
+                    remote_queue = probe_remote_queue_count(probe_env, strict=True)
 
-        if not force and callable(local_busy_provider):
-            local_busy = bool(local_busy or local_busy_provider())
+            if remote_queue is None:
+                slot_probe = self._probe_slot(env_copy, settings, slot_name)
+                if slot_probe.get("online") or slot_probe.get("auth_failed"):
+                    queue_unknown = True
+                else:
+                    sess = self._query_sessions(colab_bin, settings["colab_auth"], env_copy, force=True)
+                    has_active_session = any(item["name"] == session_name for item in sess.get("named", []))
+                    queue_unknown = (not sess.get("ok")) or has_active_session
+                remote_queue = 0
 
-        if not force and (local_busy or remote_queue > 0 or queue_unknown):
-            return {
-                "stopped": False,
-                "slot": slot_name,
-                "confirmation_required": True,
-                "local_busy": bool(local_busy),
-                "remote_queue": remote_queue,
-                "queue_unknown": queue_unknown,
-                "status": self.status(env_copy),
-            }
+            if callable(local_busy_provider):
+                local_busy = bool(local_busy or local_busy_provider())
+
+            if local_busy or remote_queue > 0 or queue_unknown:
+                return {
+                    "stopped": False,
+                    "slot": slot_name,
+                    "confirmation_required": True,
+                    "local_busy": bool(local_busy),
+                    "remote_queue": remote_queue,
+                    "queue_unknown": queue_unknown,
+                    "status": self.status(env_copy),
+                }
 
         st = self._slot(slot_name)
         with self._lock:
@@ -2036,6 +2039,8 @@ class ColabRuntimeManager:
 
         with runtime_file_lock(self.storage, slot=slot_name):
             if not force and callable(local_busy_provider) and local_busy_provider():
+                with self._lock:
+                    st.cancel_event.clear()
                 return {
                     "stopped": False,
                     "slot": slot_name,
