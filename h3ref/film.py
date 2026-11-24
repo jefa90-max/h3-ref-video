@@ -753,6 +753,21 @@ def _generate_segment(
                 rec = job.state["segs"][str(i)]
         elif provider_name == "comfyui":
             endpoint_url = str(rec.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+            if endpoint_url and endpoint_url.lower().endswith(".trycloudflare.com"):
+                cur_urls = config.video_settings()["comfyui_urls"]
+                if endpoint_url not in cur_urls:
+                    for cand in cur_urls:
+                        if cand == endpoint_url or not cand.lower().endswith(".trycloudflare.com"):
+                            continue
+                        try:
+                            comfy.assert_resume_endpoint_key_allowed(cand, expected_key_fp=rec.get("comfyui_key_fp"))
+                        except RuntimeError:
+                            continue
+                        if comfy.has_task(rec["task"], base_url=cand):
+                            job.log("relocate", f"seg{i + 1}", f"{comfy.endpoint_label(endpoint_url)} -> {comfy.endpoint_label(cand)}")
+                            endpoint_url = cand
+                            job.put("segs", str(i), comfyui_url=cand)
+                            break
             comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=rec.get("comfyui_key_fp"))
             if node_pool is not None and endpoint_url:
                 node_pool.reserve_inflight(endpoint_url)
@@ -928,9 +943,15 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
         new_seg_sem = threading.Semaphore(configured_concurrency)
 
         def run_inflight(seg):
-            if node_pool is not None:
-                return gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool)
-            return gen_segment(job, film, seg, pics[seg["idx"]])
+            try:
+                if node_pool is not None:
+                    return gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool)
+                return gen_segment(job, film, seg, pics[seg["idx"]])
+            except BaseException:
+                abort.set()
+                if node_pool is not None:
+                    node_pool.notify_all()
+                raise
 
         def run_other(seg):
             if abort.is_set():
@@ -999,6 +1020,11 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
+                    abort.set()
+                    if node_pool is not None:
+                        node_pool.notify_all()
+                    for pending_future in other_futures:
+                        pending_future.cancel()
             for future in other_futures:
                 try:
                     future.result()

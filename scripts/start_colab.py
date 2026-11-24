@@ -343,14 +343,24 @@ def _discover_cloudflared_public_url(
     return found
 
 
+def _is_valid_elf_binary(path: Path, *, min_bytes: int = 1024 * 1024) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size < min_bytes:
+            return False
+        with path.open("rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
 def ensure_cloudflared() -> str:
     existing = shutil.which("cloudflared")
     if existing:
         return existing
-    if CLOUDFLARED_BIN_LOCAL.is_file() and os.access(CLOUDFLARED_BIN_LOCAL, os.X_OK):
+    if _is_valid_elf_binary(CLOUDFLARED_BIN_LOCAL) and os.access(CLOUDFLARED_BIN_LOCAL, os.X_OK):
         return str(CLOUDFLARED_BIN_LOCAL)
     drive_cached = BASE / "bin" / "cloudflared"
-    if drive_cached.is_file() and drive_cached.stat().st_size > 0:
+    if _is_valid_elf_binary(drive_cached):
         tmp = CLOUDFLARED_BIN_LOCAL.with_suffix(".tmp")
         shutil.copyfile(drive_cached, tmp)
         tmp.chmod(0o755)
@@ -358,6 +368,9 @@ def ensure_cloudflared() -> str:
         return str(CLOUDFLARED_BIN_LOCAL)
     print("[start_colab] Downloading cloudflared binary for ephemeral HTTPS tunnel...", flush=True)
     _download_file_atomic(CLOUDFLARED_DOWNLOAD_URL, CLOUDFLARED_BIN_LOCAL, "bin/cloudflared", description="cloudflared binary")
+    if not _is_valid_elf_binary(CLOUDFLARED_BIN_LOCAL):
+        CLOUDFLARED_BIN_LOCAL.unlink(missing_ok=True)
+        raise RuntimeError("Downloaded cloudflared binary is invalid (not a Linux ELF executable)")
     CLOUDFLARED_BIN_LOCAL.chmod(0o755)
     if BASE.exists():
         tmp_drive = _unique_tmp_path(drive_cached)
@@ -493,7 +506,10 @@ def _is_passive_probe(method: str, path: str) -> bool:
     return path_only in PASSIVE_PROBE_PATHS
 
 
-def _queue_busy(progress_snapshot=None) -> bool:
+QUEUE_UNREACHABLE_GRACE_SEC = 10 * 60.0
+
+
+def _queue_busy(progress_snapshot=None, *, queue_error_elapsed: float = 0.0) -> bool:
     req = urllib.request.Request(f"http://{COMFY_HOST}:{COMFY_PORT}/queue", method="GET")
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
@@ -506,7 +522,9 @@ def _queue_busy(progress_snapshot=None) -> bool:
             updated_at = snap.get("updated_at")
             if not isinstance(updated_at, (int, float)) or (time.time() - float(updated_at)) <= 120.0:
                 return True
-        return _comfy_process_alive()
+        if queue_error_elapsed <= QUEUE_UNREACHABLE_GRACE_SEC:
+            return _comfy_process_alive()
+        return False
     return False
 
 
@@ -555,6 +573,7 @@ def _make_auth_proxy_handler(
 
     class AuthReverseProxy(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = 60
 
         def log_message(self, fmt: str, *args) -> None:
             return
@@ -649,7 +668,7 @@ def _make_auth_proxy_handler(
                     return
             forward_headers = {
                 k: v for k, v in self.headers.items()
-                if k.lower() not in _HOP_BY_HOP_HEADERS and k.lower() not in ("host", "authorization", "content-length")
+                if k.lower() not in _HOP_BY_HOP_HEADERS and k.lower() not in ("host", "authorization", "content-length", "expect")
             }
             if chunked_body is not None or raw_cl is not None:
                 forward_headers["Content-Length"] = str(content_len)
@@ -672,7 +691,7 @@ def _make_auth_proxy_handler(
                     while remaining > 0:
                         chunk = self.rfile.read(min(65536, remaining))
                         if not chunk:
-                            break
+                            raise EOFError(f"Truncated request body ({remaining} bytes missing)")
                         conn.send(chunk)
                         remaining -= len(chunk)
                         if is_work:
@@ -798,34 +817,70 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
         tunnel_proc = spawn_tunnel()
         log(f"[supervisor] Spawned ngrok pid={tunnel_proc.pid} for {public_url or 'ephemeral-domain'} (idle_timeout={idle_minutes:g}m)")
 
+    my_pid = str(os.getpid())
+    stop_event = threading.Event()
+
+    def _cleanup_pid_file() -> None:
+        try:
+            if SUPERVISOR_PID_FILE.is_file() and SUPERVISOR_PID_FILE.read_text(encoding="utf-8").strip() == my_pid:
+                SUPERVISOR_PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def handle_term(signum, frame):
-        tunnel_proc.terminate()
-        server.shutdown()
-        SUPERVISOR_PID_FILE.unlink(missing_ok=True)
-        sys.exit(0)
+        stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_term)
     signal.signal(signal.SIGINT, handle_term)
 
     check_interval = min(30.0, max(1.0, idle_seconds / 4.0))
-    while True:
-        time.sleep(check_interval)
-        if tunnel_proc.poll() is not None:
-            if skip_comfy_check or _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
-                log(f"[supervisor] {provider} exited with {tunnel_proc.returncode}; restarting...")
-                tunnel_proc = spawn_tunnel()
-        if not skip_comfy_check and _queue_busy(progress_snapshot):
-            touch_activity()
-            continue
-        if idle_elapsed() >= idle_seconds:
-            if not skip_comfy_check and _queue_busy(progress_snapshot):
+    queue_err_since: float | None = None
+
+    def _check_queue_busy() -> bool:
+        nonlocal queue_err_since
+        req = urllib.request.Request(f"http://{COMFY_HOST}:{COMFY_PORT}/queue", method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            queue_err_since = None
+            if isinstance(payload, dict):
+                return bool(payload.get("queue_running") or payload.get("queue_pending"))
+            return False
+        except Exception:
+            now_m = time.monotonic()
+            if queue_err_since is None:
+                queue_err_since = now_m
+            return _queue_busy(progress_snapshot, queue_error_elapsed=now_m - queue_err_since)
+
+    try:
+        while not stop_event.wait(timeout=check_interval):
+            if tunnel_proc.poll() is not None:
+                if skip_comfy_check or _http_status(f"http://{COMFY_HOST}:{COMFY_PORT}/system_stats") == 200:
+                    log(f"[supervisor] {provider} exited with {tunnel_proc.returncode}; restarting...")
+                    tunnel_proc = spawn_tunnel()
+            if not skip_comfy_check and _check_queue_busy():
                 touch_activity()
                 continue
-            log(f"[watchdog] Idle for >= {idle_minutes:g} min with empty queue. Unassigning runtime...")
-            if _unassign_colab_runtime(log):
-                tunnel_proc.terminate()
-                break
-            log("[watchdog] Unassign did not succeed yet; keeping supervisor alive to retry.")
+            if idle_elapsed() >= idle_seconds:
+                if not skip_comfy_check and _check_queue_busy():
+                    touch_activity()
+                    continue
+                log(f"[watchdog] Idle for >= {idle_minutes:g} min with empty queue. Unassigning runtime...")
+                if _unassign_colab_runtime(log):
+                    tunnel_proc.terminate()
+                    break
+                log("[watchdog] Unassign did not succeed yet; keeping supervisor alive to retry.")
+    finally:
+        try:
+            tunnel_proc.terminate()
+        except OSError:
+            pass
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+        _cleanup_pid_file()
 
 
 def ensure_comfyui_code() -> None:
@@ -1296,11 +1351,15 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
     api_key = _read_secret(".comfyui_api_key", "COMFYUI_API_KEY")
     ngrok_token = _read_secret(".ngrok_token", "NGROK_AUTHTOKEN") if provider == "ngrok" else ""
     public_url = _resolve_ngrok_domain() if provider == "ngrok" else ""
-    auth_headers = {
-        "Authorization": f"Bearer {api_key}",
+    unauth_headers = {
         "ngrok-skip-browser-warning": "1",
         "User-Agent": "h3-ref-video-colab-bootstrap/1.0",
     }
+    auth_headers = {
+        "Authorization": f"Bearer {api_key}",
+        **unauth_headers,
+    }
+    expected_status = 502 if skip_comfy_check else 200
     if provider == "cloudflared":
         ensure_cloudflared()
         active_url = _discover_cloudflared_public_url()
@@ -1310,7 +1369,8 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
         active_url
         and _pid_alive(SUPERVISOR_PID_FILE)
         and _http_status(f"http://{COMFY_HOST}:{GATEWAY_PORT}/system_stats") == 401
-        and (skip_comfy_check or _http_status(f"{active_url}/system_stats", headers=auth_headers, timeout=6.0) == 200)
+        and _http_status(f"{active_url}/system_stats", headers=unauth_headers, timeout=6.0) == 401
+        and _http_status(f"{active_url}/system_stats", headers=auth_headers, timeout=6.0) == expected_status
     ):
         print(f"[start_colab] Already online and auth-protected: {active_url}", flush=True)
         return active_url
@@ -1319,15 +1379,22 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
     if old_pid:
         try:
             os.kill(old_pid, signal.SIGTERM)
-            time.sleep(1)
         except OSError:
             pass
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _pid_alive(SUPERVISOR_PID_FILE) == old_pid:
+            time.sleep(0.2)
+        if _pid_alive(SUPERVISOR_PID_FILE) == old_pid:
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+            except OSError:
+                pass
     if provider == "cloudflared":
         subprocess.run(["pkill", "-f", f"cloudflared tunnel.*{COMFY_HOST}:{GATEWAY_PORT}"], check=False)
         CLOUDFLARED_URL_FILE.unlink(missing_ok=True)
         CLOUDFLARED_LOG_FILE.unlink(missing_ok=True)
     else:
-        subprocess.run(["pkill", "-f", f"ngrok http {COMFY_HOST}:{GATEWAY_PORT}"], check=False)
+        subprocess.run(["pkill", "-f", "ngrok http "], check=False)
     time.sleep(0.5)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "--daemon-supervisor"]
@@ -1343,16 +1410,24 @@ def ensure_supervisor_and_tunnel(*, skip_comfy_check: bool = False) -> str:
             start_new_session=True,
         )
 
-    expected_status = 502 if skip_comfy_check else 200
     for _ in range(35 if provider == "cloudflared" else 30):
-        unauth = _http_status(f"http://{COMFY_HOST}:{GATEWAY_PORT}/system_stats")
+        unauth_local = _http_status(f"http://{COMFY_HOST}:{GATEWAY_PORT}/system_stats")
         resolved_url = (
             _discover_cloudflared_public_url()
             if provider == "cloudflared"
             else (public_url or _discover_ngrok_public_url())
         )
-        authed = _http_status(f"{resolved_url}/system_stats", headers=auth_headers, timeout=6.0) if resolved_url else None
-        if unauth == 401 and authed == expected_status:
+        unauth_public = (
+            _http_status(f"{resolved_url}/system_stats", headers=unauth_headers, timeout=6.0)
+            if resolved_url
+            else None
+        )
+        authed = (
+            _http_status(f"{resolved_url}/system_stats", headers=auth_headers, timeout=6.0)
+            if resolved_url
+            else None
+        )
+        if unauth_local == 401 and unauth_public == 401 and authed == expected_status:
             print(f"[start_colab] TUNNEL READY (AUTH PROTECTED): {resolved_url}", flush=True)
             return resolved_url
         time.sleep(2)

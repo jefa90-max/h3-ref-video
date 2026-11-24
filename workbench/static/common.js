@@ -145,7 +145,7 @@ function scheduleRuntimePoll(statusObj) {
   }
 }
 
-function renderRuntimeNodes(nodes, secondary, gpu) {
+function renderRuntimeNodes(nodes, secondary, gpu, primary = null) {
   const list = $("runtime-nodes");
   if (!list) return;
   const secActive = Boolean(
@@ -158,7 +158,11 @@ function renderRuntimeNodes(nodes, secondary, gpu) {
     if (typeof list.replaceChildren === "function") list.replaceChildren();
     return;
   }
-  const items = rawNodes.map((n) => ({ ...n, _isSecondary: Boolean(secondary?.url && n.url === secondary.url) }));
+  const items = rawNodes.map((n) => ({
+    ...n,
+    _isSecondary: Boolean(secondary?.url && n.url === secondary.url),
+    _isPrimary: Boolean(primary?.url && n.url === primary.url),
+  }));
   if (secActive && !items.some((n) => n._isSecondary)) {
     items.push({
       url: secondary.url || "",
@@ -169,17 +173,19 @@ function renderRuntimeNodes(nodes, secondary, gpu) {
       queue_running: secondary.queue_running || 0,
       queue_pending: secondary.queue_pending || 0,
       _isSecondary: true,
+      _isPrimary: false,
     });
   }
   const rows = items.map((node) => {
     const li = element("li", "runtime-node-item");
     const isSec = Boolean(node._isSecondary);
+    const managed = isSec ? secondary : (node._isPrimary ? primary : null);
     let badgeText = "";
     let badgeClass = "status-badge";
-    if (isSec && secondary && isTransitionalState(secondary.state)) {
-      badgeText = t(`runtimeState_${secondary.state}`, { gpu });
+    if (managed && isTransitionalState(managed.state)) {
+      badgeText = t(`runtimeState_${managed.state}`, { gpu });
       badgeClass = "status-badge running";
-    } else if (isSec && secondary && secondary.state === "error") {
+    } else if (managed && managed.state === "error") {
       badgeText = t("runtimeState_error");
       badgeClass = "status-badge failed";
     } else if (node.online) {
@@ -198,7 +204,7 @@ function renderRuntimeNodes(nodes, secondary, gpu) {
     if (isSec) metaParts.push(t("runtimeNodeSecondaryTag"));
     if (devName) metaParts.push(devName);
     if (node.online) metaParts.push(t("runtimeNodeQueue", { count: queueTotal }));
-    if (isSec && secondary?.state === "error" && secondary.error) metaParts.push(secondary.error);
+    if (managed?.state === "error" && managed.error) metaParts.push(managed.error);
     const children = [
       element("span", badgeClass, badgeText),
       element("code", "runtime-node-url", label),
@@ -291,7 +297,7 @@ function renderRuntimeStatus() {
   } else {
     $("runtime-detail").textContent = t("runtimeDetailError", { error: statusObj.error || st });
   }
-  renderRuntimeNodes(nodes, secondary, gpu);
+  renderRuntimeNodes(nodes, secondary, gpu, primary);
 
   if (state.watchingSecondaryStart && secondary?.online && secondary.url) {
     state.watchingSecondaryStart = false;
@@ -332,8 +338,9 @@ function renderRuntimeStatus() {
   const secondaryTransitional = Boolean(secondary && isTransitionalState(secondary.state));
   const cliReady = Boolean(statusObj.cli_available);
   const primaryOnline = primary ? Boolean(primary.online) : st === "online";
+  const primaryUrl = primary ? (primary.url || "") : configuredUrl;
   $("runtime-refresh").disabled = state.runtimeBusy;
-  $("runtime-start").disabled = state.runtimeBusy || !cliReady || primaryOnline || primaryTransitional || !configuredUrl;
+  $("runtime-start").disabled = state.runtimeBusy || !cliReady || primaryOnline || primaryTransitional || !primaryUrl;
   $("runtime-stop").disabled = state.runtimeBusy || !cliReady || primaryState === "stopping" || (!primaryOnline && !primaryTransitional && !(primary?.has_session ?? statusObj.has_session));
   if ($("runtime-confirm-stop")) $("runtime-confirm-stop").disabled = state.runtimeBusy;
 

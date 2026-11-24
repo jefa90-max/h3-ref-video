@@ -1572,8 +1572,10 @@ class ColabRuntimeManager:
                     st.active_state = "starting_comfy"
                 local_start_script = config.ROOT / "scripts" / "start_colab.py"
                 if local_start_script.is_file():
+                    up_rc = 1
+                    up_out = ""
                     for _ in range(2):
-                        up_rc, _ = self._run_cmd_for_slot(
+                        up_rc, up_out = self._run_cmd_for_slot(
                             colab_bin,
                             auth_mode,
                             ["upload", "-s", session_name, str(local_start_script), "content/drive/MyDrive/MiniMax_ComfyUI/start_colab.py"],
@@ -1587,6 +1589,12 @@ class ColabRuntimeManager:
                             break
                         if self._sleep_cancelable(st, 2.0):
                             return
+                    if up_rc != 0:
+                        detail = (up_out.strip() or f"exit {up_rc}")[-180:]
+                        self._append_log(
+                            f"[bootstrap] Warning: failed to upload local start_colab.py ({detail}); continuing with existing Drive copy",
+                            slot=slot_name,
+                        )
                 exec_out = ""
                 rc = 1
                 discovered_url = ""
@@ -1782,7 +1790,8 @@ class ColabRuntimeManager:
             settings = config.video_settings(env_copy)
         except ValueError:
             return False
-        if settings["provider"] != "comfyui":
+        is_comfy_default = settings["provider"] == "comfyui"
+        if not is_comfy_default and not force_busy and not local_busy:
             return False
         if slot_name == "primary":
             target_url = self._primary_url(settings)
@@ -1822,7 +1831,7 @@ class ColabRuntimeManager:
             active_queue = probe_remote_queue_count(probe_env, timeout=6.0) if queue_count is None else int(queue_count)
             if active_queue > 0:
                 reason = f"queue={active_queue}"
-            elif local_busy or within_idle_grace:
+            elif is_comfy_default and (local_busy or within_idle_grace):
                 if not probe_comfyui(probe_env, timeout=6.0)["online"]:
                     return False
                 reason = "local_active" if local_busy else "idle_grace"
@@ -1947,7 +1956,15 @@ class ColabRuntimeManager:
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
 
-    def stop(self, *, environ=None, force: bool = False, local_busy: bool = False, slot: str = "primary") -> dict:
+    def stop(
+        self,
+        *,
+        environ=None,
+        force: bool = False,
+        local_busy: bool = False,
+        local_busy_provider=None,
+        slot: str = "primary",
+    ) -> dict:
         slot_name = normalize_slot(slot)
         if os.environ.get("H3_WORKBENCH_WORKER") == "1":
             raise RuntimeUnavailableError(message("colab_worker_forbidden"))
@@ -1969,11 +1986,20 @@ class ColabRuntimeManager:
                 probe_env = env_copy if (len(settings["comfyui_urls"]) <= 1 and settings["comfyui_url"] == primary_url) else {**env_copy, "COMFYUI_URL": primary_url}
                 remote_queue = probe_remote_queue_count(probe_env, strict=True)
 
+        session_name = self._session_name(settings, slot_name)
         queue_unknown = False
         if remote_queue is None:
             slot_probe = self._probe_slot(env_copy, settings, slot_name)
-            queue_unknown = bool(slot_probe.get("online") or slot_probe.get("auth_failed"))
+            if slot_probe.get("online") or slot_probe.get("auth_failed"):
+                queue_unknown = True
+            elif slot_probe.get("status_code") in (None, 500, 502, 503, 504):
+                sess = self._query_sessions(colab_bin, settings["colab_auth"], env_copy, use_cache=False)
+                has_active_session = any(item["name"] == session_name for item in sess.get("named", []))
+                queue_unknown = (not sess.get("ok")) or has_active_session
             remote_queue = 0
+
+        if not force and callable(local_busy_provider):
+            local_busy = bool(local_busy or local_busy_provider())
 
         if not force and (local_busy or remote_queue > 0 or queue_unknown):
             return {
@@ -2008,8 +2034,17 @@ class ColabRuntimeManager:
                         break
                 time.sleep(0.02)
 
-        session_name = self._session_name(settings, slot_name)
         with runtime_file_lock(self.storage, slot=slot_name):
+            if not force and callable(local_busy_provider) and local_busy_provider():
+                return {
+                    "stopped": False,
+                    "slot": slot_name,
+                    "confirmation_required": True,
+                    "local_busy": True,
+                    "remote_queue": remote_queue,
+                    "queue_unknown": queue_unknown,
+                    "status": self.status(env_copy),
+                }
             with self._lock:
                 st.cancel_event.clear()
                 st.active_state = "stopping"

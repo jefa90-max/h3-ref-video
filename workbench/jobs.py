@@ -443,6 +443,10 @@ class Jobs:
                 for r in self.records.values()
             )
 
+    def is_probing_launch(self):
+        with self.lock:
+            return bool(self._probing_launch)
+
     def available(self, *, _allow_probing=False):
         if (
             self.closing

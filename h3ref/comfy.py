@@ -638,6 +638,28 @@ def _is_transient_tunnel_error(exc: Exception) -> bool:
     return any(marker in text for marker in _TRANSIENT_NETWORK_MARKERS)
 
 
+def has_task(task: str, *, base_url: str, api_key: str | None = None) -> bool:
+    """Single-shot probe checking whether prompt_id exists in /history or /queue on a specific node."""
+    base, key = _resolve_endpoint(base_url, api_key)
+    hdrs = _headers()
+    try:
+        hist = http.request(f"{base}/history/{quote(task, safe='')}", key, timeout=10, tries=1, extra_headers=hdrs)
+        if isinstance(hist, dict) and isinstance(hist.get(task), dict):
+            return True
+    except Exception:
+        return False
+    try:
+        q = http.request(f"{base}/queue", key, timeout=10, tries=1, extra_headers=hdrs)
+        if isinstance(q, dict) and (
+            _task_in_queue_list(q.get("queue_running"), task)
+            or _task_in_queue_list(q.get("queue_pending"), task)
+        ):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def poll(task: str, *, base_url: str | None = None, api_key: str | None = None) -> dict:
     """{state: running|done|failed, url, cny: 0.0, run_seconds, error}"""
     base, key = _resolve_endpoint(base_url, api_key)

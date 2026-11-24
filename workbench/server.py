@@ -473,15 +473,30 @@ def create_app(storage=None, env_path=None):
             invalid("force", force, "choice")
         slot = _parse_runtime_slot(values)
         lang = language()
+        def local_video_busy() -> bool:
+            with jobs.lock:
+                return jobs.has_active_video_work() or jobs.is_probing_launch()
+
         with jobs.lock:
             current_env = {**env, "H3_LANG": lang}
-            local_busy = jobs.has_active_video_work()
+            local_busy = jobs.has_active_video_work() or jobs.is_probing_launch()
         with use_lang(lang):
             try:
                 if slot == "primary":
-                    res = runtime.stop(environ=current_env, force=force, local_busy=local_busy)
+                    res = runtime.stop(
+                        environ=current_env,
+                        force=force,
+                        local_busy=local_busy,
+                        local_busy_provider=local_video_busy,
+                    )
                 else:
-                    res = runtime.stop(environ=current_env, force=force, local_busy=local_busy, slot=slot)
+                    res = runtime.stop(
+                        environ=current_env,
+                        force=force,
+                        local_busy=local_busy,
+                        local_busy_provider=local_video_busy,
+                        slot=slot,
+                    )
             except (colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, RuntimeError) as exc:
                 raise InputError("comfy_runtime_action", detail=str(exc)) from exc
             return jsonify(redact_runtime_payload(res))
