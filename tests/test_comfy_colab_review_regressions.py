@@ -1507,6 +1507,50 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             st_pri.stopping = False
             st_pri.worker_thread = None
 
+            # 4a-iv. maybe_send_kernel_keepalive inner lock recheck honors st.stopping,
+            #        early-release stop() finally does not clobber a concurrent stop()'s st.stopping,
+            #        and submit_drive_authorized rejects while st.stopping=True
+            mgr_ka = colab_runtime.ColabRuntimeManager(root / "st-ka-stop", clock=lambda: 1000.0)
+            st_ka = mgr_ka._slot("primary")
+            st_ka.last_keepalive_at = 0.0
+            def ka_lock_sets_stopping(storage_dir, *, slot="primary"):
+                ctx = orig_lock_fn(storage_dir, slot=slot)
+                class _WrapKa:
+                    def __enter__(self_inner):
+                        res = ctx.__enter__()
+                        st_ka.stopping = True
+                        return res
+                    def __exit__(self_inner, *a):
+                        return ctx.__exit__(*a)
+                return _WrapKa()
+            with mock.patch.object(colab_runtime, "runtime_file_lock", side_effect=ka_lock_sets_stopping), \
+                 mock.patch.object(mgr_ka, "_run_cmd_for_slot") as ka_exec:
+                self.assertFalse(mgr_ka.maybe_send_kernel_keepalive(env_stop, force_busy=True, slot="primary"))
+            ka_exec.assert_not_called()
+            st_ka.active_state = "awaiting_drive_auth"
+            st_ka.drive_proc = mock.MagicMock(stdin=mock.MagicMock())
+            ack_stopping = mgr_ka.submit_drive_authorized(slot="primary")
+            self.assertFalse(ack_stopping["accepted"])
+            self.assertEqual(ack_stopping["state"], "stopping")
+            st_ka.stopping = False
+            st_ka.active_state = None
+            st_ka.drive_proc = None
+
+            # Concurrent stop(force=True) setting st.stopping=True during first stop()'s self.status() must NOT be cleared by first stop()'s finally
+            busy_seq = {"n": 0}
+            def flip_busy_2():
+                busy_seq["n"] += 1
+                return busy_seq["n"] >= 2
+            def status_simulates_concurrent_stop(_env):
+                st_ka.stopping = True
+                return {"state": "stopping", "logs": []}
+            with mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=0), \
+                 mock.patch.object(mgr_ka, "status", side_effect=status_simulates_concurrent_stop):
+                res_early = mgr_ka.stop(environ=env_stop, force=False, local_busy=False, local_busy_provider=flip_busy_2, slot="primary")
+            self.assertFalse(res_early["stopped"])
+            self.assertTrue(st_ka.stopping, "early-returned stop() must not clear concurrent stop()'s st.stopping")
+            st_ka.stopping = False
+
             # 4b. stop(force=True) retries lock acquisition after cancelling slow-unwinding startup worker and runs colab stop
             mgr_force = colab_runtime.ColabRuntimeManager(root / "st-force")
             lock_held = threading.Event()
