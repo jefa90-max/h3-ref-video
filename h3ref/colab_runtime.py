@@ -2005,7 +2005,8 @@ class ColabRuntimeManager:
                         current_env = provider()
                         local_busy = bool(busy_provider()) if callable(busy_provider) else False
                         self.maybe_send_kernel_keepalive(current_env, local_busy=local_busy, slot="primary")
-                        cur_api_key = str((current_env or {}).get("COMFYUI_API_KEY") or "").strip()
+                        env_copy = os.environ if current_env is None else current_env
+                        cur_api_key = str(env_copy.get("COMFYUI_API_KEY") or "").strip()
                         if self.remembered_node("secondary", api_key=cur_api_key):
                             self.maybe_send_kernel_keepalive(current_env, local_busy=local_busy, slot="secondary")
                     except Exception as exc:
