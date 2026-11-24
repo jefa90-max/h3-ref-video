@@ -424,7 +424,22 @@ class WorkbenchComfyTest(unittest.TestCase):
             finally:
                 runtime._slots["primary"].active_state = None
 
-            # p3/red-team#3: rotating COMFYUI_API_KEY on restart does not resurrect stale remembered secondary URL
+            # fix-check#3: ensure_video_runtime re-checks stopping state AFTER probe_comfyui completes
+            def probe_enters_stopping(*args, **kwargs):
+                runtime._slots["primary"].active_state = "stopping"
+                return {"online": True}
+            try:
+                with mock.patch.object(server.colab_runtime, "probe_comfyui", side_effect=probe_enters_stopping):
+                    with self.assertRaises(InputError) as post_stop_ctx:
+                        jobs.before_video_launch(
+                            {"kind": "one", "operation": "pipeline", "demo": False, "output_dir": str(root / "out-stop2"), "lang": "en"},
+                            {"VIDEO_PROVIDER": "comfyui", "COMFYUI_URL": "https://node1.ngrok-free.dev", "COMFYUI_API_KEY": "comfy-secret-token-123"},
+                        )
+                self.assertEqual(post_stop_ctx.exception.key, "comfy_runtime_action")
+            finally:
+                runtime._slots["primary"].active_state = None
+
+            # p3/red-team#3 + fix-check#1: rotating COMFYUI_API_KEY on restart or via POST /api/config strips stale secondary URL
             restart_storage = root / ".workbench-restart"
             restart_env = root / ".env-restart"
             restart_env.write_text(
@@ -444,6 +459,26 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.addCleanup(restarted_app.extensions["colab_runtime"].stop_keepalive_monitor)
             restarted_cfg = restarted_app.test_client().get("/api/bootstrap").get_json()["config"]
             self.assertEqual(restarted_cfg["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+
+            # POST /api/config rotating COMFYUI_API_KEY without touching COMFYUI_URL strips remembered secondary URL from env and .env
+            restarted_rt = restarted_app.extensions["colab_runtime"]
+            restarted_rt._set_remembered_node(
+                "secondary",
+                {
+                    "session": "comfy-a100-2",
+                    "url": "https://live-sec-55.trycloudflare.com",
+                    "key_fp": server.colab_runtime.comfy.key_fingerprint("shared-comfy-key-1234"),
+                },
+            )
+            rot_res = restarted_app.test_client().post(
+                "/api/config",
+                headers={"X-Workbench": "1"},
+                json={"COMFYUI_API_KEY": "comfy-secret-token-123", "persist": True},
+            )
+            self.assertEqual(rot_res.status_code, 200)
+            self.assertEqual(rot_res.get_json()["COMFYUI_URLS"], ["https://node1.ngrok-free.dev"])
+            self.assertIsNone(restarted_rt.remembered_node("secondary"))
+            self.assertEqual(config.read_env_file(restart_env)["COMFYUI_URL"], "https://node1.ngrok-free.dev")
 
     def test_secondary_colab_node_endpoints_sync_env_and_auto_concurrency(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -483,7 +518,8 @@ class WorkbenchComfyTest(unittest.TestCase):
             # Remembering a random URL automatically updates live config, .env, and auto-concurrency (1 -> 2)
             rand_1 = "https://wind-11.trycloudflare.com"
             rand_2 = "https://rain-22.trycloudflare.com"
-            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": rand_1, "gpu": "G4", "tunnel": "cloudflared"})
+            sec_fp = server.colab_runtime.comfy.key_fingerprint("shared-comfy-key-1234")
+            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": rand_1, "gpu": "G4", "tunnel": "cloudflared", "key_fp": sec_fp})
             cfg1 = client.get("/api/bootstrap").get_json()["config"]
             self.assertEqual(cfg1["COMFYUI_URLS"], ["https://node1.ngrok-free.dev", rand_1])
             self.assertEqual(cfg1["effective_comfyui_concurrency"], 2)
@@ -491,7 +527,7 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], f"https://node1.ngrok-free.dev,{rand_1}")
 
             # New ephemeral URL replaces old one (never accumulates dead URLs)
-            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": rand_2, "gpu": "G4", "tunnel": "cloudflared"})
+            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": rand_2, "gpu": "G4", "tunnel": "cloudflared", "key_fp": sec_fp})
             cfg2 = client.get("/api/bootstrap").get_json()["config"]
             self.assertEqual(cfg2["COMFYUI_URLS"], ["https://node1.ngrok-free.dev", rand_2])
             self.assertEqual(config.read_env_file(env_path)["COMFYUI_URL"], f"https://node1.ngrok-free.dev,{rand_2}")

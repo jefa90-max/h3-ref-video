@@ -99,7 +99,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                 on_ephemeral_url_change=lambda slot, old, new: synced.append((slot, old, new)),
             )
             sec_url = "https://alive-sec.trycloudflare.com"
-            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared"})
+            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("k-secret-1234")})
             synced.clear()
             env = {
                 "VIDEO_PROVIDER": "comfyui",
@@ -153,7 +153,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             mgr = colab_runtime.ColabRuntimeManager(storage)
             pri_url = "https://pri.ngrok-free.dev"
             sec_url = "https://sec-live.trycloudflare.com"
-            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared"})
+            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("k-secret-1234")})
             mgr.mark_local_activity(now=500.0)
             env = {
                 "VIDEO_PROVIDER": "comfyui",
@@ -225,7 +225,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
             mgr = colab_runtime.ColabRuntimeManager(storage)
             sec_url = "https://only-sec.trycloudflare.com"
-            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared"})
+            mgr._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_url, "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("k-secret-1234")})
             env_only_sec = {
                 "VIDEO_PROVIDER": "comfyui",
                 "COMFYUI_URL": sec_url,
@@ -413,7 +413,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             app = server.create_app(storage=root / ".workbench", env_path=env_path)
             runtime = app.extensions["colab_runtime"]
             self.addCleanup(runtime.stop_keepalive_monitor)
-            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec, "gpu": "G4", "tunnel": "cloudflared"})
+            runtime._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec, "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("old-key-1234")})
             client = app.test_client()
             res = client.post(
                 "/api/config",
@@ -801,7 +801,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             # 4. maybe_send_kernel_keepalive lost primary must NOT clear _last_activity_at while secondary lives
             now_box = {"t": 3000.0}
             mgr4 = colab_runtime.ColabRuntimeManager(storage / "r4", clock=lambda: now_box["t"])
-            mgr4._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": "https://sec-alive.trycloudflare.com", "gpu": "G4", "tunnel": "cloudflared"})
+            mgr4._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": "https://sec-alive.trycloudflare.com", "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("k-secret-1234")})
             mgr4.mark_local_activity(now=2900.0)
             with mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": True, "configured": True, "nodes": [], "online_count": 1, "total_count": 1}), \
                  mock.patch.object(colab_runtime, "probe_remote_queue_count", return_value=1), \
@@ -912,7 +912,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             # 7. stop("primary") drops cleared dead secondary URL from status_payload["comfyui_urls"] and stops monitor on error-only secondary
             mgr5 = colab_runtime.ColabRuntimeManager(storage / "r5")
             dead_sec = "https://dead-sec.trycloudflare.com"
-            mgr5._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": dead_sec, "gpu": "G4", "tunnel": "cloudflared"})
+            mgr5._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": dead_sec, "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("k-secret-1234")})
             env_dead = {
                 "VIDEO_PROVIDER": "comfyui",
                 "COMFYUI_URL": f"https://pri.ngrok-free.dev,{dead_sec}",
@@ -950,7 +950,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             app_sec = server.create_app(storage=storage / "srv-sec-only", env_path=env_path_sec)
             rt_sec = app_sec.extensions["colab_runtime"]
             self.addCleanup(rt_sec.stop_keepalive_monitor)
-            rt_sec._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_only_url, "gpu": "G4", "tunnel": "cloudflared"})
+            rt_sec._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": sec_only_url, "gpu": "G4", "tunnel": "cloudflared", "key_fp": comfy.key_fingerprint("k-sec-1234")})
             with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
                  mock.patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}):
                 r_sec = app_sec.test_client().post(
@@ -1322,6 +1322,10 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                 {"session": "comfy-a100-2", "url": new_cf, "key_fp": comfy.key_fingerprint("k-old-1234")},
             )
             self.assertEqual(mgr_cancel.remembered_urls(api_key="k-old-1234"), [new_cf])
+            self.assertEqual(mgr_cancel.remembered_urls(api_key="k-secret-1234"), [])
+            self.assertIsNone(mgr_cancel.remembered_node("secondary", api_key="k-secret-1234"))
+            # Legacy colab-nodes.json record lacking key_fp must also fail closed when api_key is checked
+            mgr_cancel._set_remembered_node("secondary", {"session": "comfy-a100-2", "url": new_cf})
             self.assertEqual(mgr_cancel.remembered_urls(api_key="k-secret-1234"), [])
             self.assertIsNone(mgr_cancel.remembered_node("secondary", api_key="k-secret-1234"))
 
