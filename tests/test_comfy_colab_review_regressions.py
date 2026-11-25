@@ -1715,6 +1715,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                 return dead_proc
             with mock.patch.object(start_colab, "LOCAL", comfy_dir), \
                  mock.patch.object(start_colab, "COMFY_LOG_FILE", comfy_log), \
+                 mock.patch.object(start_colab, "COMFY_PID_FILE", root / "comfy.pid"), \
                  mock.patch.object(start_colab, "_http_status", return_value=0), \
                  mock.patch.object(start_colab.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)), \
                  mock.patch.object(start_colab.subprocess, "Popen", side_effect=fake_comfy_popen), \

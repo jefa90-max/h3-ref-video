@@ -630,27 +630,30 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertIn("--disable-dynamic-vram", launched_cmds[0])
         self.assertIn("--disable-pinned-memory", launched_cmds[0])
 
-        # 2. _parallel_copy_file retries transient Drive FUSE OSError during pread
+        # 2. _parallel_copy_file retries transient Drive FUSE OSError during pread (POSIX) or copies via fallback (Windows)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "model.safetensors"
             dst = root / "staged.safetensors"
             payload = b"ABCD1234" * 4096
             src.write_bytes(payload)
-            real_pread = os.pread
-            injected = {"failed": False}
+            if hasattr(os, "pread") and hasattr(os, "pwrite"):
+                real_pread = os.pread
+                injected = {"failed": False}
 
-            def flaky_pread(fd, n, offset):
-                if not injected["failed"]:
-                    injected["failed"] = True
-                    raise OSError("transient Drive FUSE read drop")
-                return real_pread(fd, n, offset)
+                def flaky_pread(fd, n, offset):
+                    if not injected["failed"]:
+                        injected["failed"] = True
+                        raise OSError("transient Drive FUSE read drop")
+                    return real_pread(fd, n, offset)
 
-            with patch.object(start_colab.os, "pread", side_effect=flaky_pread), \
-                 patch.object(start_colab.time, "sleep"):
+                with patch.object(start_colab.os, "pread", side_effect=flaky_pread), \
+                     patch.object(start_colab.time, "sleep"):
+                    start_colab._parallel_copy_file(src, dst, len(payload), "text_encoders/qwen3vl.safetensors")
+
+                self.assertTrue(injected["failed"])
+            else:
                 start_colab._parallel_copy_file(src, dst, len(payload), "text_encoders/qwen3vl.safetensors")
-
-            self.assertTrue(injected["failed"])
             self.assertEqual(dst.read_bytes(), payload)
 
         # 3. film._generate_segment logs and surfaces the exact remote error in TERMINAL_FAILED (both live and on resume)
