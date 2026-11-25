@@ -1962,6 +1962,7 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
             }
             offline_probe = {"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}
             with mock.patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe), \
+                 mock.patch.object(colab_runtime, "find_colab_bin", return_value="/usr/local/bin/colab"), \
                  mock.patch.object(rt_wb, "start_async", side_effect=colab_runtime.RuntimeBusyError("another process holds lock")):
                 with self.assertRaises(WbInputError) as ctx_busy:
                     app_wb.extensions["jobs"].before_video_launch(
@@ -2282,8 +2283,9 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
                 "film": {"shots": [{"id": "s1", "start": 0, "end": 10, "prompt": "Shot 1"}]},
                 "frames": {}, "output_dir": str(seg_dir), "lang": "en",
             }
-            with self.assertRaises(WbInputError) as ctx_seg_pf:
-                segments.preflight(seg_req, local_http_env)
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                with self.assertRaises(WbInputError) as ctx_seg_pf:
+                    segments.preflight(seg_req, local_http_env)
             self.assertEqual(ctx_seg_pf.exception.key, "keys")
             self.assertIn("COMFYUI_API_KEY", ctx_seg_pf.exception.values.get("names", ""))
 
