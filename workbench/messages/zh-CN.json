@@ -93,5 +93,9 @@
   "segment_rewrite_done": "第 {number} 段英文提示词已更新并保存；现有视频未重生成、未调用视频接口。",
   "segments_rewrite_done": "已完成 {count} 个片段的英文提示词转化；未触发视频生成。",
   "segments_rewrite_none": "全部片段已有最新英文提示词，无需重复转化。",
-  "segment_snapshot_changed": "视频片段正在切换版本，请刷新结果；草稿会保留。"
+  "segment_snapshot_changed": "视频片段正在切换版本，请刷新结果；草稿会保留。",
+  "comfy_offline": "远端 ComfyUI 尚未连通。请先在顶部运行状态卡片点击「一键启动 Colab GPU」（或确认自建 ComfyUI 隧道已开启），变为「在线」后再发起视频生成。",
+  "comfy_starting": "远端 ComfyUI 尚未就绪，已自动触发 Colab GPU 启动。请在顶部运行状态卡片完成 Google Drive 授权（如需）并等待状态变为「在线」后重试。",
+  "comfy_auth_failed": "远端 ComfyUI 隧道鉴权失败（HTTP {code}）。请检查 COMFYUI_API_KEY 是否与远端 .comfyui_api_key 一致。",
+  "comfy_runtime_action": "{detail}"
 }

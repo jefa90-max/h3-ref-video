@@ -16,7 +16,7 @@ function makeDom() {
     const classes = new Set(className.split(/\s+/).filter(Boolean));
     const node = {
       tag, className, textContent, hidden: false, disabled: false, checked: false,
-      value: "", name: "", dataset: {}, events: {}, children: [], attributes: {},
+      value: "", name: "", dataset: {}, events: {}, children: [], attributes: {}, style: {},
       scrollHeight: 0, scrollTop: 0, clientHeight: 0,
       classList: {
         toggle(name, force) {
@@ -836,6 +836,751 @@ test("create.js does not fall back to all cast on characterless single-shot scen
   assert.ok($("film-reference-list").children.length >= 2, "Cast upload cards must still render when shots/aliases are malformed");
 });
 
+test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and serializes COLAB_AUTO_START", async () => {
+  const { $, ids } = makeDom();
+  $("persist-config").checked = true;
+  let postedPayload = null;
+  const fieldIds = [
+    "video-provider", "rh-key", "comfy-url", "comfy-key", "comfy-preset", "comfy-resolution", "comfy-upscale", "colab-gpu", "colab-auto-start",
+    "apimart-key", "llm-provider", "llm-key", "gemini-key", "llm-composition-model", "llm-rewrite-model", "llm-base",
+  ];
+  class FakeFormData {
+    constructor() {
+      const entries = [];
+      for (const id of fieldIds) {
+        const el = ids.get(id);
+        if (el && !el.disabled && el.name) entries.push([el.name, el.value]);
+      }
+      this._entries = entries;
+    }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  $("video-provider").name = "VIDEO_PROVIDER";
+  $("rh-key").name = "RUNNINGHUB_API_KEY";
+  $("comfy-url").name = "COMFYUI_URL";
+  $("comfy-key").name = "COMFYUI_API_KEY";
+  $("comfy-preset").name = "COMFYUI_PRESET";
+  $("comfy-resolution").name = "COMFYUI_RESOLUTION";
+  $("comfy-upscale").name = "COMFYUI_UPSCALE";
+  $("colab-gpu").name = "COLAB_GPU";
+  $("colab-auto-start").name = "COLAB_AUTO_START";
+  $("apimart-key").name = "APIMART_API_KEY";
+  $("llm-provider").name = "LLM_PROVIDER";
+  $("llm-key").name = "LLM_API_KEY";
+  $("gemini-key").name = "GEMINI_API_KEY";
+  $("llm-composition-model").name = "LLM_COMPOSITION_MODEL";
+  $("llm-rewrite-model").name = "LLM_REWRITE_MODEL";
+  $("llm-base").name = "LLM_BASE_URL";
+
+  const comfyConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: false, APIMART_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_PRESET: "4step",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: FakeFormData,
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => ({ state: "offline", gpu: comfyConfig.COLAB_GPU, cli_available: true, logs: [] }) };
+      }
+      if (url === "/api/config") {
+        postedPayload = JSON.parse(opts.body);
+        return {
+          ok: true,
+          json: async () => ({
+            ...comfyConfig,
+            COMFYUI_PRESET: postedPayload.COMFYUI_PRESET,
+            COMFYUI_RESOLUTION: postedPayload.COMFYUI_RESOLUTION,
+            COMFYUI_UPSCALE: postedPayload.COMFYUI_UPSCALE,
+            COLAB_GPU: postedPayload.COLAB_GPU,
+            COLAB_AUTO_START: postedPayload.COLAB_AUTO_START,
+            keys: { ...comfyConfig.keys, COMFYUI_API_KEY: true },
+          }),
+        };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  const freshMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(freshMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  // Missing COMFYUI_API_KEY on remote HTTPS tunnel -> configIncomplete
+  assert.equal($("config-summary").textContent, freshMessages.configIncomplete);
+  assert.equal($("rh-key").disabled, true);
+  assert.equal($("comfy-url").disabled, false);
+  assert.equal($("comfy-resolution").disabled, false);
+  assert.equal($("comfy-resolution").value, "768p");
+  assert.equal($("comfy-upscale").disabled, false);
+  assert.equal($("comfy-upscale").value, "0");
+  assert.equal($("colab-gpu").disabled, false);
+  assert.equal($("colab-gpu").value, "G4");
+  assert.equal($("runtime-card").hidden, false);
+  assert.ok($("runtime-start").textContent.includes("G4"));
+
+  // Preset copy reflects EasyCache default without hardcoding a single resolution, and resolution/GPU options exist in both locales
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  assert.ok(freshMessages.comfyPresetFull20.includes("EasyCache") && !freshMessages.comfyPresetFull20.includes("544p"));
+  assert.ok(zhFresh.comfyPresetFull20.includes("EasyCache") && !zhFresh.comfyPresetFull20.includes("544p"));
+  assert.ok(freshMessages.comfyResolution768p.includes("768×1344") && zhFresh.comfyResolution768p.includes("768×1344"));
+  assert.ok(freshMessages.comfyResolution544p.includes("544×960") && zhFresh.comfyResolution544p.includes("544×960"));
+
+  // Submit COMFYUI_API_KEY, 8step preset, 544p resolution, COMFYUI_UPSCALE = "1", COLAB_GPU = "H100", and COLAB_AUTO_START = "0"
+  $("comfy-key").value = "ck-secret-42";
+  $("comfy-preset").value = "8step";
+  $("comfy-resolution").value = "544p";
+  $("comfy-upscale").value = "1";
+  $("colab-gpu").value = "H100";
+  $("colab-auto-start").value = "0";
+  await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(postedPayload.VIDEO_PROVIDER, "comfyui");
+  assert.equal(postedPayload.COMFYUI_API_KEY, "ck-secret-42");
+  assert.equal(postedPayload.COMFYUI_PRESET, "8step");
+  assert.equal(postedPayload.COMFYUI_RESOLUTION, "544p");
+  assert.equal(postedPayload.COMFYUI_UPSCALE, "1");
+  assert.equal(postedPayload.COLAB_GPU, "H100");
+  assert.equal(postedPayload.COLAB_AUTO_START, "0");
+  assert.equal($("comfy-key").value, "");
+  assert.equal($("config-summary").textContent, freshMessages.configReady);
+});
+
+test("common.js renders ComfyUI/Colab runtime card states, Drive auth ack, and two-step stop confirmation", async () => {
+  const { $ } = makeDom();
+  const calls = [];
+  let currentStatus = {
+    state: "awaiting_drive_auth",
+    cli_available: true,
+    auth_url: "https://accounts.google.com/o/oauth2/auth?client_id=test",
+    comfyui_url: "https://demo.ngrok-free.dev",
+    session: "comfy-a100",
+    devices: [],
+    logs: ["Waiting for Google Drive consent"],
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { *[Symbol.iterator]() {} },
+    fetch: async (url, opts) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : null });
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => currentStatus };
+      }
+      if (url === "/api/runtime/drive-ack") {
+        currentStatus = {
+          state: "online",
+          cli_available: true,
+          comfyui_url: "https://demo.ngrok-free.dev",
+          session: "comfy-a100",
+          devices: [{ name: "NVIDIA A100-SXM4-80GB" }],
+          logs: ["ComfyUI online"],
+        };
+        return { ok: true, json: async () => ({ accepted: true, status: currentStatus }) };
+      }
+      if (url === "/api/runtime/stop") {
+        const req = JSON.parse(opts.body);
+        if (!req.force) {
+          return {
+            ok: true,
+            json: async () => ({
+              stopped: false,
+              confirmation_required: true,
+              local_busy: true,
+              remote_queue: 1,
+              status: currentStatus,
+            }),
+          };
+        }
+        currentStatus = { state: "offline", cli_available: true, comfyui_url: "https://demo.ngrok-free.dev", logs: [] };
+        return { ok: true, json: async () => ({ stopped: true, confirmation_required: false, status: currentStatus }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  const freshMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  const comfyConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: true, APIMART_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_PRESET: "4step",
+    COMFYUI_UPSCALE: "1",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(freshMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("runtime-drive-box").hidden, false);
+  assert.equal($("runtime-drive-link").href, "https://accounts.google.com/o/oauth2/auth?client_id=test");
+
+  await $("runtime-drive-ack").events.click();
+  assert.equal($("runtime-drive-box").hidden, true);
+  assert.ok($("runtime-detail").textContent.includes("A100"));
+
+  // First stop click requires secondary confirmation
+  await $("runtime-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, false);
+
+  // Confirm force stop
+  await $("runtime-confirm-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, true);
+  const stopCalls = calls.filter((c) => c.url === "/api/runtime/stop");
+  assert.deepEqual(stopCalls.map((c) => c.body.force), [false, true]);
+});
+
+test("common.js refreshes runtime card when video submission triggers auto-start HTTP 400 and submits cleared COMFYUI_URL", async () => {
+  const { $, ids } = makeDom();
+  $("persist-config").checked = true;
+  let postedConfig = null;
+  let runtimePhase = "offline";
+
+  class FakeFormData {
+    constructor() {
+      const entries = [];
+      for (const id of ["video-provider", "comfy-url", "comfy-preset", "colab-auto-start", "llm-provider", "llm-composition-model", "llm-rewrite-model", "llm-base"]) {
+        const el = ids.get(id);
+        if (el && !el.disabled && el.name) entries.push([el.name, el.value]);
+      }
+      this._entries = entries;
+    }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  $("video-provider").name = "VIDEO_PROVIDER";
+  $("comfy-url").name = "COMFYUI_URL";
+  $("comfy-preset").name = "COMFYUI_PRESET";
+  $("colab-auto-start").name = "COLAB_AUTO_START";
+  $("llm-provider").name = "LLM_PROVIDER";
+  $("llm-composition-model").name = "LLM_COMPOSITION_MODEL";
+  $("llm-rewrite-model").name = "LLM_REWRITE_MODEL";
+  $("llm-base").name = "LLM_BASE_URL";
+
+  const comfyConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: true, APIMART_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_PRESET: "4step",
+    COLAB_AUTO_START: "1",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: FakeFormData,
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") {
+        if (runtimePhase === "awaiting_drive_auth") {
+          return {
+            ok: true,
+            json: async () => ({
+              state: "awaiting_drive_auth",
+              cli_available: true,
+              auth_url: "https://accounts.google.com/o/oauth2/auth?auto=1",
+              comfyui_url: "https://demo.ngrok-free.dev",
+              logs: [],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({ state: "offline", cli_available: true, comfyui_url: "https://demo.ngrok-free.dev", logs: [] }) };
+      }
+      if (url === "/api/jobs") {
+        runtimePhase = "awaiting_drive_auth";
+        return { ok: false, status: 400, json: async () => ({ error: "Colab A100 startup triggered" }) };
+      }
+      if (url === "/api/config") {
+        postedConfig = JSON.parse(opts.body);
+        return { ok: true, json: async () => ({ ...comfyConfig, COMFYUI_URL: postedConfig.COMFYUI_URL ?? comfyConfig.COMFYUI_URL }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  const freshMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(freshMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+  assert.equal($("runtime-drive-box").hidden, true);
+
+  // Trigger POST /api/jobs returning 400 -> runtime card must auto-refresh and reveal Drive OAuth box
+  await assert.rejects(() => context.post("/api/jobs", { kind: "one" }));
+  await new Promise((r) => setImmediate(r));
+  assert.equal($("runtime-drive-box").hidden, false);
+  assert.equal($("runtime-drive-link").href, "https://accounts.google.com/o/oauth2/auth?auto=1");
+
+  // Clearing #comfy-url and saving submits COMFYUI_URL: ""
+  $("comfy-url").value = "";
+  await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
+  assert.equal(postedConfig.COMFYUI_URL, "");
+});
+
+test("style.css normalizes all form selects to custom appearance and exact height parity with text inputs", () => {
+  const rawCss = fs.readFileSync(path.join(staticDirectory, "style.css"), "utf8");
+  const topLevelCss = rawCss.replace(/@media[^{]+\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}/g, "");
+  const rules = [];
+  for (const match of topLevelCss.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
+    const selectors = match[1].trim();
+    const decls = {};
+    for (const part of match[2].split(";")) {
+      const colon = part.indexOf(":");
+      if (colon === -1) continue;
+      decls[part.slice(0, colon).trim()] = part.slice(colon + 1).trim();
+    }
+    rules.push({ selectors, decls });
+  }
+
+  const collectFor = (predicate) => {
+    const merged = {};
+    for (const rule of rules) {
+      if (predicate(rule.selectors)) {
+        if ("background" in rule.decls) {
+          delete merged["background-image"];
+        }
+        Object.assign(merged, rule.decls);
+      }
+    }
+    return merged;
+  };
+
+  const splitTopLevelCommas = (sel) => {
+    const parts = [];
+    let depth = 0, cur = "";
+    for (const ch of sel) {
+      if (ch === "(" || ch === "[") depth += 1;
+      else if (ch === ")" || ch === "]") depth -= 1;
+      if (ch === "," && depth === 0) {
+        parts.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.trim()) parts.push(cur.trim());
+    return parts;
+  };
+
+  const formSelect = collectFor((s) => splitTopLevelCommas(s).includes("select"));
+  const textInput = collectFor((s) => splitTopLevelCommas(s).some((p) => p === "input" || p.startsWith("input:where(:not(")));
+  assert.equal(formSelect.appearance, "none", "select must disable native OS popup appearance");
+  assert.equal(formSelect["-webkit-appearance"], "none", "select must disable WebKit native popup appearance on macOS");
+  assert.ok(formSelect["background-image"]?.startsWith("url("), "select must render custom dropdown chevron");
+  assert.equal(formSelect.height, "44px", "form select must set explicit 44px height");
+  assert.equal(textInput.height, formSelect.height, "single-line text input height must match form select height");
+
+  const segmentSelect = { ...formSelect, ...collectFor((s) => splitTopLevelCommas(s).includes(".segment-editor select")) };
+  assert.equal(segmentSelect.height, formSelect.height, "segment editor select must match form input height");
+
+  const headerSelect = collectFor((s) => {
+    const parts = splitTopLevelCommas(s);
+    return parts.includes("select") || parts.includes(".header-tools select");
+  });
+  assert.equal(headerSelect.height, "auto", "header language select must stay compact (height: auto)");
+  assert.ok(headerSelect["background-image"]?.startsWith("url("), "header language select must retain custom chevron background-image");
+
+  const pageJumpInput = { ...textInput, ...collectFor((s) => splitTopLevelCommas(s).includes(".page-jump input")) };
+  const plyrInput = { ...textInput, ...collectFor((s) => splitTopLevelCommas(s).includes(".artifact .plyr input")) };
+  const checkboxInput = { ...textInput, ...collectFor((s) => splitTopLevelCommas(s).includes(".checkbox-field input")) };
+  assert.equal(pageJumpInput.height, "auto", ".page-jump input must preserve compact height");
+  assert.equal(plyrInput.height, "auto", ".artifact .plyr input must not inherit 44px textbox height");
+  assert.equal(checkboxInput.height, "16px", ".checkbox-field input must remain 16px");
+});
+
+test("results.js renders live ComfyUI stage, step bar, VRAM, and elapsed progress and hides when finished", async () => {
+  const { $, element } = makeDom();
+  $("results-page").dataset.jobId = "job-live-comfy";
+  let currentJob = {
+    id: "job-live-comfy", kind: "film", demo: false, status: "running", operation: "pipeline",
+    created_at: "2026-11-18T20:00:00", output_dir: "/tmp/out", logs: "submitted seg1", report: "",
+    progress: { frames: 4, clips: 0 }, artifacts: [], review: { kind: "frames", total: 4, complete: true },
+    storyboard: [],
+    segments: [{
+      number: 1, start: 0, end: 13, seconds: 13, shots: 4, url: null, task_pending: true,
+      live_progress: { stage: "sampling", node: "125", step: 2, max_steps: 4, vram_used_gb: 31.4, vram_total_gb: 40.0, elapsed_s: 135, queued: false },
+    }],
+  };
+
+  const context = vm.createContext({
+    state: { language: "en", config: {}, jobs: [] },
+    $, element, renderPage: null,
+    document: { addEventListener() {}, querySelectorAll: () => [] },
+    window: { addEventListener() {} },
+    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => v[n] ?? ""),
+    running: (job) => Boolean(job && ["queued", "running"].includes(job.status)),
+    renderConfig() {},
+    showError() {},
+    showMessage() {},
+    clearNotices() {},
+    dateLabel: () => "",
+    initializePagination() {},
+    renderPagination() {},
+    initializeVideoSegments() {},
+    renderResultTabs() {},
+    renderVideoSegments() {},
+    pauseSegmentPlayers() {},
+    destroySegmentPlayers() {},
+    setTimeout: () => 1,
+    clearTimeout() {},
+    loadLanguage: async () => {},
+    request: async (url) => (url === "/api/bootstrap" ? { config: {}, jobs: [] } : currentJob),
+    post: async () => ({}),
+  });
+  for (const script of ["frame-references.js", "results.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(staticDirectory, script), "utf8"), context);
+  }
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("live-progress").hidden, false, "#live-progress must be visible while ComfyUI segment reports live_progress");
+  assert.match($("live-progress-label").textContent, /2\/4/, "Progress label must show live step ratio");
+  assert.match($("live-progress-meta").textContent, /31\.4\/40(\.0)? GB/, "Progress meta must show VRAM usage");
+  assert.match($("live-progress-meta").textContent, /2:15|02:15/, "Progress meta must show elapsed time");
+  assert.equal($("live-progress-fill").style.transform, "scaleX(0.5)", "Progress fill scaleX must reflect 2/4 = 50%");
+
+  currentJob = {
+    ...currentJob,
+    segments: [{
+      ...currentJob.segments[0],
+      live_progress: { stage: "upscale_video", node: "155", step: 60, max_steps: 120, vram_used_gb: 28.0, vram_total_gb: 40.0, elapsed_s: 190, queued: false },
+    }],
+  };
+  await context.refreshJob();
+  assert.match($("live-progress-label").textContent, /Upscaling video/, "Progress label must render upscale_video stage copy");
+  assert.equal($("live-progress-fill").style.transform, "scaleX(0.5)");
+
+  currentJob = { ...currentJob, status: "succeeded", segments: [{ ...currentJob.segments[0], url: "/clip.mp4", task_pending: false, live_progress: null }] };
+  await context.refreshJob();
+  assert.equal($("live-progress").hidden, true, "#live-progress must hide once job finishes");
+});
+
+test("common.js renders multi-node ComfyUI pool status list, COMFYUI_CONCURRENCY, and results.js shows node_label", async () => {
+  const { ids, $ } = makeDom();
+  $("persist-config").checked = true;
+  let postedConfig = null;
+  class FakeFormData {
+    constructor() {
+      const entries = [];
+      for (const id of ["video-provider", "comfy-url", "comfy-concurrency", "comfy-preset", "comfy-resolution", "comfy-upscale", "colab-gpu", "colab-auto-start", "llm-provider", "llm-composition-model", "llm-rewrite-model", "llm-base"]) {
+        const el = ids.get(id);
+        if (el && !el.disabled && el.name) entries.push([el.name, el.value]);
+      }
+      this._entries = entries;
+    }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  $("video-provider").name = "VIDEO_PROVIDER";
+  $("comfy-url").name = "COMFYUI_URL";
+  $("comfy-concurrency").name = "COMFYUI_CONCURRENCY";
+  $("comfy-preset").name = "COMFYUI_PRESET";
+  $("comfy-resolution").name = "COMFYUI_RESOLUTION";
+  $("comfy-upscale").name = "COMFYUI_UPSCALE";
+  $("colab-gpu").name = "COLAB_GPU";
+  $("colab-auto-start").name = "COLAB_AUTO_START";
+  $("llm-provider").name = "LLM_PROVIDER";
+  $("llm-composition-model").name = "LLM_COMPOSITION_MODEL";
+  $("llm-rewrite-model").name = "LLM_REWRITE_MODEL";
+  $("llm-base").name = "LLM_BASE_URL";
+
+  const multiConfig = {
+    keys: { RUNNINGHUB_API_KEY: false, COMFYUI_API_KEY: true, APIMART_API_KEY: true, LLM_API_KEY: true, GEMINI_API_KEY: false },
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node-a.example.com,https://node-b.example.com",
+    COMFYUI_URLS: ["https://node-a.example.com", "https://node-b.example.com"],
+    COMFYUI_CONCURRENCY: "",
+    effective_comfyui_concurrency: 2,
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: {
+      apimart: { provider: "apimart", base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["LLM_API_KEY", "APIMART_API_KEY"] },
+      gemini: { provider: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", composition_model: "gemini-flash-latest", rewrite_model: "gemini-flash-latest", key_names: ["GEMINI_API_KEY"] },
+    },
+    ffmpeg: true, ffprobe: true, python: "3.12.0", saved_to_env: true,
+  };
+
+  let statusPayload = {
+    state: "online",
+    gpu: "G4",
+    cli_available: true,
+    comfyui_url: "https://node-a.example.com",
+    online_count: 1,
+    total_count: 2,
+    nodes: [
+      { url: "https://node-a.example.com", label: "node-a.example.com", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 1, queue_pending: 0 },
+      { url: "https://node-b.example.com", label: "node-b.example.com", online: false, auth_failed: false, devices: [], queue_running: 0, queue_pending: 0 },
+    ],
+    logs: [],
+  };
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "zh-CN" },
+      title: "",
+    },
+    localStorage: { getItem: () => "zh-CN", setItem() {} },
+    FormData: FakeFormData,
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") return { ok: true, json: async () => statusPayload };
+      if (url === "/api/config") {
+        postedConfig = JSON.parse(opts.body);
+        return { ok: true, json: async () => ({ ...multiConfig, COMFYUI_CONCURRENCY: postedConfig.COMFYUI_CONCURRENCY ?? "" }) };
+      }
+      return { ok: true, json: async () => zhMessages };
+    },
+  });
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(zhFresh)}; state.config = ${JSON.stringify(multiConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("comfy-concurrency").disabled, false);
+  assert.equal($("runtime-nodes").hidden, false, "Multi-node status must reveal #runtime-nodes list");
+  assert.equal($("runtime-nodes").children.length, 2);
+  assert.match($("runtime-detail").textContent, /1\/2/);
+
+  // Submitting blank COMFYUI_CONCURRENCY sends "" so server reverts to auto concurrency
+  $("comfy-concurrency").value = "";
+  await $("config-form").events.submit({ preventDefault() {}, target: $("config-form") });
+  assert.equal(postedConfig.COMFYUI_CONCURRENCY, "");
+
+  // Single-node status hides #runtime-nodes
+  statusPayload = { state: "online", gpu: "G4", cli_available: true, comfyui_url: "https://node-a.example.com", online_count: 1, total_count: 1, nodes: [statusPayload.nodes[0]], devices: [{ name: "RTX PRO 6000" }], logs: [] };
+  await context.refreshRuntimeStatus();
+  assert.equal($("runtime-nodes").hidden, true, "Single-node status must keep #runtime-nodes hidden");
+
+  // Verify results.js formatLiveProgressParts renders node_label in both locales
+  for (const [lang, dict, expected] of [
+    ["zh-CN", zhFresh, "节点 node-b.example.com"],
+    ["en", JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8")), "Node node-b.example.com"],
+  ]) {
+    const rDom = makeDom();
+    rDom.$("results-page").dataset = { jobId: "job-multi" };
+    const rCtx = vm.createContext({
+      state: { language: lang, config: {}, jobs: [] },
+      $: rDom.$,
+      element: () => ({}),
+      renderPage: null,
+      document: { addEventListener() {}, querySelectorAll: () => [] },
+      window: { addEventListener() {} },
+      t: (k, v = {}) => (dict[k] || k).replace(/\{(\w+)\}/g, (_, n) => v[n] ?? ""),
+      running: () => true,
+      renderConfig() {}, showError() {}, showMessage() {}, clearNotices() {}, dateLabel: () => "",
+      initializePagination() {}, renderPagination() {}, initializeVideoSegments() {}, renderResultTabs() {},
+      renderVideoSegments() {}, pauseSegmentPlayers() {}, destroySegmentPlayers() {},
+      setTimeout: () => 1, clearTimeout() {}, loadLanguage: async () => {},
+      request: async () => ({}), post: async () => ({}),
+    });
+    vm.runInContext(fs.readFileSync(path.join(staticDirectory, "results.js"), "utf8"), rCtx);
+    const parts = rCtx.formatLiveProgressParts({
+      stage: "sampling", step: 10, max_steps: 20, vram_used_gb: 41.6, vram_total_gb: 95.0,
+      elapsed_s: 125, node_label: "node-b.example.com",
+    }, 2);
+    assert.ok(parts.meta.includes(expected), `${lang} live progress meta must include node label: ${parts.meta}`);
+  }
+});
+
+test("common.js supports starting, Drive-authorizing, syncing ephemeral URL, and stopping the 2nd Colab node", async () => {
+  const { $ } = makeDom();
+  const calls = [];
+  let stage = "idle";
+  const cfg = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node1.ngrok-free.dev",
+    COMFYUI_URLS: ["https://node1.ngrok-free.dev"],
+    COMFYUI_CONCURRENCY: "",
+    effective_comfyui_concurrency: 1,
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+
+  function makeStatus() {
+    const primaryNode = { url: "https://node1.ngrok-free.dev", label: "node1.ngrok-free.dev", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 0, queue_pending: 0 };
+    if (stage === "idle") {
+      return {
+        state: "online", gpu: "G4", cli_available: true, comfyui_url: primaryNode.url, comfyui_urls: [primaryNode.url],
+        online_count: 1, total_count: 1, effective_comfyui_concurrency: 1, nodes: [primaryNode], devices: primaryNode.devices, logs: [],
+        managed_nodes: [
+          { slot: "primary", session: "comfy-a100", url: primaryNode.url, state: "online", online: true, has_session: true, logs: [] },
+          { slot: "secondary", session: "comfy-a100-2", url: "", state: "offline", online: false, has_session: false, logs: [] },
+        ],
+      };
+    }
+    if (stage === "drive_auth") {
+      return {
+        state: "online", gpu: "G4", cli_available: true, comfyui_url: primaryNode.url, comfyui_urls: [primaryNode.url],
+        online_count: 1, total_count: 1, effective_comfyui_concurrency: 1, nodes: [primaryNode], devices: primaryNode.devices, logs: [],
+        managed_nodes: [
+          { slot: "primary", session: "comfy-a100", url: primaryNode.url, state: "online", online: true, has_session: true, logs: [] },
+          { slot: "secondary", session: "comfy-a100-2", url: "", state: "awaiting_drive_auth", online: false, has_session: true, auth_url: "https://accounts.google.com/o/oauth2/auth?node=2", logs: ["mounting drive..."] },
+        ],
+      };
+    }
+    const secNode = { url: "https://fresh-42.trycloudflare.com", label: "fresh-42.trycloudflare.com", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 0, queue_pending: 0 };
+    return {
+      state: "online", gpu: "G4", cli_available: true, comfyui_url: primaryNode.url, comfyui_urls: [primaryNode.url, secNode.url],
+      online_count: 2, total_count: 2, effective_comfyui_concurrency: 2, nodes: [primaryNode, secNode], devices: [...primaryNode.devices, ...secNode.devices], logs: [],
+      managed_nodes: [
+        { slot: "primary", session: "comfy-a100", url: primaryNode.url, state: "online", online: true, has_session: true, logs: [] },
+        { slot: "secondary", session: "comfy-a100-2", url: secNode.url, label: secNode.label, state: "online", online: true, has_session: true, devices: secNode.devices, queue_running: 0, queue_pending: 0, logs: [] },
+      ],
+    };
+  }
+
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "zh-CN" },
+      title: "",
+    },
+    localStorage: { getItem: () => "zh-CN", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ url, body });
+      if (url === "/api/runtime/status") return { ok: true, json: async () => makeStatus() };
+      if (url === "/api/runtime/start") {
+        stage = "drive_auth";
+        return { ok: true, json: async () => makeStatus() };
+      }
+      if (url === "/api/runtime/drive-ack") {
+        stage = "online_2";
+        return { ok: true, json: async () => ({ accepted: true, slot: "secondary", status: makeStatus() }) };
+      }
+      if (url === "/api/runtime/stop") {
+        stage = "idle";
+        return { ok: true, json: async () => ({ stopped: true, slot: "secondary", confirmation_required: false, status: makeStatus() }) };
+      }
+      return { ok: true, json: async () => zhMessages };
+    },
+  });
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(zhFresh)}; state.config = ${JSON.stringify(cfg)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("runtime-start-secondary").hidden, false);
+  assert.equal($("runtime-start-secondary").disabled, false);
+
+  // Click "+ Start 2nd node" -> posts { slot: "secondary" } and reveals secondary Drive OAuth box
+  await $("runtime-start-secondary").events.click();
+  assert.deepEqual(calls.find((c) => c.url === "/api/runtime/start").body, { slot: "secondary" });
+  assert.equal($("runtime-drive-box").hidden, false);
+  assert.equal($("runtime-drive-link").href, "https://accounts.google.com/o/oauth2/auth?node=2");
+  assert.ok($("runtime-drive-text").textContent.includes("comfy-a100-2"));
+
+  // Confirm Drive auth -> posts { slot: "secondary" }, node 2 comes online, #comfy-url syncs automatically
+  await $("runtime-drive-ack").events.click();
+  assert.deepEqual(calls.find((c) => c.url === "/api/runtime/drive-ack").body, { slot: "secondary" });
+  assert.equal($("comfy-url").value, "https://node1.ngrok-free.dev,https://fresh-42.trycloudflare.com");
+  assert.equal($("runtime-start-secondary").hidden, true);
+  assert.equal($("runtime-nodes").children.length, 2);
+
+  // Inline stop button on Node 2 row stops secondary node and cleans #comfy-url back to primary only
+  const secRow = $("runtime-nodes").children[1];
+  const stopBtn = secRow.children.find((el) => el.events?.click);
+  assert.ok(stopBtn, "Secondary node row must render an inline Stop button");
+  await stopBtn.events.click();
+  assert.deepEqual(calls.find((c) => c.url === "/api/runtime/stop").body, { force: false, slot: "secondary" });
+  assert.equal($("comfy-url").value, "https://node1.ngrok-free.dev");
+  assert.equal($("runtime-start-secondary").hidden, false);
+
+  // Stop confirmation when queue_unknown=true renders localized unknown label instead of misleading "0"
+  const origFetch = context.fetch;
+  context.fetch = async (url, opts) => {
+    if (url === "/api/runtime/stop") {
+      return {
+        ok: true,
+        json: async () => ({
+          stopped: false,
+          slot: "primary",
+          confirmation_required: true,
+          local_busy: false,
+          remote_queue: 0,
+          queue_unknown: true,
+          status: makeStatus(),
+        }),
+      };
+    }
+    return origFetch(url, opts);
+  };
+  await $("runtime-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, false);
+  assert.ok($("runtime-confirm-text").textContent.includes(zhFresh.runtimeQueueUnknown), "queue_unknown=true must display localized unknown text instead of 0");
+});
+
 test("create.js supports creating multiple combined cast sheets and adding/removing individual group members", async () => {
   const { $, element } = makeDom();
   const posted = [];
@@ -1000,5 +1745,270 @@ test("create.js supports creating multiple combined cast sheets and adding/remov
   ]);
   assert.equal(context.state.filmBindings.get("cast:2").file.id, "sheet-2.png", "Dissolving sheet #1 must not disturb sheet #2");
 });
+
+test("common.js renders primary node error/transitional state when secondary is online and disables primary start without primary URL", async () => {
+  const { $ } = makeDom();
+  const zhFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  const cfg = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node1.ngrok-free.dev,https://sec-live.trycloudflare.com",
+    COMFYUI_URLS: ["https://node1.ngrok-free.dev", "https://sec-live.trycloudflare.com"],
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+  let runtimeStatus = {
+    state: "online",
+    gpu: "G4",
+    cli_available: true,
+    comfyui_url: "https://node1.ngrok-free.dev",
+    comfyui_urls: ["https://node1.ngrok-free.dev", "https://sec-live.trycloudflare.com"],
+    online_count: 1,
+    total_count: 2,
+    nodes: [
+      { url: "https://node1.ngrok-free.dev", label: "node1.ngrok-free.dev", online: false, auth_failed: false, devices: [], queue_running: 0, queue_pending: 0 },
+      { url: "https://sec-live.trycloudflare.com", label: "sec-live.trycloudflare.com", online: true, auth_failed: false, devices: [{ name: "RTX PRO 6000" }], queue_running: 0, queue_pending: 0 },
+    ],
+    managed_nodes: [
+      { slot: "primary", session: "comfy-a100", url: "https://node1.ngrok-free.dev", state: "error", online: false, has_session: false, error: "503 quota exhausted", logs: [] },
+      { slot: "secondary", session: "comfy-a100-2", url: "https://sec-live.trycloudflare.com", state: "online", online: true, has_session: true, logs: [] },
+    ],
+    logs: [],
+  };
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "zh-CN" },
+      title: "",
+    },
+    localStorage: { getItem: () => "zh-CN", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url) => {
+      if (url === "/api/runtime/status") return { ok: true, json: async () => runtimeStatus };
+      return { ok: true, json: async () => zhFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(zhFresh)}; state.config = ${JSON.stringify(cfg)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  const priRow = $("runtime-nodes").children[0];
+  const priText = priRow.children.map((c) => c.textContent).join(" ");
+  assert.ok(priText.includes(zhFresh.runtimeState_error), `Primary row must show error badge when secondary is online: ${priText}`);
+  assert.ok(priText.includes("503 quota exhausted"), `Primary row must show primary error detail: ${priText}`);
+
+  // When primary has no configured URL and only secondary is online, #runtime-start must be disabled
+  runtimeStatus = {
+    ...runtimeStatus,
+    comfyui_url: "https://sec-live.trycloudflare.com",
+    comfyui_urls: ["https://sec-live.trycloudflare.com"],
+    online_count: 1,
+    total_count: 1,
+    nodes: [runtimeStatus.nodes[1]],
+    managed_nodes: [
+      { slot: "primary", session: "comfy-a100", url: "", state: "offline", online: false, has_session: false, logs: [] },
+      runtimeStatus.managed_nodes[1],
+    ],
+  };
+  await context.refreshRuntimeStatus();
+  assert.equal($("runtime-start").disabled, true, "#runtime-start must be disabled when primary URL is empty even if secondary is online");
+});
+
+// Generated by /ship coverage audit
+// Value: protects=common.js runtime drive-ack error display, stop cancel, transitional polling, and refresh dedup; fails_when=rejected drive-ack stays silent, cancel-stop leaves confirm open, polling leaks past terminal state, or refreshes double-fetch; why_new=test_workbench_ui only covered accepted drive-ack and confirmed stop without timer or concurrency checks; seam=none; no_claim=real browser timer loop or layout visibility (node:vm DOM harness only)
+test("common.js handles drive-ack rejection, stop cancel, transitional polling, and concurrent refresh dedup", async () => {
+  const { $ } = makeDom();
+  const timers = [];
+  let statusFetches = 0;
+  let releaseStatus = null;
+  let currentStatus = {
+    state: "provisioning",
+    gpu: "G4",
+    cli_available: true,
+    comfyui_url: "https://node1.ngrok-free.dev",
+    comfyui_urls: ["https://node1.ngrok-free.dev"],
+    online_count: 0,
+    total_count: 1,
+    nodes: [],
+    logs: [],
+  };
+  const comfyConfig = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://node1.ngrok-free.dev",
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    setTimeout: (fn, ms) => { timers.push({ fn, ms, cleared: false }); return timers.length; },
+    clearTimeout: (id) => { if (timers[id - 1]) timers[id - 1].cleared = true; },
+    fetch: async (url) => {
+      if (url === "/api/runtime/status") {
+        statusFetches += 1;
+        if (releaseStatus) await releaseStatus;
+        return { ok: true, json: async () => currentStatus };
+      }
+      if (url === "/api/runtime/drive-ack") {
+        return { ok: true, json: async () => ({ accepted: false, state: "offline", status: currentStatus }) };
+      }
+      if (url === "/api/runtime/stop") {
+        return { ok: true, json: async () => ({ stopped: false, confirmation_required: true, local_busy: true, remote_queue: 0, status: currentStatus }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  // 1. Transitional state schedules a 2500ms runtime poll
+  assert.equal(timers.filter((t) => !t.cleared).length, 1, "Transitional provisioning state must schedule one runtime poll");
+  assert.equal(timers[0].ms, 2500);
+
+  // 2. Concurrent refreshRuntimeStatus() calls deduplicate into one /api/runtime/status fetch
+  statusFetches = 0;
+  let unblock;
+  releaseStatus = new Promise((r) => { unblock = r; });
+  currentStatus = { ...currentStatus, state: "online", devices: [{ name: "L4" }], online_count: 1 };
+  const p1 = context.refreshRuntimeStatus();
+  const p2 = context.refreshRuntimeStatus();
+  unblock();
+  await Promise.all([p1, p2]);
+  releaseStatus = null;
+  assert.equal(statusFetches, 1, "Overlapping refreshRuntimeStatus calls must share in-flight request");
+  assert.equal(timers.filter((t) => !t.cleared).length, 0, "Terminal online state must clear runtime poll timer");
+
+  // 3. Rejected drive-ack surfaces visible error message instead of silently succeeding
+  currentStatus = { ...currentStatus, state: "awaiting_drive_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?x=1" };
+  await context.refreshRuntimeStatus();
+  $("global-error").hidden = true;
+  await $("runtime-drive-ack").events.click();
+  assert.equal($("global-error").hidden, false, "drive-ack accepted=false must display #global-error");
+  assert.match($("global-error").textContent, /offline/);
+
+  // 4. Stop confirmation can be dismissed cleanly via #runtime-cancel-stop
+  await $("runtime-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, false);
+  $("runtime-cancel-stop").events.click();
+  assert.equal($("runtime-confirm").hidden, true, "#runtime-cancel-stop must hide confirmation box");
+});
+
+test("common.js submitRuntimeStop hides stale confirm banner and preserves slot on failed secondary stop", async () => {
+  const { $ } = makeDom();
+  const stopRequests = [];
+  let stopCall = 0;
+  const currentStatus = {
+    state: "online",
+    cli_available: true,
+    comfyui_url: "https://pri.ngrok-free.dev",
+    comfyui_urls: ["https://pri.ngrok-free.dev", "https://sec.trycloudflare.com"],
+    online_count: 2,
+    total_count: 2,
+    managed_nodes: [
+      { slot: "primary", state: "online", online: true, url: "https://pri.ngrok-free.dev", session: "comfy-a100" },
+      { slot: "secondary", state: "online", online: true, url: "https://sec.trycloudflare.com", session: "comfy-a100-2" },
+    ],
+    devices: [{ name: "L4" }],
+    logs: [],
+  };
+  const comfyConfig = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://pri.ngrok-free.dev,https://sec.trycloudflare.com",
+    COMFYUI_URLS: ["https://pri.ngrok-free.dev", "https://sec.trycloudflare.com"],
+    COMFYUI_PRESET: "4step",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.14.0", saved_to_env: true,
+  };
+  const context = vm.createContext({
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts) => {
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => currentStatus };
+      }
+      if (url === "/api/runtime/stop") {
+        stopCall += 1;
+        const body = JSON.parse(opts.body);
+        stopRequests.push(body);
+        if (stopCall === 1) {
+          return {
+            ok: true,
+            json: async () => ({
+              stopped: false,
+              confirmation_required: true,
+              local_busy: true,
+              remote_queue: 1,
+              status: currentStatus,
+            }),
+          };
+        }
+        return { ok: false, status: 500, json: async () => ({ error: "secondary stop failed" }) };
+      }
+      return { ok: true, json: async () => enMessages };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enMessages)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  // First: primary stop asks for confirmation -> sets runtimeStopSlot = "primary" and reveals #runtime-confirm
+  await context.submitRuntimeStop(false, "primary");
+  assert.equal($("runtime-confirm").hidden, false);
+  assert.equal(vm.runInContext("state.runtimeStopSlot", context), "primary");
+
+  // Second: secondary stop fails with 500 -> stale confirm banner must hide AND runtimeStopSlot must NOT be clobbered to "secondary"
+  await context.submitRuntimeStop(false, "secondary");
+  assert.equal($("runtime-confirm").hidden, true, "Failed stop on another slot must hide previous confirmation banner");
+  assert.equal(vm.runInContext("state.runtimeStopSlot", context), "primary", "Failed stop must not overwrite runtimeStopSlot");
+  assert.equal($("global-error").hidden, false);
+  assert.deepEqual(stopRequests.map((r) => r.slot), [undefined, "secondary"]);
+});
+
+
 
 

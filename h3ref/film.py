@@ -21,8 +21,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from . import check, config, frames, http, media, rewrite, rh, staging
+from . import check, comfy, config, frames, http, media, rewrite, rh, staging
 from .i18n import message
 from .staging import deduplicate_paths, group_cast_by_picture
 
@@ -32,6 +33,38 @@ ORIENT = {"9:16": "竖屏", "16:9": "横屏", "1:1": "方形"}
 RULES = ("完整表现动作的原因、接触和结果，动作真实连续，不要静态立绘晃动；角色不互换外观，道具不凭空出现或消失，不增加额外人物。"
          "画风全片统一为上面写的风格；每个角色全片是同一位演员，长相、发型、妆容和服装前后一致；"
          "画面里不出现字幕和文字，包装和道具上不印可读的字，只用图案和颜色区分；不出现任何真实品牌的标志。")
+
+
+def _is_trycloudflare_url(url: str | None) -> bool:
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    return parts.scheme.lower() == "https" and host.endswith(".trycloudflare.com") and len(host) > len(".trycloudflare.com")
+
+
+def _relocate_trycloudflare_endpoint(job, seg_idx: int, rec: dict, endpoint_url: str | None) -> str | None:
+    if not endpoint_url or not _is_trycloudflare_url(endpoint_url):
+        return endpoint_url
+    task_id = str(rec.get("task") or "").strip()
+    if not task_id:
+        return endpoint_url
+    cur_urls = config.video_settings()["comfyui_urls"]
+    if endpoint_url in cur_urls:
+        return endpoint_url
+    for cand in cur_urls:
+        if cand == endpoint_url or not _is_trycloudflare_url(cand):
+            continue
+        try:
+            comfy.assert_resume_endpoint_key_allowed(cand, expected_key_fp=rec.get("comfyui_key_fp"))
+        except RuntimeError:
+            continue
+        if comfy.has_task(task_id, base_url=cand):
+            job.log("relocate", f"seg{seg_idx + 1}", f"{comfy.endpoint_label(endpoint_url)} -> {comfy.endpoint_label(cand)}")
+            job.put("segs", str(seg_idx), comfyui_url=cand)
+            return cand
+    return endpoint_url
 
 
 def _num(x) -> str:
@@ -561,9 +594,20 @@ def _picture_paths(job: Job, seg: dict, pics: list[dict]) -> list[Path]:
     return picture_paths(job.dir, seg, pics)
 
 
-def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None) -> dict:
+def gen_segment(
+    job: Job,
+    film: dict,
+    seg: dict,
+    pics: list[dict],
+    *,
+    reference_paths: list[Path] | None = None,
+    node_pool: comfy.ComfyNodePool | None = None,
+    abort: threading.Event | None = None,
+) -> dict:
     try:
-        return _generate_segment(job, film, seg, pics, reference_paths=reference_paths)
+        return _generate_segment(job, film, seg, pics, reference_paths=reference_paths, node_pool=node_pool, abort=abort)
+    except comfy.DispatchAbortedError:
+        raise
     except (Exception, SystemExit) as exc:
         rec = job.state['segs'].get(str(seg['idx']), {})
         if not rec.get('terminal_failed'):
@@ -572,55 +616,263 @@ def gen_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_
         raise
 
 
-def _generate_segment(job: Job, film: dict, seg: dict, pics: list[dict], *, reference_paths: list[Path] | None = None) -> dict:
+def _video_provider_name(rec: dict | None = None) -> str:
+    if rec and (rec.get("task") or rec.get("submission_unknown")):
+        return str(rec.get("provider") or "runninghub").strip().lower()
+    return config.video_settings()["provider"]
+
+
+def _comfy_endpoint_kwargs(endpoint_url: str | None) -> dict:
+    """Pass base_url explicitly when routing across multiple nodes or to a non-default saved endpoint."""
+    if not endpoint_url:
+        return {}
+    vcfg = config.video_settings()
+    urls = vcfg["comfyui_urls"]
+    if len(urls) > 1 or (urls and endpoint_url != urls[0]) or not urls:
+        return {"base_url": endpoint_url}
+    return {}
+
+
+def _select_single_comfy_endpoint(log=None) -> str | None:
+    vcfg = config.video_settings()
+    urls = vcfg["comfyui_urls"]
+    if not urls:
+        return None
+    if len(urls) == 1:
+        return urls[0]
+    pool = comfy.ComfyNodePool(urls, api_key=vcfg["comfyui_api_key"], log=log)
+    pool.probe_all(fail_if_all_offline=True)
+    return pool.healthy_urls()[0]
+
+
+def _is_auth_rejection(exc: Exception) -> bool:
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, http.HTTPResponseError) and cause.status_code in (401, 403):
+        return True
+    text = str(exc)
+    return any(
+        tok in text
+        for tok in ("HTTP 401", "HTTP 403", "Unauthorized", "Forbidden", '"_http_status": 401', '"_http_status": 403')
+    )
+
+
+def _terminal_failed_message(number: int, path: Path, error: object = None) -> str:
+    reason = str(error or "").strip()
+    if reason:
+        return message("segment_terminal_failed_with_reason", number=number, reason=reason, path=path)
+    return message("segment_terminal_failed", number=number, path=path)
+
+
+def _generate_segment(
+    job: Job,
+    film: dict,
+    seg: dict,
+    pics: list[dict],
+    *,
+    reference_paths: list[Path] | None = None,
+    node_pool: comfy.ComfyNodePool | None = None,
+    abort: threading.Event | None = None,
+) -> dict:
     i = seg["idx"]
     out = job.dir / "clips" / f"seg{i + 1}.mp4"
     rec = job.state["segs"].get(str(i)) or {}
     if out.exists() and rec.get("cny") is not None:
         return rec
     if rec.get("terminal_failed"):
-        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
-    if not rec.get("task"):
-        if rec.get("submission_unknown"):
-            raise RuntimeError(message("submission_unknown", number=i + 1, path=str(job.file)))
-        paths = _picture_paths(job, seg, pics) if reference_paths is None else reference_paths
-        missing = [str(p) for p in paths if not p.exists()]
-        if missing:
-            raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
-        job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
-        names = [rh.upload(p) for p in paths]
-        seed = int(rec["seed"] if rec.get("seed") is not None else random.randrange(10 ** 14, 10 ** 15))
-        g = rh.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
-        job.put("segs", str(i), phase="submit")
-        task = rh.submit_with_retry(g, log=lambda detail: job.log(f"seg{i + 1}", detail),
-                                    record_submission=lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed))
-        job.put("segs", str(i), task=task, seed=seed, submitted=time.time(), submission_unknown=False)
-        job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{rh.estimate_cny(seg['seconds'])}")
-        rec = job.state["segs"][str(i)]
-    job.put("segs", str(i), phase="poll")
-    for _ in range(360):
-        st = rh.poll(rec["task"])
-        if st["state"] != "running":
-            break
-        time.sleep(20)
-    else:
-        raise RuntimeError(f"RunningHub poll timed out for seg{i + 1} task {rec['task']}")
-    if st["state"] == "failed":
-        job.put("segs", str(i), terminal_failed=True, error=st.get("error"))
-        raise RuntimeError(message("segment_terminal_failed", number=i + 1, path=job.file))
-    job.put("segs", str(i), phase="download")
-    http.download(st["url"], out)
-    job.put("segs", str(i), phase="tail")
-    media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
-    with job.lock:
-        cur = job.state["segs"].setdefault(str(i), {})
-        cur.pop("clip_prompts", None)
-        cur.pop("manual_rewrite", None)
-        cur.update(file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
-                   wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None)
-        job.save()
-    job.log("done", f"seg{i + 1}", f"¥{st['cny']:.3f}", f"{st.get('run_seconds')} s on the GPU")
-    return job.state["segs"][str(i)]
+        raise RuntimeError(_terminal_failed_message(i + 1, job.file, rec.get("error")))
+    provider_name = _video_provider_name(rec)
+    backend = comfy if provider_name == "comfyui" else rh
+    extra_provider = {"provider": provider_name}
+    leased_endpoint: str | None = None
+    reserved_inflight_endpoint: str | None = None
+    endpoint_url: str | None = str(rec.get("comfyui_url") or "").strip() or None
+    multi_node = bool(node_pool is not None and len(node_pool.urls) > 1)
+    try:
+        if not rec.get("task"):
+            if rec.get("submission_unknown"):
+                unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
+                raise RuntimeError(message(unknown_key, number=i + 1, path=str(job.file)))
+            paths = _picture_paths(job, seg, pics) if reference_paths is None else reference_paths
+            missing = [str(p) for p in paths if not p.exists()]
+            if missing:
+                raise SystemExit(f"第 {i + 1} 段缺参考图：{missing}")
+            seed = int(rec["seed"] if rec.get("seed") is not None else random.randrange(10 ** 14, 10 ** 15))
+            if provider_name == "comfyui" and node_pool is not None:
+                tried: set[str] = set()
+                while True:
+                    cand = node_pool.acquire(exclude=tried, abort=abort)
+                    tried.add(cand)
+                    leased_endpoint = cand
+                    endpoint_url = cand
+                    ep_kw = _comfy_endpoint_kwargs(endpoint_url)
+                    job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
+                    try:
+                        names = comfy.upload_many(paths, **ep_kw)
+                    except Exception as exc:
+                        node_pool.mark_unhealthy(cand, f"{type(exc).__name__}: {str(exc)[:120]}")
+                        leased_endpoint = None
+                        if node_pool.healthy_count() > 0 and any(u not in tried for u in node_pool.healthy_urls()):
+                            job.log("pool", message("comfy_node_failover", number=i + 1, node=comfy.endpoint_label(cand)))
+                            continue
+                        raise
+                    g = comfy.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
+                    job.put("segs", str(i), phase="submit")
+                    key_fp = comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+                    extra_with_ep = {
+                        **extra_provider,
+                        "comfyui_url": endpoint_url,
+                        **({"comfyui_key_fp": key_fp} if key_fp else {}),
+                    }
+                    try:
+                        task = comfy.submit_with_retry(
+                            g,
+                            log=lambda detail: job.log(f"seg{i + 1}", detail),
+                            record_submission=lambda unknown, _ep=extra_with_ep: job.put(
+                                "segs", str(i), submission_unknown=unknown, seed=seed, **_ep
+                            ),
+                            **ep_kw,
+                        )
+                    except Exception as exc:
+                        can_failover = (
+                            (isinstance(exc, comfy.SubmissionRejected) and _is_auth_rejection(exc))
+                            or comfy._is_tunnel_offline_error(exc)
+                        )
+                        if can_failover or not isinstance(exc, comfy.SubmissionRejected):
+                            node_pool.mark_unhealthy(cand, f"{type(exc).__name__}: {str(exc)[:120]}")
+                            leased_endpoint = None
+                        if can_failover and node_pool.healthy_count() > 0 and any(u not in tried for u in node_pool.healthy_urls()):
+                            job.log("pool", message("comfy_node_failover", number=i + 1, node=comfy.endpoint_label(cand)))
+                            continue
+                        raise
+                    job.put(
+                        "segs", str(i), task=task, seed=seed, submitted=time.time(),
+                        submission_unknown=False, **extra_with_ep,
+                    )
+                    job.log(
+                        "submitted", f"seg{i + 1}", f"node {comfy.endpoint_label(endpoint_url)}",
+                        f"seed {seed}", f"≈¥{backend.estimate_cny(seg['seconds'])}",
+                    )
+                    rec = job.state["segs"][str(i)]
+                    break
+            else:
+                if provider_name == "comfyui":
+                    endpoint_url = _select_single_comfy_endpoint(log=lambda detail: job.log("pool", detail))
+                ep_kw = _comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
+                key_fp = (
+                    comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+                    if provider_name == "comfyui" and endpoint_url
+                    else ""
+                )
+                extra_with_ep = {
+                    **extra_provider,
+                    **({"comfyui_url": endpoint_url} if provider_name == "comfyui" and endpoint_url else {}),
+                    **({"comfyui_key_fp": key_fp} if key_fp else {}),
+                }
+                job.put("segs", str(i), phase="upload", h3_reference_version=reference_version(paths))
+                if provider_name == "comfyui":
+                    names = comfy.upload_many(paths, **ep_kw)
+                else:
+                    names = backend.upload_many(paths) if hasattr(backend, "upload_many") else [backend.upload(p) for p in paths]
+                g = backend.graph(rec["h3"], names, seg["seconds"], film["aspect"], seed)
+                job.put("segs", str(i), phase="submit")
+                task = backend.submit_with_retry(
+                    g,
+                    log=lambda detail: job.log(f"seg{i + 1}", detail),
+                    record_submission=lambda unknown: job.put("segs", str(i), submission_unknown=unknown, seed=seed, **extra_with_ep),
+                    **ep_kw,
+                )
+                job.put("segs", str(i), task=task, seed=seed, submitted=time.time(), submission_unknown=False, **extra_with_ep)
+                job.log("submitted", f"seg{i + 1}", f"seed {seed}", f"≈¥{backend.estimate_cny(seg['seconds'])}")
+                rec = job.state["segs"][str(i)]
+        elif provider_name == "comfyui":
+            endpoint_url = str(rec.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+            endpoint_url = _relocate_trycloudflare_endpoint(job, i, rec, endpoint_url)
+            comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=rec.get("comfyui_key_fp"))
+            if node_pool is not None and endpoint_url:
+                node_pool.reserve_inflight(endpoint_url)
+                reserved_inflight_endpoint = endpoint_url
+
+        provider_name = _video_provider_name(rec)
+        backend = comfy if provider_name == "comfyui" else rh
+        if provider_name == "comfyui" and not endpoint_url:
+            endpoint_url = str(rec.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+        ep_kw = _comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
+        extra_provider = {"provider": provider_name, **({"comfyui_url": endpoint_url} if provider_name == "comfyui" and endpoint_url else {})}
+        job.put("segs", str(i), phase="poll")
+        poll_interval = 5 if provider_name == "comfyui" else 20
+        poll_limit = 1440 if provider_name == "comfyui" else 360
+        started_at = float(rec.get("submitted") or time.time())
+        last_progress_sig = None
+        last_progress_log = 0.0
+        last_progress_save = 0.0
+        for _ in range(poll_limit):
+            try:
+                st = backend.poll(rec["task"], **ep_kw) if provider_name == "comfyui" else backend.poll(rec["task"])
+            except Exception as exc:
+                if provider_name == "comfyui" and node_pool is not None and endpoint_url:
+                    node_pool.mark_unhealthy(endpoint_url, f"{type(exc).__name__}: {str(exc)[:120]}")
+                    if leased_endpoint == endpoint_url:
+                        leased_endpoint = None
+                raise
+            if st["state"] != "running":
+                break
+            if provider_name == "comfyui":
+                now = time.time()
+                elapsed = max(0.0, now - started_at)
+                live_info = st if "stage" in st else comfy.live_progress(rec["task"], queued=bool(st.get("queued")), **ep_kw)
+                prog = comfy.progress_payload(live_info, elapsed_s=elapsed, endpoint=endpoint_url if multi_node else None)
+                sig = (prog["stage"], prog["step"], prog["max_steps"], prog["queue_position"])
+                if sig != last_progress_sig or (now - last_progress_save) >= 15.0:
+                    job.put("segs", str(i), live_progress=prog)
+                    last_progress_save = now
+                if sig != last_progress_sig or (now - last_progress_log) >= 20.0:
+                    job.log(
+                        "progress", f"seg{i + 1}",
+                        comfy.format_progress(live_info, elapsed_s=elapsed, include_node=multi_node),
+                    )
+                    last_progress_sig = sig
+                    last_progress_log = now
+            time.sleep(poll_interval)
+        else:
+            label = "ComfyUI" if provider_name == "comfyui" else "RunningHub"
+            raise RuntimeError(f"{label} poll timed out for seg{i + 1} task {rec['task']}")
+        with job.lock:
+            cur_seg = job.state["segs"].setdefault(str(i), {})
+            if "live_progress" in cur_seg:
+                cur_seg.pop("live_progress", None)
+                job.save()
+        if st["state"] == "failed":
+            err = st.get("error")
+            if provider_name == "comfyui" and st.get("prompt_lost") and node_pool is not None and endpoint_url:
+                node_pool.mark_unhealthy(endpoint_url, str(err or "prompt lost")[:120])
+                if leased_endpoint == endpoint_url:
+                    leased_endpoint = None
+            job.put("segs", str(i), terminal_failed=True, error=err, **extra_provider)
+            if err:
+                job.log("failed", f"seg{i + 1}", str(err))
+            raise RuntimeError(_terminal_failed_message(i + 1, job.file, err))
+        job.put("segs", str(i), phase="download")
+        if provider_name == "comfyui":
+            comfy.download(st["url"], out)
+        else:
+            http.download(st["url"], out)
+        job.put("segs", str(i), phase="tail")
+        media.last_frame(out, job.dir / "clips" / f"seg{i + 1}-last.jpg")
+        with job.lock:
+            cur = job.state["segs"].setdefault(str(i), {})
+            cur.pop("clip_prompts", None)
+            cur.pop("manual_rewrite", None)
+            cur.update(file=str(out), cny=st["cny"], coins=st.get("coins"), run_s=st.get("run_seconds"),
+                       wall_s=round(time.time() - float(rec.get("submitted") or time.time())), error=None, **extra_provider)
+            job.save()
+        job.log("done", f"seg{i + 1}", f"¥{st['cny']:.3f}", f"{st.get('run_seconds')} s on the GPU")
+        return job.state["segs"][str(i)]
+    finally:
+        if node_pool is not None:
+            if leased_endpoint is not None:
+                node_pool.release(leased_endpoint)
+            if reserved_inflight_endpoint is not None:
+                node_pool.release_inflight(reserved_inflight_endpoint)
 
 
 def _has_inflight_task(job: Job, seg: dict) -> bool:
@@ -655,7 +907,7 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                     if first_error is None:
                         first_error = exc
         elif inflight_segs:
-            pool = ThreadPoolExecutor(max(1, config.RH_CONCURRENCY))
+            pool = ThreadPoolExecutor(max(1, config.video_settings()["concurrency"]))
             try:
                 futures = [pool.submit(gen_segment, job, film, s, pics[s["idx"]]) for s in inflight_segs]
                 for future in futures:
@@ -689,26 +941,110 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
     else:
         inflight_segs = [s for s in segs if _has_inflight_task(job, s)]
         other_segs = [s for s in segs if not _has_inflight_task(job, s)]
+        vcfg = config.video_settings()
+        node_pool: comfy.ComfyNodePool | None = None
+        if vcfg["provider"] == "comfyui" and len(vcfg["comfyui_urls"]) > 1:
+            pending_new = [
+                s for s in other_segs
+                if not ((job.dir / "clips" / f"seg{s['idx'] + 1}.mp4").exists()
+                        and (job.state["segs"].get(str(s["idx"])) or {}).get("cny") is not None)
+            ]
+            if pending_new or inflight_segs:
+                node_pool = comfy.ComfyNodePool(
+                    vcfg["comfyui_urls"],
+                    api_key=vcfg["comfyui_api_key"],
+                    log=lambda detail: job.log("pool", detail),
+                )
+                if pending_new:
+                    node_pool.probe_all(fail_if_all_offline=not inflight_segs)
         abort = threading.Event()
+        configured_concurrency = max(1, vcfg["concurrency"])
+        new_seg_sem = threading.Semaphore(configured_concurrency)
+
+        def run_inflight(seg):
+            try:
+                if node_pool is not None:
+                    return gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool)
+                return gen_segment(job, film, seg, pics[seg["idx"]])
+            except BaseException:
+                abort.set()
+                if node_pool is not None:
+                    node_pool.notify_all()
+                raise
+
         def run_other(seg):
             if abort.is_set():
                 return
-            try:
-                gen_segment(job, film, seg, pics[seg["idx"]])
-            except BaseException:
-                abort.set()
-                raise
-        pool = ThreadPoolExecutor(max(1, config.RH_CONCURRENCY))
+            with new_seg_sem:
+                if abort.is_set():
+                    return
+                try:
+                    if node_pool is not None:
+                        gen_segment(job, film, seg, pics[seg["idx"]], node_pool=node_pool, abort=abort)
+                    else:
+                        gen_segment(job, film, seg, pics[seg["idx"]])
+                except comfy.DispatchAbortedError:
+                    return
+                except BaseException:
+                    abort.set()
+                    if node_pool is not None:
+                        node_pool.notify_all()
+                    raise
+
+        effective_workers = configured_concurrency
+        if node_pool is not None:
+            effective_workers = max(
+                len(inflight_segs),
+                min(effective_workers, max(1, node_pool.healthy_count() or len(node_pool.urls))),
+            )
+        pool = ThreadPoolExecutor(effective_workers)
         first_error = None
         try:
-            inflight_futures = [pool.submit(gen_segment, job, film, s, pics[s["idx"]]) for s in inflight_segs]
-            other_futures = [pool.submit(run_other, s) for s in other_segs]
+            # Pre-reserve ComfyUI inflight endpoints before dispatching new work so new segments never crowd inflight nodes.
+            inflight_pairs: list[tuple[dict, str | None]] = []
+            unsubmitted_reserved: list[str] = []
+            for s in inflight_segs:
+                res_ep: str | None = None
+                if node_pool is not None:
+                    rec_s = job.state["segs"].get(str(s["idx"])) or {}
+                    if _video_provider_name(rec_s) == "comfyui":
+                        ep_s = str(rec_s.get("comfyui_url") or "").strip() or (vcfg["comfyui_url"] or "")
+                        ep_s = _relocate_trycloudflare_endpoint(job, s["idx"], rec_s, ep_s) or ""
+                        if ep_s:
+                            node_pool.reserve_inflight(ep_s)
+                            res_ep = ep_s
+                            unsubmitted_reserved.append(ep_s)
+                inflight_pairs.append((s, res_ep))
+            try:
+                def run_inflight_releasing(seg, reserved_ep: str | None):
+                    try:
+                        return run_inflight(seg)
+                    finally:
+                        if node_pool is not None and reserved_ep:
+                            node_pool.release_inflight(reserved_ep)
+
+                inflight_futures = []
+                for s, res_ep in inflight_pairs:
+                    fut = pool.submit(run_inflight_releasing, s, res_ep)
+                    if res_ep and res_ep in unsubmitted_reserved:
+                        unsubmitted_reserved.remove(res_ep)
+                    inflight_futures.append(fut)
+                other_futures = [pool.submit(run_other, s) for s in other_segs]
+            finally:
+                if node_pool is not None:
+                    for leftover_ep in unsubmitted_reserved:
+                        node_pool.release_inflight(leftover_ep)
             for future in inflight_futures:
                 try:
                     future.result()
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
+                    abort.set()
+                    if node_pool is not None:
+                        node_pool.notify_all()
+                    for pending_future in other_futures:
+                        pending_future.cancel()
             for future in other_futures:
                 try:
                     future.result()
@@ -716,6 +1052,8 @@ def stage_generate(job: Job, film: dict, segs: list[dict], pics: dict, mode: str
                     if first_error is None:
                         first_error = exc
                     abort.set()
+                    if node_pool is not None:
+                        node_pool.notify_all()
                     for pending_future in other_futures:
                         pending_future.cancel()
             if first_error is not None:

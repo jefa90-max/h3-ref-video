@@ -18,8 +18,8 @@ from .directories import create_output_directory
 
 ARTIFACT_TYPES = {".mp4": "video", ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
                   ".md": "report", ".txt": "file", ".json": "file"}
-SECRET_NAMES = ("RUNNINGHUB_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY",
-                "VISION_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+SECRET_NAMES = ("RUNNINGHUB_API_KEY", "COMFYUI_API_KEY", "APIMART_API_KEY", "LLM_API_KEY", "GEMINI_API_KEY",
+                "VISION_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "NGROK_AUTHTOKEN")
 
 
 def write_json(path, value):
@@ -75,6 +75,16 @@ def _dirty_affected_segments(saved, out, total_segs):
     if saved.get("frames") == "shot":
         return {int(d) for d in dirty}
     return {num for num in range(1, total_segs + 1) if any(num >= int(d) for d in dirty)}
+
+
+def _video_env_signature(env):
+    vcfg = config.video_settings(env)
+    return (
+        vcfg["provider"],
+        tuple(vcfg["comfyui_urls"]),
+        (env.get("COMFYUI_API_KEY") or "").strip(),
+        (env.get("RUNNINGHUB_API_KEY") or "").strip(),
+    )
 
 
 def worker_locked(output_dir):
@@ -149,6 +159,9 @@ class Jobs:
         self.children = {}
         self.secrets = set()
         self.closing = False
+        self._probing_launch = False
+        self.before_video_launch = None
+        self.env_provider = None
         (storage / "jobs").mkdir(parents=True, exist_ok=True)
         for path in sorted((storage / "jobs").glob("*.json")):
             try:
@@ -244,9 +257,12 @@ class Jobs:
         if record["kind"] == "one" and any(a["name"] == "clip.mp4" for a in artifacts):
             result["progress"]["clips"] = 1
         result.update(storyboard=[], character_references=[], pending_video=False, can_continue=False, review=None, review_needed=False,
-                      segments=[], assembly=None, pending_assembly=False, can_assemble=False, can_rewrite_prompts=False, missing_h3_count=0)
+                      segments=[], assembly=None, pending_assembly=False, can_assemble=False, can_rewrite_prompts=False, missing_h3_count=0,
+                      live_progress=None)
         if record["kind"] == "one":
             one_state = context["state"]
+            if record["status"] in ("queued", "running") and isinstance(one_state.get("live_progress"), dict):
+                result["live_progress"] = dict(one_state["live_progress"])
             result["can_resume_video"] = not bool(
                 (one_state.get("submission_unknown") and not one_state.get("task"))
                 or one_state.get("terminal_failed")
@@ -290,6 +306,8 @@ class Jobs:
             for card in result["segments"]:
                 if card.get("error"):
                     card["error"] = self.redact(str(card["error"]))
+                if record["status"] in ("queued", "running") and result["live_progress"] is None and isinstance(card.get("live_progress"), dict):
+                    result["live_progress"] = {"segment": card["number"], **card["live_progress"]}
             result["segment_number"] = saved.get("segment") if saved.get("operation") in ("segment", "rewrite_segment") else None
             unfinished = [card for card in result['segments'] if not card['url'] or card['task_pending']]
             raw_pending_seg = context['pending']
@@ -408,8 +426,34 @@ class Jobs:
             selected = newest[:limit] if limit else newest
             return [self.snapshot(record["id"], False) for record in selected]
 
-    def available(self):
-        if self.closing or self.children or any(r["status"] in ("queued", "running") for r in self.records.values()):
+    def has_active_work(self):
+        with self.lock:
+            return any(
+                r.get("status") in ("queued", "running")
+                and not r.get("demo")
+                for r in self.records.values()
+            )
+
+    def has_active_video_work(self):
+        with self.lock:
+            return any(
+                r.get("status") in ("queued", "running")
+                and not r.get("demo")
+                and r.get("operation", "pipeline") in ("pipeline", "segment")
+                for r in self.records.values()
+            )
+
+    def is_probing_launch(self):
+        with self.lock:
+            return bool(self._probing_launch)
+
+    def available(self, *, _allow_probing=False):
+        if (
+            self.closing
+            or (self._probing_launch and not _allow_probing)
+            or self.children
+            or any(r["status"] in ("queued", "running") for r in self.records.values())
+        ):
             raise InputError("busy")
         for record in self.records.values():
             if worker_locked(record.get("output_dir")):
@@ -425,6 +469,35 @@ class Jobs:
                     record.pop("pid", None)
                     self.save(record)
 
+    def _probe_before_video_launch(self, probe_request, env):
+        """Run before_video_launch outside self.lock while _probing_launch is reserved.
+        Re-probes at most once if /api/config changed video settings mid-probe."""
+        current_env = env
+        for attempt in range(2):
+            self.before_video_launch(probe_request, current_env)
+            if self.env_provider is None:
+                return current_env
+            with self.lock:
+                live_env = dict(self.env_provider())
+            if _video_env_signature(live_env) == _video_env_signature(current_env):
+                return current_env
+            if attempt == 1:
+                raise InputError("busy")
+            preflight(probe_request, live_env)
+            current_env = live_env
+        return current_env
+
+    def _refresh_env_under_lock(self, probe_request, env):
+        """Re-check live env under self.lock after probing so /api/config cannot race with launch."""
+        if self.env_provider is None:
+            return env
+        live_env = dict(self.env_provider())
+        if _video_env_signature(live_env) != _video_env_signature(env):
+            raise InputError("busy")
+        if live_env != env:
+            preflight(probe_request, live_env)
+        return live_env
+
     def create(self, payload, env, lang):
         request = validate(payload, self.root)
         if request["operation"] == "frame":
@@ -438,8 +511,9 @@ class Jobs:
         request.pop("reset_applied", None)
         request.pop("resume_frame_tasks", None)
         preflight(request, env)
-        with self.lock:
-            self.available()
+        probe_request = {**request, "lang": lang}
+
+        def _commit(launch_env):
             identifier = uuid.uuid4().hex[:12]
             if request.get("output_root") and not request["output_dir"]:
                 output = create_output_directory(request["output_root"], self.root, self.storage)
@@ -463,8 +537,32 @@ class Jobs:
                       "operation": request["operation"]}
             self.records[identifier] = record
             self.save(record)
-            self.launch(record, request, env)
+            self.launch(record, request, launch_env)
             return self.snapshot(identifier)
+
+        probing = False
+        try:
+            with self.lock:
+                self.available()
+                if self.env_provider is not None:
+                    live_env = dict(self.env_provider())
+                    if live_env != env:
+                        preflight(request, live_env)
+                        env = live_env
+                if self.before_video_launch is not None and not request["demo"] and request["kind"] == "one":
+                    self._probing_launch = True
+                    probing = True
+                else:
+                    return _commit(env)
+            env = self._probe_before_video_launch(probe_request, env)
+            with self.lock:
+                self.available(_allow_probing=True)
+                env = self._refresh_env_under_lock(probe_request, env)
+                return _commit(env)
+        finally:
+            if probing:
+                with self.lock:
+                    self._probing_launch = False
 
     def edit_frame(self, identifier, key, prompt, env, character_reference_paths=None):
         from h3ref import frames
@@ -575,8 +673,9 @@ class Jobs:
     def continue_film(self, identifier, env, confirmation=None):
         from . import segments
         from .storyboard import frame_edit_task_pending, read_json, review_state
-        with self.lock:
-            self.available()
+
+        def _prepare_continue(check_env, *, allow_probing=False):
+            self.available(_allow_probing=allow_probing)
             record = self.find(identifier)
             snapshot = self.snapshot(identifier)
             if not snapshot["can_continue"]:
@@ -626,10 +725,14 @@ class Jobs:
             )
             if seg_changed or rw_changed:
                 request["_reconciled_segs"] = reconciled_segs
+            probe_req = dict(request)
             try:
-                preflight(request, env)
+                preflight(request, check_env)
             finally:
                 request.pop("_reconciled_segs", None)
+            return record, snapshot, out, request, seg_pending, affected, probe_req
+
+        def _commit_continue(record, snapshot, out, request, seg_pending, affected, launch_env):
             if confirmation:
                 review = review_state(out)
                 review["confirmed_version"] = snapshot["review"]["version"]
@@ -638,7 +741,28 @@ class Jobs:
                 in_affected = seg_pending.get("number") in affected
                 segments.reconcile_pending_segment(out, keep_pending=not in_affected, supersede=in_affected)
             segments.reconcile_pending_prompt_rewrite(out, request, archive_single_except=0, clear_all=True, redo_numbers=affected)
-            return self.restart(record, request, env)
+            return self.restart(record, request, launch_env)
+
+        probing = False
+        try:
+            with self.lock:
+                if self.env_provider is not None:
+                    env = dict(self.env_provider())
+                record, snapshot, out, request, seg_pending, affected, probe_request = _prepare_continue(env)
+                if self.before_video_launch is not None and not request["demo"]:
+                    self._probing_launch = True
+                    probing = True
+                else:
+                    return _commit_continue(record, snapshot, out, request, seg_pending, affected, env)
+            env = self._probe_before_video_launch(probe_request, env)
+            with self.lock:
+                env = self._refresh_env_under_lock(probe_request, env)
+                record, snapshot, out, request, seg_pending, affected, _ = _prepare_continue(env, allow_probing=True)
+                return _commit_continue(record, snapshot, out, request, seg_pending, affected, env)
+        finally:
+            if probing:
+                with self.lock:
+                    self._probing_launch = False
 
     def restart(self, record, request, env):
         if record["kind"] == "film":
@@ -653,8 +777,9 @@ class Jobs:
 
     def start_video_operation(self, identifier, operation, env, version=None, number=None, *, prompt=None, prompt_format=None, prompt_version=None, scope=None, edited=None):
         from . import segments
-        with self.lock:
-            self.available()
+
+        def _prepare_video_op(check_env, *, allow_probing=False):
+            self.available(_allow_probing=allow_probing)
             record = self.find(identifier)
             if record["kind"] != "film" or record["status"] not in ("succeeded", "failed", "interrupted"):
                 raise InputError("segment_operation")
@@ -685,8 +810,14 @@ class Jobs:
             elif operation == "rewrite_prompts":
                 request.pop("segment", None)
                 request["rewrite_scope"] = scope
-            preflight(request, env)
-            request.pop("_segment_preparation", None)
+            probe_req = dict(request)
+            try:
+                preflight(request, check_env)
+            finally:
+                request.pop("_segment_preparation", None)
+            return record, request, probe_req
+
+        def _commit_video_op(record, request, launch_env):
             if operation == "segment":
                 request["segment_revision"] = segments.prepare_regeneration(request, number, version, prompt=prompt, prompt_format=prompt_format, prompt_version=prompt_version)
             elif operation == "rewrite_segment":
@@ -695,17 +826,38 @@ class Jobs:
                 request["segment_revision"] = segments.prepare_rewrite_prompts(request, scope=scope)
             else:
                 segments.prepare_assembly(request, version)
-            return self.restart(record, request, env)
+            return self.restart(record, request, launch_env)
+
+        probing = False
+        try:
+            with self.lock:
+                if self.env_provider is not None:
+                    env = dict(self.env_provider())
+                record, request, probe_request = _prepare_video_op(env)
+                if self.before_video_launch is not None and not request["demo"] and operation == "segment":
+                    self._probing_launch = True
+                    probing = True
+                else:
+                    return _commit_video_op(record, request, env)
+            env = self._probe_before_video_launch(probe_request, env)
+            with self.lock:
+                env = self._refresh_env_under_lock(probe_request, env)
+                record, request, _ = _prepare_video_op(env, allow_probing=True)
+                return _commit_video_op(record, request, env)
+        finally:
+            if probing:
+                with self.lock:
+                    self._probing_launch = False
 
     def resume(self, identifier, env):
-        with self.lock:
+        def _prepare_resume(check_env, *, allow_probing=False):
             record = self.find(identifier)
             snapshot = self.snapshot(identifier)
             remaining_frames = bool(snapshot.get('can_resume_frames'))
             remaining_pipeline = bool(snapshot.get('can_resume_pipeline'))
             if record["status"] not in ("failed", "interrupted") and not remaining_frames and not remaining_pipeline:
                 raise InputError("resume")
-            self.available()
+            self.available(_allow_probing=allow_probing)
             out_dir = Path(record["output_dir"])
             request = json.loads((out_dir / "inputs" / "request.json").read_text(encoding="utf-8"))
             if remaining_pipeline:
@@ -769,10 +921,14 @@ class Jobs:
                         for k, rec in reconciled_segs.items()
                     }
                 request["_reconciled_segs"] = reconciled_segs
+            probe_req = dict(request)
             try:
-                preflight(request, env)
+                preflight(request, check_env)
             finally:
                 request.pop("_reconciled_segs", None)
+            return record, out_dir, request, remaining_frames, remaining_pipeline, has_inflight_segments, unblock_pipeline, probe_req
+
+        def _commit_resume(record, out_dir, request, remaining_frames, remaining_pipeline, has_inflight_segments, unblock_pipeline, launch_env):
             if remaining_pipeline:
                 from . import segments
                 segments.reconcile_pending_segment(out_dir, keep_pending=False, supersede=False, drain_siblings=has_inflight_segments)
@@ -811,7 +967,28 @@ class Jobs:
                                 error=pending_frame["error"], task=None, task_failed=False, moderation_error=None,
                             )
                 (out_dir / "inputs" / "frame-edit.json").unlink(missing_ok=True)
-            return self.restart(record, request, env)
+            return self.restart(record, request, launch_env)
+
+        probing = False
+        try:
+            with self.lock:
+                if self.env_provider is not None:
+                    env = dict(self.env_provider())
+                record, out_dir, request, remaining_frames, remaining_pipeline, has_inflight_segments, unblock_pipeline, probe_request = _prepare_resume(env)
+                if self.before_video_launch is not None and not request["demo"]:
+                    self._probing_launch = True
+                    probing = True
+                else:
+                    return _commit_resume(record, out_dir, request, remaining_frames, remaining_pipeline, has_inflight_segments, unblock_pipeline, env)
+            env = self._probe_before_video_launch(probe_request, env)
+            with self.lock:
+                env = self._refresh_env_under_lock(probe_request, env)
+                record, out_dir, request, remaining_frames, remaining_pipeline, has_inflight_segments, unblock_pipeline, _ = _prepare_resume(env, allow_probing=True)
+                return _commit_resume(record, out_dir, request, remaining_frames, remaining_pipeline, has_inflight_segments, unblock_pipeline, env)
+        finally:
+            if probing:
+                with self.lock:
+                    self._probing_launch = False
 
     def launch(self, record, request, env):
         self.remember_secrets(env)

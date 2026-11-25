@@ -1,6 +1,7 @@
 """Keys, endpoints and defaults. Keys come from the environment or a `.env` file at the repo root (see `.env.example`);
 they are read, never written or logged."""
 import os
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -59,7 +60,7 @@ def atomic_replace(source: Path, target: Path, *, sleep=time.sleep):
             sleep(min(0.05 * 2 ** attempt, 0.5))
 
 
-_SEEDED_DOTENV = _load_env_file()
+_SEEDED_DOTENV = {} if "unittest" in sys.modules and os.environ.get("H3_FORCE_DOTENV") != "1" else _load_env_file()
 
 
 def load_server_env(env_path: Path = ROOT / ".env") -> dict[str, str]:
@@ -89,12 +90,188 @@ def need(name: str, what: str) -> str:
 RH_BASE = env("RUNNINGHUB_BASE", "https://www.runninghub.cn")
 RH_WORKFLOW_ID = "2113525277564424193"
 RH_GRAPH = ROOT / "workflows/h3-ref2va-turbo.json"
+COMFY_GRAPH = ROOT / "workflows/comfy-h3-ref2va.json"
 RH_CONCURRENCY = int(env("RUNNINGHUB_CONCURRENCY", "3"))          # set to the account's API allowance; website tasks share it
 RH_COIN_CNY = float(env("RUNNINGHUB_COIN_CNY", str(399 / 180000)))  # what one RH coin cost you (Max monthly: ¥399 for 180k)
 H3_STEPS = int(env("H3_STEPS", "20"))
 SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
+COMFY_RESOLUTIONS = {
+    "768p": {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (1024, 1024)},
+    "544p": {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)},
+}
+COMFY_SIZES = COMFY_RESOLUTIONS["768p"]
+VIDEO_PROVIDERS = ("runninghub", "comfyui")
+COLAB_GPUS = ("G4", "A100", "H100")
+COMFY_PRESETS = {
+    "full20": {
+        "steps": 20,
+        "enable_lora": False,
+        "enable_easycache": True,
+        "enable_sparse_attention": True,
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "sampler": "res_multistep",
+        "scheduler": "beta",
+    },
+    "8step": {
+        "steps": 8,
+        "enable_lora": True,
+        "enable_easycache": False,
+        "enable_sparse_attention": False,
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "sampler": "res_multistep",
+        "scheduler": "beta",
+    },
+    "4step": {
+        "steps": 4,
+        "enable_lora": True,
+        "enable_easycache": False,
+        "enable_sparse_attention": False,
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+    },
+}
+COLAB_AUTH_MODES = ("oauth2", "adc")
 MAX_IMAGES = 9                                                     # the workflow's nine LoadImage inputs
 MIN_SECONDS, MAX_SECONDS = 5, 15
+
+
+def _parse_positive_int(raw: str, name: str) -> int:
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{name}={raw!r} must be >= 1")
+    return parsed
+
+
+def validate_endpoint_url(raw: str, name: str) -> str:
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    try:
+        parts = urlsplit(cleaned)
+        _ = parts.port
+    except ValueError as exc:
+        raise ValueError(f"{name} invalid URL") from exc
+    if parts.username or parts.password:
+        raise ValueError(f"{name} must not contain embedded credentials")
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname or parts.query or parts.fragment:
+        raise ValueError(f"{name}={cleaned!r} must be a clean http(s) URL")
+    return cleaned.rstrip("/")
+
+
+def parse_endpoint_urls(raw: str, name: str) -> list[str]:
+    """Parse one or more comma/newline-separated http(s) endpoint URLs, preserving order and deduplicating."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return []
+    parts: list[str] = []
+    for line in cleaned.splitlines():
+        for chunk in line.split(","):
+            item = chunk.strip()
+            if item:
+                parts.append(item)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        url = validate_endpoint_url(part, name)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def format_endpoint_urls(urls: list[str]) -> str:
+    return ",".join(urls)
+
+
+def comfy_requires_api_key(comfyui_url: str | list[str]) -> bool:
+    if not comfyui_url:
+        return False
+    if isinstance(comfyui_url, (list, tuple)):
+        candidates = list(comfyui_url)
+    else:
+        raw = str(comfyui_url).strip()
+        if not raw:
+            return False
+        candidates = [chunk.strip() for line in raw.splitlines() for chunk in line.split(",") if chunk.strip()]
+    for url in candidates:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            continue
+        if parts.scheme.lower() == "https":
+            return True
+    return False
+
+
+def video_settings(environ=None) -> dict:
+    values = os.environ if environ is None else environ
+    provider = values.get("VIDEO_PROVIDER", "").strip().lower() or "runninghub"
+    if provider not in VIDEO_PROVIDERS:
+        raise ValueError(f"VIDEO_PROVIDER={provider!r} (runninghub | comfyui)")
+    preset = values.get("COMFYUI_PRESET", "").strip().lower() or "full20"
+    if preset not in COMFY_PRESETS:
+        raise ValueError(f"COMFYUI_PRESET={preset!r} (full20 | 8step | 4step)")
+    resolution = values.get("COMFYUI_RESOLUTION", "").strip().lower() or "768p"
+    if resolution not in COMFY_RESOLUTIONS:
+        raise ValueError(f"COMFYUI_RESOLUTION={resolution!r} (768p | 544p)")
+    comfyui_urls = parse_endpoint_urls(values.get("COMFYUI_URL", ""), "COMFYUI_URL")
+    comfyui_url = comfyui_urls[0] if comfyui_urls else ""
+    comfyui_api_key = values.get("COMFYUI_API_KEY", "").strip()
+    raw_upscale = values.get("COMFYUI_UPSCALE", "").strip().lower() or "0"
+    if raw_upscale in ("0", "false", "no", "off"):
+        comfyui_upscale = False
+    elif raw_upscale in ("1", "true", "yes", "on"):
+        comfyui_upscale = True
+    else:
+        raise ValueError(f"COMFYUI_UPSCALE={raw_upscale!r} (0 | 1)")
+    raw_comfy_conc = values.get("COMFYUI_CONCURRENCY", "").strip()
+    if raw_comfy_conc:
+        comfy_concurrency = _parse_positive_int(raw_comfy_conc, "COMFYUI_CONCURRENCY")
+        comfy_concurrency_explicit = True
+    else:
+        comfy_concurrency = max(1, len(comfyui_urls))
+        comfy_concurrency_explicit = False
+    raw_rh_conc = values.get("RUNNINGHUB_CONCURRENCY", "").strip()
+    rh_concurrency = _parse_positive_int(raw_rh_conc, "RUNNINGHUB_CONCURRENCY") if raw_rh_conc else RH_CONCURRENCY
+    colab_session = values.get("COLAB_SESSION", "").strip() or "comfy-a100"
+    colab_gpu = values.get("COLAB_GPU", "").strip().upper() or "G4"
+    if colab_gpu not in COLAB_GPUS:
+        raise ValueError(f"COLAB_GPU={colab_gpu!r} (G4 | A100 | H100)")
+    raw_auto = values.get("COLAB_AUTO_START", "").strip().lower() or "0"
+    if raw_auto in ("0", "false", "no", "off"):
+        colab_auto_start = False
+    elif raw_auto in ("1", "true", "yes", "on"):
+        colab_auto_start = True
+    else:
+        raise ValueError(f"COLAB_AUTO_START={raw_auto!r} (0 | 1)")
+    colab_bin = values.get("COLAB_BIN", "").strip()
+    colab_auth = values.get("COLAB_AUTH", "").strip().lower()
+    if colab_auth and colab_auth not in COLAB_AUTH_MODES:
+        raise ValueError(f"COLAB_AUTH={colab_auth!r} (oauth2 | adc)")
+    return {
+        "provider": provider,
+        "comfyui_url": comfyui_url,
+        "comfyui_urls": comfyui_urls,
+        "comfyui_urls_text": format_endpoint_urls(comfyui_urls),
+        "comfyui_api_key": comfyui_api_key,
+        "comfy_requires_key": comfy_requires_api_key(comfyui_urls),
+        "comfyui_preset": preset,
+        "comfyui_resolution": resolution,
+        "comfyui_upscale": comfyui_upscale,
+        "comfyui_concurrency": comfy_concurrency,
+        "comfyui_concurrency_explicit": comfy_concurrency_explicit,
+        "runninghub_concurrency": rh_concurrency,
+        "concurrency": comfy_concurrency if provider == "comfyui" else rh_concurrency,
+        "colab_session": colab_session,
+        "colab_gpu": colab_gpu,
+        "colab_auto_start": colab_auto_start,
+        "colab_bin": colab_bin,
+        "colab_auth": colab_auth,
+    }
 
 
 def max_shots() -> int:
@@ -154,6 +331,24 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36"
 
 def rh_key() -> str:
     return need("RUNNINGHUB_API_KEY", "RunningHub 的 API key，控制台「API 调用」里拿")
+
+
+def comfy_urls(environ=None) -> list[str]:
+    urls = video_settings(environ)["comfyui_urls"]
+    if urls:
+        return urls
+    return parse_endpoint_urls(
+        need("COMFYUI_URL", "远端 ComfyUI 隧道地址（支持逗号分隔多节点），例如 https://xxx.ngrok-free.dev"),
+        "COMFYUI_URL",
+    )
+
+
+def comfy_url(environ=None) -> str:
+    return comfy_urls(environ)[0]
+
+
+def comfy_key(environ=None) -> str:
+    return video_settings(environ)["comfyui_api_key"]
 
 
 def apimart_key() -> str:

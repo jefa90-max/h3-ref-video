@@ -181,9 +181,19 @@ def preview_reconciled_segments(out, records=None, *, keep_pending=False, supers
                 rec.pop('attempt_blocked', None)
                 rec.update(terminal_failed=True, task=staged.get('task'),
                            error=staged.get('error') or pending.get('error'), file=None, cny=None)
+                if staged.get('provider'):
+                    rec['provider'] = staged['provider']
+                else:
+                    rec.pop('provider', None)
+                if staged.get('comfyui_url'):
+                    rec['comfyui_url'] = staged['comfyui_url']
+                else:
+                    rec.pop('comfyui_url', None)
+                rec.pop('live_progress', None)
                 changed = True
             elif not staged.get('task') and not staged.get('submission_unknown'):
-                for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
+                for stale_key in ('task', 'provider', 'comfyui_url', 'comfyui_key_fp', 'live_progress',
+                                  'terminal_failed', 'submission_unknown', 'submitted',
                                   'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                                   'error_code', 'attempt_blocked'):
                     if rec.pop(stale_key, None) is not None:
@@ -683,6 +693,7 @@ def view(request, artifacts, editable, *, context=None, editable_numbers=None):
                       'h3_missing': bool((pending_src_draft and pending_src_draft != pair['source']) or segment_needs_h3_rewrite(record, pair, automatic, has_clip=bool(version), rewrite_required=src_rewrite_req)),
                       'automatic_source_prompt': automatic['source'], 'source_changed': bool(override.get('source_version') and override['source_version'] != automatic['source_version']),
                       'error': error, 'attempt_error': pending.get('attempt_error') or unapplied.get('attempt_error'), 'task_pending': task_pending,
+                      'live_progress': attempted.get('live_progress') if (task_pending and isinstance(attempted.get('live_progress'), dict)) else None,
                       'submission_unknown': unknown, 'terminal_failed': terminal, 'attempt_revision': single_rw.get('revision') or pending.get('revision') or unapplied.get('revision') or record.get('revision'),
                       'applied_revision': record.get('revision'), 'publishing': publishing, 'reference_images': references,
                       'reference_history_known': 'reference_images' in record, 'references_for_regeneration': True,
@@ -752,8 +763,22 @@ def preflight(request, env):
         raise InputError('segment_terminal', number=request['segment'])
     if staged.get('submission_unknown') and not staged.get('task'):
         raise InputError('segment_locked', number=request['segment'])
-    if not env.get('RUNNINGHUB_API_KEY', '').strip():
-        raise InputError('keys', names='RUNNINGHUB_API_KEY')
+    from .inputs import invalid, resumable_comfyui_state, video_provider_missing_keys
+    if staged.get('task'):
+        seg_provider = staged.get('provider') or 'runninghub'
+    else:
+        try:
+            seg_provider = config.video_settings(env)['provider']
+        except ValueError:
+            invalid('COMFYUI_URL', '[URL]', 'choice')
+    check_env = env
+    if seg_provider == 'comfyui' and staged.get('task'):
+        saved_urls, needs_pool = resumable_comfyui_state(request, env)
+        if saved_urls and not needs_pool:
+            check_env = {**env, 'COMFYUI_URL': config.format_endpoint_urls(saved_urls)}
+    missing_video = video_provider_missing_keys(seg_provider, check_env)
+    if missing_video:
+        raise InputError('keys', names=', '.join(missing_video))
     if staged.get('task'):
         return
     if pending.get('prompt_format') == 'source' and not pending.get('reuse_h3') and not staged.get('h3'):
@@ -1123,6 +1148,15 @@ def prepare_rewrite_segment(request, number, *, prompt=None, prompt_format=None,
                     cur_rec.pop('attempt_blocked', None)
                     cur_rec.update(terminal_failed=True, task=staged_rec.get('task'),
                                    error=staged_rec.get('error') or existing_seg.get('error'), file=None, cny=None)
+                    if staged_rec.get('provider'):
+                        cur_rec['provider'] = staged_rec['provider']
+                    else:
+                        cur_rec.pop('provider', None)
+                    if staged_rec.get('comfyui_url'):
+                        cur_rec['comfyui_url'] = staged_rec['comfyui_url']
+                    else:
+                        cur_rec.pop('comfyui_url', None)
+                    cur_rec.pop('live_progress', None)
                     fjob.state['segs'][idx_str] = cur_rec
                     fjob.save()
             (out / 'inputs' / 'segment-edit.json').unlink(missing_ok=True)
@@ -1277,8 +1311,18 @@ def _execute_rewrite_targets(request):
                     if staged_rec.get('terminal_failed'):
                         rec.update(terminal_failed=True, task=staged_rec.get('task'),
                                    error=staged_rec.get('error') or existing_seg_edit.get('error'))
+                        if staged_rec.get('provider'):
+                            rec['provider'] = staged_rec['provider']
+                        else:
+                            rec.pop('provider', None)
+                        if staged_rec.get('comfyui_url'):
+                            rec['comfyui_url'] = staged_rec['comfyui_url']
+                        else:
+                            rec.pop('comfyui_url', None)
+                        rec.pop('live_progress', None)
                     elif not staged_rec.get('task') and not staged_rec.get('submission_unknown'):
-                        for stale_key in ('task', 'terminal_failed', 'submission_unknown', 'submitted',
+                        for stale_key in ('task', 'provider', 'comfyui_url', 'comfyui_key_fp', 'live_progress',
+                                          'terminal_failed', 'submission_unknown', 'submitted',
                                           'phase', 'seed', 'file', 'cny', 'coins', 'run_s', 'wall_s',
                                           'error_code', 'attempt_blocked'):
                             rec.pop(stale_key, None)

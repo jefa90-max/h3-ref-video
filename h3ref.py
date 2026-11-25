@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from h3ref import check, config, film, http, media, rewrite, rh  # noqa: E402
+from h3ref import check, comfy, config, film, http, media, rewrite, rh  # noqa: E402
 from h3ref.i18n import message  # noqa: E402
 
 
@@ -57,37 +57,123 @@ def cmd_one(a):
         (out / "prompt.h3.txt").write_text(st["h3"], encoding="utf-8")
         save()
         print("改写好了：", out / "prompt.h3.txt")
+    provider_name = (
+        str(st.get("provider") or "runninghub").strip().lower()
+        if (st.get("task") or st.get("submission_unknown"))
+        else config.video_settings()["provider"]
+    )
+    backend = comfy if provider_name == "comfyui" else rh
+    endpoint_url = str(st.get("comfyui_url") or "").strip() or None
     if not st.get("task"):
         if st.get("submission_unknown"):
-            raise RuntimeError(message("submission_unknown", number=1, path=state_file))
-        names = [rh.upload(p) for p in images]
+            unknown_key = "comfy_submission_unknown" if provider_name == "comfyui" else "submission_unknown"
+            raise RuntimeError(message(unknown_key, number=1, path=state_file))
+        if provider_name == "comfyui":
+            endpoint_url = film._select_single_comfy_endpoint(log=lambda detail: print(detail, flush=True))
+        ep_kw = film._comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
+        if provider_name == "comfyui":
+            names = comfy.upload_many(images, **ep_kw)
+        else:
+            names = backend.upload_many(images) if hasattr(backend, "upload_many") else [backend.upload(p) for p in images]
         st["seed"] = a.seed if a.seed is not None else random.randrange(10 ** 14, 10 ** 15)
-        g = rh.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
+        g = backend.graph(st["h3"], names, a.seconds, a.aspect, st["seed"])
         def record_submission(unknown):
+            st["provider"] = provider_name
+            if provider_name == "comfyui" and endpoint_url:
+                st["comfyui_url"] = endpoint_url
+                key_fp = comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+                if key_fp:
+                    st["comfyui_key_fp"] = key_fp
             st["submission_unknown"] = unknown
             save()
-        st["task"] = rh.submit_with_retry(g, log=lambda detail: print(detail, flush=True),
-                                           record_submission=record_submission)
+        st["task"] = backend.submit_with_retry(
+            g,
+            log=lambda detail: print(detail, flush=True),
+            record_submission=record_submission,
+            **ep_kw,
+        )
+        st["provider"] = provider_name
+        if provider_name == "comfyui" and endpoint_url:
+            st["comfyui_url"] = endpoint_url
+            key_fp = comfy.key_fingerprint(comfy.key_for_endpoint(endpoint_url, config.comfy_key()))
+            if key_fp:
+                st["comfyui_key_fp"] = key_fp
         st["submission_unknown"] = False
         save()
-        print(f"已提交，预计 ¥{rh.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
-    for _ in range(360):
-        res = rh.poll(st["task"])
+        print(f"已提交，预计 ¥{backend.estimate_cny(a.seconds)}、4–6 分钟", flush=True)
+    else:
+        if provider_name == "comfyui":
+            endpoint_url = str(st.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+            if endpoint_url and film._is_trycloudflare_url(endpoint_url):
+                cur_urls = config.video_settings()["comfyui_urls"]
+                if endpoint_url not in cur_urls:
+                    for cand in cur_urls:
+                        if cand == endpoint_url or not film._is_trycloudflare_url(cand):
+                            continue
+                        try:
+                            comfy.assert_resume_endpoint_key_allowed(cand, expected_key_fp=st.get("comfyui_key_fp"))
+                        except RuntimeError:
+                            continue
+                        if comfy.has_task(st["task"], base_url=cand):
+                            print(f"重定位任务：{comfy.endpoint_label(endpoint_url)} -> {comfy.endpoint_label(cand)}", flush=True)
+                            endpoint_url = cand
+                            st["comfyui_url"] = cand
+                            save()
+                            break
+            comfy.assert_resume_endpoint_key_allowed(endpoint_url, expected_key_fp=st.get("comfyui_key_fp"))
+    provider_name = str(st.get("provider") or "runninghub").strip().lower()
+    backend = comfy if provider_name == "comfyui" else rh
+    if provider_name == "comfyui" and not endpoint_url:
+        endpoint_url = str(st.get("comfyui_url") or "").strip() or (config.video_settings()["comfyui_url"] or None)
+    ep_kw = film._comfy_endpoint_kwargs(endpoint_url) if provider_name == "comfyui" else {}
+    multi_node = provider_name == "comfyui" and len(config.video_settings()["comfyui_urls"]) > 1
+    poll_interval = 5 if provider_name == "comfyui" else 20
+    poll_limit = 1440 if provider_name == "comfyui" else 360
+    last_progress_sig = None
+    last_progress_log = 0.0
+    last_progress_save = 0.0
+    for _ in range(poll_limit):
+        res = backend.poll(st["task"], **ep_kw) if provider_name == "comfyui" else backend.poll(st["task"])
         if res["state"] != "running":
             break
-        time.sleep(20)
+        if provider_name == "comfyui":
+            now = time.time()
+            elapsed = max(0.0, now - t0)
+            live_info = res if "stage" in res else comfy.live_progress(st["task"], queued=bool(res.get("queued")), **ep_kw)
+            prog = comfy.progress_payload(live_info, elapsed_s=elapsed, endpoint=endpoint_url if multi_node else None)
+            sig = (prog["stage"], prog["step"], prog["max_steps"], prog["queue_position"])
+            if sig != last_progress_sig or (now - last_progress_save) >= 15.0:
+                st["live_progress"] = prog
+                save()
+                last_progress_save = now
+            if sig != last_progress_sig or (now - last_progress_log) >= 20.0:
+                print(f"进度：{comfy.format_progress(live_info, elapsed_s=elapsed, include_node=multi_node)}", flush=True)
+                last_progress_sig = sig
+                last_progress_log = now
+        time.sleep(poll_interval)
     else:
-        raise RuntimeError(f"RunningHub 轮询超时：{st['task']}")
+        label = "ComfyUI" if provider_name == "comfyui" else "RunningHub"
+        raise RuntimeError(f"{label} 轮询超时：{st['task']}")
+    if "live_progress" in st:
+        st.pop("live_progress", None)
+        save()
     if res["state"] == "failed":
         st.update(terminal_failed=True, error=res.get("error"))
         save()
         raise RuntimeError(message("one_terminal_failed", path=state_file))
-    http.download(res["url"], clip)
+    if provider_name == "comfyui":
+        comfy.download(res["url"], clip)
+    else:
+        http.download(res["url"], clip)
+    dur = media.duration(clip)
+    if dur <= 0:
+        clip.unlink(missing_ok=True)
+        raise RuntimeError(f"下载的成片无效（时长 {dur:.1f}s）：{clip}")
     st.update(cny=res["cny"], run_s=res.get("run_seconds"), wall_s=round(time.time() - t0))
     if config.SUBTITLE_CHECKS_ENABLED and (any(ord(ch) > 0x2E80 for ch in st["h3"]) or a.check):
         st["subtitles"] = check.subtitles(clip)
     save()
-    print(f"成片 {clip}，{media.duration(clip):.1f} 秒，¥{res['cny']:.3f}，GPU {res.get('run_seconds')} 秒")
+    print(f"成片 {clip}，{dur:.1f} 秒，¥{res['cny']:.3f}，GPU {res.get('run_seconds')} 秒")
     if (st.get("subtitles") or {}).get("burned_text"):
         print("注意：画面里烧了字幕/文字：", st["subtitles"].get("text"), "—— 换个种子（--seed）重跑，或者删掉那句台词")
 
@@ -131,8 +217,11 @@ def main():
     elif a.cmd == "rewrite":
         print(rewrite.rewrite(Path(a.prompt).read_text(encoding="utf-8"), a.images, a.seconds, a.aspect))
     else:
-        acc = rh.account()
-        print({k: acc.get(k) for k in ("remainCoins", "remainMoney", "currentTaskCounts") if k in acc})
+        if config.video_settings()["provider"] == "comfyui":
+            print(comfy.account())
+        else:
+            acc = rh.account()
+            print({k: acc.get(k) for k in ("remainCoins", "remainMoney", "currentTaskCounts") if k in acc})
 
 
 if __name__ == "__main__":
