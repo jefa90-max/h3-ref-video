@@ -17,14 +17,19 @@ import os
 import random
 import re
 import stat
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import check, comfy, config, frames, http, media, rewrite, rh, staging
+from . import check, comfy, config, frames, http, media, preflight, rewrite, rh, staging
 from .i18n import message
+from .preflight import (
+    DIALOGUE_RATE_CONFIG, FilmValidationError, check_dialogue_budget, escape_markdown_cell,
+    inspect_dialogue_budget, normalize_shots, normalize_speech, sanitize_line_preview,
+)
 from .staging import deduplicate_paths, group_cast_by_picture
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
@@ -74,12 +79,19 @@ def _num(x) -> str:
 
 # ------------------------------------------------------------------ the storyboard
 
-def load(path: Path, check_images: bool = True) -> dict:
-    film = json.loads(path.read_text(encoding="utf-8"))
+def load(path: Path, check_images: bool = True, *, normalized_times: bool = False) -> dict:
+    return _load_script(preflight.read_script(path), path, check_images=check_images, normalized_times=normalized_times)
+
+
+def _load_script(film, path, *, check_images=True, normalized_times=False):
+    if not isinstance(film, dict):
+        raise FilmValidationError("film_object_invalid", field="film")
     base = path.parent
     if film.get("aspect", "9:16") not in config.SIZES:
         raise SystemExit(f"aspect 只支持 {', '.join(config.SIZES)}")
     film.setdefault("aspect", "9:16")
+    if "speech" in film and not isinstance(film["speech"], str):
+        film["speech"] = ""
     for c in film.get("cast") or []:
         p = Path(c["picture"]).expanduser()
         c["picture"] = str((p if p.is_absolute() else (base / p)).resolve())
@@ -88,18 +100,7 @@ def load(path: Path, check_images: bool = True) -> dict:
     if film.get("board"):
         p = Path(film["board"]).expanduser()
         film["board"] = str((p if p.is_absolute() else (base / p)).resolve())
-    shots = [s for s in film.get("shots") or [] if (s.get("action") or "").strip()]
-    if not shots:
-        raise SystemExit("film.json 里没有镜头（shots）")
-    limit_shots = config.max_shots()
-    if len(shots) > limit_shots:
-        raise SystemExit(f"镜头数不能超过 {limit_shots}（当前 {len(shots)}）")
-    t = 0.0
-    for s in shots:                                    # times made continuous; a shot without times lasts 2 s
-        length = float(s["end"]) - float(s["start"]) if s.get("start") is not None and s.get("end") is not None else 2.0
-        s["start"], s["end"] = round(t, 2), round(t + max(0.5, length), 2)
-        t = s["end"]
-    film["shots"] = shots
+    film["shots"] = normalize_shots(film.get("shots"), strict=True, normalized_times=normalized_times)
     return film
 
 
@@ -187,7 +188,8 @@ def _clean_scene_text(scene: str) -> str:
     return re.sub(r"^场景(?:为|是|：|:)\s*", "", scene.strip()).rstrip("。；; ")
 
 
-def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compositions: dict[str, dict] | None = None) -> str:
+def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *,
+                   compositions: dict[str, dict] | None = None, shot_state_note: str | None = None) -> str:
     """The segment's prompt in Chinese, written the way you would for Seedance; rewrite.py turns it into H3's format."""
     frame_pic_numbers = {p["shot"]: idx for idx, p in enumerate(pics, 1) if p["kind"] == "frame"}
     compositions = {key: value for key, value in (compositions or {}).items()
@@ -254,6 +256,8 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     n = sum(len(p.get("active_cast") or [p["cast"]]) for p in pics if p["kind"] == "cast")
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
+    if shot_state_note:
+        lines.append(shot_state_note)
     out = [head, "\n".join(lines)]
     first_v3_scene = next(
         (_clean_scene_text(compositions[_frame_key(seg["idx"], j)]["scene"])
@@ -316,6 +320,7 @@ class Job:
         self.file = self.dir / "state.json"
         self.state = json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists() else {"frames": {}, "segs": {}}
         self.lock = threading.RLock()
+        self.preflight_override = None
 
     def save(self):
         with self.lock:
@@ -1078,7 +1083,9 @@ def stage_check(job: Job, film: dict, segs: list[dict]):
     """Burned-subtitle check on every segment with lines (and every segment when the film has any lines)."""
     if not config.SUBTITLE_CHECKS_ENABLED:
         return
-    if not film.get("speech") or not any((s.get("line") or "").strip() for s in film["shots"]):
+    if not normalize_speech(film.get("speech")) or not any(
+        isinstance(s.get("line"), str) and s["line"].strip() for s in film["shots"]
+    ):
         return
     total_segments = len(plan(film["shots"]))
     for seg in segs:
@@ -1097,6 +1104,154 @@ def stage_check(job: Job, film: dict, segs: list[dict]):
             job.log("SUBTITLES", f"seg{seg['idx'] + 1}", res.get("text"))
 
 
+def _read_preflight_snapshot(path):
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if (not isinstance(result, dict) or not isinstance(result.get("meta"), dict)
+            or not isinstance(result.get("warnings"), list)
+            or not all(isinstance(warning, dict) for warning in result["warnings"])
+            or result.get("status") not in ("complete", "partial", "unsupported", "invalid")):
+        raise ValueError("invalid preflight snapshot")
+    return result
+
+
+def _save_preflight_snapshot(path, result):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(result, stream, ensure_ascii=True, indent=2)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return _read_preflight_snapshot(path)
+        return result
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _log_preflight(job, result):
+    meta = result["meta"]
+    if meta.get("rate_config_fallback"):
+        job.log("preflight", "[WARN]", message("dialogue_rate_config_fallback"))
+    if result["status"] != "complete":
+        job.log("preflight", "[WARN]", preflight.summary_message(result, message))
+    for warning in result["warnings"]:
+        parts = ["preflight", "[WARN]"]
+        if warning["shot"] is not None:
+            parts.append(f"shot#{warning['shot']}")
+        parts.append(preflight.warning_message(warning, message))
+        preview = sanitize_line_preview(warning.get("line_preview", ""))
+        if preview:
+            parts.append(preview)
+        job.log(*parts)
+
+
+def _preflight_source_hash(script):
+    canonical = json.dumps(script, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _preflight_candidate(job, source, *, script=None, normalized_times=False):
+    if config.env("H3_SKIP_PREFLIGHT") == "1":
+        return None, False
+    try:
+        cached = _read_preflight_snapshot(job.dir / "inputs" / "preflight.json")
+        if cached is not None:
+            before = cached["meta"].get("source_sha256")
+            if normalized_times or script is None or not before or before == _preflight_source_hash(script):
+                return cached, False
+        if script is None:
+            script = preflight.read_script(source)
+        result = preflight.inspect_automatic(script, os.environ, normalized_times=normalized_times)
+        if not normalized_times:
+            result["meta"]["source_sha256"] = _preflight_source_hash(script)
+        if cached is not None:
+            result["meta"]["source_changed"] = True
+        return result, cached is None
+    except (OSError, ValueError, RecursionError) as exc:
+        job.log("preflight", "[WARN]", message("dialogue_pipeline_unavailable", detail=type(exc).__name__))
+        return None, False
+
+
+def _publish_preflight(job, result, fresh, *, normalized_times):
+    if result is None:
+        return
+    try:
+        if fresh and not normalized_times:
+            path = job.dir / "inputs" / "preflight.json"
+            stored = _save_preflight_snapshot(path, result)
+            if stored["meta"].get("source_sha256") != result["meta"]["source_sha256"]:
+                result["meta"]["source_changed"] = True
+            else:
+                result = stored
+        elif fresh and (result["warnings"] or result["status"] != "complete"):
+            job.log("preflight", "[WARN]", message("dialogue_provenance_unknown",
+                    fingerprint=result["meta"]["effective_config_sha256"]))
+        if result["meta"].get("source_changed"):
+            job.preflight_override = result
+            job.log("preflight", "[WARN]", message("dialogue_source_changed"))
+        _log_preflight(job, result)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        job.log("preflight", "[WARN]", message("dialogue_pipeline_unavailable", detail=type(exc).__name__))
+
+
+def log_created_preflight(job, source):
+    normalized_times = source == job.dir / "inputs" / "film.json" and source.with_name("request.json").is_file()
+    candidate = _preflight_candidate(job, source, normalized_times=normalized_times)
+    _publish_preflight(job, *candidate, normalized_times=normalized_times)
+
+
+def preflight_report_lines(job, script):
+    try:
+        result = getattr(job, "preflight_override", None) or _read_preflight_snapshot(job.dir / "inputs" / "preflight.json")
+        unknown = result is None
+        if unknown:
+            if config.env("H3_SKIP_PREFLIGHT") == "1":
+                return []
+            result = preflight.inspect_automatic(script, os.environ, normalized_times=True)
+        return _render_report_preflight(result, script, unknown)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        return [f"## {message('dialogue_title')}", "",
+                message("dialogue_pipeline_unavailable", detail=type(exc).__name__), ""]
+
+
+def _render_report_preflight(result, script, unknown):
+    meta = result["meta"]
+    if not (result["warnings"] or result["status"] != "complete" or meta.get("rate_config_fallback") or meta.get("source_changed")):
+        return []
+    lines = [f"## {message('dialogue_title')}", ""]
+    if unknown:
+        lines.extend([message("dialogue_provenance_unknown", fingerprint=result["meta"]["effective_config_sha256"]), ""])
+    if meta.get("source_changed"):
+        lines.extend([message("dialogue_source_changed"), ""])
+    if meta.get("rate_config_fallback"):
+        lines.extend([message("dialogue_rate_config_fallback"), ""])
+    if meta["calibration_status"] == "provisional":
+        lines.extend([message("dialogue_provisional"), ""])
+    speech = normalize_speech(script.get("speech"))
+    if speech and speech != "zh":
+        lines.extend([message("dialogue_non_zh"), ""])
+    if result["status"] != "complete":
+        lines.extend([preflight.summary_message(result, message), ""])
+    if result["warnings"]:
+        headers = [message(f"dialogue_warn_{column}") for column in ("shot", "message", "preview")]
+        lines += ["| " + " | ".join(headers) + " |", "|---|---|---|"]
+        for warning in result["warnings"]:
+            shot = str(warning["shot"]) if warning["shot"] is not None else "—"
+            raw_shot = warning.get("raw_shot")
+            if raw_shot is not None and raw_shot != warning["shot"]:
+                shot = message("dialogue_raw_shot", shot=shot, raw_shot=raw_shot)
+            cells = [shot, preflight.warning_message(warning, message), sanitize_line_preview(warning.get("line_preview", ""))]
+            lines.append("| " + " | ".join(escape_markdown_cell(cell) for cell in cells) + " |")
+        lines.append("")
+    return lines
+
+
 def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Path:
     fr = sum(float(r.get("cny") or 0) for r in job.state["frames"].values())
     gen = sum(float(r.get("cny") or 0) for r in job.state["segs"].values())
@@ -1106,6 +1261,7 @@ def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Pa
              f"成片 `{final.name}`，{media.duration(final):.1f} 秒，{len(segs)} 段，分镜图模式 {mode}。", "",
              f"花费：分镜图 {len(job.state['frames'])} 张 ¥{fr:.2f}，H3 生成 ¥{gen:.2f}，合计 ¥{fr + gen:.2f}；"
              f"GPU {gpu / 60:.1f} 分钟，这次运行墙钟 {wall / 60:.0f} 分钟（续跑只算这一次）。", ""]
+    lines += preflight_report_lines(job, film)
     subs = [s for s in segs if (job.state["segs"].get(str(s["idx"])) or {}).get("subtitles", {}).get("burned_text")]
     if subs:
         lines += ["**烧字幕了**：" + "、".join(f"第 {s['idx'] + 1} 段" for s in subs)
@@ -1232,9 +1388,14 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     locked_artifact = _workbench_activity_locked(job.dir)
     if locked_artifact is not None:
         raise RuntimeError(message("segment_publication_pending", path=locked_artifact))
-    film = load(Path(job.state["film_path"]))
+    source = Path(job.state["film_path"])
+    normalized_times = source == job.dir / "inputs" / "film.json" and source.with_name("request.json").is_file()
+    script = preflight.read_script(source)
+    candidate = _preflight_candidate(job, source, script=script, normalized_times=normalized_times)
+    film = _load_script(script, source, normalized_times=normalized_times)
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}
+    _publish_preflight(job, *candidate, normalized_times=normalized_times)
     if redo and unaffected_segment_blocker(job, mode, redo, planned_count=len(segs)) is None:
         invalidate_segments(job, mode, redo)
     job.state["t_start"] = time.time()

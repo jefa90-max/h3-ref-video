@@ -141,7 +141,7 @@ def submit_with_retry(g: dict, log, *, record_submission=None) -> str:
             raise
 
 
-def poll(task: str) -> dict:
+def poll(task: str, *, report_billing: bool = False) -> dict:
     """{state: running|done|failed, url, cny, coins, run_seconds, error}"""
     out = _post("/task/openapi/outputs", {"taskId": task})
     http_status = out.get("_http_status")
@@ -173,5 +173,10 @@ def poll(task: str) -> dict:
         return {"state": "failed", "error": "completed without output fileUrl"}
     coins = float(item.get("consumeCoins") or 0)
     money = float(item.get("consumeMoney") or 0)
-    return {"state": "done", "url": item["fileUrl"], "cny": round(money + coins * config.RH_COIN_CNY, 4), "coins": coins,
-            "money": money, "run_seconds": float(item.get("taskCostTime") or 0)}
+    result = {"state": "done", "url": item["fileUrl"], "cny": round(money + coins * config.RH_COIN_CNY, 4), "coins": coins,
+              "money": money, "run_seconds": float(item.get("taskCostTime") or 0)}
+    if report_billing:
+        result["billing_known"] = any(type(item.get(key)) in (int, float) or
+                                      isinstance(item.get(key), str) and bool(item[key].strip())
+                                      for key in ("consumeCoins", "consumeMoney"))
+    return result

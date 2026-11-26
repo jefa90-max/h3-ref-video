@@ -1071,6 +1071,9 @@ def assemble(request):
         report = message("demo_report", request["lang"], kind="film", mode=request["frames"], segments=len(planned),
                          frames=len(list((out / "frames").glob("*.png"))), seconds=sum(s["seconds"] for s in planned),
                          path=out, video=message("demo_video", request["lang"]))
+        notes = film.preflight_report_lines(film.Job(out), request["film"])
+        if notes:
+            report = report.rstrip() + "\n\n" + "\n".join(notes)
         (out / "report.md").write_text(report, encoding="utf-8")
     else:
         film.report(film.Job(out), request["film"], film.plan(request["film"]["shots"]), request["frames"], final)

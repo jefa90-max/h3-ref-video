@@ -1,14 +1,25 @@
 """Turn the CLI's cast/board reference slots into a path-free upload checklist."""
 import copy
+import os
 from pathlib import Path
 
-from .i18n import InputError
+from h3ref import config, preflight
+from .i18n import InputError, message
 from .inputs import array, invalid, text, verify_image
 
 
-def describe_references(script):
+def describe_references(script, *, lang="zh-CN", include_preflight=False, environ=None):
     if not isinstance(script, dict):
+        if include_preflight:
+            raise InputError("film_object_invalid", field="film")
         invalid("film", script, "object")
+    if include_preflight:
+        shots = script.get("shots")
+        if shots is not None and not isinstance(shots, list):
+            raise InputError("dialogue_shots_invalid", field="film.shots")
+        limit = max(2000, config.max_shots() * 2)
+        if isinstance(shots, list) and len(shots) > limit:
+            raise InputError("dialogue_references_limit", field="film.shots", actual=len(shots), limit=limit)
     script = copy.deepcopy(script)
     slots = []
     cast = script.get("cast") if script.get("cast") is not None else []
@@ -27,12 +38,18 @@ def describe_references(script):
     slots.append({"id": "board", "kind": "board", "name": "",
                   "description": text(script.get("setting") or "", "film.setting", empty=True),
                   "required": bool(board)})
-    return {"film": script, "slots": slots}
+    response = {"film": script, "slots": slots}
+    if include_preflight:
+        result = preflight.inspect_automatic(script, os.environ if environ is None else environ)
+        if result["meta"].get("rate_config_fallback"):
+            result["warnings"].append({"code": "dialogue_rate_config_fallback", "severity": "warn", "shot": None})
+        warnings = [{**warning, "message": preflight.warning_message(warning, lambda key, **values: message(key, lang, **values))}
+                    for warning in result["warnings"]]
+        response.update(warnings=warnings, preflight_status=result["status"], preflight_meta=result["meta"])
+    return response
 
 
 def bind_references(payload, upload_dir: Path, lang="zh-CN"):
-    from .i18n import message
-
     result = copy.deepcopy(payload)
     described = describe_references(result.get("film"))
     script, slots = described["film"], described["slots"]

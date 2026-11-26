@@ -9,7 +9,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from h3ref import film, media, rewrite
-from .i18n import message
+from h3ref.i18n import use_lang
+from .i18n import InputError, message
 
 
 def demo_h3_prompt(n_images: int, seconds: float, aspect: str, number: int) -> str:
@@ -69,7 +70,12 @@ def run(request):
             script["board"] = str(placeholder(out / "inputs" / "demo-board.png", "BOARD", script["aspect"]))
         source = out / "inputs" / "demo-film.json"
         source.write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
-        script = film.load(source)
+        with use_lang(lang):
+            film.log_created_preflight(film.Job(out), out / "inputs" / "film.json")
+        try:
+            script = film.load(source, normalized_times=True)
+        except (SystemExit, film.FilmValidationError) as exc:
+            raise InputError("film_invalid", detail=str(exc)) from exc
         segments = film.plan(script["shots"])
         aspect = script["aspect"]
         for segment in segments:
@@ -136,6 +142,11 @@ def run(request):
     report = message("demo_report", lang, kind=request["kind"], mode=mode, segments=len(segments), frames=frames_count,
                      seconds=sum(s["seconds"] for s in segments), path=out,
                      video=message("demo_video" if has_video else "demo_no_video", lang))
+    if request["kind"] == "film":
+        with use_lang(lang):
+            notes = film.preflight_report_lines(film.Job(out), script)
+        if notes:
+            report = report.rstrip() + "\n\n" + "\n".join(notes)
     (out / "report.md").write_text(report, encoding="utf-8")
     log("demo_done", path=out / "report.md")
 

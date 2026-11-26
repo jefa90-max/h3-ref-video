@@ -4,16 +4,18 @@
 
 Windows 10/11 64 位可直接双击 `start-windows.cmd`，自动准备依赖并打开浏览器；见 [Windows 一键部署说明](windows.md)。首次需要联网，后续复用已安装环境。
 
-在仓库根目录执行：
+在源码目录首次使用时，先准备 Python 3.10+ 的虚拟环境。macOS 和 Linux 可运行以下命令。
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-web.txt
-python workbench.py
+.venv/bin/python -m pip install -r requirements-web.txt
 ```
 
-打开 http://127.0.0.1:7860。`python workbench.py --port 7862` 可换端口；同一仓库只允许一个工作台服务，换端口前先退出原服务。已有 `.venv` 时只需激活并运行最后两条命令。Windows 可用 `.venv\Scripts\python.exe`。真实出片需要 Python 3.10+、ffmpeg 和 ffprobe（macOS：`brew install ffmpeg`）。不需要 Node 或 pnpm dev。
+Windows 使用 `python -m venv .venv` 创建环境，再运行 `.venv\Scripts\python.exe -m pip install -r requirements-web.txt`。
+
+装好依赖后，在仓库根目录运行 `pnpm dev`，打开 http://127.0.0.1:7860。它会使用项目的 `.venv` 或当前已激活的 Python 虚拟环境。`pnpm dev --port 7862 --open` 会换端口并打开浏览器。同一份源码只允许一个工作台服务，切换端口前先退出已有服务。
+
+也可以直接用虚拟环境运行 `workbench.py`。macOS 和 Linux 使用 `.venv/bin/python workbench.py`，Windows 使用 `.venv\Scripts\python.exe workbench.py`。完整出片需要 ffmpeg 和 ffprobe，macOS 可通过 `brew install ffmpeg` 安装。
 
 ## 不用 key 演示
 
@@ -66,6 +68,54 @@ ComfyUI 模式默认并发等于已配置节点数（每节点同时 1 段，可
 上传绑定与编辑器里的故事分开保存，启动时程序写出带绝对路径的 CLI 输入副本。导入另一份 JSON 或恢复示例会清空原绑定；编辑角色名／重排角色会让对应位置重新待上传，避免串图。离线与真实模式切换保留已上传绑定；真实模式始终要求必需图片齐全。演示也可以关闭占位选项，完整验证上传流程。
 
 `board: true` 是工作台导入标记；直接使用 CLI 时仍应按原格式提供图片路径，原 CLI 接口未更改。
+
+<a id="dialogue-preflight"></a>
+## 台词语速预检
+
+创建页解析剧本后会自动给出预算提示。先看风险较高的镜头，用「定位到脚本」选中原始台词。补填 `speech`、精简台词或调整生成预算后，页面会重新估算。提示不会修改 JSON，也不会拦住任务。估算按镜头时长、语速档和停顿计算，有效镜长最多取 15 秒。实际口播还受分段取整和开场停顿影响，默认阈值仍待实片校准。
+
+```bash
+python h3ref.py preflight --film examples/dialogue-budget.json --json
+```
+
+示例的 JSON 关键字段如下，实际输出还包含镜头号、预算、台词预览、详细计数和配置指纹。
+
+```json
+{
+  "status": "partial",
+  "warnings": [
+    {"code": "dialogue_over_budget", "shot": 2, "raw_shot_index": 1},
+    {"code": "dialogue_slow_over_budget", "shot": 3, "raw_shot_index": 2}
+  ],
+  "meta": {"calibration_status": "provisional", "checked_shots": 3, "skipped_shots": 1}
+}
+```
+
+省略 `--json` 可读人类摘要，`--film -` 从标准输入读取最多 32 MiB。退出码 `0` 表示命令产生了结果，`1` 表示文件、JSON 或阈值配置有误，`2` 表示启用 `--fail-on-warn` 后有告警或状态不为 `complete`。命令从环境变量读取 `H3_LANG` 和可选的 `H3_DIALOGUE_RATE_CONFIG`，无需加载 `.env`、生成服务或参考素材。原始时间戳必须在 0–3600 秒之间。旧 CLI 剧本若用了超出范围的绝对时间，可减去共同起点再续跑，镜长保持相同。
+
+| 告警 | 建议 |
+|---|---|
+| `dialogue_over_budget` / `dialogue_slow_over_budget` | 精简台词，或拆成总有效生成预算足够的多段，单段上限仍为 15 秒。 |
+| `dialogue_long_line` | 台词偏长，可按表达节奏拆镜。 |
+| `dialogue_speech_unset` | 补充台词语言，如 `"speech": "zh"`。 |
+| `dialogue_unsupported_script` | 该镜文字暂无法估算，需人工核对。 |
+| `dialogue_shots_invalid` | 将 `film.shots` 改为镜头数组。 |
+
+`complete` 表示检查覆盖完整，可包含告警。`partial` 表示使用了默认时长、略过镜头或缺少检查所需信息。`unsupported` 表示有台词文字暂不支持计数，且没有可估算的台词。`invalid` 表示缺少可检查的镜头数组。草稿中缺失 `shots` 或给出 `null` 时，参考图接口仍可返回上传位。
+
+对于已经运行的本地工作台，同一份脚本可直接调用接口。
+
+```bash
+jq '{film: .}' examples/dialogue-budget.json | curl -sS \
+  -H 'X-Workbench: 1' -H 'Accept-Language: en' -H 'Content-Type: application/json' \
+  --data-binary @- http://127.0.0.1:7860/api/film/references
+```
+
+示例返回 `film`、`slots`、英文 `warnings[].message`、`preflight_status: "partial"` 和 `preflight_meta`。失败响应使用 `application/problem+json`，包含 `code`、`fix` 和兼容字段 `error`。
+
+需要自定义语速时，`H3_DIALOGUE_RATE_CONFIG` 支持内联 JSON 或不超过 64 KiB 的普通 JSON 文件。覆盖项按 `chars` / `words` 分组，可分别指定 `regular_rate`、`slow_rate`、`long_line_limit`，例如 `{"chars":{"regular_rate":6.5}}`。`H3_SKIP_PREFLIGHT=1` 可关闭自动任务的预检。显式 CLI 检查和创建页的参考图请求仍会运行。覆盖配置无效时，CLI 返回配置错误，工作台显示提醒并使用默认阈值。
+
+新任务把检查时的阈值指纹和结果存进 `inputs/preflight.json`。CLI 任务的源剧本变更后，会为当前剧本重新估算，并保留创建时快照。历史任务缺少快照时，报告会标出 `provenance_unknown` 和重算指纹。升级后的续跑仍复用已缓存的提示词和分镜图；主动重新改写或重生成才会触发相应的模型调用和费用。
 
 ## 状态、播放与恢复
 

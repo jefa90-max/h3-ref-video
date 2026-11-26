@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .preflight import MAX_SECONDS, max_shots
+
 PKG = Path(__file__).resolve().parent
 ROOT = PKG.parent
 
@@ -133,7 +135,7 @@ COMFY_PRESETS = {
 }
 COLAB_AUTH_MODES = ("oauth2", "adc")
 MAX_IMAGES = 9                                                     # the workflow's nine LoadImage inputs
-MIN_SECONDS, MAX_SECONDS = 5, 15
+MIN_SECONDS = 5
 
 
 def _parse_positive_int(raw: str, name: str) -> int:
@@ -272,10 +274,6 @@ def video_settings(environ=None) -> dict:
         "colab_bin": colab_bin,
         "colab_auth": colab_auth,
     }
-
-
-def max_shots() -> int:
-    return max(1, int(env("H3_MAX_SHOTS", "1000")))
 
 
 def max_segments() -> int:

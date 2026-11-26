@@ -193,12 +193,14 @@ test("create.js parses UTF-8 BOM JSON, debounces #film-json input, and drops sta
   const { $, element } = makeDom();
   let refPosts = 0;
   const resolvers = [];
+  const zhMessages = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/zh-CN.json"), "utf8"));
+  let messages = enMessages;
   const timers = [];
   const context = vm.createContext({
     state: { language: "en", config: { output_root: "/tmp/jobs", keys: {} }, jobs: [], ready: true },
     $, element, renderPage: null,
     document: { addEventListener() {}, querySelector: () => element("div"), querySelectorAll: () => [] },
-    t: (k, v = {}) => (enMessages[k] || k).replace(/\{(\w+)\}/g, (_, n) => v[n] ?? ""),
+    t: (k, v = {}) => (messages[k] || k).replace(/\{(\w+)\}/g, (_, n) => v[n] ?? ""),
     running: () => false,
     busy: () => false,
     renderConfig() {},
@@ -246,13 +248,64 @@ test("create.js parses UTF-8 BOM JSON, debounces #film-json input, and drops sta
   const secondRefresh = secondTimers[secondTimers.length - 1].fn();
   assert.equal(refPosts, 2);
 
+  const warning = { code: "dialogue_over_budget", shot: 1, raw_shot: 2, raw_shot_index: 1,
+    count: 23, unit: "chars", duration: 1, min_seconds: 4, line_preview: "<b>literal</b>" };
   // Resolve newer response first, then stale older response out of order
-  resolvers[1]({ film: { shots: [{ action: "newest" }] }, slots: [{ id: "cast:0", kind: "cast", name: "Newest", description: "", required: true }] });
+  resolvers[1]({ film: { shots: [{ action: "newest" }] }, slots: [{ id: "cast:0", kind: "cast", name: "Newest", description: "", required: true }], warnings: [warning], preflight_status: "complete" });
   await secondRefresh;
   resolvers[0]({ film: { shots: [{ action: "stale" }] }, slots: [{ id: "cast:0", kind: "cast", name: "Stale", description: "", required: true }] });
   await firstRefresh;
   assert.equal(context.state.film.shots[0].action, "newest");
   assert.equal(context.state.filmSlots[0].name, "Newest");
+  assert.equal(context.state.filmWarnings.length, 1);
+  assert.equal($("film-warnings").hidden, false);
+  assert.match($("film-warnings-title").textContent, /1/);
+  assert.equal($("film-preflight-live").textContent, enMessages.dialogue_warning_count.replace("{count}", "1"));
+
+  const editor = $("film-json");
+  editor.value = '{"other":{"shots":[{"line":"wrong"}]},"shots":[null,{"nested":{"line":"wrong"},"line":"correct"}]}';
+  let selection;
+  editor.setSelectionRange = (start, end) => { selection = editor.value.slice(start, end); };
+  context.locateFilmWarning(warning);
+  assert.equal(selection, '"correct"');
+
+  messages = zhMessages;
+  $("frames").value = "shot";
+  context.state.language = "zh-CN";
+  context.renderPage();
+  assert.equal($("film-warnings-title").textContent, zhMessages.dialogue_warning_count.replace("{count}", "1"));
+
+  editor.value = '{"shots":[]}';
+  editor.events.input();
+  assert.equal($("film-warnings").classList.contains("is-stale"), true);
+  assert.equal($("film-warnings").hidden, false);
+  editor.value = "";
+  editor.events.input();
+  assert.equal(context.state.filmWarnings.length, 0);
+  assert.equal($("film-warnings").hidden, true);
+
+  context.state.filmParsing = false;
+  editor.value = '{"shots":[]}';
+  const unknown = { code: "future_warning", message: "<img src=x onerror=alert(1)>", shot: 2 };
+  const longLine = { ...warning, code: "dialogue_long_line", line_preview: "Long line" };
+  const warnings = [longLine, warning, unknown, ...Array(102).fill(longLine)];
+  context.setFilmPreflight({ warnings, preflight_status: "complete" });
+  context.renderFilmReferences();
+  const [inline, details] = $("film-warning-items").children;
+  assert.equal(inline.children.length, 3);
+  assert.equal(inline.children[0].children[2].textContent, "<b>literal</b>");
+  const technical = inline.children[1].children.find((item) => item.tag === "details");
+  assert.match(technical.children[1].textContent, /<img/);
+  assert.equal(technical.children[1].children.length, 0);
+  assert.equal(details.children[1].children.length, 100);
+  details.open = true;
+  messages = enMessages;
+  context.state.language = "en";
+  context.renderPage();
+  assert.equal($("film-warning-items").children[1].open, true);
+  assert.equal($("film-warning-jump").hidden, false);
+  context.switchWorkflow("one");
+  assert.equal($("film-warning-jump").hidden, true);
 });
 
 test("initializeResults renders config and schedules poll even when initial job snapshot transiently fails", async () => {

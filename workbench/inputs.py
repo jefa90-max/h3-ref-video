@@ -60,7 +60,7 @@ def verify_image(path):
         raise InputError("image", path=str(path)) from exc
 
 
-def validate(payload, root):
+def validate(payload, root, *, normalized_times=False):
     if not isinstance(payload, dict):
         invalid("request", payload, "object")
     job = copy.deepcopy(payload)
@@ -129,7 +129,7 @@ def validate(payload, root):
                 invalid(prefix, shot, "object")
             for field in ("action", "camera", "line"):
                 text(shot.get(field) or "", prefix + "." + field, empty=True)
-            if shot.get("start") is not None and shot.get("end") is not None:
+            if not normalized_times and shot.get("start") is not None and shot.get("end") is not None:
                 for field in ("start", "end"):
                     raw_val = shot[field]
                     if isinstance(raw_val, bool):
@@ -145,7 +145,7 @@ def validate(payload, root):
             source = Path(temporary) / "film.json"
             source.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
             try:
-                loaded = film.load(source, check_images=not job["demo"])
+                loaded = film.load(source, check_images=not job["demo"], normalized_times=normalized_times)
                 planned = film.plan(loaded["shots"])
             except (SystemExit, ValueError, TypeError, KeyError, OverflowError) as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc

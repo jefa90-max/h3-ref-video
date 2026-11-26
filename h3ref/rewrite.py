@@ -95,13 +95,15 @@ def guide() -> str:
         return cache.read_text(encoding="utf-8")
 
 
-def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback: str = "") -> str:
+def request(prompt_zh: str, n_images: int, seconds: float, aspect: str, feedback: str = "", *,
+            rules_override: str | None = None, examples_override: str | None = None,
+            guide_override: str | None = None) -> str:
     return "\n\n".join([
         "You rewrite one video-generation prompt for MiniMax H3 in its full-reference (Ref2VA) mode. "
         "Read the official guide, the rules and the two tested examples, then rewrite the input.",
-        "=== OFFICIAL GUIDE ===\n" + guide(),
-        "=== RULES ===\n" + RULES,
-        "=== EXAMPLES ===\n" + EXAMPLES.read_text(encoding="utf-8"),
+        "=== OFFICIAL GUIDE ===\n" + (guide() if guide_override is None else guide_override),
+        "=== RULES ===\n" + (RULES if rules_override is None else rules_override),
+        "=== EXAMPLES ===\n" + (EXAMPLES.read_text(encoding="utf-8") if examples_override is None else examples_override),
         f"=== INPUT ===\nThis segment is {seconds:g} seconds, aspect ratio {aspect}, and the request carries {n_images} reference "
         f"images in this order (Picture 1 … Picture {n_images}).\n\n{prompt_zh}",
         (f"=== FIX ===\nYour previous rewrite had these problems; fix them:\n{feedback}" if feedback else ""),
@@ -261,12 +263,12 @@ def _claude(prompt: str) -> str:
     return result
 
 
-def _llm(prompt: str) -> str:
+def _llm(prompt: str, *, tries: int = 3) -> str:
     llm = config.llm_settings()
     try:
         out = http.request(llm["base_url"] + "/chat/completions", config.llm_key(),
                            {"model": llm["rewrite_model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "stream": False},
-                           timeout=600)
+                           timeout=600, tries=tries)
     except http.HTTPResponseError as exc:
         err_cls = RewriteFatalError if exc.status_code in FATAL_REWRITE_STATUSES else RewriteError
         raise err_cls("改写模型请求失败：" + str(exc)[:300]) from None
@@ -293,19 +295,24 @@ def _llm(prompt: str) -> str:
     return text
 
 
-def backend() -> str:
-    if config.REWRITER in ("claude", "llm"):
-        return config.REWRITER
+def backend(rewriter_override: str | None = None) -> str:
+    selected = config.env("H3_REWRITER", "auto") if rewriter_override is None else rewriter_override
+    if selected in ("claude", "llm"):
+        return selected
+    if rewriter_override not in (None, "auto"):
+        raise ValueError(f"Unsupported rewriter: {rewriter_override!r}")
     return "claude" if claude_bin() else "llm"
 
 
-def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str, *, max_retries: int = 6) -> str:
+def rewrite(prompt_zh: str, n_images: int, seconds: float, aspect: str, *, max_retries: int = 6,
+            rewriter_override: str | None = None, infer=None, **request_overrides) -> str:
     """The H3 prompt for one clip. Retries up to `max_retries` times with concrete validation feedback."""
-    call = _claude if backend() == "claude" else _llm
+    selected = backend() if rewriter_override is None else backend(rewriter_override)
+    call = infer if infer is not None else (_claude if selected == "claude" else _llm)
     attempts = max(1, int(max_retries) + 1)
     feedback = ""
     for _ in range(attempts):
-        req_text = request(prompt_zh, n_images, seconds, aspect, feedback)
+        req_text = request(prompt_zh, n_images, seconds, aspect, feedback, **request_overrides)
         try:
             raw = call(req_text)
         except RewriteFatalError:
