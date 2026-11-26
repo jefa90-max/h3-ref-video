@@ -104,6 +104,7 @@ class StagingAndTimestampRecovery(unittest.TestCase):
             "短发戴黑框眼镜，灰衬衣": "短发，灰衬衣",
             "身穿灰衬衣戴着黑框眼镜": "身穿灰衬衣",
             "戴着黑框眼镜身穿灰衬衣": "身穿灰衬衣",
+            "短发不戴黑框眼镜，灰衬衣": "短发，灰衬衣",
         }
         for look, expected in cases.items():
             with self.subTest(look=look):
@@ -119,6 +120,22 @@ class StagingAndTimestampRecovery(unittest.TestCase):
         character, = scoped["characters"]
         self.assertEqual(character["locked_look"], "短发")
         self.assertEqual(character["placement_and_pose"], "戴着黑框眼镜，站在窗前")
+
+    def test_coordinated_wearables_share_a_verb_but_keep_separate_states(self):
+        opening = {"action": "阿宁戴着黑框眼镜，站在窗前。"}
+        removal = {"action": "阿宁摘下眼镜和帽子。"}
+        script = {"cast": [{"name": "阿宁"}], "shots": [opening, removal]}
+        composition = {"version": 3, "characters": [
+            {"name": "阿宁", "locked_look": "短发，戴着黑框眼镜和灰帽子", "placement_and_pose": "站在窗前"},
+        ]}
+        changes = staging.changing_wearables(script)
+        self.assertEqual(changes, {"阿宁": {"眼镜", "帽子"}})
+        character, = staging.scope_wearable_look(composition, script, opening, changes)["characters"]
+        self.assertEqual(character["locked_look"], "短发")
+        self.assertEqual(character["placement_and_pose"], "戴着黑框眼镜，站在窗前")
+        opening["action"] = "阿宁戴着眼镜和帽子，站在窗前。"
+        character, = staging.scope_wearable_look(composition, script, opening, changes)["characters"]
+        self.assertEqual(character["placement_and_pose"], "戴着黑框眼镜，戴着灰帽子，站在窗前")
 
     def test_single_out_of_range_timestamp_uses_same_default_as_preflight(self):
         for raw_time in ({"start": 3601}, {"end": 3601}):

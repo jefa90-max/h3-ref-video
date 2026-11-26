@@ -90,6 +90,60 @@ class ABRecoveryRegressions(unittest.TestCase):
     def test_resume_keeps_reported_video_charge_when_poll_omits_billing(self):
         self.assert_resumed_charge_blocks_next_submission("video")
 
+    def test_resume_keeps_video_charge_when_only_coins_are_returned(self):
+        output = {"fileUrl": "https://example.invalid/video.mp4", "fileType": "mp4", "consumeCoins": 0}
+        polls = [{"code": 0, "data": [{**output, "consumeMoney": "0.80"}]}, {"code": 0, "data": [output]}]
+        arguments = ("Opening scene", [self.picture], 5, "16:9", 2)
+
+        def download(url, path):
+            path.write_bytes(b"completed video")
+
+        with patch.object(rh, "_post", side_effect=polls), \
+             patch.object(rh, "upload", return_value="opening.jpg"), \
+             patch.object(rh, "submit", return_value="video-task") as submit, \
+             patch.object(http, "download", side_effect=OSError("download interrupted")) as fetch:
+            with self.assertRaisesRegex(OSError, "download interrupted"):
+                self.run_session(cap="1.00").video("first", *arguments)
+            fetch.side_effect = download
+            resumed = self.run_session(resume=True, cap="1.00")
+            resumed.video("first", *arguments)
+            self.assertEqual(resumed.journal.committed_cny(), money("0.80"))
+            with self.assertRaisesRegex(ExperimentError, "budget_exhausted"):
+                resumed.video("second", *arguments)
+            submit.assert_called_once()
+
+    def test_forbidden_reply_with_choices_stops_ab_composition(self):
+        import io
+        from urllib.error import HTTPError
+
+        fixture = {"id": "plain-room", "film": {"shots": [{"start": 0, "end": 5, "action": "亮灯。"}]}}
+        reply = b'{"error":{"message":"Forbidden"},"choices":null,"_http_status":null}'
+
+        def forbidden(*args, **kwargs):
+            raise HTTPError("https://example.invalid/chat/completions", 403, "Forbidden", {}, io.BytesIO(reply))
+
+        with patch.object(frames.config, "llm_key", return_value="test-key"), \
+             patch.object(http.urllib.request, "urlopen", side_effect=forbidden) as send:
+            with self.assertRaises(http.HTTPResponseError) as rejected:
+                ab_eval.run_pairs(self.run_session(), [("3B", fixture, "llm")], {}, 2)
+            self.assertEqual(rejected.exception.status_code, 403)
+            send.assert_called_once()
+
+    def test_nonfinite_response_is_cached_as_invalid_without_resubmission(self):
+        run = self.run_session()
+        with patch.object(frames, "draw") as draw, \
+             patch.object(frames.config, "llm_key", return_value="test-key"), \
+             patch.object(http, "request", return_value={"choices": None, "usage": {"tokens": float("nan")}}) as send:
+            script = {"shots": [{"start": 0, "end": 5, "action": "亮灯。"}]}
+            self.assertIsNone(ab_eval.stage_composition(run, "side/compose", "llm", script,
+                                                        script["shots"][0], (None, {}), "Rules"))
+            resumed = self.run_session(resume=True)
+            self.assertIsNone(ab_eval.stage_composition(resumed, "side/compose", "llm", script,
+                                                        script["shots"][0], (None, {}), "Rules"))
+            self.assertEqual(resumed.journal.steps["side/compose"]["status"], "invalid_response")
+            send.assert_called_once()
+            draw.assert_not_called()
+
     def assert_resumed_charge_blocks_next_submission(self, kind):
         def download(url, path):
             path.write_bytes(b"completed media")
@@ -124,7 +178,7 @@ class ABRecoveryRegressions(unittest.TestCase):
         fixture = {"id": "plain-room", "description": "A light turns on.",
                    "film": {"aspect": "16:9", "shots": [{"start": 0, "end": 5, "action": "客厅亮起灯。"}]}}
         cases = [("3B", fixture, "llm")]
-        invalid = {"choices": [{"message": {"content": "not JSON"}}]}
+        invalid = {"_http_status": None, "choices": [{"message": {"content": "not JSON"}}]}
         valid = {"choices": [{"message": {"content": '{"version":3,"camera":"全景","scene":"客厅","characters":[]}'}}]}
 
         def draw(prompt, references, aspect, path, *, record, task, settle):
