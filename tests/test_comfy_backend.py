@@ -7,8 +7,9 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -295,29 +296,40 @@ class ComfyBackendTest(unittest.TestCase):
     def test_windows_nt_upload_escapes_backslashes_and_keeps_key_out_of_argv(self):
         captured = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured["input"] = kwargs.get("input", "")
-            return MagicMock(returncode=0, stdout='{"name": "abcd1234abcd1234.png"}\n200', stderr="")
+        def fake_open(req, timeout=None):
+            captured["req"] = req
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            resp.read.return_value = b'{"name": "abcd1234abcd1234.png"}'
+            return resp
 
-        win_path = PureWindowsPath(r"D:\工具\H3 工作台\jobs\frames\s1-1.png")
         secret = "h3c_win_secret_token_999"
-        with patch("subprocess.run", side_effect=fake_run), patch.object(http, "os", SimpleNamespace(name="nt")):
-            res = http.upload(
-                "https://demo.ngrok-free.dev/upload/image",
-                secret,
-                win_path,
-                fields={"type": "input", "overwrite": "true"},
-                file_field_name="image",
-                filename="abcd1234abcd1234.png",
-                extra_headers={"ngrok-skip-browser-warning": "1"},
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "工具" / "H3 工作台" / "jobs" / "frames" / "s1-1.png"
+            nested.parent.mkdir(parents=True)
+            Image.new("RGB", (8, 8), "purple").save(nested)
+            expected_bytes = nested.read_bytes()
+            with patch.object(http._OPENER, "open", side_effect=fake_open), \
+                 patch("subprocess.run", side_effect=AssertionError("curl subprocess must not be invoked")):
+                res = http.upload(
+                    "https://demo.ngrok-free.dev/upload/image",
+                    secret,
+                    nested,
+                    fields={"type": "input", "overwrite": "true"},
+                    file_field_name="image",
+                    filename="abcd1234abcd1234.png",
+                    extra_headers={"ngrok-skip-browser-warning": "1"},
+                )
         self.assertEqual(res["name"], "abcd1234abcd1234.png")
-        self.assertFalse(any(secret in str(a) for a in captured["cmd"]))
-        self.assertIn(r"D:\\工具\\H3 工作台\\jobs\\frames\\s1-1.png", captured["input"])
-        self.assertNotIn(r"D:\\\\工具", captured["input"])
-        self.assertIn('filename=\\"abcd1234abcd1234.png\\"', captured["input"])
-        self.assertIn('ngrok-skip-browser-warning: 1', captured["input"])
+        req = captured["req"]
+        self.assertEqual(req.get_header("Authorization"), f"Bearer {secret}")
+        self.assertEqual(req.get_header("Ngrok-skip-browser-warning"), "1")
+        self.assertIn(b'name="image"; filename="abcd1234abcd1234.png"', req.data)
+        self.assertIn(b"Content-Type: image/png", req.data)
+        self.assertIn(b'name="type"\r\n\r\ninput\r\n', req.data)
+        self.assertIn(b'name="overwrite"\r\n\r\ntrue\r\n', req.data)
+        self.assertIn(expected_bytes, req.data)
 
     def test_upload_many_deduplicates_by_content_hash_preserves_order_and_invalidates_on_loadimage_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -802,21 +814,21 @@ class ComfyBackendTest(unittest.TestCase):
                 st = comfy.poll("pid-ngrok-html")
                 self.assertEqual(st["state"], "running")
 
-    # Value: protects=HTTPS authenticated download downgrade prevention and Bearer key scrubbing; fails_when=--proto-redir allows http downgrade on https downloads or curl failure leaks COMFYUI_API_KEY; why_new=existing download test only covers loopback HTTP 200 success; seam=none; no_claim=does not test live TLS handshake
+    # Value: protects=HTTPS authenticated download downgrade prevention and Bearer key scrubbing; fails_when=redirect handler allows http downgrade on https downloads or download failure leaks COMFYUI_API_KEY; why_new=existing download test only covers loopback HTTP 200 success; seam=none; no_claim=does not test live TLS handshake
     def test_https_download_enforces_https_only_redirects_and_scrubs_bearer_key_on_error(self):
         secret = "h3c_dl_secret_token_888"
         captured = {}
 
-        def fake_ok_run(cmd, **kwargs):
-            captured["cmd"] = list(cmd)
-            captured["input"] = kwargs.get("input", "")
-            out_path = Path(cmd[cmd.index("-o") + 1])
-            out_path.write_bytes(b"V" * 2048)
-            return MagicMock(returncode=0, stdout="", stderr="")
+        def fake_ok_open(req, timeout=None):
+            captured["req"] = req
+            resp = io.BytesIO(b"V" * 2048)
+            resp.headers = {"Content-Length": "2048"}
+            return resp
 
         with tempfile.TemporaryDirectory() as tmp:
             dst = Path(tmp) / "clip.mp4"
-            with patch("subprocess.run", side_effect=fake_ok_run):
+            with patch.object(http._OPENER, "open", side_effect=fake_ok_open), \
+                 patch("subprocess.run", side_effect=AssertionError("curl subprocess must not be invoked")):
                 http.download(
                     "https://node-a.ngrok-free.dev/view?filename=out.mp4",
                     dst,
@@ -824,29 +836,40 @@ class ComfyBackendTest(unittest.TestCase):
                     extra_headers={"ngrok-skip-browser-warning": "1"},
                 )
             self.assertEqual(dst.read_bytes(), b"V" * 2048)
-            self.assertEqual(captured["cmd"][captured["cmd"].index("--proto-redir") + 1], "=https")
-            self.assertIn("--config", captured["cmd"])
-            self.assertFalse(any(secret in str(arg) for arg in captured["cmd"]), "Bearer key must never appear in curl argv")
-            self.assertIn(f"Authorization: Bearer {secret}", captured["input"])
-            self.assertIn("ngrok-skip-browser-warning: 1", captured["input"])
+            self.assertEqual(captured["req"].get_header("Authorization"), f"Bearer {secret}")
+            self.assertEqual(captured["req"].get_header("Ngrok-skip-browser-warning"), "1")
+
+            # HTTPS -> HTTP downgrade must be rejected immediately without retrying
+            dst_downgrade = Path(tmp) / "downgrade.mp4"
+            with patch.object(
+                http._OPENER, "open",
+                side_effect=http._UnsafeRedirectError("Blocked unsafe redirect to http scheme"),
+            ) as open_mock, patch("h3ref.http.time.sleep") as sleep_mock:
+                with self.assertRaises(RuntimeError) as down_ctx:
+                    http.download("https://node-a.ngrok-free.dev/view?filename=out.mp4", dst_downgrade, key=secret)
+            self.assertIn("Blocked unsafe redirect", str(down_ctx.exception))
+            self.assertEqual(open_mock.call_count, 1)
+            sleep_mock.assert_not_called()
+            self.assertFalse(dst_downgrade.with_suffix(".mp4.part").exists())
 
             dst_fail = Path(tmp) / "fail.mp4"
-
-            def fake_fail_run(cmd, **kwargs):
-                Path(cmd[cmd.index("-o") + 1]).write_bytes(b"partial")
-                return MagicMock(
-                    returncode=22,
-                    stdout="",
-                    stderr=f"curl: (22) failed with Bearer {secret} on upstream",
-                )
-
-            with patch("subprocess.run", side_effect=fake_fail_run):
-                with self.assertRaises(RuntimeError) as err_ctx:
-                    http.download(
-                        f"https://node-a.ngrok-free.dev/view?token={secret}",
-                        dst_fail,
-                        key=secret,
-                    )
+            err_403 = urllib.error.HTTPError(
+                f"https://node-a.ngrok-free.dev/view?token={secret}",
+                403,
+                "Forbidden",
+                {},
+                io.BytesIO(f"failed with Bearer {secret} on upstream".encode("utf-8")),
+            )
+            try:
+                with patch.object(http._OPENER, "open", side_effect=err_403):
+                    with self.assertRaises(RuntimeError) as err_ctx:
+                        http.download(
+                            f"https://node-a.ngrok-free.dev/view?token={secret}",
+                            dst_fail,
+                            key=secret,
+                        )
+            finally:
+                err_403.close()
             self.assertNotIn(secret, str(err_ctx.exception))
             self.assertIn("[key]", str(err_ctx.exception))
             self.assertFalse(dst_fail.with_suffix(".mp4.part").exists())

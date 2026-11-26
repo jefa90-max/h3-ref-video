@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -310,30 +310,37 @@ class SecurityAndHttpHardeningTest(unittest.TestCase):
             Image.new("RGB", (8, 8), "red").save(tricky)
             captured = {}
 
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
-                captured["input"] = kwargs.get("input", "")
-                return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/ok.png"}', stderr="")
+            def fake_upload_open(req, timeout=None):
+                captured["req"] = req
+                resp = MagicMock()
+                resp.status = 200
+                resp.__enter__.return_value = resp
+                resp.read.return_value = b'{"url": "https://cdn.example/ok.png"}'
+                return resp
 
-            with patch("subprocess.run", side_effect=fake_run):
+            with patch.object(http._OPENER, "open", side_effect=fake_upload_open), \
+                 patch("subprocess.run", side_effect=AssertionError("curl subprocess must not be invoked")):
                 res = http.upload("https://api.example/upload", secret, tricky)
             self.assertEqual(res["url"], "https://cdn.example/ok.png")
-            self.assertFalse(any(secret in str(arg) for arg in captured["cmd"]), "API key leaked in curl argv")
+            self.assertEqual(captured["req"].get_header("Authorization"), f"Bearer {secret}")
+            self.assertIn(b'filename="semi;colon,comma.png"', captured["req"].data)
+            self.assertIn(b"Content-Type: image/png", captured["req"].data)
 
-            # Download rejects non-http(s) schemes and passes -f --proto =http,https
+            # Download rejects non-http(s) schemes and fails cleanly on HTTP errors without curl
             with self.assertRaises(RuntimeError):
                 http.download("file:///etc/passwd", Path(tmp) / "out.bin")
 
-            dl_cmd = {}
-            def fake_dl(cmd, **kwargs):
-                dl_cmd["cmd"] = cmd
-                return MagicMock(returncode=22)
+            def _make_404(*_args, **_kwargs):
+                raise urllib.error.HTTPError(
+                    "https://cdn.example/err.png", 404, "Not Found", {}, io.BytesIO(b"missing"),
+                )
 
-            with patch("subprocess.run", side_effect=fake_dl):
-                with self.assertRaises(RuntimeError):
+            with patch.object(http._OPENER, "open", side_effect=_make_404), \
+                 patch("h3ref.http.time.sleep"), \
+                 patch("subprocess.run", side_effect=AssertionError("curl subprocess must not be invoked")):
+                with self.assertRaises(RuntimeError) as dl_caught:
                     http.download("https://cdn.example/err.png", Path(tmp) / "out.png")
-            self.assertIn("-f", dl_cmd["cmd"])
-            self.assertIn("--", dl_cmd["cmd"])
+            self.assertIn("HTTP 404", str(dl_caught.exception))
 
 
 class WindowsRetryPollingAndLifecycleTest(unittest.TestCase):
@@ -413,29 +420,28 @@ class WindowsRetryPollingAndLifecycleTest(unittest.TestCase):
         with self.assertRaises(urllib.error.URLError):
             handler.redirect_request(orig, None, 302, "Found", {}, "http://api.example/v1/chat")
 
-        # Upload uses form-string for fields, -f flag, and double-escapes Windows backslashes & quotes
-        captured = {}
-        def fake_upload_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured["input"] = kwargs.get("input", "")
-            return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/win.png"}', stderr="")
+        # Pure-Python multipart upload keeps literal field values (including leading @/;) and strips quotes/slashes from filename
+        with tempfile.TemporaryDirectory() as up_tmp:
+            sample_img = Path(up_tmp) / "frames" / "s1-1;comma,name.png"
+            sample_img.parent.mkdir(parents=True)
+            Image.new("RGB", (8, 8), "blue").save(sample_img)
+            captured = {}
 
-        sample_win_path = PureWindowsPath(r"C:\Users\temp\frames\s1-1.png")
-        with patch("subprocess.run", side_effect=fake_upload_run), patch.object(http, "os", SimpleNamespace(name="posix")):
-            http.upload("https://api.example/up", secret, sample_win_path, fields={"apiKey": "@not-a-file;x"})
-        self.assertIn("-w", captured["cmd"])
-        self.assertIn("--proto", captured["cmd"])
-        self.assertIn("form-string =", captured["input"])
-        self.assertIn(r"C:\\\\Users\\\\temp\\\\frames\\\\s1-1.png", captured["input"])
+            def fake_upload_open(req, timeout=None):
+                captured["req"] = req
+                resp = MagicMock()
+                resp.status = 200
+                resp.__enter__.return_value = resp
+                resp.read.return_value = b'{"url": "https://cdn.example/win.png"}'
+                return resp
 
-        captured_nt = {}
-        def fake_upload_nt(cmd, **kwargs):
-            captured_nt["input"] = kwargs.get("input", "")
-            return MagicMock(returncode=0, stdout='{"url": "https://cdn.example/win.png"}', stderr="")
-        with patch("subprocess.run", side_effect=fake_upload_nt), patch.object(http, "os", SimpleNamespace(name="nt")):
-            http.upload("https://api.example/up", secret, sample_win_path, fields={"apiKey": "@not-a-file;x"})
-        self.assertIn(r"C:\\Users\\temp\\frames\\s1-1.png", captured_nt["input"])
-        self.assertNotIn(r"C:\\\\Users", captured_nt["input"])
+            with patch.object(http._OPENER, "open", side_effect=fake_upload_open), \
+                 patch("subprocess.run", side_effect=AssertionError("curl subprocess must not be invoked")):
+                http.upload("https://api.example/up", secret, sample_img, fields={"apiKey": "@not-a-file;x"}, filename='a\\b"c.png')
+            body_bytes = captured["req"].data
+            self.assertIn(b'name="apiKey"\r\n\r\n@not-a-file;x\r\n', body_bytes)
+            self.assertIn(b'filename="abc.png"', body_bytes)
+            self.assertIn(b"Content-Type: image/png", body_bytes)
 
         # Reference endpoints reject tampered non-image / non-cast paths (e.g. .env)
         with tempfile.TemporaryDirectory() as tmp:
@@ -833,12 +839,18 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             img = Path(tmp) / "m.jpg"
             img.write_bytes(b"jpg")
-            fake_curl = MagicMock(returncode=0, stdout='{"error":{"message":"content_policy_violation"}}\n400', stderr="")
-            with patch("subprocess.run", return_value=fake_curl) as run_mock, \
-                 patch.dict(os.environ, {"APIMART_API_KEY": "am-key"}, clear=True):
-                with self.assertRaises(frames.ContentPolicyError):
-                    frames._upload(img)
-                self.assertEqual(run_mock.call_count, 1)
+            mod_err = urllib.error.HTTPError(
+                "https://api.apimart.ai/v1/uploads/images", 400, "Bad Request", {},
+                io.BytesIO(b'{"error":{"message":"content_policy_violation"}}'),
+            )
+            try:
+                with patch.object(http._OPENER, "open", side_effect=mod_err) as open_mock, \
+                     patch.dict(os.environ, {"APIMART_API_KEY": "am-key"}, clear=True):
+                    with self.assertRaises(frames.ContentPolicyError):
+                        frames._upload(img)
+                    self.assertEqual(open_mock.call_count, 1)
+            finally:
+                mod_err.close()
 
     def test_session_then_persist_origin_change_seed_zero_and_english_lang_parity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -973,11 +985,18 @@ class DirectoriesPackagingAndPerfTest(unittest.TestCase):
 
             upload_file = Path(tmp) / "u.png"
             Image.new("RGB", (8, 8)).save(upload_file)
-            fake_curl = MagicMock(returncode=0, stdout='{"error": {"code": 400, "message": "bad"}}\n400', stderr="")
-            with patch("subprocess.run", return_value=fake_curl) as run_mock:
-                up_res = http.upload("http://localhost:8080/upload", "4", upload_file)
-            self.assertEqual(run_mock.call_count, 1)
-            self.assertEqual(up_res["_http_status"], 400)
+            up_err_400 = urllib.error.HTTPError(
+                "http://localhost:8080/upload", 400, "Bad Request", {},
+                io.BytesIO(b'{"error": {"code": 400, "message": "bad"}}'),
+            )
+            try:
+                with patch.object(http._OPENER, "open", side_effect=up_err_400) as open_mock:
+                    up_res = http.upload("http://localhost:8080/upload", "4", upload_file)
+                self.assertEqual(open_mock.call_count, 1)
+                self.assertEqual(up_res["_http_status"], 400)
+                self.assertEqual(up_res["error"]["code"], 400)
+            finally:
+                up_err_400.close()
 
     def test_artifact_negative_paths_lock_scope_and_reference_etag_stat_caching(self):
         import threading

@@ -257,8 +257,9 @@ def _upload(path: Path) -> str:
     out = http.upload(config.APIMART_BASE + "/uploads/images", config.apimart_key(), path)
     if is_moderation_error(out.get("error") or out):
         raise ContentPolicyError(json.dumps(out, ensure_ascii=False))
+    status = out.get("_http_status")
     url = out.get("url") or (out.get("data") or {}).get("url")
-    if not url:
+    if (isinstance(status, int) and status >= 400) or not url:
         raise RuntimeError("APIMart upload failed: " + json.dumps(out, ensure_ascii=False)[:200])
     return url
 
