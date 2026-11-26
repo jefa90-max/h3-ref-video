@@ -1798,11 +1798,11 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
 
             # 6. p1/outside-voice#5: http.download rejects HTML error pages for media & cmd_one rejects duration=0 clips
             dl_out = root / "bad.mp4"
-            def fake_curl_html(cmd, **kwargs):
-                tmp_path = Path(cmd[cmd.index("-o") + 1])
-                tmp_path.write_bytes(b"<!DOCTYPE html><html><body>502 Bad Gateway" + b"x" * 2048 + b"</body></html>")
-                return types.SimpleNamespace(returncode=0, stderr=b"")
-            with mock.patch.object(http.subprocess, "run", side_effect=fake_curl_html):
+            def fake_html_open(req, timeout=None):
+                resp = io.BytesIO(b"<!DOCTYPE html><html><body>502 Bad Gateway" + b"x" * 2048 + b"</body></html>")
+                resp.headers = {}
+                return resp
+            with mock.patch.object(http._OPENER, "open", side_effect=fake_html_open):
                 with self.assertRaisesRegex(RuntimeError, "non-media response"):
                     http.download(f"{pri}/view?filename=out.mp4", dl_out)
             self.assertFalse(dl_out.exists())

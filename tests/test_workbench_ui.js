@@ -2063,6 +2063,428 @@ test("common.js submitRuntimeStop hides stale confirm banner and preserves slot 
   assert.deepEqual(stopRequests.map((r) => r.slot), [undefined, "secondary"]);
 });
 
+test("common.js renders cli_auth_required, supports cross-device OAuth code flow and copies auth links", async () => {
+  const { $ } = makeDom();
+  const enFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  const copied = [];
+  const calls = [];
+  let currentStatus = {
+    state: "cli_auth_required",
+    cli_available: true,
+    comfyui_url: "https://demo.ngrok-free.dev",
+    comfyui_urls: ["https://demo.ngrok-free.dev"],
+    cli_auth: { state: "required", auth_url: null, error: null, keyring_warning: null },
+    logs: [],
+  };
+  const comfyConfig = {
+    VIDEO_PROVIDER: "comfyui",
+    COMFYUI_URL: "https://demo.ngrok-free.dev",
+    COMFYUI_URLS: ["https://demo.ngrok-free.dev"],
+    COMFYUI_PRESET: "full20",
+    COMFYUI_RESOLUTION: "768p",
+    COMFYUI_UPSCALE: "0",
+    COLAB_GPU: "G4",
+    COLAB_AUTO_START: "0",
+    comfy_requires_key: true,
+    LLM_PROVIDER: "apimart",
+    LLM_BASE_URL: "https://api.apimart.ai/v1",
+    LLM_MODEL: "deepseek-v4-pro",
+    llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "deepseek-v4-pro", rewrite_model: "deepseek-v4-pro", key_names: ["APIMART_API_KEY"] } },
+    keys: { APIMART_API_KEY: true, COMFYUI_API_KEY: true, LLM_API_KEY: false, GEMINI_API_KEY: false, RUNNINGHUB_API_KEY: false },
+    ffmpeg: true, ffprobe: true, python: "3.13.17", saved_to_env: true,
+  };
+  const context = vm.createContext({
+    navigator: { clipboard: { writeText: async (txt) => { copied.push(txt); } } },
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts) => {
+      const body = opts?.body ? JSON.parse(opts.body) : null;
+      calls.push({ url, body });
+      if (url === "/api/runtime/status") {
+        return { ok: true, json: async () => currentStatus };
+      }
+      if (url === "/api/runtime/cli-auth/start") {
+        currentStatus = {
+          state: "awaiting_cli_auth",
+          cli_available: true,
+          comfyui_url: "https://demo.ngrok-free.dev",
+          comfyui_urls: ["https://demo.ngrok-free.dev"],
+          auth_url: "https://accounts.google.com/o/oauth2/auth?remote=1",
+          cli_auth: { state: "awaiting_cli_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?remote=1", error: null, keyring_warning: null },
+          logs: [],
+        };
+        return { ok: true, json: async () => ({ started: true, already_authenticated: false, auth_url: currentStatus.auth_url, status: currentStatus }) };
+      }
+      if (url === "/api/runtime/cli-auth/submit") {
+        currentStatus = {
+          state: "offline",
+          cli_available: true,
+          comfyui_url: "https://demo.ngrok-free.dev",
+          comfyui_urls: ["https://demo.ngrok-free.dev"],
+          cli_auth: { state: "idle", auth_url: null, error: null, keyring_warning: null },
+          logs: [],
+        };
+        return { ok: true, json: async () => ({ accepted: true, authenticated: true, status: currentStatus }) };
+      }
+      return { ok: true, json: async () => enFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enFresh)}; state.config = ${JSON.stringify(comfyConfig)}; renderConfig(true);`, context);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal($("runtime-cli-auth-start").hidden, false);
+  assert.equal($("runtime-start").disabled, true);
+  assert.equal($("runtime-cli-auth-box").hidden, true);
+
+  await $("runtime-cli-auth-start").events.click();
+  assert.equal($("runtime-cli-auth-box").hidden, false);
+  assert.equal($("runtime-cli-auth-url").value, "https://accounts.google.com/o/oauth2/auth?remote=1");
+  assert.equal($("runtime-cli-auth-link").href, "https://accounts.google.com/o/oauth2/auth?remote=1");
+
+  await $("runtime-cli-auth-copy").events.click();
+  assert.deepEqual(copied, ["https://accounts.google.com/o/oauth2/auth?remote=1"]);
+  assert.equal($("global-message").hidden, false);
+
+  $("runtime-cli-auth-code").value = "4/0A-remote-code";
+  await $("runtime-cli-auth-submit").events.click();
+  assert.equal($("runtime-cli-auth-code").value, "");
+  assert.equal($("runtime-cli-auth-box").hidden, true);
+  assert.equal($("runtime-start").disabled, false);
+  const submitCall = calls.find((c) => c.url === "/api/runtime/cli-auth/submit");
+  assert.equal(submitCall.body.code, "4/0A-remote-code");
+
+  // Also verify Drive auth URL box + copy button
+  vm.runInContext(`state.runtimeStatus = { state: "awaiting_drive_auth", cli_available: true, comfyui_url: "https://demo.ngrok-free.dev", auth_url: "https://accounts.google.com/o/oauth2/auth?drive=1", logs: [] }; renderRuntimeStatus();`, context);
+  assert.equal($("runtime-drive-url").value, "https://accounts.google.com/o/oauth2/auth?drive=1");
+  await $("runtime-drive-copy").events.click();
+  assert.deepEqual(copied, [
+    "https://accounts.google.com/o/oauth2/auth?remote=1",
+    "https://accounts.google.com/o/oauth2/auth?drive=1",
+  ]);
+});
+
+test("common.js drops stale runtime poll after cli-auth restart, refreshes on submit 400, and submits on Enter", async () => {
+  const { $ } = makeDom();
+  const enFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  let resolveStalePoll;
+  let statusCalls = 0;
+  const calls = [];
+  const context = vm.createContext({
+    navigator: {},
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : null });
+      if (url === "/api/runtime/status") {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return await new Promise((resolve) => { resolveStalePoll = resolve; });
+        }
+        return { ok: true, json: async () => ({ state: "cli_auth_required", cli_available: true, cli_auth: { state: "required" }, logs: [] }) };
+      }
+      if (url === "/api/runtime/cli-auth/start") {
+        return {
+          ok: true,
+          json: async () => ({
+            started: true,
+            already_authenticated: false,
+            auth_url: "https://accounts.google.com/o/oauth2/auth?fresh=2",
+            status: {
+              state: "awaiting_cli_auth",
+              cli_available: true,
+              auth_url: "https://accounts.google.com/o/oauth2/auth?fresh=2",
+              cli_auth: { state: "awaiting_cli_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?fresh=2" },
+              logs: [],
+            },
+          }),
+        };
+      }
+      if (url === "/api/runtime/cli-auth/submit") {
+        return { ok: false, status: 400, json: async () => ({ error: "expired flow" }) };
+      }
+      return { ok: true, json: async () => enFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enFresh)}; state.config = { VIDEO_PROVIDER: "comfyui", COMFYUI_URL: "https://demo.ngrok-free.dev", keys: { COMFYUI_API_KEY: true }, llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "m", rewrite_model: "m", key_names: ["APIMART_API_KEY"] } }, LLM_PROVIDER: "apimart" };`, context);
+
+  const stalePollPromise = vm.runInContext("refreshRuntimeStatus()", context);
+  await $("runtime-cli-auth-refresh").events.click();
+  assert.equal($("runtime-cli-auth-url").value, "https://accounts.google.com/o/oauth2/auth?fresh=2");
+
+  // Resolve stale poll with an OLD auth URL — must NOT overwrite the newer URL!
+  resolveStalePoll({
+    ok: true,
+    json: async () => ({
+      state: "awaiting_cli_auth",
+      cli_available: true,
+      auth_url: "https://accounts.google.com/o/oauth2/auth?stale=1",
+      cli_auth: { state: "awaiting_cli_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?stale=1" },
+      logs: [],
+    }),
+  });
+  await stalePollPromise;
+  assert.equal($("runtime-cli-auth-url").value, "https://accounts.google.com/o/oauth2/auth?fresh=2");
+
+  // Pressing Enter in #runtime-cli-auth-code triggers submit; HTTP 400 clears code & refreshes status
+  $("runtime-cli-auth-code").value = "4/0A-stale-code";
+  assert.equal(typeof $("runtime-cli-auth-code").events.keydown, "function");
+  let prevented = false;
+  await $("runtime-cli-auth-code").events.keydown({ key: "Enter", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal($("runtime-cli-auth-code").value, "");
+  assert.equal(statusCalls, 2);
+  assert.equal($("runtime-cli-auth-box").hidden, true);
+});
+
+test("style.css defines all var(--*) tokens and base.html gives cli-auth code input aria-label and balanced buttons", () => {
+  const css = fs.readFileSync(path.join(staticDirectory, "style.css"), "utf8");
+  const defs = new Set([...css.matchAll(/(--[a-z0-9-]+)\s*:/gi)].map((m) => m[1]));
+  const missing = [...css.matchAll(/var\(\s*(--[a-z0-9-]+)\s*\)/gi)].map((m) => m[1]).filter((v) => !defs.has(v));
+  assert.deepEqual(missing, []);
+
+  const baseHtml = fs.readFileSync(path.join(staticDirectory, "../templates/base.html"), "utf8");
+  assert.match(baseHtml, /id="runtime-cli-auth-code"[^>]*data-i18n-aria=/);
+  assert.doesNotMatch(baseHtml, /id="runtime-cli-auth-start"[^>]*class="button primary"/);
+  assert.doesNotMatch(baseHtml, /id="runtime-cli-auth-submit"[^>]*class="button primary"/);
+});
+
+test("common.js Pass 2 fixes: restores polling on POST error, refreshes on cli-auth restart failure, guards finally runtimeBusy, respects Enter disabled, and shows keyring warning as error", async () => {
+  const { $ } = makeDom();
+  const enFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  let timerId = 0;
+  const activeTimers = new Set();
+  const calls = [];
+  let resolveSlowStart;
+  let startAttempt = 0;
+  let statusCalls = 0;
+
+  const context = vm.createContext({
+    navigator: {},
+    setTimeout: (fn) => { const id = ++timerId; activeTimers.add(id); return id; },
+    clearTimeout: (id) => { activeTimers.delete(id); },
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : null });
+      if (url === "/api/runtime/start") {
+        return { ok: false, status: 400, json: async () => ({ error: "busy" }) };
+      }
+      if (url === "/api/runtime/cli-auth/start") {
+        startAttempt += 1;
+        if (startAttempt === 1) {
+          return { ok: false, status: 400, json: async () => ({ error: "spawn failed" }) };
+        }
+        if (startAttempt === 2) {
+          return await new Promise((resolve) => { resolveSlowStart = resolve; });
+        }
+        return await new Promise(() => {});
+      }
+      if (url === "/api/runtime/cli-auth/cancel") {
+        return { ok: true, json: async () => ({ cancelled: true, status: { state: "cli_auth_required", cli_available: true, cli_auth: { state: "required" }, logs: [] } }) };
+      }
+      if (url === "/api/runtime/cli-auth/submit") {
+        return {
+          ok: true,
+          json: async () => ({
+            accepted: true,
+            authenticated: true,
+            keyring_warning: "OS keyring locked",
+            status: { state: "cli_auth_required", cli_available: true, cli_auth: { state: "required" }, logs: [] },
+          }),
+        };
+      }
+      if (url === "/api/runtime/status") {
+        statusCalls += 1;
+        return { ok: true, json: async () => ({ state: "cli_auth_required", cli_available: true, cli_auth: { state: "required" }, logs: [] }) };
+      }
+      return { ok: true, json: async () => enFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enFresh)}; state.config = { VIDEO_PROVIDER: "comfyui", COMFYUI_URL: "https://demo.ngrok-free.dev", keys: { COMFYUI_API_KEY: true }, llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "m", rewrite_model: "m", key_names: ["APIMART_API_KEY"] } }, LLM_PROVIDER: "apimart" };`, context);
+
+  // 1) Failed submitRuntimeStart during transitional state must re-arm polling
+  vm.runInContext(`state.runtimeStatus = { state: "provisioning", cli_available: true, logs: [] }; scheduleRuntimePoll(state.runtimeStatus);`, context);
+  assert.equal(activeTimers.size, 1);
+  await context.submitRuntimeStart("primary");
+  assert.equal(activeTimers.size, 1, "Transitional polling must be restored after failed POST");
+
+  // 2) Failed startCliAuthFlow(true) must refresh status so stale dead URL is cleared
+  vm.runInContext(`state.runtimeStatus = { state: "awaiting_cli_auth", cli_available: true, auth_url: "https://accounts.google.com/o/oauth2/auth?dead=1", cli_auth: { state: "awaiting_cli_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?dead=1" }, logs: [] }; renderRuntimeStatus();`, context);
+  await context.startCliAuthFlow(true);
+  assert.equal(statusCalls, 1);
+  assert.equal($("runtime-cli-auth-box").hidden, true);
+
+  // 3) Enter key when #runtime-cli-auth-submit is disabled (!cliAuthUrl) must NOT submit
+  vm.runInContext(`state.runtimeStatus = { state: "awaiting_cli_auth", cli_available: true, auth_url: "", cli_auth: { state: "awaiting_cli_auth", auth_url: "" }, logs: [] }; renderRuntimeStatus();`, context);
+  assert.equal($("runtime-cli-auth-submit").disabled, true);
+  $("runtime-cli-auth-code").value = "4/0A-premature";
+  await $("runtime-cli-auth-code").events.keydown({ key: "Enter", preventDefault() {} });
+  assert.equal(calls.filter((c) => c.url === "/api/runtime/cli-auth/submit").length, 0);
+
+  // 4) keyring_warning must show in #global-error rather than green #global-message
+  vm.runInContext(`state.runtimeStatus = { state: "awaiting_cli_auth", cli_available: true, auth_url: "https://accounts.google.com/o/oauth2/auth?ok=1", cli_auth: { state: "awaiting_cli_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?ok=1" }, logs: [] }; renderRuntimeStatus();`, context);
+  $("runtime-cli-auth-code").value = "4/0A-warn-code";
+  await context.submitCliAuthCode();
+  assert.equal($("global-error").hidden, false);
+  assert.match($("global-error").textContent, /OS keyring locked/);
+  assert.equal($("global-message").hidden, true);
+
+  // 5) Superseded slow start (seq=N) settling after cancel + new start must NOT clear state.runtimeBusy
+  const pSlow = context.startCliAuthFlow(false);
+  await context.cancelCliAuthFlow();
+  const pNew = context.startCliAuthFlow(false);
+  void pNew;
+  assert.equal(vm.runInContext("state.runtimeBusy", context), true);
+  resolveSlowStart({ ok: true, json: async () => ({ started: true, status: { state: "awaiting_cli_auth", cli_available: true, logs: [] } }) });
+  await pSlow;
+  assert.equal(vm.runInContext("state.runtimeBusy", context), true, "Stale finally must not unlock runtimeBusy for newer in-flight action");
+});
+
+test("common.js Pass 3 fix: #runtime-refresh click respects runtimeStatusSeq and does not unlock runtimeBusy during cancel", async () => {
+  const { $ } = makeDom();
+  const enFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  let resolveRefresh;
+  let resolveCancel;
+  const context = vm.createContext({
+    navigator: {},
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url) => {
+      if (url === "/api/runtime/status") {
+        return await new Promise((resolve) => { resolveRefresh = resolve; });
+      }
+      if (url === "/api/runtime/cli-auth/cancel") {
+        return await new Promise((resolve) => { resolveCancel = resolve; });
+      }
+      return { ok: true, json: async () => enFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enFresh)}; state.config = { VIDEO_PROVIDER: "comfyui", COMFYUI_URL: "https://demo.ngrok-free.dev", keys: { COMFYUI_API_KEY: true }, llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "m", rewrite_model: "m", key_names: ["APIMART_API_KEY"] } }, LLM_PROVIDER: "apimart" }; state.runtimeStatus = { state: "awaiting_cli_auth", cli_available: true, auth_url: "https://accounts.google.com/o/oauth2/auth?r=1", cli_auth: { state: "awaiting_cli_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?r=1" }, logs: [] }; renderRuntimeStatus();`, context);
+
+  const pRefresh = $("runtime-refresh").events.click();
+  const pCancel = $("runtime-cli-auth-cancel").events.click();
+  assert.equal(vm.runInContext("state.runtimeBusy", context), true);
+  // Stale refresh fails while cancel is still in flight -> must NOT unlock runtimeBusy or show stale error
+  resolveRefresh({ ok: false, status: 500, json: async () => ({ error: "stale refresh err" }) });
+  await pRefresh;
+  assert.equal(vm.runInContext("state.runtimeBusy", context), true, "Superseded #runtime-refresh must not clear runtimeBusy while cancel is in flight");
+  assert.equal($("global-error").hidden, true, "Superseded #runtime-refresh must not display stale error");
+  resolveCancel({ ok: true, json: async () => ({ cancelled: true, status: { state: "cli_auth_required", cli_available: true, cli_auth: { state: "required" }, logs: [] } }) });
+  await pCancel;
+  assert.equal(vm.runInContext("state.runtimeBusy", context), false);
+});
+
+test("common.js Ship Pass 1 fixes: poll preserves URL selection, submit/cancel forward auth_id, and concurrent GET cannot overwrite POST status", async () => {
+  const { $ } = makeDom();
+  const enFresh = JSON.parse(fs.readFileSync(path.join(staticDirectory, "messages/en.json"), "utf8"));
+  const posted = [];
+  let resolvePost;
+  let resolveGet;
+
+  // Spy on value setter of #runtime-cli-auth-url and #runtime-drive-url
+  const cliUrlSets = [];
+  const driveUrlSets = [];
+  function trackValue(el, log) {
+    let val = "";
+    Object.defineProperty(el, "value", {
+      get() { return val; },
+      set(v) { log.push(v); val = v; },
+      configurable: true,
+    });
+  }
+  trackValue($("runtime-cli-auth-url"), cliUrlSets);
+  trackValue($("runtime-drive-url"), driveUrlSets);
+
+  const context = vm.createContext({
+    navigator: {},
+    document: {
+      getElementById: $,
+      createElement: (tag) => $(`anon-${Math.random()}-${tag}`),
+      querySelectorAll: () => [],
+      documentElement: { lang: "en" },
+      title: "",
+    },
+    localStorage: { getItem: () => "en", setItem() {} },
+    FormData: class { [Symbol.iterator]() { return [][Symbol.iterator](); } },
+    fetch: async (url, opts = {}) => {
+      if (opts.method === "POST") {
+        posted.push({ url, body: JSON.parse(opts.body || "{}") });
+        if (url === "/api/runtime/cli-auth/submit") {
+          return await new Promise((resolve) => { resolvePost = resolve; });
+        }
+        if (url === "/api/runtime/cli-auth/cancel") {
+          return { ok: true, json: async () => ({ cancelled: false, stale: true, status: { state: "awaiting_cli_auth", cli_available: true, cli_auth: { state: "awaiting_cli_auth", auth_id: "sess-new", auth_url: "https://accounts.google.com/o/oauth2/auth?n=2" }, logs: [] } }) };
+        }
+      }
+      if (url === "/api/runtime/status") {
+        return await new Promise((resolve) => { resolveGet = resolve; });
+      }
+      return { ok: true, json: async () => enFresh };
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(staticDirectory, "common.js"), "utf8"), context);
+  vm.runInContext(`state.messages = ${JSON.stringify(enFresh)}; state.config = { VIDEO_PROVIDER: "comfyui", COMFYUI_URL: "https://demo.ngrok-free.dev", keys: { COMFYUI_API_KEY: true }, llm_providers: { apimart: { base_url: "https://api.apimart.ai/v1", composition_model: "m", rewrite_model: "m", key_names: ["APIMART_API_KEY"] } }, LLM_PROVIDER: "apimart" };`, context);
+
+  // 1) Repeated renderRuntimeStatus() with unchanged auth URLs must NOT reassign input.value (preserves manual highlight)
+  vm.runInContext(`state.runtimeStatus = { state: "awaiting_cli_auth", cli_available: true, auth_url: "https://accounts.google.com/o/oauth2/auth?u=1", cli_auth: { state: "awaiting_cli_auth", auth_id: "sess-1", auth_url: "https://accounts.google.com/o/oauth2/auth?u=1" }, managed_nodes: [{ slot: "secondary", state: "awaiting_drive_auth", auth_url: "https://accounts.google.com/o/oauth2/auth?d=1" }], logs: [] }; renderRuntimeStatus(); renderRuntimeStatus();`, context);
+  assert.equal(cliUrlSets.length, 1, "Unchanged #runtime-cli-auth-url must not be reassigned on poll re-render");
+  assert.equal(driveUrlSets.length, 1, "Unchanged #runtime-drive-url must not be reassigned on poll re-render");
+
+  // 2) submitCliAuthCode forwards auth_id AND bumps seq on apply so concurrent GET started mid-POST cannot overwrite POST status
+  $("runtime-cli-auth-code").value = "4/0A-good";
+  const pSubmit = context.submitCliAuthCode();
+  const pConcurrentGet = context.refreshRuntimeStatus();
+  resolvePost({ ok: true, json: async () => ({ accepted: true, authenticated: true, status: { state: "offline", cli_available: true, cli_auth: { state: "idle", auth_id: null }, logs: [] } }) });
+  await pSubmit;
+  assert.equal(posted[0].url, "/api/runtime/cli-auth/submit");
+  assert.equal(posted[0].body.auth_id, "sess-1");
+  assert.equal(vm.runInContext("state.runtimeStatus.state", context), "offline");
+  resolveGet({ ok: true, json: async () => ({ state: "awaiting_cli_auth", cli_available: true, cli_auth: { state: "awaiting_cli_auth", auth_id: "sess-1" }, logs: [] }) });
+  await pConcurrentGet;
+  assert.equal(vm.runInContext("state.runtimeStatus.state", context), "offline", "Concurrent GET started mid-POST must not overwrite newer POST status");
+
+  // 3) cancelCliAuthFlow forwards auth_id and suppresses cancelled notice when server returns stale=true
+  vm.runInContext(`state.runtimeStatus = { state: "awaiting_cli_auth", cli_available: true, cli_auth: { state: "awaiting_cli_auth", auth_id: "sess-old", auth_url: "https://accounts.google.com/o/oauth2/auth?old=1" }, logs: [] }; renderRuntimeStatus();`, context);
+  await context.cancelCliAuthFlow();
+  const cancelCall = posted.find((p) => p.url === "/api/runtime/cli-auth/cancel");
+  assert.equal(cancelCall.body.auth_id, "sess-old");
+  assert.equal($("global-message").hidden, true, "Stale cancel must not display cancelled confirmation banner");
+  assert.equal(vm.runInContext("state.runtimeStatus.cli_auth.auth_id", context), "sess-new");
+});
+
+
 
 
 
