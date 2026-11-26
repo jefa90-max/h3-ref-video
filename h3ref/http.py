@@ -326,36 +326,43 @@ class _DynamicProxyHandler(urllib.request.ProxyHandler):
             proxies = urllib.request.getproxies()
         except OSError:
             return None
-        for candidate in (proxies.get(scheme), proxies.get("all"), proxies.get("socks")):
+        for proxy_key, candidate in (
+            (scheme, proxies.get(scheme)),
+            ("all", proxies.get("all")),
+            ("socks", proxies.get("socks")),
+        ):
             proxy = (candidate or "").strip()
             if not proxy:
                 continue
             has_scheme = "://" in proxy
             if not has_scheme and "/" in proxy:
                 continue
+            default_scheme = "socks5h" if proxy_key == "socks" else "http"
             try:
-                parsed_proxy = urlsplit(proxy if has_scheme else f"http://{proxy}")
+                parsed_proxy = urlsplit(proxy if has_scheme else f"{default_scheme}://{proxy}")
                 proxy_port = parsed_proxy.port
             except ValueError:
                 continue
             if not parsed_proxy.hostname:
                 continue
+            proxy_scheme = parsed_proxy.scheme.lower()
+            if proxy_key == "socks" and proxy_scheme == "http":
+                proxy_scheme = "socks5h"
+            if proxy_scheme in ("socks", "socks5", "socks5h"):
+                socks_cfg = (
+                    parsed_proxy.hostname,
+                    proxy_port or 1080,
+                    unquote(parsed_proxy.username) if parsed_proxy.username is not None else None,
+                    unquote(parsed_proxy.password) if parsed_proxy.password is not None else None,
+                    proxy_scheme in ("socks", "socks5h"),
+                )
+                socks_deadline = getattr(req, "_deadline", None)
+                if scheme == "https":
+                    conn_cls = functools.partial(_Socks5HTTPSConnection, socks_cfg=socks_cfg, socks_deadline=socks_deadline)
+                    return urllib.request.HTTPSHandler().do_open(conn_cls, req)
+                conn_cls = functools.partial(_Socks5HTTPConnection, socks_cfg=socks_cfg, socks_deadline=socks_deadline)
+                return urllib.request.HTTPHandler().do_open(conn_cls, req)
             if has_scheme:
-                proxy_scheme = parsed_proxy.scheme.lower()
-                if proxy_scheme in ("socks", "socks5", "socks5h"):
-                    socks_cfg = (
-                        parsed_proxy.hostname,
-                        proxy_port or 1080,
-                        unquote(parsed_proxy.username) if parsed_proxy.username is not None else None,
-                        unquote(parsed_proxy.password) if parsed_proxy.password is not None else None,
-                        proxy_scheme in ("socks", "socks5h"),
-                    )
-                    socks_deadline = getattr(req, "_deadline", None)
-                    if scheme == "https":
-                        conn_cls = functools.partial(_Socks5HTTPSConnection, socks_cfg=socks_cfg, socks_deadline=socks_deadline)
-                        return urllib.request.HTTPSHandler().do_open(conn_cls, req)
-                    conn_cls = functools.partial(_Socks5HTTPConnection, socks_cfg=socks_cfg, socks_deadline=socks_deadline)
-                    return urllib.request.HTTPHandler().do_open(conn_cls, req)
                 if proxy_scheme not in ("http", "https"):
                     continue
                 if proxy_scheme == "https":
