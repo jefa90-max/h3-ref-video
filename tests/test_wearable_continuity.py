@@ -80,6 +80,33 @@ class WearableContinuity(unittest.TestCase):
         second = self.describe(self.second, self.composition(self.opening_pose))
         self.assertNotIn('佩戴细圆框眼镜', frames.prompt(self.script, self.second, [self.actor], False, second))
 
+    def test_unnamed_removal_in_adjacent_sentence_uses_the_named_actor(self):
+        self.initial_look = '短黑发，外穿蓝色薄外套，内搭米色针织衫'
+        self.first['action'] = '阿宁穿蓝外套半跪在木椅前。'
+        self.second['action'] = '切镜时阿宁仍穿着蓝外套。在本镜动作中，她向后耸肩脱下外套。'
+        third = {'start': 10, 'end': 15, 'action': '阿宁穿着米色针织衫站直，蓝外套拿在手上。'}
+        self.script['shots'].append(third)
+        first = self.describe(self.first, self.composition('半跪在木椅前。'))
+        lock = first['characters'][0]['locked_look']
+        self.assertEqual(lock, '短黑发，内搭米色针织衫')
+        self.assertIn('外穿蓝色薄外套', frames.prompt(self.script, self.first, [self.actor], False, first))
+
+        second = self.describe(self.second, self.composition('保持半跪。'), locked_looks={'阿宁': lock})
+        self.assertIn('外穿蓝色薄外套', frames.prompt(self.script, self.second, [self.actor], False, second))
+        final = self.describe(third, self.composition('站直，右手拿着蓝外套。'), locked_looks={'阿宁': lock})
+        text = frames.prompt(self.script, third, [self.actor], False, final)
+        self.assertIn('右手拿着蓝外套', text)
+        self.assertIn('米色针织衫', text)
+        self.assertNotIn('外穿蓝色薄外套', text)
+
+    def test_pronoun_does_not_carry_across_a_cut_or_an_ambiguous_sentence(self):
+        self.script['cast'].append({'name': '小李', 'look': '短发', 'picture': 'other.png'})
+        for action in ('她摘下圆框眼镜。', '阿宁和小李坐在桌边。随后，她摘下圆框眼镜。'):
+            with self.subTest(action=action):
+                self.second['action'] = action
+                first = self.describe(self.first, self.composition('坐在木桌旁。'))
+                self.assertEqual(first['characters'][0]['locked_look'], self.initial_look)
+
     def test_video_compile_does_not_promote_legacy_wearing_to_segment_identity(self):
         segment, = film.plan(self.script['shots'])
         refs = film.refs(self.script, segment, 'shot')
