@@ -193,6 +193,7 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     compositions = {key: value for key, value in (compositions or {}).items()
                     if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
     v2_covered = {c['name'] for comp in compositions.values() if comp.get('version') == 2 for c in comp['characters']}
+    changing = staging.changing_wearables(film)
     v3_looks: dict[str, str] = {}
     comp_looks: dict[str, str] = {}
     for comp in compositions.values():
@@ -200,6 +201,8 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
         for ch in comp.get('characters') or []:
             if ch.get('name'):
                 lk = (ch.get('locked_look') or ch.get('appearance') or '').strip().rstrip('。；; ')
+                if is_v3:
+                    lk = staging.stable_locked_look(lk, changing.get(ch['name'], set()))
                 if lk:
                     comp_looks.setdefault(ch['name'], lk)
                     if is_v3:
@@ -226,11 +229,13 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
                     look = ""
                 else:
                     look = (c.get("look") or "").strip().rstrip("。")
+                    look = staging.stable_locked_look(look, changing.get(c['name'], set()))
                 lines.append(f"参考图片{k}只约束{c['name']}身份" + (f"：{look}。" if look else "。"))
             else:
                 parts = []
                 for c in active_list:
                     lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                    lk = staging.stable_locked_look(lk, changing.get(c['name'], set()))
                     parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
                 absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in absent_list)}，严禁将未出场角色画进画面。" if absent_list else ""
                 lines.append(
@@ -383,6 +388,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
     wanted = [(i, p['shot']) for i, seg in enumerate(segs) for p in pics[i] if p['kind'] == 'frame']
     versions = frame_reference_versions(film, segs, job.state['frames'])
     effective = saved_compositions(job.state['frames'], reference_versions=versions)
+    changing = staging.changing_wearables(film)
     known_scenes, locked_looks, previous, previous_key = {}, {}, None, None
 
     def failure(key, exc):
@@ -407,7 +413,8 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
             for j, shot in enumerate(segment['shots']):
                 key = _frame_key(i, j)
                 rec = job.state['frames'].get(key) or {}
-                composition = effective.get(key)
+                saved = effective.get(key)
+                composition = staging.scope_wearable_look(saved, film, shot, changing)
                 out = job.dir / 'frames' / f'{key}.png'
                 skip = ((i, j) not in wanted or (out.exists() and not frames.task_pending(rec))
                         or ((rec.get('error') or rec.get('moderation_error')) and not (resume_tasks and frames.task_pending(rec))))
@@ -421,8 +428,12 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                             text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             references = rec.get('reference_paths', references)
                         elif rec.get('prompt') or rec.get('composition'):
-                            text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             references = rec.get('reference_paths', references)
+                            if composition != saved:
+                                text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
+                                job.put('frames', key, composition=composition, prompt=text, composition_prompt=text)
+                            else:
+                                text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             job.log('staging cache', key, 'source', previous_key)
                         elif not optimize_storyboard:
                             composition = None
@@ -438,6 +449,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                                     locked_looks=dict(locked_looks),
                                 )
                                 composition = staging.validate_composition(planned, film, shot, known_scenes)
+                                composition = staging.scope_wearable_look(composition, film, shot, changing)
                                 if composition.get('version') == 3:
                                     for ch in composition.get('characters') or []:
                                         if ch['name'] in locked_looks:

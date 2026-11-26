@@ -12,6 +12,14 @@ PROP_FIELDS = ('name', 'holder', 'contact', 'position', 'orientation', 'state', 
 PARTS = ('opening_direction', 'base_direction', 'knot_position')
 VISIBILITY = ('visible', 'cropped', 'occluded', 'offscreen')
 
+_WEARABLE_NAMES = r'眼镜|墨镜|毛巾|外套|夹克|大衣|围巾|口罩|头盔|帽子'
+_WEARABLE_REMOVAL = re.compile(r'(?:摘下|脱下|扯下|取下|解下|拿下|摘掉|脱掉)[^，,。！？；;]{0,24}?('
+                               + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
+_WEARABLE_AT_OPENING = re.compile(r'(?:戴着|佩戴|穿着|身穿|围着|挂着|系着)[^，,。！？；;]{0,20}?('
+                                 + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
+_NEGATED_STATE = ('未', '没', '没有', '不', '别', '不要')
+_COMPLETED_STATE = ('已', '已经', '早已', '刚', '刚刚', '先前')
+
 _V3_LOC_PREFIX = (
     r'(?:在|于)?(?:画面|镜头|前景|中景|背景|后景|远景|近景)?'
     r'(?:正中|中央|中间|左侧|右侧|左边|右边|左方|右方|左前|右前|左后|右后|前方|后方|深处|一侧|角落)'
@@ -25,6 +33,71 @@ _V3_PLACEMENT_VERB = re.compile(
 
 def is_structured(composition: object) -> bool:
     return isinstance(composition, dict) and composition.get('version') in (2, 3)
+
+
+def _actor_sentences(film: dict, action: str):
+    names = {alias: actor['name'] for actor in film.get('cast') or []
+             for alias in (actor['name'], *(actor.get('aliases') or [])) if alias}
+    for sentence in re.split(r'[。！？；;\n]', action):
+        actors = {name for alias, name in names.items() if alias in sentence}
+        if len(actors) == 1:
+            yield actors.pop(), sentence
+
+
+def changing_wearables(film: dict) -> dict[str, set[str]]:
+    """Recognize explicit removals in action sentences with one unambiguous cast member."""
+    changes: dict[str, set[str]] = {}
+    for shot in film.get('shots') or []:
+        for name, sentence in _actor_sentences(film, shot.get('action') or ''):
+            removed = {match[1] for match in _WEARABLE_REMOVAL.finditer(sentence)
+                       if not sentence[:match.start()].endswith(_NEGATED_STATE)}
+            if removed:
+                changes.setdefault(name, set()).update(removed)
+    return changes
+
+
+def _split_locked_look(look: str, changing: set[str]) -> tuple[str, list[tuple[str, str]]]:
+    fixed, mutable = [], []
+    for clause in re.split(r'[，,。；;、\n]+', look):
+        clause = clause.strip()
+        if clause:
+            wearable = next((item for item in changing if clause.endswith(item)), None)
+            if wearable:
+                mutable.append((wearable, clause))
+            else:
+                fixed.append(clause)
+    if not mutable:
+        return look, mutable
+    return '，'.join(fixed) or '保持角色身份外观', mutable
+
+
+def stable_locked_look(look: str, changing: set[str]) -> str:
+    return _split_locked_look(look, changing)[0] if changing else look
+
+
+def scope_wearable_look(composition: dict | None, film: dict, shot: dict, changes: dict[str, set[str]]) -> dict | None:
+    """Keep explicitly changing wearables local to the corresponding opening pose."""
+    if not changes or not composition or composition.get('version') != 3:
+        return composition
+    worn: dict[str, set[str]] = {}
+    for name, sentence in _actor_sentences(film, shot.get('action') or ''):
+        items = worn.setdefault(name, set())
+        items.update(match[1] for match in _WEARABLE_AT_OPENING.finditer(sentence)
+                     if not sentence[:match.start()].endswith(_NEGATED_STATE))
+        for match in _WEARABLE_REMOVAL.finditer(sentence):
+            if sentence[:match.start()].endswith(_COMPLETED_STATE) or sentence[match.end():].startswith(('后', '之后', '以后')):
+                items.discard(match[1])
+            elif not sentence[:match.start()].endswith(_NEGATED_STATE):
+                items.add(match[1])
+    characters = []
+    for character in composition['characters']:
+        look, mutable = _split_locked_look(character['locked_look'], changes.get(character['name'], set()))
+        pose = character['placement_and_pose']
+        wearing = [clause for item, clause in mutable if item in worn.get(character['name'], ()) and item not in pose]
+        if mutable:
+            character = {**character, 'locked_look': look, 'placement_and_pose': '，'.join([*wearing, pose])}
+        characters.append(character)
+    return {**composition, 'characters': characters}
 
 
 def canonical_path_key(raw: str, resolve_cache: dict[str, str] | None = None) -> str:
