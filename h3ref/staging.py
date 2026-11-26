@@ -21,7 +21,9 @@ _WEARABLE_ON_BODY = re.compile(r'(' + _WEARABLE_NAMES + r')\s*(?:挂|架|戴|系
 _LOOK_WEAR_VERB = re.compile(r'(?:没有|不要|未|没|不|别)?(?:(?:头|脸|肩|颈|脖子|脖颈|鼻梁|身|腰|背|胸|耳)(?:上|前|间))?'
                             r'(?:戴着?|佩戴|外穿|身穿|穿着|穿(?!过|越|行|梭)|围着|挂着|系着)')
 _LOOK_WEARABLE = re.compile(r'(' + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
-_JOINED_WEARABLE = re.compile(r'\s*(?:以及|和|与|及|、)\s*(?P<description>[^，,。！？；;\n摘脱戴穿取拿]{0,16}?'
+# Limit shared verbs to clear item lists. A conjunction may instead introduce a new action.
+_JOINED_WEARABLE = re.compile(r'\s*(?:以及|和|与|及|、)\s*(?P<description>(?:一[副顶件条个])?'
+                              r'[黑白灰红橙黄绿青蓝紫粉棕褐金银米深浅色宽窄粗细长短圆方厚薄框边皮布针织绒毛]{0,12}?'
                               r'(?P<item>' + _WEARABLE_NAMES + r')(?!框|片|盒|架))')
 _LOOK_CONNECTOR = re.compile(r'(?:并且|同时|而且|还|也|又|并|和|与)\s*$')
 _NEGATED_STATE = ('未', '没', '没有', '不', '别', '不要')
