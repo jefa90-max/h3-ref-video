@@ -37,7 +37,7 @@
 - Python 3.13.17 x64：[官方 Windows 发布清单](https://www.python.org/ftp/python/3.13.17/windows-3.13.17.json)。完整运行时约 31 MB；包含 `Lib/venv`、`Lib/ensurepip`、pip 和 `vcruntime140*.dll`。
 - FFmpeg 9.0.2 essentials：[Gyan Windows 构建](https://www.gyan.dev/ffmpeg/builds/)及[对应 SHA-256](https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256)。Gyan 是 [FFmpeg 官网列出的 Windows 二进制提供方](https://ffmpeg.org/download.html)。解压时保留许可证文件。
 - curl 8.23.0_8：[curl 官方 Windows 构建](https://curl.se/windows/)。安装包当前仍保留该工具供命令行手动诊断；工作台自身的上传与下载已改用内置 Python `urllib.request`（OpenSSL）执行，不依赖系统 `curl.exe`。
-- Python 依赖从 PyPI 获取，遵循仓库 `requirements-web.txt` 和 `requirements.txt`。当前 [Flask](https://pypi.org/project/Flask/) 和 [Pillow](https://pypi.org/project/Pillow/) 支持 Python 3.13；后续启动在依赖声明未变化时不会联网重新安装。
+- Python 依赖从 PyPI 获取，遵循仓库 `requirements-web.txt`、`requirements.txt` 与 `requirements-colab.txt`（可选的 Colab CLI 依赖）。当前 [Flask](https://pypi.org/project/Flask/) 和 [Pillow](https://pypi.org/project/Pillow/) 支持 Python 3.13；后续启动在依赖声明未变化时不会联网重新安装。
 
 ## 验证边界
 
