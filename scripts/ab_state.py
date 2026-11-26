@@ -144,3 +144,8 @@ class Journal:
     def update(self, key, **changes):
         self.steps[key].update(changes)
         self.save()
+
+    def record_charge(self, key, charge):
+        # A later poll can omit billing after the original completion response.
+        if charge is not None:
+            self.update(key, actual_cny=str(money(charge)))

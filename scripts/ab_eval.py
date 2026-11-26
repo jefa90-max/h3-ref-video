@@ -85,22 +85,22 @@ def get_assets(cases, overrides, asset_root):
             identifier = reference.removeprefix("asset:")
             if not _IDENTIFIER.fullmatch(identifier):
                 raise ExperimentError(f"invalid_asset: {fixture['id']}")
-            key = (fixture["id"], identifier)
-            if key in resolved or key in missing:
+            asset_id = (fixture["id"], identifier)
+            if asset_id in resolved or asset_id in missing:
                 continue
-            asset = overrides.get(key[0], {}).get(identifier, fixture["assets"].get(identifier, {}))
+            asset = overrides.get(fixture["id"], {}).get(identifier, fixture["assets"].get(identifier, {}))
             digest = asset.get("sha256")
             relative = asset.get("path")
             if not relative or not digest:
-                missing.add(key)
+                missing.add(asset_id)
                 continue
             source = (root / relative).resolve()
             if (Path(relative).is_absolute() or not source.is_relative_to(root) or not _SHA256.fullmatch(digest)
                     or source.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp")):
-                raise ExperimentError(f"invalid_asset: {'/'.join(key)} requires a relative image path and a SHA-256")
+                raise ExperimentError(f"invalid_asset: {'/'.join(asset_id)} requires a relative image path and a SHA-256")
             if not source.is_file() or file_sha256(source) != digest:
-                raise ExperimentError(f"asset_changed: {'/'.join(key)} is missing or does not match its SHA-256")
-            resolved[key] = (source, digest)
+                raise ExperimentError(f"asset_changed: {'/'.join(asset_id)} is missing or does not match its SHA-256")
+            resolved[asset_id] = (source, digest)
     return resolved, missing
 
 
@@ -196,7 +196,7 @@ class Run:
         self.prompt_lengths[key] = len(prompt)
 
     def text(self, key, stage, request, send, stub):
-        from h3ref import rewrite
+        from h3ref import http, rewrite
 
         estimate = self.price(stage)
         self.describe(key, request)
@@ -215,8 +215,8 @@ class Run:
         self.journal.update(key, status="submission_unknown", request_sha256=request_sha)
         try:
             result = send()
-        except rewrite.RewriteResponseError:
-            # Cache the missing text so downstream validation can reject it without a second call.
+        except (http.JSONResponseError, rewrite.RewriteResponseError):
+            # Cache the invalid response so downstream validation can reject it without a second call.
             result = None
         # Never put provider credentials into prompts or reproducibility artifacts.
         content = json.dumps(result, ensure_ascii=False)
@@ -280,7 +280,7 @@ class Run:
 
         try:
             frames.draw(prompt, references, aspect, path, record=record, task=step.get("task"),
-                        settle=lambda charge: self.journal.update(key, actual_cny=None if charge is None else str(money(charge))))
+                        settle=lambda charge: self.journal.record_charge(key, charge))
         except frames.ContentPolicyError:
             self.journal.update(key, status="failed", moderation_failed=True)
             return None
@@ -340,7 +340,7 @@ class Run:
                 return None
             if result["state"] == "done":
                 charge = result.get("cny") if result.get("billing_known") else None
-                self.journal.update(key, actual_cny=None if charge is None else str(money(charge)))
+                self.journal.record_charge(key, charge)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if is_comfy:
                     backend.download(result["url"], path)

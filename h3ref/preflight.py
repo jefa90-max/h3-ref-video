@@ -20,8 +20,8 @@ _FULLWIDTH = {0x3000: " ", **{n: n - 0xFEE0 for n in range(0xFF01, 0xFF5F)}}
 _HAN = r"\u3400-\u4dbf\u4e00-\u9fff\u3005"
 _KANA_HANGUL = r"\u3040-\u30ff\uac00-\ud7af"
 _LATIN = r"A-Za-zÀ-ÖØ-öø-ÿ"
-_CHAR_TOKEN = re.compile(rf"[{_HAN}{_KANA_HANGUL}0-9]|[A-Za-z]+")
-_WORD_TOKEN = re.compile(rf"[0-9{_LATIN}]+(?:['’][0-9{_LATIN}]+)*|[{_HAN}]")
+_CHAR_PATTERN = re.compile(rf"[{_HAN}{_KANA_HANGUL}0-9]|[A-Za-z]+")
+_WORD_PATTERN = re.compile(rf"[0-9{_LATIN}]+(?:['’][0-9{_LATIN}]+)*|[{_HAN}]")
 _COVERED_CHARS = re.compile(rf"[{_HAN}{_KANA_HANGUL}A-Za-z]")
 _COVERED_WORDS = re.compile(rf"[{_HAN}{_LATIN}]")
 _SLOW_CUE = re.compile(
@@ -260,7 +260,7 @@ def inspect_with_env(film, environ, *, rate_config=None, normalized_times=False)
         status = "partial"
     elif spoken:
         unit = "chars" if speech in {"zh", "ja", "ko"} else "words"
-        counter, covered = (_CHAR_TOKEN, _COVERED_CHARS) if unit == "chars" else (_WORD_TOKEN, _COVERED_WORDS)
+        counter, covered = (_CHAR_PATTERN, _COVERED_CHARS) if unit == "chars" else (_WORD_PATTERN, _COVERED_WORDS)
         settings = rates[unit]
         speaker = _speaker_prefix(film.get("cast"))
         checked_lines = 0

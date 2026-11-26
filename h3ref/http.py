@@ -63,6 +63,10 @@ class TransportError(RuntimeError):
     """Connection/TLS/proxy transport failure before an HTTP request was delivered."""
 
 
+class JSONResponseError(RuntimeError):
+    """A successful HTTP response body could not be decoded as JSON."""
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         old_scheme = urlsplit(req.full_url).scheme.lower()
@@ -137,16 +141,22 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
     if extra_headers:
         headers.update(extra_headers)
     last = None
-    last_is_transport = False
+    error_cls = RuntimeError
     for attempt in range(tries):
         req = urllib.request.Request(url, data=data, method=method or ("POST" if data else "GET"), headers=headers)
         open_fn = _OPENER.open if urllib.request.urlopen is _ORIG_URLOPEN else urllib.request.urlopen
         try:
             with open_fn(req, timeout=timeout) as r:
-                parsed_ok = json.loads(r.read().decode(errors="replace"))
-                return _scrub_json(parsed_ok, key)
+                raw_text = r.read().decode(errors="replace")
+                try:
+                    parsed_ok = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    error_cls = JSONResponseError
+                    last = _scrub(f"{type(exc).__name__}: {exc}", key)
+                else:
+                    return _scrub_json(parsed_ok, key)
         except urllib.error.HTTPError as exc:
-            last_is_transport = False
+            error_cls = RuntimeError
             raw_text = exc.read().decode(errors="replace")
             exc.close()
             summary = _summarize_error_body(raw_text, key, limit=300)
@@ -164,11 +174,10 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
                 return parsed
             last = f"{exc.code}: {_summarize_error_body(raw_text, key, limit=200)}"
         except Exception as exc:
-            last_is_transport = isinstance(exc, urllib.error.URLError)
+            error_cls = TransportError if isinstance(exc, urllib.error.URLError) else RuntimeError
             last = _scrub(f"{type(exc).__name__}: {exc}", key)
         if attempt + 1 < tries:
             time.sleep(4 * (attempt + 1))
-    error_cls = TransportError if last_is_transport else RuntimeError
     raise error_cls(f"{url}: {_scrub(str(last), key)[:300]}")
 
 
