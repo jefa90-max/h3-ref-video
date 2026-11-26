@@ -137,6 +137,17 @@ class StagingAndTimestampRecovery(unittest.TestCase):
         character, = staging.scope_wearable_look(composition, script, opening, changes)["characters"]
         self.assertEqual(character["placement_and_pose"], "戴着黑框眼镜，戴着灰帽子，站在窗前")
 
+    def test_following_action_does_not_share_the_wearable_verb(self):
+        opening = {"action": "阿宁戴着眼镜和朋友一起挑选帽子。"}
+        removal = {"action": "阿宁摘下眼镜和同事讨论帽子。"}
+        script = {"cast": [{"name": "阿宁"}], "shots": [opening, removal]}
+        self.assertEqual(staging.changing_wearables(script), {"阿宁": {"眼镜"}})
+        composition = {"version": 3, "characters": [
+            {"name": "阿宁", "locked_look": "戴着黑框眼镜和灰帽子", "placement_and_pose": "站在柜台前"},
+        ]}
+        character, = staging.scope_wearable_look(composition, script, opening, {"阿宁": {"眼镜", "帽子"}})["characters"]
+        self.assertEqual(character["placement_and_pose"], "戴着黑框眼镜，站在柜台前")
+
     def test_single_out_of_range_timestamp_uses_same_default_as_preflight(self):
         for raw_time in ({"start": 3601}, {"end": 3601}):
             with self.subTest(raw_time=raw_time):
