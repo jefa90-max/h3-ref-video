@@ -18,6 +18,10 @@ _WEARABLE_REMOVAL = re.compile(r'(?:摘下|脱下|扯下|取下|解下|拿下|�
 _WEARABLE_AT_OPENING = re.compile(r'(?:戴着|佩戴|穿着|身穿|穿(?!过|越|行|梭)|围着|挂着|系着)[^，,。！？；;]{0,20}?('
                                  + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
 _WEARABLE_ON_BODY = re.compile(r'(' + _WEARABLE_NAMES + r')\s*(?:挂|架|戴|系|搭|罩|裹|套|别|扣|遮|压)(?:着|在|于|住)')
+_LOOK_WEAR_VERB = re.compile(r'(?:(?:头|脸|肩|颈|脖子|脖颈|鼻梁|身|腰|背|胸|耳)(?:上|前|间))?'
+                            r'(?:戴着?|佩戴|外穿|身穿|穿着|穿(?!过|越|行|梭)|围着|挂着|系着)')
+_LOOK_WEARABLE = re.compile(r'(' + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
+_LOOK_CONNECTOR = re.compile(r'(?:并且|同时|而且|还|也|又|并|和|与)\s*$')
 _NEGATED_STATE = ('未', '没', '没有', '不', '别', '不要')
 _COMPLETED_STATE = ('已', '已经', '早已', '刚', '刚刚', '先前')
 _SUBJECT_PRONOUN = re.compile(r'^\s*(?:[^，,]{1,16}[，,]\s*)?([他她])(?!们|人)')
@@ -85,16 +89,38 @@ def changing_wearables(film: dict) -> dict[str, set[str]]:
 
 
 def _split_locked_look(look: str, changing: set[str]) -> tuple[str, list[tuple[str, str]]]:
+    if not changing:
+        return look, []
     fixed, mutable = [], []
     for clause in re.split(r'[，,。；;、\n]+', look):
         clause = clause.strip()
-        if clause:
-            worn = {match[1] for pattern in (_WEARABLE_AT_OPENING, _WEARABLE_ON_BODY) for match in pattern.finditer(clause)}
-            wearable = next((item for item in changing if clause.endswith(item) or item in worn), None)
-            if wearable:
-                mutable.append((wearable, clause))
-            else:
-                fixed.append(clause)
+        if not clause:
+            continue
+        verbs = list(_LOOK_WEAR_VERB.finditer(clause))
+        if verbs:
+            prefix = _LOOK_CONNECTOR.sub('', clause[:verbs[0].start()]).strip()
+            fixed_parts, mutable_parts = ([prefix] if prefix else []), []
+            for index, verb in enumerate(verbs):
+                end = verbs[index + 1].start() if index + 1 < len(verbs) else len(clause)
+                specifier = clause[verb.start():end]
+                if end < len(clause):
+                    specifier = _LOOK_CONNECTOR.sub('', specifier).strip()
+                wearable = _LOOK_WEARABLE.search(clause, verb.end(), end)
+                if wearable and wearable[1] in changing:
+                    mutable_parts.append((wearable[1], specifier))
+                else:
+                    fixed_parts.append(specifier)
+            if mutable_parts:
+                fixed.extend(fixed_parts)
+                mutable.extend(mutable_parts)
+                continue
+        wearable = next((match[1] for match in _WEARABLE_ON_BODY.finditer(clause) if match[1] in changing), None)
+        if wearable is None:
+            wearable = next((item for item in _WEARABLE_NAMES.split('|') if item in changing and clause.endswith(item)), None)
+        if wearable:
+            mutable.append((wearable, clause))
+        else:
+            fixed.append(clause)
     if not mutable:
         return look, mutable
     return '，'.join(fixed) or '保持角色身份外观', mutable
