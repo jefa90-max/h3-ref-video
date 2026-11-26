@@ -2,9 +2,8 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import os
 from pathlib import Path
-
-from . import config
 
 MESSAGES = {lang: json.loads((Path(__file__).parent / "messages" / f"{lang}.json").read_text(encoding="utf-8"))
             for lang in ("zh-CN", "en")}
@@ -21,6 +20,6 @@ def use_lang(lang: str | None):
 
 
 def message(key, **values):
-    raw = _LANG.get() or config.env("H3_LANG")
+    raw = _LANG.get() or os.environ.get("H3_LANG", "").strip()
     lang = "en" if raw.lower().startswith("en") else "zh-CN"
     return MESSAGES[lang][key].format(**values)

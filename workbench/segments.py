@@ -571,7 +571,10 @@ def segment_needs_h3_rewrite(record, pair, automatic, *, has_clip: bool = False,
     if not has_clip:
         expected_source = film.segment_prompt_text(record, automatic['source'])
         if pair['source'] != expected_source:
-            return True
+            paired_record = {**record, 'zh': pair['source'], 'h3': pair['h3']}
+            if not film.cached_segment_source(paired_record, expected_source, automatic['reference_version'],
+                                              len(automatic['pictures']), legacy_source=automatic['legacy_source']):
+                return True
     if rewrite_required is not None:
         if rewrite_required:
             return True
@@ -607,10 +610,17 @@ def automatic_inputs(request, number, context):
         paths = film.picture_paths(Path(request['output_dir']), segment, pictures)
         with use_lang(request.get('lang')):
             source = film.compile_prompt(request['film'], segment, pictures, len(planned), compositions=context['compositions'])
+
+        def legacy_source():
+            with use_lang(request.get('lang')):
+                return film.compile_prompt(request['film'], segment, pictures, len(planned),
+                                           compositions=context['compositions'], scope_wearables=False)
+
         reference_version = film.reference_version(paths, metadata=context['path_versions'])
         source_version = hashlib.sha256(json.dumps([source, reference_version], ensure_ascii=False).encode()).hexdigest()
         context['automatic'][number] = {'source': source, 'source_version': source_version,
-                                        'reference_version': reference_version, 'pictures': pictures, 'paths': paths}
+                                        'legacy_source': legacy_source, 'reference_version': reference_version,
+                                        'pictures': pictures, 'paths': paths}
     return context['automatic'][number]
 
 
@@ -1071,6 +1081,9 @@ def assemble(request):
         report = message("demo_report", request["lang"], kind="film", mode=request["frames"], segments=len(planned),
                          frames=len(list((out / "frames").glob("*.png"))), seconds=sum(s["seconds"] for s in planned),
                          path=out, video=message("demo_video", request["lang"]))
+        notes = film.preflight_report_lines(film.Job(out), request["film"])
+        if notes:
+            report = report.rstrip() + "\n\n" + "\n".join(notes)
         (out / "report.md").write_text(report, encoding="utf-8")
     else:
         film.report(film.Job(out), request["film"], film.plan(request["film"]["shots"]), request["frames"], final)

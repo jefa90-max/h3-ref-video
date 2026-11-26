@@ -5,6 +5,14 @@ description: 通过 ComfyUI（Google Colab / 自建 GPU）或 RunningHub 用 Min
 
 # h3-ref-video
 
+起草或收到 `film.json` 后，先声明台词语种（如 `"speech": "zh"`），再用下面的命令运行零成本预检。
+
+```bash
+python h3ref.py preflight --film examples/dialogue-budget.json --json
+```
+
+示例返回 `status: "partial"` 和两条告警 `dialogue_over_budget`、`dialogue_slow_over_budget`。检查实际剧本时换成相应路径，或用 `--film -` 输入 JSON。自动化门禁可加 `--fail-on-warn`，用 `raw_shot_index` 定位原始 `shots` 数组；出现超预算时精简台词，或拆为总有效生成预算足够的多个段落。预估为启发式，默认阈值尚待实片校准。
+
 工具在这个目录里：`h3ref.py` 是入口，`README.md` 讲做法、实测结论和坑。跑之前确认 `.env`（或环境变量）已配置视频后端和图片/文字密钥：`VIDEO_PROVIDER=comfyui`（`.env.example` 默认）需 `COMFYUI_URL`（公网 HTTPS 隧道另需 `COMFYUI_API_KEY`），`VIDEO_PROVIDER=runninghub`（未设置时的代码回退）需 `RUNNINGHUB_API_KEY`；画分镜图需 `APIMART_API_KEY`（若设 `LLM_PROVIDER=gemini` 另需 `GEMINI_API_KEY`）。机器上有 Python 3.10+、ffmpeg；提示词改写默认用本机登录过的 Claude Code，没有就用 `H3_REWRITER=llm`。
 
 1. **一条片段**（5–15 秒）：把用户的 Seedance 写法提示词存成文件，参考图按「参考图片1、参考图片2…」的顺序给：

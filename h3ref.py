@@ -20,6 +20,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+if __name__ == "__main__" and sys.argv[1:2] == ["preflight"]:
+    # The read-only command must run before generation imports seed the environment.
+    sys.dont_write_bytecode = True
+    from h3ref.preflight import cli
+
+    raise SystemExit(cli(sys.argv[2:]))
+
+
+from h3ref import preflight  # noqa: E402
 from h3ref import check, comfy, config, film, http, media, rewrite, rh  # noqa: E402
 from h3ref.i18n import message  # noqa: E402
 
@@ -201,6 +210,7 @@ def main():
     r.add_argument("--images", type=int, required=True)
     r.add_argument("--seconds", type=int, default=12)
     r.add_argument("--aspect", default="9:16", choices=list(config.SIZES))
+    preflight.add_cli_arguments(sub.add_parser("preflight", help=message("dialogue_cli_help")))
     sub.add_parser("account", help="RunningHub 余额")
     a = ap.parse_args()
     if a.cmd == "one":
@@ -209,8 +219,13 @@ def main():
         if not config.MIN_SECONDS <= a.seconds <= config.MAX_SECONDS:
             raise SystemExit("--seconds 只能是 5 到 15")
         cmd_one(a)
+    elif a.cmd == "preflight":
+        raise SystemExit(preflight.cli(sys.argv[2:]))
     elif a.cmd == "film":
-        film.run(a.job, a.film, a.frames, a.redo, resume_frame_tasks=True, optimize_storyboard=a.optimize_storyboard)
+        try:
+            film.run(a.job, a.film, a.frames, a.redo, resume_frame_tasks=True, optimize_storyboard=a.optimize_storyboard)
+        except film.FilmValidationError as exc:
+            raise SystemExit(str(exc)) from exc
         failed = film.Job(a.job).state.get("frame_failures") or []
         if failed:
             raise SystemExit(message("frames_cli_incomplete", keys=", ".join(failed), path=a.job / "state.json"))

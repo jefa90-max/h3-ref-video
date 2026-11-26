@@ -1,0 +1,1128 @@
+{
+  "schema_version": 1,
+  "run_id": "prompt-enhancements-v1",
+  "status": "preregistered",
+  "reproducibility": "unreproducible",
+  "model_context": {
+    "image": {
+      "provider": "apimart",
+      "model": "gpt-image-2.6-sunburst",
+      "upstream_version": "unpinned",
+      "resolution": "1k",
+      "quality": "medium"
+    },
+    "video": {
+      "model": "minimax-h3",
+      "upstream_version": "unpinned",
+      "runninghub": {
+        "workflow": {
+          "path": "workflows/h3-ref2va-turbo.json",
+          "sha256": "b3d5a20e0638e568af90a17612f5c4cdae682f405b950acee843f61d55a5d390"
+        },
+        "workflow_id": "2113525277564424193",
+        "sampling": {
+          "steps": 20,
+          "resolution_short_edge": 544
+        }
+      },
+      "comfyui": {
+        "workflow": {
+          "path": "workflows/comfy-h3-ref2va.json",
+          "sha256": "9463a135e5a85a90874477429849205c3aebd9c8421f6a3fa613c975ba80a71d"
+        },
+        "sampling": {
+          "preset": "full20",
+          "steps": 20,
+          "resolution": "768p",
+          "upscale": false
+        }
+      }
+    },
+    "text": {
+      "required": [
+        "workbench-llm",
+        "claude"
+      ],
+      "h3_rewriter_modes": [
+        "llm",
+        "claude"
+      ],
+      "apimart": {
+        "composition_model": "deepseek-v4-pro",
+        "rewrite_model": "deepseek-v4-pro",
+        "upstream_version": "unpinned"
+      },
+      "gemini": {
+        "composition_model": "gemini-flash-latest",
+        "rewrite_model": "gemini-flash-latest",
+        "upstream_version": "unpinned"
+      },
+      "claude": {
+        "model": "opus",
+        "upstream_version": "unpinned"
+      }
+    },
+    "actual_run": {
+      "configuration_sha256": null,
+      "rules_sha256": null,
+      "prompt_sha256": null,
+      "scored_media_sha256": null,
+      "blind_scores": null
+    }
+  },
+  "retirement": {
+    "comparison": "在同一新模型、同一固定输入、同一采样和评分条件下，比较全补丁版本与仅移除目标补丁的版本。",
+    "thresholds": [
+      "逐个缺陷类别计算盲评胜负与并列。移除版的胜率至少达到保留版，且叙事忠实度没有下降。",
+      "移除版无新增内容审核拦截，包含重试在内的可交付总成本不上升。",
+      "重新跑组合回归。系统提示词累计增长不超过 20%，没有规则冲突。"
+    ],
+    "decision": "以上条件全部由可复现的结果支持后，该补丁才可退场。"
+  },
+  "fixtures": [
+    {
+      "id": "staged-shove",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "看清两人的前后位置、向后失去平衡的一步，以及重新站稳的方向。",
+      "category": "交手受力",
+      "control": false,
+      "film": {
+        "title": "staged-shove",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "小型排练厅，后景是木质墙面。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "中景，侧机位",
+            "action": "舞台排练记录称这一拍为殴打。阿青向前一顶，阿南受力向后撤一步，双脚仍在地面。画面是两人动作刚交接的瞬间。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "staged-recoil",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "看清被逼退者的后仰幅度与脚下重心，周围的道具留在原位。",
+      "category": "交手受力",
+      "control": false,
+      "film": {
+        "title": "staged-recoil",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "空旷的店铺布景，侧边有一张矮木凳。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "侧面中近景",
+            "action": "旧分镜标题写暴打，镜头实际开在布景里的虚构冲突起势。一人逼近，另一人肩背刚向后躲开，脚跟仍靠近矮凳。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "red-cloth-mark",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "袖口只出现一小块深红色痕迹，人物保持原来的服装与站位。",
+      "category": "色迹与擦痕",
+      "control": false,
+      "film": {
+        "title": "red-cloth-mark",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "后台化妆间，窗户在右，室内有浅色桌面。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "手部近景",
+            "action": "演员将手放在桌沿，低头发现袖口沾着一点舞台假鲜血颜料。场记称这个细节为流血，画面只表现袖口上的颜料和织物纹理。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "prop-visible-scratch",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "近景能看清道具表面的擦痕，手指保持自然姿势。",
+      "category": "色迹与擦痕",
+      "control": false,
+      "film": {
+        "title": "prop-visible-scratch",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "后台道具室，工作灯照在手套上。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "物件特写",
+            "action": "演员把皮质手套搁到桌上，露出道具师标记为伤口的一道表面擦痕，拍摄只呈现手套的表面。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "stage-faceoff",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "让两位演员在画面两边清楚对峙，中间保留能辨认的空间。",
+      "category": "虚构交锋",
+      "control": false,
+      "film": {
+        "title": "stage-faceoff",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "开阔舞台，地面上有一条浅色装饰带。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "对称全景",
+            "action": "虚构舞台剧的情节摘要写砍杀，分镜第一拍只见两位演员隔着装饰带对峙，手中的道具保持低位。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "staged-parry",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "表现接近前的紧张与两人的相对距离，保持画面上的手势和方位连贯。",
+      "category": "虚构交锋",
+      "control": false,
+      "film": {
+        "title": "staged-parry",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "排练厅，窗格光落在两人之间。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "侧面双人中景",
+            "action": "旧台本在这个动作前标作捅伤、刺伤。画面只拍演练开头，左侧演员走近一步，右侧演员抬前臂作防备姿态。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "shoulder-standoff",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "肩部的姿态和人物间距要清楚，两个演员的动作能分辨。",
+      "category": "虚构交锋",
+      "control": false,
+      "film": {
+        "title": "shoulder-standoff",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "室内布景，单侧窗光。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "斜侧双人近景",
+            "action": "剧本行旁原标掐脖、勒脖，但布景彩排只表现两位演员接近对峙，左侧人物屈膝绷紧肩，右侧人物仍站稳。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "scattered-props",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "散落物应保持舞台道具的外观，焦点在碎石和翻倒的器具。",
+      "category": "道具散落",
+      "control": false,
+      "film": {
+        "title": "scattered-props",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "电影布景的废弃仓库，地上散着泡沫石块和塑料支架。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "低机位全景",
+            "action": "道具表称其中几件为断肢道具，镜头只拍在灰尘初散的地面上散落的几件浅色模型、泡沫碎石与翻倒的小推车。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "dust-after-impact",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "表现气浪扫过小碎石和灰尘的方向，保留地面和背景轮廓。",
+      "category": "冲击与环境",
+      "control": false,
+      "film": {
+        "title": "dust-after-impact",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "室外摄影棚的空地，后景是遮在烟尘里的布景墙。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "低角度宽景",
+            "action": "旧片段备注有炸飞碎尸的粗略写法，本镜的动作是气浪把碎石和灰尘推向画面右方，前景的石块刚离地，画面里不出现人物。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "grip-and-gaze",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "手仍用力抓着扶栏，视线稳定落到扶栏尽头。",
+      "category": "情绪与用力",
+      "control": false,
+      "film": {
+        "title": "grip-and-gaze",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "清晨的旧桥，木扶栏在画面左边。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "手与面部同框的中近景",
+            "action": "阿茵死死抓住扶栏，死盯扶栏尽头的灯。她刚停在画面左侧，头朝右，袖口被攥紧的手带起一点褶皱。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "table-lantern",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "保留桌面灯笼作为主光源和人物脸上随光线形成的明暗层次。",
+      "category": "布光",
+      "control": true,
+      "film": {
+        "title": "table-lantern",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "黄昏的木桌边，灯笼在镜头左侧，远处窗帘半掩。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "人物近景",
+            "action": "阿河刚转脸看向桌面的灯笼，右手仍扶着椅背。微暖的光照亮他的近侧面颊，窗外仍有淡淡蓝光。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "window-daylight",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "表现靠窗的柔和侧光和室内的自然阴影，人物与陈设的位置保持清楚。",
+      "category": "布光",
+      "control": true,
+      "film": {
+        "title": "window-daylight",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "白天的公寓，左侧大窗旁有木边桌和水杯。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "中景，平视",
+            "action": "小雨刚在窗边坐下，左肩靠近窗，双手放在膝盖上。薄窗帘把日光散开，桌面的水杯留在画面右下角。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "plain-paper-package",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "让装瓶和纸盒靠形状和素色区分，清楚保留两种包装的尺寸。",
+      "category": "文字与道具保真",
+      "control": true,
+      "film": {
+        "title": "plain-paper-package",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "杂货店的道具台上放着素色的绿瓶和米色纸盒。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "静物近景",
+            "action": "一只手刚伸进画面，指向米色纸盒。瓶身只用绿色和圆形浮纹表现，纸盒裹着整张米色纸。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "abstract-vase",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "蓝陶瓶和背景的图案用形状与颜色表现，瓶身装饰轮廓保持清楚。",
+      "category": "文字与道具保真",
+      "control": true,
+      "film": {
+        "title": "abstract-vase",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "陶艺店，深蓝色波纹陶瓶在浅木展示台中央。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "台面平视特写",
+            "action": "镜头刚对准陶瓶，圆柱瓶身上是一圈相连的浅蓝色波纹，干净的展示台上没有其他物件。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "quiet-crowd",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "中心角色在动，背景几人站在各自的位置，观众能分辨两层动作。",
+      "category": "群像控制",
+      "control": true,
+      "film": {
+        "title": "quiet-crowd",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "明亮的排练厅，后侧墙有木质条形装饰。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "固定中全景",
+            "action": "中央演员抬手准备指向窗户，后排三人各自安静站着看同一个方向。人与人之间有清楚间隔。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "heavy-basket",
+      "arms": [
+        "3A",
+        "3B",
+        "3C-neg",
+        "3C-light"
+      ],
+      "description": "篮子维持一个，抓篮沿的手势与起身前的重心清楚可见。",
+      "category": "日常物理动作",
+      "control": true,
+      "film": {
+        "title": "heavy-basket",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "早市摊位，桌下有一只矮藤篮。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "斜侧中景",
+            "action": "小禾半蹲在桌前，双手握住面前的藤篮两侧，准备把篮子提到桌上。篮子仍接触地面，身体重心略向前移。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {}
+    },
+    {
+      "id": "serious-face",
+      "arms": [
+        "3D"
+      ],
+      "description": "在整个对话镜头里保持严肃表情，确认情绪与对白同步。",
+      "category": "视觉否定",
+      "control": false,
+      "film": {
+        "title": "serious-face",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "安静的候车厅，走道柔和均匀。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "正面近景",
+            "action": "阿宁面对来人，面无笑意。说完后闭唇，眉眼保持平稳直到切镜。",
+            "line": "我在这里等。"
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "matte-orb",
+      "arms": [
+        "3D"
+      ],
+      "description": "圆球应保持原有哑光材质，手掌转动时只看到环境光的变化。",
+      "category": "视觉否定",
+      "control": false,
+      "film": {
+        "title": "matte-orb",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "阴天的室内道具台。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "手部特写",
+            "action": "阿宁在手掌里慢慢转动不发光的暗蓝哑光圆球。球的表面光泽在整个镜头维持不变。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "character-first",
+      "arms": [
+        "3D"
+      ],
+      "description": "第一拍看到角色，再看她站起来的动作和椅子的位置。",
+      "category": "视觉否定",
+      "control": false,
+      "film": {
+        "title": "character-first",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "候场室，椅子靠在米色墙面前。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "中景，轻推",
+            "action": "不要空镜。阿宁开场就在画面中央坐着，看到门外的人才把双手按到椅面并起身。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "clean-cloth",
+      "arms": [
+        "3D"
+      ],
+      "description": "检查近景里白布和手的外观连贯，松开手后手掌保持干净。",
+      "category": "视觉否定",
+      "control": false,
+      "film": {
+        "title": "clean-cloth",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "安静的室内排练台上有一张软白布。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "手部近景",
+            "action": "角色用白布包住自己的手背作排练动作，手臂放松，不流血。她解开白布，手掌仍然干净。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "closed-door-control",
+      "arms": [
+        "3D"
+      ],
+      "description": "角色敲门后继续等候，门在镜头末尾保持闭合。",
+      "category": "合法剧情否定",
+      "control": true,
+      "film": {
+        "title": "closed-door-control",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "走廊尽头是一扇闭合的木门。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "中景",
+            "action": "阿宁抬手敲一次门。门还没有打开，她垂下手站在原地等回应。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "cup-stays-control",
+      "arms": [
+        "3D"
+      ],
+      "description": "角色的目光移向杯子并收回，杯子始终留在桌面原位。",
+      "category": "合法剧情否定",
+      "control": true,
+      "film": {
+        "title": "cup-stays-control",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "起居室内，杯子在桌角。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "侧面中景",
+            "action": "阿宁瞟向桌角的杯子，不拿起杯子，只把自己的手放到膝盖上。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "unexpected-knock",
+      "arms": [
+        "4"
+      ],
+      "description": "看清突然听见声音时的表情变化，以及停一拍后慢慢恢复的过程。",
+      "category": "大幅惊讶",
+      "control": false,
+      "film": {
+        "title": "unexpected-knock",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "安静的老房间，敲门声从画外传来。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "面部近景",
+            "action": "阿宁独自坐在桌边。突如其来的敲门声让她明显吃惊，停住一瞬，然后逐渐收回反应。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "scared-step",
+      "arms": [
+        "4"
+      ],
+      "description": "从察觉危险到紧张后撤的幅度清楚，动作留有反应高点和回落。",
+      "category": "恐惧与肩颈",
+      "control": false,
+      "film": {
+        "title": "scared-step",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "空旷舞台后场，重道具在远处突然晃动。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "面部和上半身近景",
+            "action": "阿宁听到身后传来撞击声后吃惊，转头看见摇晃的道具，害怕地缩肩向后退一步，再扶稳桌角。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "genuine-laugh",
+      "arms": [
+        "4"
+      ],
+      "description": "看清她先礼貌回应，随后笑到收不住，再慢慢恢复的区别。",
+      "category": "笑容幅度",
+      "control": false,
+      "film": {
+        "title": "genuine-laugh",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "好友面对面坐在咖啡桌边，柔和侧光。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "固定面部近景",
+            "action": "阿宁先礼貌地回一个小小的微笑，接着听清朋友的笑话，真心大笑，停了一拍后缓慢恢复。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "cry-relief",
+      "arms": [
+        "4"
+      ],
+      "description": "检查听到消息后的情绪起落，泪水、嘴唇和呼吸变化要能辨认。",
+      "category": "哭泣与缓和",
+      "control": false,
+      "film": {
+        "title": "cry-relief",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "带暖色窗光的休息室，扶手椅靠着窗。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "面部近景",
+            "action": "听说好友平安，阿宁从紧张转为如释重负，泪水滑下，短暂停住后慢慢呼出一口气。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "restrained-response",
+      "arms": [
+        "4"
+      ],
+      "description": "保持克制，只让观众察觉她略有迟疑，避免把内心变化演成强烈反应。",
+      "category": "克制表演",
+      "control": true,
+      "film": {
+        "title": "restrained-response",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "早晨的维修铺，桌面只放着记事本。",
+        "speech": "zh",
+        "cast": [],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "固定近景",
+            "action": "听到有人问她是否同意，阿宁略作停顿，嘴角和眼睑只有细微变化，随后很轻地回答。",
+            "line": "我再想想。"
+          }
+        ]
+      },
+      "frozen_frames": [
+        "asset:opening"
+      ],
+      "assets": {
+        "opening": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "glasses-between-shots",
+      "arms": [
+        "2A"
+      ],
+      "description": "第一镜看清眼镜还在脸上。切到下一镜时眼镜已拿在手上，脸上不能同时出现另一副，人物长相需连续。",
+      "category": "切镜前已经摘下",
+      "control": false,
+      "film": {
+        "title": "glasses-between-shots",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "同一间排练室，左边有窗，前景是木桌，椅子始终靠着木桌。",
+        "speech": "zh",
+        "cast": [
+          {
+            "name": "阿宁",
+            "look": "年轻成年演员，黑色短发，浅灰衬衣，参考图中佩戴细圆框眼镜。",
+            "picture": "asset:glasses-reference"
+          }
+        ],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "正面中近景",
+            "action": "阿宁戴着圆框眼镜坐在木桌旁，左手放在膝盖上，右手在桌面上。",
+            "line": ""
+          },
+          {
+            "start": 5,
+            "end": 10,
+            "camera": "斜侧特写",
+            "action": "切镜时阿宁已经摘下圆框眼镜，右手握着合拢的眼镜腿，鼻梁和眼周直接可见。她把眼镜放上同一张木桌。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {
+        "glasses-reference": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "coat-removed-on-camera",
+      "arms": [
+        "2A"
+      ],
+      "description": "看见开场仍穿外套、脱下后露出内搭、下一镜放下外套并起身的连续过程。外套始终只有一件，另一人只观察。",
+      "category": "镜内摘脱与姿态交接",
+      "control": false,
+      "film": {
+        "title": "coat-removed-on-camera",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "后台衣帽间，屏风靠墙，衣架在左，木椅在同一地点。",
+        "speech": "zh",
+        "cast": [
+          {
+            "name": "阿程",
+            "look": "成年演员，微卷短发，参考图外穿蓝色薄外套，内搭米色针织衫。",
+            "picture": "asset:coat-reference"
+          },
+          {
+            "name": "小路",
+            "look": "成年演员，深色直发，穿棕色工装背心。",
+            "picture": "asset:observer-reference"
+          }
+        ],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "侧面全景",
+            "action": "阿程穿蓝外套半跪在木椅前系鞋带，裤腿和手部清楚可见。小路站在衣架边安静看着。",
+            "line": ""
+          },
+          {
+            "start": 5,
+            "end": 10,
+            "camera": "斜侧中景",
+            "action": "切镜时阿程仍穿着蓝外套、保持半跪姿势。在本镜动作中，他向后耸肩脱下外套，露出里面的米色针织衫，并把外套拿在手上。小路原地看。",
+            "line": ""
+          },
+          {
+            "start": 10,
+            "end": 15,
+            "camera": "平视中景",
+            "action": "阿程已经站直，穿着米色针织衫，蓝外套拿在手上。他将外套放在木椅上，空手转身。小路仍站在衣架旁。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {
+        "coat-reference": {
+          "path": null,
+          "sha256": null
+        },
+        "observer-reference": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    },
+    {
+      "id": "reverse-over-shoulder",
+      "arms": [
+        "2A"
+      ],
+      "description": "检查反打时近景肩膀的位置、两人的目光和后排人物位置。动作由当前讲话的人完成。",
+      "category": "空间轴线与群像分层",
+      "control": true,
+      "film": {
+        "title": "reverse-over-shoulder",
+        "aspect": "9:16",
+        "look": "写实短剧，器物与衣物材质可信，人物动作克制。",
+        "setting": "排练厅长桌后有高窗，画面背景两名配角分立在窗边。",
+        "speech": "zh",
+        "cast": [
+          {
+            "name": "阿宁",
+            "look": "黑色短发，穿浅灰衬衣。",
+            "picture": "asset:first-performer"
+          },
+          {
+            "name": "阿程",
+            "look": "微卷短发，穿蓝色外套。",
+            "picture": "asset:second-performer"
+          }
+        ],
+        "shots": [
+          {
+            "start": 0,
+            "end": 5,
+            "camera": "越过阿宁右肩拍阿程，阿宁在画面左前景",
+            "action": "阿宁身体面向桌对面。阿程坐在桌对侧，将手放到桌面上，背景两人留在窗边看着。",
+            "line": ""
+          },
+          {
+            "start": 5,
+            "end": 10,
+            "camera": "越过阿程左肩反拍阿宁，阿程在画面右前景",
+            "action": "阿程的手停在桌面，阿宁抬眼看他，保持同一张桌和窗边人物的位置。",
+            "line": ""
+          }
+        ]
+      },
+      "frozen_frames": [],
+      "assets": {
+        "first-performer": {
+          "path": null,
+          "sha256": null
+        },
+        "second-performer": {
+          "path": null,
+          "sha256": null
+        }
+      }
+    }
+  ]
+}

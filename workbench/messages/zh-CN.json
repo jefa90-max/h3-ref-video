@@ -1,4 +1,5 @@
 {
+  "dev_missing_venv": "找不到 Python 虚拟环境。请按 README.md 的工作台启动步骤创建 .venv 并安装依赖，再运行 pnpm dev。",
   "frame_task_failed": "图片任务 {task} 已失败，请从卡片手动重新生成后再发起新任务。{reason}",
   "frame_submission_unknown": "图片提交结果未知，已阻止重提以免重复付费。请先在 APIMart 核对任务，再恢复任务号或清除未知标记：{path}",
   "frame_task_pending": "分镜任务 {task} 尚未确认结束。请点击继续生成剩余分镜，查询原任务后再编辑或发起新的付费生成。",
@@ -97,5 +98,24 @@
   "comfy_offline": "远端 ComfyUI 尚未连通。请先在顶部运行状态卡片点击「一键启动 Colab GPU」（或确认自建 ComfyUI 隧道已开启），变为「在线」后再发起视频生成。",
   "comfy_starting": "远端 ComfyUI 尚未就绪，已自动触发 Colab GPU 启动。请在顶部运行状态卡片完成 Google Drive 授权（如需）并等待状态变为「在线」后重试。",
   "comfy_auth_failed": "远端 ComfyUI 隧道鉴权失败（HTTP {code}）。请检查 COMFYUI_API_KEY 是否与远端 .comfyui_api_key 一致。",
-  "comfy_runtime_action": "{detail}"
+  "comfy_runtime_action": "{detail}",
+  "dialogue_unit_chars": "字",
+  "dialogue_unit_words": "词",
+  "dialogue_over_budget": "第 {shot} 镜 · {count} {unit}，估算约 {min_seconds}s / 原镜长 {duration}s。可以缩短台词，或把台词分到几个镜头里，每个镜头都留够说话时间。",
+  "dialogue_slow_over_budget": "第 {shot} 镜 · 慢速台词 {count} {unit}，估算约 {min_seconds}s / 原镜长 {duration}s。可以缩短台词，或把台词分到几个镜头里，每个镜头都留够说话时间。",
+  "dialogue_over_budget_clamped": "第 {shot} 镜 · {count} {unit}，估算约 {min_seconds}s / 有效生成预算 {effective_duration}s（原镜长 {duration}s）。可以缩短台词，或把台词分到几个镜头里，每个镜头都留够说话时间。",
+  "dialogue_slow_over_budget_clamped": "第 {shot} 镜 · 慢速台词 {count} {unit}，估算约 {min_seconds}s / 有效生成预算 {effective_duration}s（原镜长 {duration}s）。可以缩短台词，或把台词分到几个镜头里，每个镜头都留够说话时间。",
+  "dialogue_long_line": "第 {shot} 镜 · 单句偏长（{count} {unit}），可考虑按表达节奏拆镜。",
+  "dialogue_speech_unset": "请设置 speech（如 \"speech\": \"zh\"）。设置前跳过这些镜头的逐镜语速检查：{shots}。",
+  "dialogue_shots_more": " 等（共 {count} 镜）",
+  "dialogue_shots_invalid": "请将 film.shots 设置为镜头数组。",
+  "dialogue_unsupported_script": "第 {shot} 镜 · 台词含暂不支持计数的文字，已跳过该镜的语速估算。",
+  "dialogue_problem_title": "脚本预检请求失败",
+  "dialogue_references_limit": "请求含 {actual} 镜，超过预检上限 {limit}。请拆成较小的剧本后重试。",
+  "dialogue_request_json": "请以 JSON 对象提交请求，包含 film 剧本对象。",
+  "dialogue_request_type": "请使用 Content-Type: application/json。",
+  "dialogue_request_size": "请求体超过大小限制。请缩小剧本并重新提交。",
+  "dialogue_internal": "请重试。若仍失败，在 storage/server.log 中查看关联号 {instance}。",
+  "film_object_invalid": "请提供一个 JSON 剧本对象。",
+  "dialogue_rate_config_fallback": "语速覆盖配置无效，本次使用默认阈值。请检查 H3_DIALOGUE_RATE_CONFIG。"
 }

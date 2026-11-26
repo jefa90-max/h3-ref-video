@@ -5,6 +5,7 @@ Object.assign(state, {
   uploading: false, pollTimer: null, filmDebounceTimer: null, film: null, filmSlots: [],
   filmBindings: new Map(), filmGroups: [], selectedCastSlots: new Set(), groupBuilderOpen: false,
   openGroupAdders: new Set(), filmRevision: 0, filmParsing: false,
+  filmWarnings: [], filmPreflightStatus: null, filmPreflightMeta: {}, filmPreflightSpeech: "",
   filmImporting: false, filmError: null, choosingOutput: false, optimizeStoryboard: true,
 });
 $("optimize-storyboard").checked = true;
@@ -17,7 +18,7 @@ function renderMode() {
   document.querySelector(".run-settings").classList.toggle("live", !state.demo);
   $("mode-hint").textContent = t(state.demo ? "demoHint" : "liveHint");
   $("start-label").textContent = t(state.submitting ? "starting" : state.kind === "film" ? ($("frames").value === "none" ? "prepareScriptReview" : "prepareFrameReview") : state.demo ? "startDemo" : "startLive");
-  $("submit-hint").textContent = t(busy() ? "submitHintBusy" : state.demo ? "submitHintDemo" : "submitHintLive");
+  renderFilmWarningEcho(busy() ? "submitHintBusy" : state.demo ? "submitHintDemo" : "submitHintLive");
   const filmBlocked = state.kind === "film" && (!state.film || state.filmParsing || state.filmImporting || missingFilmReferences().length > 0);
   $("start-job").disabled = !state.ready || state.submitting || state.uploading || state.choosingOutput || busy() || filmBlocked;
   $("choose-output-folder").disabled = !state.ready || state.submitting || state.choosingOutput;
@@ -104,6 +105,7 @@ function invalidateFilmReferences(clearBindings = false, clearSlots = false) {
   state.filmRevision += 1;
   state.film = null;
   if (clearSlots) state.filmSlots = [];
+  if (clearSlots || !$("film-json").value.trim()) setFilmPreflight();
   state.filmError = null;
   if (clearBindings) {
     state.filmBindings.clear();
@@ -134,6 +136,7 @@ async function refreshFilmReferences({ reset = false, format = false } = {}) {
     if (revision !== state.filmRevision) return false;
     state.film = result.film;
     state.filmSlots = result.slots;
+    setFilmPreflight(result);
     const retained = new Map();
     for (const slot of result.slots) {
       const binding = state.filmBindings.get(slot.id);
@@ -168,6 +171,7 @@ async function refreshFilmReferences({ reset = false, format = false } = {}) {
     return true;
   } catch (error) {
     if (revision !== state.filmRevision) return false;
+    setFilmPreflight();
     state.filmError = error.message;
     return false;
   } finally {
@@ -308,7 +312,203 @@ function addCastMemberToGroup(group, slotId, castSlots) {
   showMessage(t("castMemberAdded", { name: target.name, index: groupIndex }));
 }
 
+function setFilmPreflight(result = {}) {
+  state.filmWarnings = Array.isArray(result.warnings) ? result.warnings : [];
+  state.filmPreflightStatus = result.preflight_status || null;
+  state.filmPreflightMeta = result.preflight_meta || {};
+  const speech = result.film?.speech;
+  state.filmPreflightSpeech = typeof speech === "string" ? speech.trim().toLowerCase().split(/[-_]/)[0] : "";
+}
+
+function filmWarningRange(text, rawIndex) {
+  const frames = [];
+  let range = null;
+  const tokens = /"(?:\\[\s\S]|[^"\\])*"|[{}\[\],:]|[^{}\[\],:\s"]+/g;
+  for (const { 0: token, index } of text.matchAll(tokens)) {
+    const parent = frames[frames.length - 1];
+    const end = index + token.length;
+    if (token === ":") continue;
+    if (token === ",") {
+      if (parent.array) parent.index += 1;
+      else parent.key = null;
+      continue;
+    }
+    if (token === "}" || token === "]") {
+      const frame = frames.pop();
+      if (frame.target) range = frame.line || [frame.start, end];
+      continue;
+    }
+    if (parent && !parent.array && parent.key === null) {
+      parent.key = JSON.parse(token);
+      continue;
+    }
+    const shotsProperty = frames.length === 1 && !parent.array && parent.key === "shots";
+    if (shotsProperty) range = null;
+    const target = parent?.shots && parent.index === rawIndex;
+    if (parent?.target && !parent.array && parent.key === "line") {
+      parent.line = token.startsWith('"') ? [index, end] : null;
+    }
+    if (token === "{" || token === "[") {
+      frames.push({ array: token === "[", key: null, index: 0,
+        shots: shotsProperty && token === "[", target, start: index, line: null });
+    } else if (target) {
+      range = [index, end];
+    }
+  }
+  return range;
+}
+
+function locateFilmWarning(warning) {
+  if (state.filmParsing || state.filmImporting || !Number.isInteger(warning.raw_shot_index)) return;
+  const editor = $("film-json");
+  const range = filmWarningRange(editor.value, warning.raw_shot_index);
+  if (!range) return;
+  editor.focus();
+  editor.setSelectionRange(...range);
+  const line = editor.value.slice(0, range[0]).split("\n").length - 1;
+  if (line && typeof getComputedStyle === "function") {
+    const lineHeight = parseFloat(getComputedStyle(editor).lineHeight);
+    if (Number.isFinite(lineHeight)) editor.scrollTop = Math.max(0, line * lineHeight - editor.clientHeight / 2);
+  }
+}
+
+const FILM_WARNING_PRIORITY = {
+  dialogue_speech_unset: 0, dialogue_shots_invalid: 0, dialogue_rate_config_fallback: 0,
+  dialogue_slow_over_budget: 1, dialogue_over_budget: 1, dialogue_unsupported_script: 2, dialogue_long_line: 3,
+};
+let filmWarningView = null;
+let filmWarningControls = new Map();
+let filmWarningDetails = null;
+let filmWarningAnnouncement = null;
+let filmWarningEcho = null;
+
+function filmWarningItem(warning, index) {
+  const { code } = warning;
+  const known = Object.hasOwn(FILM_WARNING_PRIORITY, code);
+  const key = known && code.endsWith("_over_budget") && warning.effective_duration !== undefined ? `${code}_clamped` : code;
+  const affected = warning.affected_shots || [];
+  const shots = affected.length > 6
+    ? affected.slice(0, 5).join(t("listSeparator")) + t("dialogue_shots_more", { count: affected.length })
+    : affected.join(t("listSeparator"));
+  const values = { ...warning, shots, unit: warning.unit ? t(`dialogue_unit_${warning.unit}`) : "" };
+  const item = element("li", "film-warning");
+  item.append(element("p", "", known ? t(key, values) : t("dialogue_unknown")));
+  if (warning.raw_shot != null && warning.raw_shot !== warning.shot) {
+    item.append(element("small", "film-warning-number", t("dialogue_raw_position", warning)));
+  }
+  if (warning.line_preview) item.append(element("p", "hint film-warning-preview", warning.line_preview));
+  if (!known && warning.message) {
+    const details = element("details");
+    const summary = element("summary", "", t("dialogue_technical"));
+    details.append(summary, element("p", "hint", warning.message));
+    filmWarningControls.set(`technical:${index}`, summary);
+    item.append(details);
+  }
+  if (Number.isInteger(warning.raw_shot_index) || code === "dialogue_speech_unset") {
+    const locate = code !== "dialogue_speech_unset";
+    const button = element("button", "button text-button film-warning-action",
+      t(locate ? "dialogue_locate" : "dialogue_copy_speech"));
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      if (locate) return locateFilmWarning(warning);
+      try {
+        await navigator.clipboard.writeText('"speech": "zh"');
+        $("film-preflight-live").textContent = t("dialogue_copied");
+      } catch {
+        $("film-preflight-live").textContent = t("dialogue_copy_failed");
+      }
+    });
+    filmWarningControls.set(`${locate ? "locate" : "copy"}:${warning.raw_shot_index ?? index}`, button);
+    item.append(button);
+  }
+  return item;
+}
+
+function renderFilmWarnings() {
+  const section = $("film-warnings");
+  const warnings = state.filmWarnings;
+  const status = state.filmPreflightStatus;
+  const meta = state.filmPreflightMeta;
+  const stale = state.filmParsing && !state.filmImporting && !!$("film-json").value.trim();
+  section.hidden = !warnings.length && (!status || status === "complete");
+  section.classList.toggle("is-stale", stale && !section.hidden);
+  if (stale && !section.hidden) section.setAttribute("aria-busy", "true");
+  else section.removeAttribute("aria-busy");
+
+  if (filmWarningView?.warnings !== warnings || filmWarningView?.language !== state.language) {
+    const focused = [...filmWarningControls].find(([, control]) => control === document.activeElement)?.[0];
+    const expanded = filmWarningDetails?.open;
+    const technicalOpen = new Set([...filmWarningControls].filter(([key, control]) =>
+      key.startsWith("technical:") && control.parentElement?.open).map(([key]) => key));
+    filmWarningView = { warnings, language: state.language };
+    filmWarningControls = new Map();
+    filmWarningDetails = null;
+    $("film-warnings-title").textContent = warnings.length
+      ? t("dialogue_warning_count", { count: warnings.length }) : t("dialogue_title");
+    $("film-warning-label").textContent = t("dialogue_advisory");
+    const notes = [];
+    if (status && status !== "complete") {
+      notes.push(t("dialogue_summary", { ...meta, state: t(`dialogue_status_${status}`) }));
+    }
+    if (meta.calibration_status === "provisional") notes.push(t("dialogue_provisional"));
+    const speech = state.filmPreflightSpeech;
+    if (speech && speech !== "zh") notes.push(t("dialogue_non_zh"));
+    $("film-warning-notes").textContent = notes.join(" ");
+
+    const ordered = [...warnings].sort((a, b) =>
+      (FILM_WARNING_PRIORITY[a.code] ?? 2) - (FILM_WARNING_PRIORITY[b.code] ?? 2) || (a.shot ?? 0) - (b.shot ?? 0));
+    const groups = [];
+    if (ordered.length) {
+      const inline = element("ul", "film-warning-list");
+      inline.append(...ordered.slice(0, 3).map(filmWarningItem));
+      groups.push(inline);
+    }
+    if (ordered.length > 3) {
+      const details = element("details", "film-warning-more");
+      details.open = Boolean(expanded);
+      const summary = element("summary", "", t("dialogue_more", { count: ordered.length - 3 }));
+      filmWarningControls.set("more", summary);
+      const rest = element("ul", "film-warning-list");
+      rest.append(...ordered.slice(3, 103).map((warning, index) => filmWarningItem(warning, index + 3)));
+      details.append(summary, rest);
+      if (ordered.length > 103) details.append(element("p", "hint", t("dialogue_limit", { count: ordered.length - 103 })));
+      groups.push(details);
+      filmWarningDetails = details;
+    }
+    $("film-warning-items").replaceChildren(...groups);
+    for (const key of technicalOpen) {
+      const details = filmWarningControls.get(key)?.parentElement;
+      if (details) details.open = true;
+    }
+    if (!section.hidden && focused) filmWarningControls.get(focused)?.focus({ preventScroll: true });
+  }
+  for (const [key, control] of filmWarningControls) {
+    if (key.startsWith("locate:")) control.setAttribute("aria-disabled", String(stale));
+  }
+  if (!stale) {
+    const previous = filmWarningAnnouncement;
+    const current = warnings.length ? `warnings:${warnings.length}` : status || "empty";
+    if (previous !== current) {
+      filmWarningAnnouncement = current;
+      $("film-preflight-live").textContent = warnings.length ? t("dialogue_warning_count", { count: warnings.length })
+        : status === "complete" && previous?.startsWith("warnings:") ? t("dialogue_clean")
+        : status && status !== "complete" ? t(`dialogue_status_${status}`) : "";
+    }
+  }
+}
+
+function renderFilmWarningEcho(baseKey) {
+  const count = state.kind === "film" ? state.filmWarnings.length : 0;
+  const signature = [state.kind, baseKey, count, state.language].join(":");
+  if (filmWarningEcho === signature) return;
+  filmWarningEcho = signature;
+  $("submit-hint-base").textContent = t(baseKey);
+  $("film-warning-jump").hidden = count === 0;
+  $("film-warning-jump").textContent = count ? t("dialogue_submit_echo", { count }) : "";
+}
+
 function renderFilmReferences() {
+  renderFilmWarnings();
   $("film-parse-status").textContent = state.filmImporting ? t("filmImporting") : state.filmParsing ? t("filmParsing") : state.filmError || "";
   $("film-parse-status").classList.toggle("field-error", Boolean(state.filmError));
   $("film-json").setAttribute("aria-invalid", String(Boolean(state.filmError)));

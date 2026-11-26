@@ -1,0 +1,10 @@
+{
+  "title": "台词预算示例",
+  "speech": "zh",
+  "shots": [
+    {"start": 0, "end": 3, "action": "小林停在门口", "line": "我到了。"},
+    {"start": 3, "end": 4, "action": "小林转身", "line": "你把门口那张纸条拿过来给我看看。"},
+    {"start": 4, "end": 5, "action": "小林低声说", "line": "现在请跟我一起走。"},
+    {"start": 5, "end": 6, "action": "", "line": ""}
+  ]
+}

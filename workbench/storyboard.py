@@ -22,7 +22,10 @@ def read_json(path, default):
 def plan(request, check_images=True, *, records=None):
     out = Path(request["output_dir"])
     source = out / "inputs" / ("demo-film.json" if request["demo"] else "film.json")
-    script = film.load(source, check_images=check_images)
+    try:
+        script = film.load(source, check_images=check_images, normalized_times=True)
+    except (SystemExit, film.FilmValidationError) as exc:
+        raise InputError("film_invalid", detail=str(exc)) from exc
     segments = film.plan(script["shots"])
     resolve_cache: dict[str, str] = {}
     pictures = {s["idx"]: film.refs(script, s, request["frames"], resolve_cache=resolve_cache) for s in segments}
@@ -70,7 +73,10 @@ def frame_records(request):
 def character_references(request, identifier):
     inputs = Path(request["output_dir"]) / "inputs"
     source = inputs / "demo-film.json" if request["demo"] and (inputs / "demo-film.json").exists() else inputs / "film.json"
-    script = film.load(source, check_images=False)
+    try:
+        script = film.load(source, check_images=False, normalized_times=True)
+    except (SystemExit, film.FilmValidationError) as exc:
+        raise InputError("film_invalid", detail=str(exc)) from exc
     references = []
     groups = film.group_cast_by_picture(script.get("cast") or [], script.get("cast") or [])
     for index, group in enumerate(groups):
@@ -298,6 +304,7 @@ def run(request):
     elif operation == "frames":
         script, segments, pictures, _ = plan(request)
         job = film.Job(out)
+        film.log_created_preflight(job, out / "inputs" / "film.json")
         optimize = bool(request.get("optimize_storyboard", True))
         job.state.update(film_path=str(out / "inputs" / "film.json"), mode=request["frames"], optimize_storyboard=optimize)
         job.save()
@@ -314,7 +321,10 @@ def run(request):
             if (request.get("film") or {}).get("shots"):
                 planned_count = len(film.plan(request["film"]["shots"]))
             elif (out / "inputs" / "film.json").is_file():
-                planned_count = len(film.plan(film.load(out / "inputs" / "film.json", check_images=False)["shots"]))
+                try:
+                    planned_count = len(film.plan(film.load(out / "inputs" / "film.json", check_images=False, normalized_times=True)["shots"]))
+                except (SystemExit, film.FilmValidationError) as exc:
+                    raise InputError("film_invalid", detail=str(exc)) from exc
             if film.unaffected_segment_blocker(fjob, request["frames"], request.get("redo", []), planned_count=planned_count) is None:
                 film.invalidate_segments(fjob, request["frames"], request.get("redo", []))
                 request["reset_applied"] = True
@@ -328,4 +338,10 @@ def run(request):
 
 
 if __name__ == "__main__":
-    run(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")))
+    request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    try:
+        run(request)
+    except InputError as exc:
+        raise SystemExit(exc.localized(request["lang"])) from exc
+    except film.FilmValidationError as exc:
+        raise SystemExit(str(exc)) from exc

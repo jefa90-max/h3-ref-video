@@ -1,4 +1,5 @@
 {
+  "dev_missing_venv": "Python virtual environment not found. Follow the workbench setup in README.md to create .venv and install dependencies, then run pnpm dev.",
   "frame_task_failed": "Image task {task} failed. Manually regenerate its card to start a new task. {reason}",
   "frame_submission_unknown": "The image submission result is unknown. Resubmission is blocked to avoid duplicate charges. Check the task in APIMart before restoring its task ID or clearing the uncertainty marker: {path}",
   "frame_task_pending": "Frame task {task} has no confirmed terminal result. Continue the remaining storyboard frames to query this task before editing or starting another paid generation.",
@@ -97,5 +98,24 @@
   "comfy_offline": "Remote ComfyUI is offline. Start Colab GPU from the top runtime status card (or start your ComfyUI tunnel) and wait until it is Online before generating video.",
   "comfy_starting": "Remote ComfyUI is offline; Colab GPU startup has been triggered automatically. Complete Google Drive authorization if prompted in the top runtime card and retry once Online.",
   "comfy_auth_failed": "Remote ComfyUI tunnel rejected authentication (HTTP {code}). Check that COMFYUI_API_KEY matches .comfyui_api_key.",
-  "comfy_runtime_action": "{detail}"
+  "comfy_runtime_action": "{detail}",
+  "dialogue_unit_chars": "characters",
+  "dialogue_unit_words": "words",
+  "dialogue_over_budget": "Shot {shot} · {count} {unit}, estimated {min_seconds}s / {duration}s available. Shorten the line or split it across several shots, leaving enough time to say each part.",
+  "dialogue_slow_over_budget": "Shot {shot} · Slow delivery, {count} {unit}, estimated {min_seconds}s / {duration}s available. Shorten the line or split it across several shots, leaving enough time to say each part.",
+  "dialogue_over_budget_clamped": "Shot {shot} · {count} {unit}, estimated {min_seconds}s / {effective_duration}s effective budget (original shot: {duration}s). Shorten the line or split it across several shots, leaving enough time to say each part.",
+  "dialogue_slow_over_budget_clamped": "Shot {shot} · Slow delivery, {count} {unit}, estimated {min_seconds}s / {effective_duration}s effective budget (original shot: {duration}s). Shorten the line or split it across several shots, leaving enough time to say each part.",
+  "dialogue_long_line": "Shot {shot} · Long line ({count} {unit}). Consider breaking it across shots to fit the delivery.",
+  "dialogue_speech_unset": "Set speech (for example, \"speech\": \"zh\"). Pacing checks are paused for shots {shots} until it is set.",
+  "dialogue_shots_more": " … ({count} shots total)",
+  "dialogue_shots_invalid": "Set film.shots to an array of shot objects.",
+  "dialogue_unsupported_script": "Shot {shot} · The line uses an unsupported writing system. Pacing was skipped for this shot.",
+  "dialogue_problem_title": "Script preflight request failed",
+  "dialogue_references_limit": "The request has {actual} shots and exceeds the preflight limit of {limit}. Split the film into smaller scripts and retry.",
+  "dialogue_request_json": "Send a valid JSON object containing a film object.",
+  "dialogue_request_type": "Use Content-Type: application/json.",
+  "dialogue_request_size": "The request exceeds the body size limit. Reduce the script size and retry.",
+  "dialogue_internal": "Retry the request. If it still fails, look up {instance} in storage/server.log.",
+  "film_object_invalid": "Provide a JSON film object.",
+  "dialogue_rate_config_fallback": "The pacing override is invalid. Default thresholds were used. Check H3_DIALOGUE_RATE_CONFIG."
 }

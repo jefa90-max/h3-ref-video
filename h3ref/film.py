@@ -17,14 +17,19 @@ import os
 import random
 import re
 import stat
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import check, comfy, config, frames, http, media, rewrite, rh, staging
+from . import check, comfy, config, frames, http, media, preflight, rewrite, rh, staging
 from .i18n import message
+from .preflight import (
+    DIALOGUE_RATE_CONFIG, FilmValidationError, check_dialogue_budget, escape_markdown_cell,
+    inspect_dialogue_budget, normalize_shots, normalize_speech, sanitize_line_preview,
+)
 from .staging import deduplicate_paths, group_cast_by_picture
 
 GROUP_WORDS = ("两人", "二人", "三人", "四人", "俩", "大家", "众人", "所有人", "他们", "她们", "全员", "everyone", "both")
@@ -74,12 +79,19 @@ def _num(x) -> str:
 
 # ------------------------------------------------------------------ the storyboard
 
-def load(path: Path, check_images: bool = True) -> dict:
-    film = json.loads(path.read_text(encoding="utf-8"))
+def load(path: Path, check_images: bool = True, *, normalized_times: bool = False) -> dict:
+    return _load_script(preflight.read_script(path), path, check_images=check_images, normalized_times=normalized_times)
+
+
+def _load_script(film, path, *, check_images=True, normalized_times=False):
+    if not isinstance(film, dict):
+        raise FilmValidationError("film_object_invalid", field="film")
     base = path.parent
     if film.get("aspect", "9:16") not in config.SIZES:
         raise SystemExit(f"aspect 只支持 {', '.join(config.SIZES)}")
     film.setdefault("aspect", "9:16")
+    if "speech" in film and not isinstance(film["speech"], str):
+        film["speech"] = ""
     for c in film.get("cast") or []:
         p = Path(c["picture"]).expanduser()
         c["picture"] = str((p if p.is_absolute() else (base / p)).resolve())
@@ -88,18 +100,7 @@ def load(path: Path, check_images: bool = True) -> dict:
     if film.get("board"):
         p = Path(film["board"]).expanduser()
         film["board"] = str((p if p.is_absolute() else (base / p)).resolve())
-    shots = [s for s in film.get("shots") or [] if (s.get("action") or "").strip()]
-    if not shots:
-        raise SystemExit("film.json 里没有镜头（shots）")
-    limit_shots = config.max_shots()
-    if len(shots) > limit_shots:
-        raise SystemExit(f"镜头数不能超过 {limit_shots}（当前 {len(shots)}）")
-    t = 0.0
-    for s in shots:                                    # times made continuous; a shot without times lasts 2 s
-        length = float(s["end"]) - float(s["start"]) if s.get("start") is not None and s.get("end") is not None else 2.0
-        s["start"], s["end"] = round(t, 2), round(t + max(0.5, length), 2)
-        t = s["end"]
-    film["shots"] = shots
+    film["shots"] = normalize_shots(film.get("shots"), strict=True, normalized_times=normalized_times)
     return film
 
 
@@ -187,12 +188,15 @@ def _clean_scene_text(scene: str) -> str:
     return re.sub(r"^场景(?:为|是|：|:)\s*", "", scene.strip()).rstrip("。；; ")
 
 
-def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compositions: dict[str, dict] | None = None) -> str:
+def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *,
+                   compositions: dict[str, dict] | None = None, shot_state_note: str | None = None,
+                   scope_wearables: bool = True) -> str:
     """The segment's prompt in Chinese, written the way you would for Seedance; rewrite.py turns it into H3's format."""
     frame_pic_numbers = {p["shot"]: idx for idx, p in enumerate(pics, 1) if p["kind"] == "frame"}
     compositions = {key: value for key, value in (compositions or {}).items()
                     if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
     v2_covered = {c['name'] for comp in compositions.values() if comp.get('version') == 2 for c in comp['characters']}
+    changing = staging.changing_wearables(film) if scope_wearables else {}
     v3_looks: dict[str, str] = {}
     comp_looks: dict[str, str] = {}
     for comp in compositions.values():
@@ -200,6 +204,8 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
         for ch in comp.get('characters') or []:
             if ch.get('name'):
                 lk = (ch.get('locked_look') or ch.get('appearance') or '').strip().rstrip('。；; ')
+                if is_v3:
+                    lk = staging.stable_locked_look(lk, changing.get(ch['name'], set()))
                 if lk:
                     comp_looks.setdefault(ch['name'], lk)
                     if is_v3:
@@ -226,11 +232,13 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
                     look = ""
                 else:
                     look = (c.get("look") or "").strip().rstrip("。")
+                    look = staging.stable_locked_look(look, changing.get(c['name'], set()))
                 lines.append(f"参考图片{k}只约束{c['name']}身份" + (f"：{look}。" if look else "。"))
             else:
                 parts = []
                 for c in active_list:
                     lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                    lk = staging.stable_locked_look(lk, changing.get(c['name'], set()))
                     parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
                 absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in absent_list)}，严禁将未出场角色画进画面。" if absent_list else ""
                 lines.append(
@@ -249,6 +257,8 @@ def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *, compo
     n = sum(len(p.get("active_cast") or [p["cast"]]) for p in pics if p["kind"] == "cast")
     if n:
         lines.append((f"只有这{n}名角色" if n > 1 else "只有这一名角色") + "，保持各自发型、五官、服饰纹样与比例。")
+    if shot_state_note:
+        lines.append(shot_state_note)
     out = [head, "\n".join(lines)]
     first_v3_scene = next(
         (_clean_scene_text(compositions[_frame_key(seg["idx"], j)]["scene"])
@@ -311,6 +321,7 @@ class Job:
         self.file = self.dir / "state.json"
         self.state = json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists() else {"frames": {}, "segs": {}}
         self.lock = threading.RLock()
+        self.preflight_override = None
 
     def save(self):
         with self.lock:
@@ -383,6 +394,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
     wanted = [(i, p['shot']) for i, seg in enumerate(segs) for p in pics[i] if p['kind'] == 'frame']
     versions = frame_reference_versions(film, segs, job.state['frames'])
     effective = saved_compositions(job.state['frames'], reference_versions=versions)
+    changing = staging.changing_wearables(film)
     known_scenes, locked_looks, previous, previous_key = {}, {}, None, None
 
     def failure(key, exc):
@@ -407,7 +419,8 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
             for j, shot in enumerate(segment['shots']):
                 key = _frame_key(i, j)
                 rec = job.state['frames'].get(key) or {}
-                composition = effective.get(key)
+                saved = effective.get(key)
+                composition = staging.scope_wearable_look(saved, film, shot, changing)
                 out = job.dir / 'frames' / f'{key}.png'
                 skip = ((i, j) not in wanted or (out.exists() and not frames.task_pending(rec))
                         or ((rec.get('error') or rec.get('moderation_error')) and not (resume_tasks and frames.task_pending(rec))))
@@ -421,8 +434,12 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                             text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             references = rec.get('reference_paths', references)
                         elif rec.get('prompt') or rec.get('composition'):
-                            text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             references = rec.get('reference_paths', references)
+                            if composition != saved:
+                                text = frames.prompt(film, shot, who, bool(film.get('board')), composition)
+                                job.put('frames', key, composition=composition, prompt=text, composition_prompt=text)
+                            else:
+                                text = rec.get('prompt') or frames.prompt(film, shot, who, bool(film.get('board')), rec.get('composition'))
                             job.log('staging cache', key, 'source', previous_key)
                         elif not optimize_storyboard:
                             composition = None
@@ -438,6 +455,7 @@ def stage_frames(job: Job, film: dict, segs: list[dict], pics: dict, *, resume_t
                                     locked_looks=dict(locked_looks),
                                 )
                                 composition = staging.validate_composition(planned, film, shot, known_scenes)
+                                composition = staging.scope_wearable_look(composition, film, shot, changing)
                                 if composition.get('version') == 3:
                                     for ch in composition.get('characters') or []:
                                         if ch['name'] in locked_looks:
@@ -508,6 +526,27 @@ def segment_prompt_text(record: dict, automatic: str) -> str:
     return override.get('text', automatic) if override.get('format') == 'source' else automatic
 
 
+def cached_segment_source(record, source, reference, n_pictures, *, legacy_source):
+    """Return the source paired with a reusable cached rewrite, including pre-wearable jobs."""
+    saved, h3 = record.get('zh'), record.get('h3')
+    if not saved or not h3 or record.get('h3_source', saved) != saved:
+        return None
+    if record.get('h3_reference_version') and record['h3_reference_version'] != reference:
+        return None
+    if saved != source and (record.get('prompt_override') or saved != legacy_source()):
+        return None
+    if 'subject_definitions:' in h3 and rewrite.cached_problems(h3, n_pictures):
+        return None
+    return saved
+
+
+def segment_resume_prompt(record, script, segment, pictures, count, compositions, reference):
+    source = segment_prompt_text(record, compile_prompt(script, segment, pictures, count, compositions=compositions))
+    cached = cached_segment_source(record, source, reference, len(pictures), legacy_source=lambda: compile_prompt(
+        script, segment, pictures, count, compositions=compositions, scope_wearables=False))
+    return cached or source, cached is not None
+
+
 def frozen_segment(record: dict) -> bool:
     return bool(record.get('task') or record.get('submission_unknown') or record.get('terminal_failed')
                 or record.get('attempt_blocked')
@@ -532,12 +571,10 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
             (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(rec.get('zh') or '', encoding='utf-8')
             (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec.get('h3') or '', encoding='utf-8')
             return
-        zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
         paths = _picture_paths(job, seg, pics[i])
         reference = reference_version(paths) if all(path.is_file() for path in paths) else None
-        if (rec.get('h3') and rec.get('zh') == zh and rec.get('h3_source', rec.get('zh')) == zh
-                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)
-                and ('subject_definitions:' not in rec['h3'] or not rewrite.cached_problems(rec['h3'], len(pics[i])))):
+        zh, cached = segment_resume_prompt(rec, film, seg, pics[i], len(segs), compositions, reference)
+        if cached:
             (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
             (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec['h3'], encoding='utf-8')
             if 'unapplied_edit' in rec:
@@ -1066,7 +1103,9 @@ def stage_check(job: Job, film: dict, segs: list[dict]):
     """Burned-subtitle check on every segment with lines (and every segment when the film has any lines)."""
     if not config.SUBTITLE_CHECKS_ENABLED:
         return
-    if not film.get("speech") or not any((s.get("line") or "").strip() for s in film["shots"]):
+    if not normalize_speech(film.get("speech")) or not any(
+        isinstance(s.get("line"), str) and s["line"].strip() for s in film["shots"]
+    ):
         return
     total_segments = len(plan(film["shots"]))
     for seg in segs:
@@ -1085,6 +1124,154 @@ def stage_check(job: Job, film: dict, segs: list[dict]):
             job.log("SUBTITLES", f"seg{seg['idx'] + 1}", res.get("text"))
 
 
+def _read_preflight_snapshot(path):
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if (not isinstance(result, dict) or not isinstance(result.get("meta"), dict)
+            or not isinstance(result.get("warnings"), list)
+            or not all(isinstance(warning, dict) for warning in result["warnings"])
+            or result.get("status") not in ("complete", "partial", "unsupported", "invalid")):
+        raise ValueError("invalid preflight snapshot")
+    return result
+
+
+def _save_preflight_snapshot(path, result):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(result, stream, ensure_ascii=True, indent=2)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return _read_preflight_snapshot(path)
+        return result
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _log_preflight(job, result):
+    meta = result["meta"]
+    if meta.get("rate_config_fallback"):
+        job.log("preflight", "[WARN]", message("dialogue_rate_config_fallback"))
+    if result["status"] != "complete":
+        job.log("preflight", "[WARN]", preflight.summary_message(result, message))
+    for warning in result["warnings"]:
+        parts = ["preflight", "[WARN]"]
+        if warning["shot"] is not None:
+            parts.append(f"shot#{warning['shot']}")
+        parts.append(preflight.warning_message(warning, message))
+        preview = sanitize_line_preview(warning.get("line_preview", ""))
+        if preview:
+            parts.append(preview)
+        job.log(*parts)
+
+
+def _preflight_source_hash(script):
+    canonical = json.dumps(script, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _preflight_candidate(job, source, *, script=None, normalized_times=False):
+    if config.env("H3_SKIP_PREFLIGHT") == "1":
+        return None, False
+    try:
+        cached = _read_preflight_snapshot(job.dir / "inputs" / "preflight.json")
+        if cached is not None:
+            before = cached["meta"].get("source_sha256")
+            if normalized_times or script is None or not before or before == _preflight_source_hash(script):
+                return cached, False
+        if script is None:
+            script = preflight.read_script(source)
+        result = preflight.inspect_automatic(script, os.environ, normalized_times=normalized_times)
+        if not normalized_times:
+            result["meta"]["source_sha256"] = _preflight_source_hash(script)
+        if cached is not None:
+            result["meta"]["source_changed"] = True
+        return result, cached is None
+    except (OSError, ValueError, RecursionError) as exc:
+        job.log("preflight", "[WARN]", message("dialogue_pipeline_unavailable", detail=type(exc).__name__))
+        return None, False
+
+
+def _publish_preflight(job, result, fresh, *, normalized_times):
+    if result is None:
+        return
+    try:
+        if fresh and not normalized_times:
+            path = job.dir / "inputs" / "preflight.json"
+            stored = _save_preflight_snapshot(path, result)
+            if stored["meta"].get("source_sha256") != result["meta"]["source_sha256"]:
+                result["meta"]["source_changed"] = True
+            else:
+                result = stored
+        elif fresh and (result["warnings"] or result["status"] != "complete"):
+            job.log("preflight", "[WARN]", message("dialogue_provenance_unknown",
+                    fingerprint=result["meta"]["effective_config_sha256"]))
+        if result["meta"].get("source_changed"):
+            job.preflight_override = result
+            job.log("preflight", "[WARN]", message("dialogue_source_changed"))
+        _log_preflight(job, result)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        job.log("preflight", "[WARN]", message("dialogue_pipeline_unavailable", detail=type(exc).__name__))
+
+
+def log_created_preflight(job, source):
+    normalized_times = source == job.dir / "inputs" / "film.json" and source.with_name("request.json").is_file()
+    candidate = _preflight_candidate(job, source, normalized_times=normalized_times)
+    _publish_preflight(job, *candidate, normalized_times=normalized_times)
+
+
+def preflight_report_lines(job, script):
+    try:
+        result = getattr(job, "preflight_override", None) or _read_preflight_snapshot(job.dir / "inputs" / "preflight.json")
+        unknown = result is None
+        if unknown:
+            if config.env("H3_SKIP_PREFLIGHT") == "1":
+                return []
+            result = preflight.inspect_automatic(script, os.environ, normalized_times=True)
+        return _render_report_preflight(result, script, unknown)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        return [f"## {message('dialogue_title')}", "",
+                message("dialogue_pipeline_unavailable", detail=type(exc).__name__), ""]
+
+
+def _render_report_preflight(result, script, unknown):
+    meta = result["meta"]
+    if not (result["warnings"] or result["status"] != "complete" or meta.get("rate_config_fallback") or meta.get("source_changed")):
+        return []
+    lines = [f"## {message('dialogue_title')}", ""]
+    if unknown:
+        lines.extend([message("dialogue_provenance_unknown", fingerprint=result["meta"]["effective_config_sha256"]), ""])
+    if meta.get("source_changed"):
+        lines.extend([message("dialogue_source_changed"), ""])
+    if meta.get("rate_config_fallback"):
+        lines.extend([message("dialogue_rate_config_fallback"), ""])
+    if meta["calibration_status"] == "provisional":
+        lines.extend([message("dialogue_provisional"), ""])
+    speech = normalize_speech(script.get("speech"))
+    if speech and speech != "zh":
+        lines.extend([message("dialogue_non_zh"), ""])
+    if result["status"] != "complete":
+        lines.extend([preflight.summary_message(result, message), ""])
+    if result["warnings"]:
+        headers = [message(f"dialogue_warn_{column}") for column in ("shot", "message", "preview")]
+        lines += ["| " + " | ".join(headers) + " |", "|---|---|---|"]
+        for warning in result["warnings"]:
+            shot = str(warning["shot"]) if warning["shot"] is not None else "—"
+            raw_shot = warning.get("raw_shot")
+            if raw_shot is not None and raw_shot != warning["shot"]:
+                shot = message("dialogue_raw_shot", shot=shot, raw_shot=raw_shot)
+            cells = [shot, preflight.warning_message(warning, message), sanitize_line_preview(warning.get("line_preview", ""))]
+            lines.append("| " + " | ".join(escape_markdown_cell(cell) for cell in cells) + " |")
+        lines.append("")
+    return lines
+
+
 def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Path:
     fr = sum(float(r.get("cny") or 0) for r in job.state["frames"].values())
     gen = sum(float(r.get("cny") or 0) for r in job.state["segs"].values())
@@ -1094,6 +1281,7 @@ def report(job: Job, film: dict, segs: list[dict], mode: str, final: Path) -> Pa
              f"成片 `{final.name}`，{media.duration(final):.1f} 秒，{len(segs)} 段，分镜图模式 {mode}。", "",
              f"花费：分镜图 {len(job.state['frames'])} 张 ¥{fr:.2f}，H3 生成 ¥{gen:.2f}，合计 ¥{fr + gen:.2f}；"
              f"GPU {gpu / 60:.1f} 分钟，这次运行墙钟 {wall / 60:.0f} 分钟（续跑只算这一次）。", ""]
+    lines += preflight_report_lines(job, film)
     subs = [s for s in segs if (job.state["segs"].get(str(s["idx"])) or {}).get("subtitles", {}).get("burned_text")]
     if subs:
         lines += ["**烧字幕了**：" + "、".join(f"第 {s['idx'] + 1} 段" for s in subs)
@@ -1220,9 +1408,14 @@ def run(job_dir: Path, film_path: Path | None, mode: str = "shot", redo: list[in
     locked_artifact = _workbench_activity_locked(job.dir)
     if locked_artifact is not None:
         raise RuntimeError(message("segment_publication_pending", path=locked_artifact))
-    film = load(Path(job.state["film_path"]))
+    source = Path(job.state["film_path"])
+    normalized_times = source == job.dir / "inputs" / "film.json" and source.with_name("request.json").is_file()
+    script = preflight.read_script(source)
+    candidate = _preflight_candidate(job, source, script=script, normalized_times=normalized_times)
+    film = _load_script(script, source, normalized_times=normalized_times)
     segs = plan(film["shots"])
     pics = {s["idx"]: refs(film, s, mode) for s in segs}
+    _publish_preflight(job, *candidate, normalized_times=normalized_times)
     if redo and unaffected_segment_blocker(job, mode, redo, planned_count=len(segs)) is None:
         invalidate_segments(job, mode, redo)
     job.state["t_start"] = time.time()

@@ -28,6 +28,12 @@
             <textarea id="film-json" class="json-editor" rows="12" spellcheck="false" data-i18n-placeholder="filmJsonPlaceholder" aria-describedby="film-reference-hint film-parse-status"></textarea>
             <p id="film-reference-hint" class="hint" data-i18n="filmReferenceHint"></p>
             <p id="film-parse-status" class="hint" aria-live="polite"></p>
+            <p id="film-preflight-live" class="sr-only" aria-live="polite"></p>
+            <section id="film-warnings" class="notice warning film-warnings" aria-labelledby="film-warnings-title" hidden>
+              <div class="film-warning-heading"><h3 id="film-warnings-title"></h3><span id="film-warning-label" class="hint"></span></div>
+              <p id="film-warning-notes" class="hint"></p>
+              <div id="film-warning-items"></div>
+            </section>
             <section class="film-reference-section" aria-labelledby="film-references-title"><h3 id="film-references-title" data-i18n="filmReferencesTitle"></h3><p class="hint" data-i18n="filmReferencesHint"></p><div id="film-reference-list"></div><p id="film-missing-references" class="hint" aria-live="polite"></p></section>
             <label id="demo-placeholders-field" class="checkbox-field"><input id="demo-placeholders" type="checkbox" checked><span data-i18n="demoPlaceholders"></span></label>
             <label><span data-i18n="frameMode"></span><select id="frames"><option value="shot" data-i18n="framesShot"></option><option value="first" data-i18n="framesFirst"></option><option value="none" data-i18n="framesNone"></option></select></label>
@@ -42,7 +48,7 @@
             <p class="hint" data-i18n="outputHint"></p>
           </div>
           <div class="run-settings live"><div class="mode-heading"><span data-i18n="runMode"></span><div class="mode-toggle"><button id="mode-demo" type="button" aria-pressed="false" data-i18n="demoMode"></button><button id="mode-live" type="button" aria-pressed="true" class="active" data-i18n="liveMode"></button></div></div><p id="mode-hint" class="hint"></p></div>
-          <div class="submit-row"><div class="button-row run-buttons"><button id="start-job" class="button primary" type="submit" disabled><span id="start-label"></span><span aria-hidden="true">↗</span></button></div><span id="submit-hint" class="hint"></span></div>
+          <div class="submit-row"><div class="button-row run-buttons"><button id="start-job" class="button primary" type="submit" disabled><span id="start-label"></span><span aria-hidden="true">↗</span></button></div><span id="submit-hint" class="hint"><span id="submit-hint-base"></span> <a id="film-warning-jump" href="#film-warnings" hidden></a></span></div>
         </form>
       </section>
 

@@ -59,16 +59,14 @@ H3 这条用的 7 张分镜图，第一张画好以后，后面每张都带着�
 
 Windows 10/11 64 位：解压 Windows 发布包后双击 `start-windows.cmd`，首次自动下载并校验 Python、FFmpeg、curl，安装虚拟环境依赖后打开工作台。无需预装 Python；详细步骤见 [Windows 一键部署](docs/windows.md)。
 
-可选的轻量 Web 界面，沿用下方 `one` / `film` CLI 流水线：
+在源码目录首次使用时，先创建 Python 虚拟环境并安装依赖。
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-web.txt
-python workbench.py
+.venv/bin/python -m pip install -r requirements-web.txt
 ```
 
-打开 **http://127.0.0.1:7860**（端口被占用可加 `--port 7862`）。只监听本机，不需要 Node 或 `pnpm dev`。
+已安装 Node.js 和 pnpm 时，在仓库根目录运行 `pnpm dev`，打开 **http://127.0.0.1:7860**。带浏览器和自定义端口可运行 `pnpm dev --port 7862 --open`。也可以用 `.venv/bin/python workbench.py` 直接启动。Windows 源码安装及端口说明见 [工作台使用说明](docs/workbench.md#启动)。
 
 - **先试演示**：默认选中「整条片」和「真实生成」，分镜 JSON 输入框为空。试用时先手动切到「离线演示」 → 下载示例 JSON，再导入 `.json` / `.txt` 分镜文件（内容为 JSON），选择 `shot / first / none` 后启动 → 独立结果页审核分镜，再生成并播放/下载 DEMO 视频，查看日志与报告。也可切到「一条片段」填写提示词后启动。无需 key，不联网、不扣费；缺 ffmpeg 时仍可产出计划和报告。
 - **真实生成**：环境配置选择视频后端（ComfyUI 或 RunningHub）并填写对应地址/密钥（ComfyUI 填 `COMFYUI_URL`、`COMFYUI_API_KEY` 及预设/分辨率/超分/GPU 参数，顶部卡片支持探活与可选 Colab 一键启停；RunningHub 填 `RUNNINGHUB_API_KEY`）与 `APIMART_API_KEY`，选择 APIMart 或 Gemini 官方文字服务，分别填写构图规划模型和提示词改写模型；Gemini 另填对应 key。勾选保存到本机 `.env`（也可预先手动配置；取消勾选则只用当前服务）→ 上传参考图（film 导入后按清单逐项上传，角色较多时可勾选多个角色合并为一张合图上传以控制在 9 张上限内，不用填路径） → 关闭离线演示 → 启动。工作台固定用 `H3_REWRITER=llm`，不调用 Claude；APIMart 选项也支持自定义 OpenAI 兼容 key 和 URL。
@@ -81,13 +79,21 @@ key 仅按选择写入被 git 忽略的本机 `.env`（权限 0600），不会�
 
 提示词就按 Seedance 的写法：画面描述、分镜时间、台词、「参考图片N 是谁」。工具先改写成官方格式（结果存在 `--out` 目录的 `prompt.h3.txt`），再连同参考图提交，大约 4–6 分钟出一条视频（ComfyUI 默认 768p 档为 768×1344 竖屏 / 1344×768 横屏 / 1024×1024 方形；RunningHub 或 ComfyUI 544p 档为 544×960 竖屏 / 960×544 横屏 / 736×736 方形），带模型自己生成的声音。已经是六段式的提示词原样提交。字幕检查目前暂停，自动检查及 `--check` 都会跳过，不调用视觉模型。
 
+## 出图前检查台词预算
+
+```bash
+python h3ref.py preflight --film examples/dialogue-budget.json --json
+```
+
+示例返回 `status: "partial"`（跳过一条空动作），第 2 镜常速超预算、第 3 镜慢速超预算，`meta.calibration_status` 为 `"provisional"`。这条命令支持 `--film -` 读标准输入，且无需服务、密钥或参考图。脚本检查、状态和退出码详见[台词语速预检](docs/workbench.md#dialogue-preflight)。
+
 ## 整条片：`film`
 
 分镜脚本写成 JSON，格式看 `examples/film.example.json`：画幅、画风一句话、场景与道具、台词语言、角色（名字、参考图、外观描述）、每个镜头的起止秒数、机位、动作和台词。
 
 工具按镜头边界切成每段不超过 15 秒，然后：
 
-1. **画分镜图**（`--frames shot`，默认；加 `--no-optimize-storyboard` 可跳过文字优化直接按原剧本词画图）：先用文字模型（默认 `deepseek-v4-pro`）按全片镜序输出精简的 `composition v3`（机位构图、当前场景陈设、人物左中右站位与首帧姿态），并由程序跨镜头逐字锁死每个角色的固定外貌衣着词（`locked_look`）；若文字模型输出为空或格式不符，自动重试最多 3 次后回退原剧本分镜词继续出图。每镜文字落盘后立即交给四线程图片池，和后续文字规划重叠；多角色共用同一张合图时自动按路径去重并生成防串脸／禁画未出场角色说明。再用图片模型（默认 `gpt-image-2.6-sunburst`）画出镜头开始的一瞬间。各图仅使用场景／道具总表和对应角色图作为参考，不引用首张分镜。参考图按像素收费，上传前缩到 1024 像素。
+1. **画分镜图**（`--frames shot`，默认；加 `--no-optimize-storyboard` 可跳过文字优化直接按原剧本词画图）：先用文字模型（默认 `deepseek-v4-pro`）按全片镜序输出精简的 `composition v3`（机位构图、当前场景陈设、人物左中右站位与首帧姿态）。程序通过 `locked_look` 保持角色固定外貌和服装一致，剧本明确摘下或脱下的物件按当前镜头描述穿戴状态。若文字模型输出为空或格式不符，自动重试最多 3 次后回退原剧本分镜词继续出图。每镜文字落盘后立即交给四线程图片池，和后续文字规划重叠；多角色共用同一张合图时自动按路径去重并生成防串脸／禁画未出场角色说明。再用图片模型（默认 `gpt-image-2.6-sunburst`）画出镜头开始的一瞬间。各图仅使用场景／道具总表和对应角色图作为参考，不引用首张分镜。参考图按像素收费，上传前缩到 1024 像素。
 2. **写提示词**：每段按 Seedance 的写法拼出中文提示词（参考图片1 是总表、2 是谁、之后每张是第几个镜头的首帧），再改写成 H3 官方六段式英文（强制每段非空，空输出或格式／图片编号问题最多纠错重试 6 次）。
 3. **生成**：每段参考图最多 9 张（工作流就 9 个图片口），放不下时先拿掉总表，再拿掉后面镜头的分镜图。分镜图模式下各段互不依赖，并行生成（ComfyUI 默认并发等于节点数，RunningHub 默认最多同时生成 3 段），其余等待空位。
 4. **拼片、出报告**，出 `film.mp4` 和 `report.md`（每段费用、GPU 时间）。字幕检查目前暂停，整片和单段重生成均跳过；检查代码与已有记录保留。

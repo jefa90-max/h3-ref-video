@@ -84,46 +84,59 @@ def without_anchor_reference(text: str) -> str:
     return re.sub(r"参考图片\d+是同一部片子另一个镜头的画面：人物的长相、妆容、服装和场景的样子与它保持一致，构图按上面的画面描述来。(?:\r?\n)?", "", text)
 
 
+COMPOSITION_RULES = (
+    "你是分镜美术指导。只输出精简的 composition v3 JSON 对象，不输出 Markdown、代码块或任何多余解释。"
+    "必填字段：{\"version\":3, \"camera\":\"...\", \"scene\":\"...\", \"characters\":[{\"name\":\"...\",\"locked_look\":\"...\",\"placement_and_pose\":\"...\"}]}；无人空镜填 \"characters\":[]。"
+    "camera：若 current_shot.camera 已指定景别/视角则忠实展开，未指定时按当前镜头人物关系与空间补足清晰机位与构图（如多人殿堂补高角度斜俯拍广角或对称全景，单人对话补近景/过肩等，不要把单一机位写死为全片固定机位）。"
+    "scene：写当前镜头的具体场景环境及前中背景核心陈设与关键道具（key_scenes 仅作参考；与 previous_composition 同场景时保持核心陈设位置一致，反打只改机位和画面左右相对关系）。"
+    "characters：name 使用 cast 正式姓名，同一镜内不重复。"
+    "locked_look：严格只写跨镜头固定不变的五官长相、发型胡须、固定头饰与固定服装；严禁把单镜临时道具、持物、动作、姿态或朝向（如手持某物、端杯、毛巾挂脖、背对镜头、正面站立）塞进 locked_look；若 locked_looks 已给出某角色锁死词，必须原样逐字复用。"
+    "changing_wearables 按角色列出剧本中会摘下或脱下的物件，整片都不得把这些物件写入该角色的 locked_look。即使本镜仍佩戴，也只在 placement_and_pose 交代可见的穿戴或持物状态。"
+    "placement_and_pose：只写本镜首帧（动作刚开始那一瞬，不提前画出动作结束结果）的画面左/中/右站位、身体朝向、视线、姿态与当前持物（如“画面左侧站着，侧身面向中央长案，右手轻按婚书”）。"
+    "背影镜头不要求露脸，不沿用参考图的正面立绘姿势，不引用参考图编号，不画任何字幕或文字。"
+    "内容安全（必须严格遵守，避免触发图片生成审核拦截）：严禁在任何字段中输出暴力、血腥、伤残、流血、伤口、杀戮、殴打、虐待、尸体、自残、色情裸露或“死”字等敏感词与直白伤害画面；"
+    "若剧本涉及打斗、冲突、受伤或威胁情节，必须改写为克制、安全的影视戏剧化画面（例如改为紧张对峙、防备架势、气场压迫、衣衫微乱或远景剪影，不描写武器刺伤/击打身体、血迹伤口或残忍细节）。"
+)
+
+
 def describe_composition(film: dict, shot: dict, *, previous_composition: dict | None = None,
                          known_scenes: dict | None = None, locked_looks: dict[str, str] | None = None,
-                         max_retries: int = 3) -> dict:
+                         max_retries: int = 3, rules_override: str | None = None, infer=None) -> dict:
     """Describe only this shot's opening image, using earlier shots for continuity."""
     shots = film.get("shots") or [shot]
     number = shots.index(shot) + 1
     visible = lambda item: {key: item.get(key, "") for key in ("camera", "action", "line")}
+    changing = staging.changing_wearables(film)
+    locked_looks = {name: staging.stable_locked_look(look, changing.get(name, set()))
+                    for name, look in (locked_looks or {}).items()}
     context = {"shot_number": number, "current_shot": visible(shot),
                "previous_shots": [visible(item) for item in shots[:number - 1]], "key_scenes": film.get("setting") or "",
-               "cast": film.get("cast") or [], "previous_composition": previous_composition,
-               "known_scenes": known_scenes or {}, "locked_looks": locked_looks or {}}
-    rules = (
-        "你是分镜美术指导。只输出精简的 composition v3 JSON 对象，不输出 Markdown、代码块或任何多余解释。"
-        "必填字段：{\"version\":3, \"camera\":\"...\", \"scene\":\"...\", \"characters\":[{\"name\":\"...\",\"locked_look\":\"...\",\"placement_and_pose\":\"...\"}]}；无人空镜填 \"characters\":[]。"
-        "camera：若 current_shot.camera 已指定景别/视角则忠实展开，未指定时按当前镜头人物关系与空间补足清晰机位与构图（如多人殿堂补高角度斜俯拍广角或对称全景，单人对话补近景/过肩等，不要把单一机位写死为全片固定机位）。"
-        "scene：写当前镜头的具体场景环境及前中背景核心陈设与关键道具（key_scenes 仅作参考；与 previous_composition 同场景时保持核心陈设位置一致，反打只改机位和画面左右相对关系）。"
-        "characters：name 使用 cast 正式姓名，同一镜内不重复。"
-        "locked_look：严格只写跨镜头固定不变的五官长相、发型胡须、固定头饰与固定服装；严禁把单镜临时道具、持物、动作、姿态或朝向（如手持某物、端杯、毛巾挂脖、背对镜头、正面站立）塞进 locked_look；若 locked_looks 已给出某角色锁死词，必须原样逐字复用。"
-        "placement_and_pose：只写本镜首帧（动作刚开始那一瞬，不提前画出动作结束结果）的画面左/中/右站位、身体朝向、视线、姿态与当前持物（如“画面左侧站着，侧身面向中央长案，右手轻按婚书”）。"
-        "背影镜头不要求露脸，不沿用参考图的正面立绘姿势，不引用参考图编号，不画任何字幕或文字。"
-        "内容安全（必须严格遵守，避免触发图片生成审核拦截）：严禁在任何字段中输出暴力、血腥、伤残、流血、伤口、杀戮、殴打、虐待、尸体、自残、色情裸露或“死”字等敏感词与直白伤害画面；"
-        "若剧本涉及打斗、冲突、受伤或威胁情节，必须改写为克制、安全的影视戏剧化画面（例如改为紧张对峙、防备架势、气场压迫、衣衫微乱或远景剪影，不描写武器刺伤/击打身体、血迹伤口或残忍细节）。"
-    )
-    llm = config.llm_settings()
-    key = config.llm_key()
-    base_messages = [{"role": "system", "content": rules},
+               "cast": film.get("cast") or [], "previous_composition": staging.scope_wearable_look(previous_composition, film, {}, changing),
+               "known_scenes": known_scenes or {}, "locked_looks": locked_looks,
+               "changing_wearables": {name: sorted(items) for name, items in changing.items()}}
+    if infer is None:
+        llm = config.llm_settings()
+        key = config.llm_key()
+
+        def infer(messages):
+            return http.request(llm["base_url"] + "/chat/completions", key,
+                                {"model": llm["composition_model"], "messages": messages,
+                                 "max_tokens": 8000, "stream": False},
+                                timeout=600, tries=1)
+
+    base_messages = [{"role": "system", "content": COMPOSITION_RULES if rules_override is None else rules_override},
                      {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
     retry_messages: list[dict] = []
     attempts = max(1, int(max_retries) + 1)
     last_error = ""
     for _ in range(attempts):
-        out = http.request(llm["base_url"] + "/chat/completions", key,
-                           {"model": llm["composition_model"], "messages": base_messages + retry_messages,
-                            "max_tokens": 8000, "stream": False},
-                           timeout=600, tries=1)
-        if isinstance(out, dict) and (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+        out = infer(base_messages + retry_messages)
+        http_status = out.get("_http_status") if isinstance(out, dict) else None
+        if isinstance(out, dict) and ((isinstance(http_status, int) and http_status >= 400)
+                                      or (out.get("error") and "choices" not in out)):
             err_obj = out.get("error")
             detail = json.dumps(out, ensure_ascii=False)
             low = detail.lower()
-            http_status = out.get("_http_status")
             raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
             if http_status in (401, 403) or raw_code in (401, 403, "invalid_api_key", "api_key_invalid", "unauthorized", "authentication_error") or any(
                 tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid", "incorrect api key", "unauthorized", "forbidden")
@@ -162,6 +175,7 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
             except ValueError as exc:
                 last_error = str(exc)
             else:
+                validated = staging.scope_wearable_look(validated, film, shot, changing)
                 if validated.get("version") == 3 and locked_looks:
                     for ch in validated.get("characters") or []:
                         if ch["name"] in locked_looks:
@@ -175,8 +189,17 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
     raise CompositionFormatError(last_error)
 
 
+def neutralize_text(text: str, *, neutral_words: dict[str, str] | None = None) -> str:
+    if neutral_words is None:
+        return NEUTRAL_PATTERN.sub(lambda match: NEUTRAL_WORDS[match.group()], text)
+    words = {**NEUTRAL_WORDS, **neutral_words, "死": NEUTRAL_WORDS["死"]}
+    pattern = re.compile("|".join(re.escape(word) for word in sorted(words, key=len, reverse=True)))
+    return pattern.sub(lambda match: words[match.group()], text).replace("死", NEUTRAL_WORDS["死"])
+
+
 def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, composition: dict | None = None, *,
-           resolve_cache: dict[str, str] | None = None) -> str:
+           resolve_cache: dict[str, str] | None = None, neutral_words: dict[str, str] | None = None,
+           tail_override: str | None = None, shot_state_note: str | None = None) -> str:
     """Chinese prompt for one frame. Pictures in order: board (optional), each character in it."""
     aspect = film["aspect"]
     lines = [f"一张{ORIENT.get(aspect, '竖屏')}电影剧照，画幅 {aspect}，它是一段视频里一个镜头的第一帧。画风：{(film.get('look') or '').strip()}"]
@@ -187,6 +210,8 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
         lines.append(f"参考图片1是本片的角色、道具和场景参考总表，优先查找第{number}镜对应的关键场景，只采用当前镜头需要的外观线索。不要把其他场景、总表、白底和文字标注画进画面。")
         k = 2
     cam = (shot.get("camera") or "").strip().strip("【】")
+    changing = staging.changing_wearables(film)
+    composition = staging.scope_wearable_look(composition, film, shot, changing)
     structured = staging.is_structured(composition)
     if structured:
         lines.append(staging.render_opening(composition))
@@ -203,23 +228,29 @@ def prompt(film: dict, shot: dict, who: list[dict], with_board: bool, compositio
                 comp_looks[ch["name"]] = (ch.get("locked_look") or ch.get("appearance") or "").strip().rstrip("。；; ")
     groups = staging.group_cast_by_picture(who, film.get("cast") or who, resolve_cache=resolve_cache)
     for g in groups:
+        wearable_clause = ("角色可变物件的穿戴与位置以当前镜头描述为准。"
+                           if any(c['name'] in changing for c in g['active']) else "")
         if len(g["all"]) <= 1 and len(g["active"]) == 1 and not g["absent"]:
             c = g["active"][0]
             look = "" if structured else (c.get("look") or "").strip().rstrip("。")
-            lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。")
+            look = staging.stable_locked_look(look, changing.get(c['name'], set()))
+            lines.append(f"参考图片{k}是{c['name']}" + (f"：{look}" if look else "") + "。长相、发型、妆容和服装严格照参考图，朝向按当前镜头描述，不沿用参考图中的正面姿态。" + wearable_clause)
         else:
             parts = []
             for c in g["active"]:
                 lk = comp_looks.get(c["name"]) or (c.get("look") or "").strip().rstrip("。；; ")
+                lk = staging.stable_locked_look(lk, changing.get(c['name'], set()))
                 parts.append(f"{c['name']}（{lk}）" if lk else c["name"])
             absent_clause = f"该参考图中还包含未出场的{'、'.join(c['name'] for c in g['absent'])}，严禁将未出场角色画进画面。" if g["absent"] else ""
             lines.append(
                 f"参考图片{k}是多角色合图，本镜出场角色为{'、'.join(parts)}。请按各自外观特征将长相、发型、妆容和服装严格对号入座，切勿角色串脸；朝向与动作按当前镜头描述，不沿用参考图中的正面姿态。"
-                + absent_clause
+                + wearable_clause + absent_clause
             )
         k += 1
-    lines.append(TAIL)
-    return NEUTRAL_PATTERN.sub(lambda match: NEUTRAL_WORDS[match.group()], "\n".join(lines))
+    if shot_state_note:
+        lines.append(shot_state_note)
+    lines.append(TAIL if tail_override is None else tail_override)
+    return neutralize_text("\n".join(lines), neutral_words=neutral_words)
 
 
 def _upload(path: Path) -> str:
@@ -324,7 +355,8 @@ def poll(task: str) -> dict:
     return res
 
 
-def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k: None, task: str | None = None) -> float:
+def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k: None, task: str | None = None,
+         *, settle=None) -> float:
     """Draw one frame to `out`; `record(task=…)` is called with the task id before waiting, so a rerun resumes it.
     Returns the cost in CNY."""
     if not task:
@@ -336,6 +368,8 @@ def draw(text: str, refs: list[Path], aspect: str, out: Path, record=lambda **k:
     record(task=task, task_failed=False, submission_unknown=False)
     for _ in range(MAX_POLL_ATTEMPTS):
         st = poll(task)
+        if settle is not None and st["state"] in ("done", "failed"):
+            settle(st.get("cny"))
         if st["state"] == "done":
             http.download(st["url"], out)
             return float(st.get("cny") or 0)

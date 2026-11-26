@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from h3ref import config
+from h3ref.preflight import FilmValidationError, inspect_automatic
 from .i18n import InputError, message
 from .inputs import preflight, validate
 from .directories import create_output_directory
@@ -499,6 +500,12 @@ class Jobs:
         return live_env
 
     def create(self, payload, env, lang):
+        snapshot = None
+        if isinstance(payload, dict) and payload.get("kind") == "film" and isinstance(payload.get("film"), dict):
+            shots = payload["film"].get("shots")
+            oversized = isinstance(shots, list) and len(shots) > max(2000, config.max_shots() * 2)
+            if not oversized and env.get("H3_SKIP_PREFLIGHT", "").strip() != "1":
+                snapshot = inspect_automatic(payload["film"], env)
         request = validate(payload, self.root)
         if request["operation"] == "frame":
             raise InputError("frame_operation")
@@ -530,6 +537,8 @@ class Jobs:
             write_json(output / "inputs" / "request.json", request)
             if request["kind"] == "film":
                 write_json(output / "inputs" / "film.json", request["film"])
+                if snapshot is not None:
+                    write_json(output / "inputs" / "preflight.json", snapshot)
             else:
                 (output / "inputs" / "prompt.txt").write_text(request["prompt"], encoding="utf-8")
             record = {"id": identifier, "kind": request["kind"], "demo": request["demo"], "output_dir": str(output),
@@ -581,7 +590,7 @@ class Jobs:
             try:
                 script, planned_segments, _, descriptions = plan(request, check_images=False)
                 description = next((item for item in descriptions if item["key"] == key), None)
-            except SystemExit as exc:
+            except (SystemExit, FilmValidationError) as exc:
                 raise InputError("film_invalid", detail=str(exc)) from exc
             pending_frame = read_json(out / "inputs" / "frame-edit.json", {})
             active_pending = pending_frame if pending_frame and not pending_frame.get("applied") else {}
@@ -886,7 +895,7 @@ class Jobs:
                     except (OSError, ValueError):
                         one_inflight = False
                 if not one_inflight:
-                    request = validate(request, self.root)
+                    request = validate(request, self.root, normalized_times=True)
             if request["kind"] == "film" and request["operation"] == "pipeline" and not snapshot["review"]["complete"]:
                 # Old/interrupted jobs cannot bypass the newly required review via resume.
                 request["operation"] = "frames"

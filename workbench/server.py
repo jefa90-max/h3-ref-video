@@ -5,6 +5,7 @@ import platform
 import re
 import shutil
 import threading
+import traceback
 import uuid
 from pathlib import Path
 
@@ -271,9 +272,10 @@ def create_app(storage=None, env_path=None):
         response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self'; style-src-attr 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         return response
 
-    def segment_problem(code, detail, status, *, field=None, instance=None):
-        body = dict(type='urn:workbench:error:' + code, title=message('segment_problem_title', language()), status=status,
-                    detail=jobs.redact(detail), error=jobs.redact(detail), code=code, doc_anchor='docs/workbench.md#video-prompt-errors')
+    def api_problem(code, detail, status, *, title_key, doc_anchor, field=None, instance=None, **extensions):
+        detail = jobs.redact(detail)
+        body = dict(type="urn:workbench:error:" + code, title=message(title_key, language()), status=status,
+                    detail=detail, error=detail, code=code, doc_anchor=doc_anchor, **extensions)
         if field:
             body['field'] = field
         if instance:
@@ -283,22 +285,47 @@ def create_app(storage=None, env_path=None):
         response.mimetype = 'application/problem+json'
         return response
 
+    def segment_problem(code, detail, status, **extensions):
+        return api_problem(code, detail, status, title_key="segment_problem_title",
+                           doc_anchor="docs/workbench.md#video-prompt-errors", **extensions)
+
+    def film_problem(code, detail, status, *, fix=None, **extensions):
+        return api_problem(code, detail, status, title_key="dialogue_problem_title",
+                           doc_anchor="docs/workbench.md#dialogue-preflight", fix=jobs.redact(fix or detail), **extensions)
+
     @app.errorhandler(InputError)
     def input_error(exc):
         status = 404 if exc.key == 'not_found' else 400
         if request.endpoint in ('regenerate_segment', 'rewrite_segment', 'rewrite_prompts'):
             field = exc.values.get('field') or {'segment_changed': 'version', 'segment_number': 'number'}.get(exc.key)
             return segment_problem(exc.key, exc.localized(language()), status, field=field)
+        if request.endpoint == "film_references":
+            return film_problem(exc.key, exc.localized(language()), status, field=exc.values.get("field"))
         return jsonify(error=jobs.redact(exc.localized(language()))), status
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
+        if request.endpoint == "film_references" and exc.code in (400, 413, 415):
+            code = {400: "dialogue_request_json", 413: "dialogue_request_size", 415: "dialogue_request_type"}[exc.code]
+            return film_problem(code, message(code, language()), exc.code, field="request")
         return jsonify(error=message("http", language(), code=exc.code, detail=exc.description)), exc.code
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
+        if request.endpoint == "film_references":
+            instance = uuid.uuid4().hex
+            trace = " ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                             for frame in traceback.extract_tb(exc.__traceback__)[-5:])
+            try:
+                with (storage / "server.log").open("a", encoding="utf-8") as log:
+                    log.write(f"correlation={instance} endpoint=film_references error={type(exc).__name__} trace={trace}\n")
+            except OSError:
+                app.logger.error("Cannot write preflight trace %s", instance)
+            code = "dialogue_internal"
+            return film_problem(code, message(code, language(), instance=instance), 500,
+                                instance=instance, recovery={"side_effects": "none"},
+                                context={"endpoint": "/api/film/references"})
         if request.endpoint in ('regenerate_segment', 'rewrite_segment', 'rewrite_prompts', 'get_job'):
-            import traceback
             instance = uuid.uuid4().hex
             number = (request.view_args or {}).get('number', '?')
             identifier = (request.view_args or {}).get('identifier', '?')
@@ -658,8 +685,11 @@ def create_app(storage=None, env_path=None):
     def film_references():
         payload = request.get_json()
         if not isinstance(payload, dict):
-            invalid("request", payload, "object")
-        return jsonify(describe_references(payload.get("film")))
+            raise InputError("dialogue_request_json", field="request")
+        with jobs.lock:
+            env_snapshot = dict(env)
+        return jsonify(describe_references(payload.get("film"), lang=language(),
+                                           include_preflight=True, environ=env_snapshot))
 
     @app.get("/api/jobs/<identifier>")
     def get_job(identifier):
@@ -712,7 +742,10 @@ def create_app(storage=None, env_path=None):
         seg_idx, shot_idx = int(match.group(1)) - 1, int(match.group(2)) - 1
         saved = json.loads((out / "inputs" / "request.json").read_text(encoding="utf-8"))
         source = out / "inputs" / ("demo-film.json" if saved["demo"] and (out / "inputs" / "demo-film.json").exists() else "film.json")
-        script = film.load(source, check_images=False)
+        try:
+            script = film.load(source, check_images=False, normalized_times=True)
+        except (SystemExit, film.FilmValidationError) as exc:
+            raise InputError("film_invalid", detail=str(exc)) from exc
         planned = film.plan(script["shots"])
         if not (0 <= seg_idx < len(planned)):
             raise InputError("not_found", value=f"{key}/{index}")
