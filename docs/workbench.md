@@ -13,7 +13,7 @@ python3 -m venv .venv
 
 Windows 使用 `python -m venv .venv` 创建环境，再运行 `.venv\Scripts\python.exe -m pip install -r requirements-web.txt`。
 
-装好依赖后，在仓库根目录运行 `pnpm dev`，打开 http://127.0.0.1:7860。它会使用项目的 `.venv` 或当前已激活的 Python 虚拟环境。`pnpm dev --port 7862 --open` 会换端口并打开浏览器。同一份源码只允许一个工作台服务，切换端口前先退出已有服务。
+已安装 Node.js 和 pnpm 时，在仓库根目录运行 `pnpm dev`，打开 http://127.0.0.1:7860。脚本优先使用当前已激活的 Python 虚拟环境，未激活时使用项目的 `.venv`。`pnpm dev --port 7862 --open` 会换端口并打开浏览器。同一份源码只允许一个工作台服务，切换端口前先退出已有服务。
 
 也可以直接用虚拟环境运行 `workbench.py`。macOS 和 Linux 使用 `.venv/bin/python workbench.py`，Windows 使用 `.venv\Scripts\python.exe workbench.py`。完整出片需要 ffmpeg 和 ffprobe，macOS 可通过 `brew install ffmpeg` 安装。
 
@@ -91,7 +91,7 @@ python h3ref.py preflight --film examples/dialogue-budget.json --json
 }
 ```
 
-省略 `--json` 可读人类摘要，`--film -` 从标准输入读取最多 32 MiB。退出码 `0` 表示命令产生了结果，`1` 表示文件、JSON 或阈值配置有误，`2` 表示启用 `--fail-on-warn` 后有告警或状态不为 `complete`。命令从环境变量读取 `H3_LANG` 和可选的 `H3_DIALOGUE_RATE_CONFIG`，无需加载 `.env`、生成服务或参考素材。原始时间戳必须在 0–3600 秒之间。旧 CLI 剧本若用了超出范围的绝对时间，可减去共同起点再续跑，镜长保持相同。
+省略 `--json` 可读人类摘要，`--film -` 从标准输入读取最多 32 MiB。退出码 `0` 表示命令产生了结果，`1` 表示文件、JSON 或阈值配置有误，`2` 表示启用 `--fail-on-warn` 后有告警或状态不为 `complete`。命令从环境变量读取 `H3_LANG` 和可选的 `H3_DIALOGUE_RATE_CONFIG`，无需加载 `.env`、生成服务或参考素材。原始时间戳的有效范围为 0–3600 秒。起止时间任一缺失或无效时，预检按默认 2 秒估算，并将该镜计入 `default_duration_shots`。旧 CLI 剧本若用了绝对时间，可减去共同起点。在所有时间戳都落入有效范围时，镜长保持相同。
 
 | 告警 | 建议 |
 |---|---|
@@ -115,7 +115,7 @@ jq '{film: .}' examples/dialogue-budget.json | curl -sS \
 
 需要自定义语速时，`H3_DIALOGUE_RATE_CONFIG` 支持内联 JSON 或不超过 64 KiB 的普通 JSON 文件。覆盖项按 `chars` / `words` 分组，可分别指定 `regular_rate`、`slow_rate`、`long_line_limit`，例如 `{"chars":{"regular_rate":6.5}}`。`H3_SKIP_PREFLIGHT=1` 可关闭自动任务的预检。显式 CLI 检查和创建页的参考图请求仍会运行。覆盖配置无效时，CLI 返回配置错误，工作台显示提醒并使用默认阈值。
 
-新任务把检查时的阈值指纹和结果存进 `inputs/preflight.json`。CLI 任务的源剧本变更后，会为当前剧本重新估算，并保留创建时快照。历史任务缺少快照时，报告会标出 `provenance_unknown` 和重算指纹。升级后的续跑仍复用已缓存的提示词和分镜图；主动重新改写或重生成才会触发相应的模型调用和费用。
+开启自动预检时，新整片任务把检查时的阈值指纹和结果存进 `inputs/preflight.json`。CLI 任务的源剧本变更后，会为当前剧本重新估算，并保留创建时快照。历史任务缺少快照且重算发现告警或检查不完整时，报告会标出 `provenance_unknown` 和重算指纹。升级后的续跑仍可复用匹配的提示词和分镜图缓存。重新改写、重生成或补跑尚未完成的步骤可能触发相应的模型调用和费用。
 
 ## 状态、播放与恢复
 
@@ -145,7 +145,7 @@ first / none 的上一段尾帧也是参考图，并非固定首尾帧约束。�
 
 ## 单首帧调度与兼容
 
-仍是一镜一张首帧，不生成尾图，不引用其它生成分镜。新镜默认采用精简的 `composition v3`（机位与构图、当前场景陈设、人物左中右站位及本镜首帧姿态，外貌特征由程序按首次出场 `locked_look` 跨镜头逐字锁定，剥离临时持物与姿势），渲染为紧凑自然的中文剧照描述并同步精简下游视频中文提示词；历史任务已落盘的 `composition v2` 缓存继续原样兼容读取。
+仍是一镜一张首帧，不生成尾图，不引用其它生成分镜。新镜默认采用精简的 `composition v3`（机位与构图、当前场景陈设、人物左中右站位及本镜首帧姿态），渲染为中文剧照描述并同步精简下游视频中文提示词。程序通过 `locked_look` 保持固定外貌一致，临时持物、姿势及剧本明确摘下或脱下的物件按当前镜头处理。历史任务已落盘的 `composition v2` 缓存继续兼容读取。
 
 规划顺序执行，每镜落盘后立即并行画图；构图调用遇到空返回或 JSON／字段校验不通过时最多重试 3 次，仍失败则回退原始分镜词继续出图，鉴权／欠费／限流／模型不存在（401/402/403/404/429）立即中止。也可在创建页取消勾选优化开关（或 CLI 传 `--no-optimize-storyboard`）跳过构图模型，此时仅生成分镜图无需配置文字模型密钥。单镜图片生成失败仍不妨碍其它镜头，CLI 以 FRAME_BATCH_INCOMPLETE 非零退出并指明 state.json。
 
