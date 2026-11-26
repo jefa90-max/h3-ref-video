@@ -95,8 +95,30 @@ class StagingAndTimestampRecovery(unittest.TestCase):
 
     def test_removed_glasses_leave_legacy_locked_look_when_followed_by_description(self):
         self.assertEqual(staging.stable_locked_look("短发，眼镜挂在鼻梁上，灰衬衣", {"眼镜"}), "短发，灰衬衣")
+        self.assertEqual(staging.stable_locked_look("短发，眼镜戴在鼻梁上，灰衬衣", {"眼镜"}), "短发，灰衬衣")
         self.assertEqual(staging.stable_locked_look("短发，戴着眼镜微笑，灰衬衣", {"眼镜"}), "短发，灰衬衣")
         self.assertEqual(staging.stable_locked_look("短发，眼镜盒在包里，灰衬衣", {"眼镜"}), "短发，眼镜盒在包里，灰衬衣")
+
+    def test_fixed_appearance_adjacent_to_wearable_stays_locked(self):
+        cases = {
+            "短发戴黑框眼镜，灰衬衣": "短发，灰衬衣",
+            "身穿灰衬衣戴着黑框眼镜": "身穿灰衬衣",
+            "戴着黑框眼镜身穿灰衬衣": "身穿灰衬衣",
+        }
+        for look, expected in cases.items():
+            with self.subTest(look=look):
+                self.assertEqual(staging.stable_locked_look(look, {"眼镜"}), expected)
+
+    def test_compound_wearables_follow_their_own_opening_states(self):
+        opening = {"action": "阿宁戴着黑框眼镜，站在窗前。"}
+        script = {"cast": [{"name": "阿宁"}], "shots": [opening, {"action": "阿宁摘下眼镜。阿宁摘下帽子。"}]}
+        composition = {"version": 3, "camera": "中景", "scene": "客厅", "characters": [
+            {"name": "阿宁", "locked_look": "短发，戴着黑框眼镜并戴着灰帽子", "placement_and_pose": "站在窗前"},
+        ]}
+        scoped = staging.scope_wearable_look(composition, script, opening, staging.changing_wearables(script))
+        character, = scoped["characters"]
+        self.assertEqual(character["locked_look"], "短发")
+        self.assertEqual(character["placement_and_pose"], "戴着黑框眼镜，站在窗前")
 
     def test_single_out_of_range_timestamp_uses_same_default_as_preflight(self):
         for raw_time in ({"start": 3601}, {"end": 3601}):
