@@ -17,8 +17,8 @@ class ABRecoveryRegressions(unittest.TestCase):
         self.picture = self.root / "opening.png"
         self.picture.write_bytes(b"opening")
 
-    def run_session(self, *, resume=False):
-        journal = Journal(self.journal_path, "run", "rules", money("10"), resume=resume)
+    def run_session(self, *, resume=False, cap="10"):
+        journal = Journal(self.journal_path, "run", "rules", money(cap), resume=resume)
         quotes = {"image": "0.5", "composition.llm": "0.1", "rewrite.llm": "0.1", "video_per_second": "0.1"}
         return ab_eval.Run(self.root, {"video": {"provider": "runninghub"}}, rh, None,
                            quotes, "Guide fixture.", dry_run=False, journal=journal)
@@ -82,6 +82,42 @@ class ABRecoveryRegressions(unittest.TestCase):
                 self.run_session().video("side/video", "Opening scene", [self.picture], 5, "16:9", 2)
             with self.assertRaisesRegex(ExperimentError, "submission_unknown"):
                 self.run_session(resume=True).video("side/video", "Opening scene", [self.picture], 5, "16:9", 2)
+            submit.assert_called_once()
+
+    def test_resume_keeps_reported_image_charge_when_poll_omits_billing(self):
+        self.assert_resumed_charge_blocks_next_submission("image")
+
+    def test_resume_keeps_reported_video_charge_when_poll_omits_billing(self):
+        self.assert_resumed_charge_blocks_next_submission("video")
+
+    def assert_resumed_charge_blocks_next_submission(self, kind):
+        def download(url, path):
+            path.write_bytes(b"completed media")
+
+        sent = {"data": [{"task_id": "image-task"}]} if kind == "image" else "video-task"
+        provider = frames if kind == "image" else rh
+        submit_target, submit_method = (http, "request") if kind == "image" else (rh, "submit")
+        polls = [{"state": "done", "url": "https://example.invalid/media", "cny": 0.8, "billing_known": True},
+                 {"state": "done", "url": "https://example.invalid/media"},
+                 {"state": "done", "url": "https://example.invalid/media", "cny": 0.5, "billing_known": True}]
+        arguments = ("Opening scene", [], "16:9") if kind == "image" else ("Opening scene", [self.picture], 5, "16:9", 2)
+        with patch.object(frames.config, "apimart_key", return_value="test-key"), \
+             patch.object(rh, "upload", return_value="opening.jpg"), \
+             patch.object(submit_target, submit_method, return_value=sent) as submit, \
+             patch.object(provider, "poll", side_effect=polls), \
+             patch.object(http, "download", side_effect=OSError("download interrupted")) as fetch:
+            run = self.run_session(cap="1.00")
+            with self.assertRaisesRegex(OSError, "download interrupted"):
+                getattr(run, kind)("first", *arguments)
+            self.assertEqual(run.journal.committed_cny(), money("0.80"))
+
+            resumed = self.run_session(resume=True, cap="1.00")
+            fetch.side_effect = download
+            media_path = getattr(resumed, kind)("first", *arguments)
+            self.assertEqual(media_path.read_bytes(), b"completed media")
+            with self.assertRaisesRegex(ExperimentError, "budget_exhausted"):
+                getattr(resumed, kind)("second", *arguments)
+            self.assertEqual(resumed.journal.committed_cny(), money("0.80"))
             submit.assert_called_once()
 
     def test_invalid_composition_stops_only_its_side_and_is_not_resent(self):
