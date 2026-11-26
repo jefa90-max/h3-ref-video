@@ -699,6 +699,55 @@ class HttpUrllibTransportRegressionTest(unittest.TestCase):
                     http.download("https://cdn.example/interrupted.mp4", dst_int)
             self.assertEqual(list(root.glob("*.part")), [])
 
+    def test_ship_pass2_macos_scproxy_http_prefixed_and_schemeless_socks_route_as_socks5(self):
+        import struct
+
+        # Both macOS _scproxy._get_proxies() ({'socks': 'http://127.0.0.1:PORT'}) and schemeless
+        # SOCKS_PROXY ({'socks': '127.0.0.1:PORT'}) must speak SOCKS5 (ATYP=0x03 remote DNS), NOT HTTP CONNECT.
+        for label, proxy_val in (("macos_http_prefix", "http://127.0.0.1:{port}"), ("schemeless", "127.0.0.1:{port}")):
+            seen = {}
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(2)
+            port = srv.getsockname()[1]
+
+            def serve_one():
+                conn, _ = srv.accept()
+                try:
+                    seen["greet"] = conn.recv(16)
+                    if seen["greet"].startswith(b"\x05"):
+                        conn.sendall(b"\x05\x00")
+                        hdr = conn.recv(4)
+                        seen["hdr"] = hdr
+                        if len(hdr) == 4 and hdr[3] == 3:
+                            alen = conn.recv(1)[0]
+                            seen["host"] = conn.recv(alen).decode("ascii")
+                            seen["port"] = struct.unpack("!H", conn.recv(2))[0]
+                        conn.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+                        http_req = conn.recv(4096)
+                        seen["http_req"] = http_req
+                        body = b'{"ok": true}'
+                        conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii") + body)
+                finally:
+                    conn.close()
+
+            t = threading.Thread(target=serve_one, daemon=True)
+            t.start()
+            try:
+                with patch("urllib.request.getproxies", return_value={"socks": proxy_val.format(port=port)}), \
+                     patch("urllib.request.proxy_bypass", return_value=False):
+                    res = http.request("http://api.example:8080/ping", "", tries=1, timeout=3)
+            finally:
+                t.join(2.0)
+                srv.close()
+
+            self.assertEqual(res, {"ok": True}, f"Failed for {label}")
+            self.assertEqual(seen.get("greet"), b"\x05\x01\x00", f"Expected SOCKS5 greeting for {label}, got {seen.get('greet')!r}")
+            self.assertEqual(seen.get("hdr"), b"\x05\x01\x00\x03", f"Expected remote-DNS SOCKS5 CONNECT for {label}")
+            self.assertEqual(seen.get("host"), "api.example")
+            self.assertEqual(seen.get("port"), 8080)
+
 
 if __name__ == "__main__":
     unittest.main()
