@@ -132,8 +132,11 @@ class DialogueBudgetTests(unittest.TestCase):
             self.assertEqual(snapshot, film.inspect_dialogue_budget(source))
             self.assertEqual(snapshot["warnings"][0]["raw_shot"], 2)
             normalized = json.loads((output / "inputs" / "film.json").read_text())
-            with patch.dict(os.environ, {"H3_DIALOGUE_RATE_CONFIG": '{"chars":{"slow_rate":999}}'}):
-                result = film.report(film.Job(output), normalized, [], "shot", output / "film.mp4")
+            final = output / "film.mp4"
+            with patch.object(film.media, "duration", return_value=4.0) as duration, \
+                 patch.dict(os.environ, {"H3_DIALOGUE_RATE_CONFIG": '{"chars":{"slow_rate":999}}'}):
+                result = film.report(film.Job(output), normalized, [], "shot", final)
+            duration.assert_called_once_with(final)
             self.assertIn("我们现在就必须离开这里。", result.read_text())
             self.assertEqual(path.read_bytes(), original)
 
