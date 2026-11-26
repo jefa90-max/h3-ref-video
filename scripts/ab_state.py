@@ -127,7 +127,8 @@ class Journal:
         write_json(self.path, self.state)
 
     def committed_cny(self):
-        return sum((money(step["estimate_cny"] if step["actual_cny"] is None else step["actual_cny"])
+        return sum((money(step["actual_cny"]) if step["actual_cny"] is not None
+                    else max(money(step["estimate_cny"]), money(step.get("observed_cny", 0)))
                     for step in self.steps.values()), Decimal(0))
 
     def reserve(self, key, estimate):
@@ -145,7 +146,16 @@ class Journal:
         self.steps[key].update(changes)
         self.save()
 
-    def record_charge(self, key, charge):
-        # A later poll can omit billing after the original completion response.
-        if charge is not None:
-            self.update(key, actual_cny=str(money(charge)))
+    def record_charge(self, key, charge, *, complete=True):
+        if charge is None:
+            return
+        charge = money(charge)
+        if complete:
+            self.update(key, actual_cny=str(charge), observed_cny="0")
+            return
+        step = self.steps[key]
+        previous = step["actual_cny"]
+        if previous is not None and charge <= money(previous):
+            return
+        # A partial bill only establishes a lower bound on spend.
+        self.update(key, actual_cny=None, observed_cny=str(max(charge, money(step.get("observed_cny", 0)))))

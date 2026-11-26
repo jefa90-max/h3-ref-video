@@ -131,11 +131,12 @@ def describe_composition(film: dict, shot: dict, *, previous_composition: dict |
     last_error = ""
     for _ in range(attempts):
         out = infer(base_messages + retry_messages)
-        if isinstance(out, dict) and (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+        http_status = out.get("_http_status") if isinstance(out, dict) else None
+        if isinstance(out, dict) and ((isinstance(http_status, int) and http_status >= 400)
+                                      or (out.get("error") and "choices" not in out)):
             err_obj = out.get("error")
             detail = json.dumps(out, ensure_ascii=False)
             low = detail.lower()
-            http_status = out.get("_http_status")
             raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
             if http_status in (401, 403) or raw_code in (401, 403, "invalid_api_key", "api_key_invalid", "unauthorized", "authentication_error") or any(
                 tok in low for tok in ("invalid_api_key", "api_key_invalid", "api key not valid", "incorrect api key", "unauthorized", "forbidden")

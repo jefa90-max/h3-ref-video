@@ -219,7 +219,12 @@ class Run:
             # Cache the invalid response so downstream validation can reject it without a second call.
             result = None
         # Never put provider credentials into prompts or reproducibility artifacts.
-        content = json.dumps(result, ensure_ascii=False)
+        try:
+            content = json.dumps(result, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            status = result.get("_http_status") if isinstance(result, dict) else None
+            result = {"_http_status": status} if isinstance(status, int) and status >= 400 else None
+            content = json.dumps(result)
         if self.redact(content) != content:
             raise ExperimentError(f"secret_in_response: {key}")
         write_json(path, result)
@@ -340,7 +345,7 @@ class Run:
                 return None
             if result["state"] == "done":
                 charge = result.get("cny") if result.get("billing_known") else None
-                self.journal.record_charge(key, charge)
+                self.journal.record_charge(key, charge, complete=result.get("billing_complete", True))
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if is_comfy:
                     backend.download(result["url"], path)

@@ -176,7 +176,9 @@ def poll(task: str, *, report_billing: bool = False) -> dict:
     result = {"state": "done", "url": item["fileUrl"], "cny": round(money + coins * config.RH_COIN_CNY, 4), "coins": coins,
               "money": money, "run_seconds": float(item.get("taskCostTime") or 0)}
     if report_billing:
-        result["billing_known"] = any(type(item.get(key)) in (int, float) or
-                                      isinstance(item.get(key), str) and bool(item[key].strip())
-                                      for key in ("consumeCoins", "consumeMoney"))
+        reported = [type(item.get(field)) in (int, float) or
+                    isinstance(item.get(field), str) and bool(item[field].strip())
+                    for field in ("consumeCoins", "consumeMoney")]
+        result["billing_known"] = any(reported)
+        result["billing_complete"] = all(reported)
     return result

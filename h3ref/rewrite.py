@@ -282,9 +282,9 @@ def _llm(prompt: str, *, tries: int = 3) -> str:
         raise err_cls("改写模型请求失败：" + str(exc)[:300]) from None
     if not isinstance(out, dict):
         raise RewriteResponseError(message("rewrite_empty"))
-    if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
+    http_status = out.get("_http_status")
+    if (isinstance(http_status, int) and http_status >= 400) or (out.get("error") and "choices" not in out):
         err_obj = out.get("error")
-        http_status = out.get("_http_status")
         raw_code = err_obj.get("code") if isinstance(err_obj, dict) else None
         detail = json.dumps(out, ensure_ascii=False)
         low = detail.lower()

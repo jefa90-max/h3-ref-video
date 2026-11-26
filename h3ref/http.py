@@ -170,7 +170,7 @@ def request(url: str, key: str, body: dict | None = None, method: str | None = N
                     auth_code = 401 if exc.code == 400 and ("api_key_invalid" in low or "api key not valid" in low) else exc.code
                     raise HTTPResponseError(auth_code, f"{url} {exc.code}: {summary}") from None
                 parsed = _scrub_json(parsed, key)
-                parsed.setdefault("_http_status", exc.code)
+                parsed["_http_status"] = exc.code
                 return parsed
             last = f"{exc.code}: {_summarize_error_body(raw_text, key, limit=200)}"
         except Exception as exc:
