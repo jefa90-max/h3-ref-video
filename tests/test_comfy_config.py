@@ -27,6 +27,8 @@ class ComfyConfigTest(unittest.TestCase):
         self.assertEqual(config.COMFY_SIZES, {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (1024, 1024)})
         self.assertEqual(config.COMFY_RESOLUTIONS["544p"], {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)})
         self.assertEqual(config.COMFY_RESOLUTIONS["768p"], {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (1024, 1024)})
+        self.assertEqual(config.COMFY_RESOLUTIONS["1088p"], {"9:16": (1088, 1920), "16:9": (1920, 1088), "1:1": (1472, 1472)})
+        self.assertEqual(config.COMFY_LATENT_REFINE_RESOLUTIONS, ("768p", "1088p"))
 
     def test_comfyui_settings_parse_valid_options_and_strip_trailing_slash(self):
         settings = config.video_settings({
@@ -56,6 +58,7 @@ class ComfyConfigTest(unittest.TestCase):
         self.assertTrue(settings["colab_auto_start"])
         self.assertEqual(settings["colab_bin"], "/opt/bin/colab")
         self.assertEqual(settings["colab_auth"], "adc")
+        self.assertEqual(config.video_settings({"COMFYUI_RESOLUTION": "1088P"})["comfyui_resolution"], "1088p")
 
     def test_invalid_enum_and_url_values_fail_fast_without_leaking_credentials(self):
         bad_cases = [
@@ -114,7 +117,11 @@ class ComfyConfigTest(unittest.TestCase):
         self.assertEqual(graph["128"]["class_type"], "CLIPLoader")
         self.assertEqual(graph["128"]["inputs"]["clip_name"], "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
         self.assertEqual(graph["136"]["class_type"], "MiniMaxH3ReferenceToVideo")
-        self.assertEqual((graph["136"]["inputs"]["width"], graph["136"]["inputs"]["height"]), (768, 1344))
+        self.assertEqual((graph["136"]["inputs"]["width"], graph["136"]["inputs"]["height"]), (544, 960))
+        self.assertEqual(graph["160"]["class_type"], "MinimaxH3LatentUpscaler3DRefineHandoff")
+        self.assertEqual((graph["160"]["inputs"]["width"], graph["160"]["inputs"]["height"]), (768, 1344))
+        self.assertEqual(graph["121"]["inputs"]["samples"], ["160", 0])
+        self.assertEqual(graph["122"]["inputs"]["samples"], ["160", 0])
         self.assertEqual(graph["138"]["inputs"]["value"], "")
         self.assertFalse(graph["146"]["inputs"]["value"])
         self.assertEqual(graph["124"]["inputs"]["scheduler"], "beta")

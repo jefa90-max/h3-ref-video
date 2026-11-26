@@ -33,7 +33,18 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertEqual(g1["137"]["inputs"]["image"], "hash1.png")
         ref_keys_1 = [k for k in g1[comfy.SIZE]["inputs"] if k.startswith("ref_images.")]
         self.assertEqual(ref_keys_1, ["ref_images.ref_image_0"])
-        self.assertEqual((g1[comfy.SIZE]["inputs"]["width"], g1[comfy.SIZE]["inputs"]["height"]), (768, 1344))
+        # Default 768p uses 544p pass-1 + 3D latent upscale/refine to 768x1344
+        self.assertEqual((g1[comfy.SIZE]["inputs"]["width"], g1[comfy.SIZE]["inputs"]["height"]), (544, 960))
+        self.assertEqual((g1[comfy.REFINE_UPSCALER]["inputs"]["width"], g1[comfy.REFINE_UPSCALER]["inputs"]["height"]), (768, 1344))
+        self.assertEqual(g1[comfy.REFINE_UPSCALER]["inputs"]["model_name"], comfy.LATENT_UPSCALE_MODEL_NAME)
+        self.assertTrue(g1[comfy.REFINE_UPSCALER]["inputs"]["lock_audio"])
+        self.assertEqual(g1[comfy.REFINE_UPSCALER]["inputs"]["model"], [comfy.SPARSE_ATTN, 0])
+        self.assertEqual(g1[comfy.REFINE_STEPS]["inputs"]["model"], [comfy.SPARSE_ATTN, 0])
+        self.assertEqual(g1[comfy.REFINE_STEPS]["inputs"]["steps"], comfy.REFINE_DEFAULT_STEPS)
+        self.assertEqual(g1[comfy.REFINE_STEPS]["inputs"]["denoise"], comfy.REFINE_DEFAULT_DENOISE)
+        self.assertEqual(g1[comfy.REFINE_SEED]["inputs"]["noise_seed"], 42 + comfy.REFINE_SEED_OFFSET)
+        self.assertEqual(g1[comfy.VAE_DECODE]["inputs"]["samples"], [comfy.REFINE_UPSCALER, 0])
+        self.assertEqual(g1[comfy.VAE_DECODE_AUDIO]["inputs"]["samples"], [comfy.REFINE_UPSCALER, 0])
         self.assertEqual(g1[comfy.CLIP]["inputs"]["clip_name"], "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
         self.assertEqual(g1[comfy.PROMPT]["inputs"]["value"], "prompt one")
         self.assertEqual(g1[comfy.DURATION]["inputs"]["value"], 6.0)
@@ -42,7 +53,8 @@ class ComfyBackendTest(unittest.TestCase):
         g2 = comfy.graph("prompt two", ["a.png", "b.jpg"], 12, "16:9", 99)
         load_nodes_2 = [nid for nid, n in g2.items() if n.get("class_type") == "LoadImage"]
         self.assertEqual(load_nodes_2, ["137", "139"])
-        self.assertEqual((g2[comfy.SIZE]["inputs"]["width"], g2[comfy.SIZE]["inputs"]["height"]), (1344, 768))
+        self.assertEqual((g2[comfy.SIZE]["inputs"]["width"], g2[comfy.SIZE]["inputs"]["height"]), (960, 544))
+        self.assertEqual((g2[comfy.REFINE_UPSCALER]["inputs"]["width"], g2[comfy.REFINE_UPSCALER]["inputs"]["height"]), (1344, 768))
         ref_keys_2 = sorted(k for k in g2[comfy.SIZE]["inputs"] if k.startswith("ref_images."))
         self.assertEqual(ref_keys_2, ["ref_images.ref_image_0", "ref_images.ref_image_1"])
 
@@ -50,11 +62,26 @@ class ComfyBackendTest(unittest.TestCase):
         g9 = comfy.graph("prompt nine", names9, 15, "1:1", 7)
         load_nodes_9 = [nid for nid in comfy.IMAGES if nid in g9]
         self.assertEqual(len(load_nodes_9), 9)
-        self.assertEqual((g9[comfy.SIZE]["inputs"]["width"], g9[comfy.SIZE]["inputs"]["height"]), (1024, 1024))
+        self.assertEqual((g9[comfy.SIZE]["inputs"]["width"], g9[comfy.SIZE]["inputs"]["height"]), (736, 736))
+        self.assertEqual((g9[comfy.REFINE_UPSCALER]["inputs"]["width"], g9[comfy.REFINE_UPSCALER]["inputs"]["height"]), (1024, 1024))
         ref_keys_9 = [k for k in g9[comfy.SIZE]["inputs"] if k.startswith("ref_images.")]
         self.assertEqual(len(ref_keys_9), 9)
 
-        # 544p fast tier maps to 544x960 / 960x544 / 736x736 via env or explicit keyword
+        # 1088p tier uses 544p pass-1 + 3D latent upscale/refine to 1088x1920 / 1920x1088 / 1472x1472
+        with patch.dict(os.environ, {"COMFYUI_RESOLUTION": "1088p"}, clear=False):
+            g_1088_p = comfy.graph("p", ["a.png"], 6, "9:16", 11)
+            g_1088_l = comfy.graph("p", ["a.png"], 6, "16:9", 11)
+            g_1088_s = comfy.graph("p", ["a.png"], 6, "1:1", 11)
+        self.assertEqual((g_1088_p[comfy.SIZE]["inputs"]["width"], g_1088_p[comfy.SIZE]["inputs"]["height"]), (544, 960))
+        self.assertEqual((g_1088_p[comfy.REFINE_UPSCALER]["inputs"]["width"], g_1088_p[comfy.REFINE_UPSCALER]["inputs"]["height"]), (1088, 1920))
+        self.assertEqual((g_1088_l[comfy.SIZE]["inputs"]["width"], g_1088_l[comfy.SIZE]["inputs"]["height"]), (960, 544))
+        self.assertEqual((g_1088_l[comfy.REFINE_UPSCALER]["inputs"]["width"], g_1088_l[comfy.REFINE_UPSCALER]["inputs"]["height"]), (1920, 1088))
+        self.assertEqual((g_1088_s[comfy.SIZE]["inputs"]["width"], g_1088_s[comfy.SIZE]["inputs"]["height"]), (736, 736))
+        self.assertEqual((g_1088_s[comfy.REFINE_UPSCALER]["inputs"]["width"], g_1088_s[comfy.REFINE_UPSCALER]["inputs"]["height"]), (1472, 1472))
+        self.assertEqual(g_1088_p[comfy.VAE_DECODE]["inputs"]["samples"], [comfy.REFINE_UPSCALER, 0])
+        self.assertEqual(g_1088_p[comfy.VAE_DECODE_AUDIO]["inputs"]["samples"], [comfy.REFINE_UPSCALER, 0])
+
+        # 544p fast tier runs single-pass 544x960 / 960x544 / 736x736 and prunes pass-2 refine nodes
         with patch.dict(os.environ, {"COMFYUI_RESOLUTION": "544p"}, clear=False):
             g_544_p = comfy.graph("p", ["a.png"], 6, "9:16", 1)
             g_544_l = comfy.graph("p", ["a.png"], 6, "16:9", 1)
@@ -62,8 +89,16 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertEqual((g_544_p[comfy.SIZE]["inputs"]["width"], g_544_p[comfy.SIZE]["inputs"]["height"]), (544, 960))
         self.assertEqual((g_544_l[comfy.SIZE]["inputs"]["width"], g_544_l[comfy.SIZE]["inputs"]["height"]), (960, 544))
         self.assertEqual((g_544_s[comfy.SIZE]["inputs"]["width"], g_544_s[comfy.SIZE]["inputs"]["height"]), (736, 736))
+        for refine_nid in (comfy.REFINE_STEPS, comfy.REFINE_SEED, comfy.REFINE_UPSCALER):
+            self.assertNotIn(refine_nid, g_544_p)
+        self.assertEqual(g_544_p[comfy.VAE_DECODE]["inputs"]["samples"], ["125", 0])
+        self.assertEqual(g_544_p[comfy.VAE_DECODE_AUDIO]["inputs"]["samples"], ["125", 0])
+
         g_768_override = comfy.graph("p", ["a.png"], 6, "9:16", 1, resolution="768p")
-        self.assertEqual((g_768_override[comfy.SIZE]["inputs"]["width"], g_768_override[comfy.SIZE]["inputs"]["height"]), (768, 1344))
+        self.assertEqual((g_768_override[comfy.SIZE]["inputs"]["width"], g_768_override[comfy.SIZE]["inputs"]["height"]), (544, 960))
+        self.assertEqual((g_768_override[comfy.REFINE_UPSCALER]["inputs"]["width"], g_768_override[comfy.REFINE_UPSCALER]["inputs"]["height"]), (768, 1344))
+        g_1088_override = comfy.graph("p", ["a.png"], 6, "9:16", 1, resolution="1088p")
+        self.assertEqual((g_1088_override[comfy.REFINE_UPSCALER]["inputs"]["width"], g_1088_override[comfy.REFINE_UPSCALER]["inputs"]["height"]), (1088, 1920))
 
         # RunningHub graph keeps 544p untouched
         rh_g = rh.graph("prompt rh", ["a.png"], 6, "9:16", 42)
@@ -87,6 +122,9 @@ class ComfyBackendTest(unittest.TestCase):
         self.assertEqual(g4["126"]["inputs"]["model"], [comfy.SWITCH_MODEL, 0])
         self.assertNotIn(comfy.EASYCACHE, g4)
         self.assertNotIn(comfy.SPARSE_ATTN, g4)
+        # Pass-2 latent refine falls back to raw UNET ("127") without Turbo LoRA when LoRA preset is active
+        self.assertEqual(g4[comfy.REFINE_UPSCALER]["inputs"]["model"], ["127", 0])
+        self.assertEqual(g4[comfy.REFINE_STEPS]["inputs"]["model"], ["127", 0])
         self.assertEqual(
             g4[comfy.LORA]["inputs"]["lora_name"],
             "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
@@ -130,12 +168,14 @@ class ComfyBackendTest(unittest.TestCase):
     def test_upscale_graph_toggle_and_progress_stages(self):
         from h3ref.i18n import use_lang
 
-        # Default (COMFYUI_UPSCALE unset -> disabled, native 768p): CreateVideo wired directly to VAEDecode (122)
+        # Default (COMFYUI_UPSCALE unset -> disabled, 768p latent refine): CreateVideo wired directly to VAEDecode (122)
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("COMFYUI_UPSCALE", None)
             os.environ.pop("COMFYUI_RESOLUTION", None)
             g_default = comfy.graph("p", ["a.png"], 5, "9:16", 1)
-        self.assertEqual((g_default[comfy.SIZE]["inputs"]["width"], g_default[comfy.SIZE]["inputs"]["height"]), (768, 1344))
+        self.assertEqual((g_default[comfy.SIZE]["inputs"]["width"], g_default[comfy.SIZE]["inputs"]["height"]), (544, 960))
+        self.assertEqual((g_default[comfy.REFINE_UPSCALER]["inputs"]["width"], g_default[comfy.REFINE_UPSCALER]["inputs"]["height"]), (768, 1344))
+        self.assertEqual(comfy.NODE_STAGE_KEYS[comfy.REFINE_UPSCALER], "refine_latent")
         self.assertNotIn(comfy.UPSCALE_LOADER, g_default)
         self.assertNotIn(comfy.UPSCALE_IMAGE, g_default)
         self.assertEqual(g_default[comfy.CREATE_VIDEO]["inputs"]["images"], [comfy.VAE_DECODE, 0])

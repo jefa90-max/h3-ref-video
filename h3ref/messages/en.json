@@ -88,6 +88,7 @@
   "comfy_stage_load_images": "Loading reference images",
   "comfy_stage_encode_prompt": "Encoding prompt & references",
   "comfy_stage_sampling": "Diffusion sampling",
+  "comfy_stage_refine_latent": "3D latent upscale & refine",
   "comfy_stage_decode_video": "Decoding video frames",
   "comfy_stage_decode_audio": "Decoding audio",
   "comfy_stage_load_upscaler": "Loading upscale model",

@@ -97,8 +97,10 @@ H3_STEPS = int(env("H3_STEPS", "20"))
 SIZES = {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)}
 COMFY_RESOLUTIONS = {
     "768p": {"9:16": (768, 1344), "16:9": (1344, 768), "1:1": (1024, 1024)},
+    "1088p": {"9:16": (1088, 1920), "16:9": (1920, 1088), "1:1": (1472, 1472)},
     "544p": {"9:16": (544, 960), "16:9": (960, 544), "1:1": (736, 736)},
 }
+COMFY_LATENT_REFINE_RESOLUTIONS = ("768p", "1088p")
 COMFY_SIZES = COMFY_RESOLUTIONS["768p"]
 VIDEO_PROVIDERS = ("runninghub", "comfyui")
 COLAB_GPUS = ("G4", "A100", "H100")
@@ -217,7 +219,7 @@ def video_settings(environ=None) -> dict:
         raise ValueError(f"COMFYUI_PRESET={preset!r} (full20 | 8step | 4step)")
     resolution = values.get("COMFYUI_RESOLUTION", "").strip().lower() or "768p"
     if resolution not in COMFY_RESOLUTIONS:
-        raise ValueError(f"COMFYUI_RESOLUTION={resolution!r} (768p | 544p)")
+        raise ValueError(f"COMFYUI_RESOLUTION={resolution!r} (768p | 1088p | 544p)")
     comfyui_urls = parse_endpoint_urls(values.get("COMFYUI_URL", ""), "COMFYUI_URL")
     comfyui_url = comfyui_urls[0] if comfyui_urls else ""
     comfyui_api_key = values.get("COMFYUI_API_KEY", "").strip()

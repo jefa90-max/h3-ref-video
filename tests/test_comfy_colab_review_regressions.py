@@ -439,8 +439,27 @@ class ComfyColabReviewRegressionsTest(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", return_value=_FakeResp()):
             self.assertFalse(start_colab._queue_busy(stuck_snap))
 
-        # 3. Unused fl2v LoRA is no longer required in MODEL_FILES
+        # 3. Unused fl2v LoRA is no longer required in MODEL_FILES, while 3D latent upscaler is staged & auto-downloadable
         self.assertFalse(any("fl2v" in m for m in start_colab.MODEL_FILES))
+        self.assertIn(start_colab.LATENT_UPSCALER_MODEL_REL, start_colab.MODEL_FILES)
+        self.assertIn(start_colab.LATENT_UPSCALER_MODEL_REL, start_colab.AUTO_DOWNLOAD_MODELS)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_local = Path(tmp) / "ComfyUI_local"
+            with mock.patch.object(start_colab, "LOCAL", fake_local), \
+                 mock.patch.object(start_colab.subprocess, "run") as run_mock:
+                start_colab.ensure_latent_upscaler_node()
+                run_mock.assert_called_once()
+                argv = run_mock.call_args.args[0]
+                self.assertEqual(argv[:4], ["git", "clone", "--depth", "1"])
+                self.assertEqual(argv[4], start_colab.LATENT_UPSCALER_REPO_URL)
+                # Idempotent once __init__.py exists
+                node_dir = fake_local / "custom_nodes" / start_colab.LATENT_UPSCALER_NODE_DIR_NAME
+                node_dir.mkdir(parents=True, exist_ok=True)
+                (node_dir / "__init__.py").write_text("", encoding="utf-8")
+                run_mock.reset_mock()
+                start_colab.ensure_latent_upscaler_node()
+                run_mock.assert_not_called()
 
     def test_start_colab_auth_reverse_proxy_security_chunked_and_stream_error(self):
         # Check non-ASCII auth header never raises TypeError

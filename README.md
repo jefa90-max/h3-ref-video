@@ -44,7 +44,7 @@ H3 这条用的 7 张分镜图，第一张画好以后，后面每张都带着�
 
 1. **Python 3.10+、ffmpeg**，`pip install -r requirements.txt`。
 2. **视频后端与 API key**，复制 `.env.example` 成 `.env` 填上：
-   - `VIDEO_PROVIDER`：视频生成后端，可选 `comfyui`（`.env.example` 默认推荐，连接远端 Colab GPU 或自建 ComfyUI）或 `runninghub`（未设置时的代码默认回退）。选 `comfyui` 时填写 `COMFYUI_URL`（支持英文逗号分隔多节点并行）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填，本机 HTTP 可留空），并可按需配置 `COMFYUI_PRESET`（默认 `full20`，可选 `8step` / `4step`）、`COMFYUI_RESOLUTION`（默认 `768p`，可选 `544p`）、`COMFYUI_UPSCALE`（默认 `0`）、`COMFYUI_CONCURRENCY`（默认等于节点数）、`COLAB_GPU`（默认 `G4`，可选 `A100` / `H100`）与 `COLAB_AUTO_START`（默认 `0`）。
+   - `VIDEO_PROVIDER`：视频生成后端，可选 `comfyui`（`.env.example` 默认推荐，连接远端 Colab GPU 或自建 ComfyUI）或 `runninghub`（未设置时的代码默认回退）。选 `comfyui` 时填写 `COMFYUI_URL`（支持英文逗号分隔多节点并行）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填，本机 HTTP 可留空），并可按需配置 `COMFYUI_PRESET`（默认 `full20`，可选 `8step` / `4step`）、`COMFYUI_RESOLUTION`（默认 `768p` 3D 潜空间二采，可选 `1088p` 3D 潜空间二采真 1080p 或 `544p` 单采快速档）、`COMFYUI_UPSCALE`（默认 `0`）、`COMFYUI_CONCURRENCY`（默认等于节点数）、`COLAB_GPU`（默认 `G4`，可选 `A100` / `H100`）与 `COLAB_AUTO_START`（默认 `0`）。
    - `RUNNINGHUB_API_KEY`：使用 `VIDEO_PROVIDER=runninghub` 时填写，取自 [RunningHub](https://www.runninghub.cn) 控制台「API 调用」。本项目使用工作流 API；消费级会员 key 扣积分，企业共享 key 扣钱包。默认同时跑 3 段，可通过 `RUNNINGHUB_CONCURRENCY` 按实际 API 额度调整。
    - `APIMART_API_KEY`：[APIMart](https://apimart.ai/register?aff=J2lV)（推荐链接），画分镜图（GPT Image 2.6），默认也用于逐镜头文字描述和视频提示词改写。
    - `GEMINI_API_KEY`：选择 Gemini 官方文字服务时填写。设 `LLM_PROVIDER=gemini`，通过 [Google 官方兼容接口](https://ai.google.dev/gemini-api/docs/openai)调用；分镜图片仍需要 APIMart key。
