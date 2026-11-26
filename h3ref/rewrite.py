@@ -64,6 +64,10 @@ class RewriteFatalError(RewriteError):
     pass
 
 
+class RewriteResponseError(RewriteError):
+    """The provider completed the request without usable response text."""
+
+
 FATAL_REWRITE_STATUSES = {400, 401, 402, 403, 404, 405, 413, 422, 429}
 
 
@@ -253,13 +257,17 @@ def _claude(prompt: str) -> str:
     try:
         out = json.loads(proc.stdout)
     except ValueError:
-        err_cls = RewriteFatalError if proc.returncode else RewriteError
+        err_cls = RewriteFatalError if proc.returncode else RewriteResponseError
         raise err_cls(f"Claude 没有返回结果：{(proc.stderr or proc.stdout)[:300]}") from None
+    if not isinstance(out, dict):
+        err_cls = RewriteFatalError if proc.returncode else RewriteResponseError
+        raise err_cls(message("rewrite_empty"))
     if out.get("is_error"):
         raise RewriteFatalError(f"Claude 调用失败：{str(out.get('result'))[:300]}")
     result = str(out.get("result") or "")
     if not result.strip():
-        raise RewriteError("Claude 没有返回内容")
+        err_cls = RewriteError if proc.returncode else RewriteResponseError
+        raise err_cls("Claude 没有返回内容")
     return result
 
 
@@ -273,7 +281,7 @@ def _llm(prompt: str, *, tries: int = 3) -> str:
         err_cls = RewriteFatalError if exc.status_code in FATAL_REWRITE_STATUSES else RewriteError
         raise err_cls("改写模型请求失败：" + str(exc)[:300]) from None
     if not isinstance(out, dict):
-        raise RewriteError(message("rewrite_empty"))
+        raise RewriteResponseError(message("rewrite_empty"))
     if (out.get("error") or out.get("_http_status", 200) >= 400) and "choices" not in out:
         err_obj = out.get("error")
         http_status = out.get("_http_status")
@@ -291,7 +299,7 @@ def _llm(prompt: str, *, tries: int = 3) -> str:
     msg = first.get("message") if isinstance(first.get("message"), dict) else {}
     text = msg.get("content")
     if not isinstance(text, str) or not text.strip():
-        raise RewriteError(message("rewrite_empty"))
+        raise RewriteResponseError(message("rewrite_empty"))
     return text
 
 

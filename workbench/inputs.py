@@ -467,17 +467,11 @@ def preflight(job, env):
                 if operation == "pipeline":
                     rec = records.get(str(segment["idx"]), {})
                     if not has_blocker and not film.frozen_segment(rec) and (rec.get("prompt_override") or {}).get("format") != "h3":
-                        zh = film.segment_prompt_text(rec, film.compile_prompt(job["film"], segment, pics, len(segments), compositions=compositions))
                         paths = film.picture_paths(out, segment, pics) if out is not None else []
                         tail_invalidated = any(p["kind"] == "prev" and (segment["idx"] - 1) in invalidated for p in pics)
                         reference = film.reference_version(paths) if (out is not None and not tail_invalidated and all(p.is_file() for p in paths)) else None
-                        needs_rewrite |= not (
-                            rec.get("h3")
-                            and rec.get("zh") == zh
-                            and rec.get("h3_source", rec.get("zh")) == zh
-                            and (not rec.get("h3_reference_version") or rec["h3_reference_version"] == reference)
-                            and ("subject_definitions:" not in rec["h3"] or not film.rewrite.cached_problems(rec["h3"], len(pics)))
-                        )
+                        _, cached = film.segment_resume_prompt(rec, job["film"], segment, pics, len(segments), compositions, reference)
+                        needs_rewrite |= not cached
         if operation == "frame":
             needs_frames = True
         # film.stage_check catches missing vision configuration and records it,

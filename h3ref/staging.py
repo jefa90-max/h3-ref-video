@@ -17,9 +17,11 @@ _WEARABLE_REMOVAL = re.compile(r'(?:摘下|脱下|扯下|取下|解下|拿下|�
                                + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
 _WEARABLE_AT_OPENING = re.compile(r'(?:戴着|佩戴|穿着|身穿|穿(?!过|越|行|梭)|围着|挂着|系着)[^，,。！？；;]{0,20}?('
                                  + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
+_WEARABLE_ON_BODY = re.compile(r'(' + _WEARABLE_NAMES + r')\s*(?:挂|架|戴|系|搭|罩|裹|套|别|扣|遮|压)(?:着|在|于|住)')
 _NEGATED_STATE = ('未', '没', '没有', '不', '别', '不要')
 _COMPLETED_STATE = ('已', '已经', '早已', '刚', '刚刚', '先前')
-_SUBJECT_PRONOUN = re.compile(r'^\s*(?:[^，,]{1,16}[，,]\s*)?[他她](?!们|人)')
+_SUBJECT_PRONOUN = re.compile(r'^\s*(?:[^，,]{1,16}[，,]\s*)?([他她])(?!们|人)')
+_ACTION_CONNECTOR = re.compile(r'^(?:随后|然后|接着|此时|这时)\s*')
 
 _V3_LOC_PREFIX = (
     r'(?:在|于)?(?:画面|镜头|前景|中景|背景|后景|远景|近景)?'
@@ -43,13 +45,31 @@ def _actor_sentences(film: dict, action: str):
     for sentence in re.split(r'[。！？；;\n]', action):
         if not sentence.strip():
             continue
+        pronoun = _SUBJECT_PRONOUN.match(sentence)
+        if pronoun:
+            # Names after a leading pronoun can be objects of its action.
+            # Only a new clause with a named subject can replace that actor.
+            actor = previous_actor
+            prefix = sentence[:pronoun.start(1)].strip().rstrip('，,')
+            named_prefix = {name for alias, name in names.items() if alias in prefix}
+            if named_prefix:
+                actor = named_prefix.pop() if len(named_prefix) == 1 else None
+                if actor:
+                    yield actor, prefix
+            for clause in re.split(r'[，,]', sentence[pronoun.start(1):]):
+                clause = clause.strip()
+                beginning = _ACTION_CONNECTOR.sub('', clause)
+                if not _SUBJECT_PRONOUN.match(beginning) and any(beginning.startswith(alias) for alias in names):
+                    named = {name for alias, name in names.items() if alias in clause}
+                    actor = named.pop() if len(named) == 1 else None
+                if actor:
+                    yield actor, clause
+            previous_actor = actor
+            continue
         actors = {name for alias, name in names.items() if alias in sentence}
-        actor = previous_actor if not actors and _SUBJECT_PRONOUN.match(sentence) else None
-        previous_actor = None
-        if len(actors) == 1:
-            actor = previous_actor = actors.pop()
-        if actor:
-            yield actor, sentence
+        previous_actor = actors.pop() if len(actors) == 1 else None
+        if previous_actor:
+            yield previous_actor, sentence
 
 
 def changing_wearables(film: dict) -> dict[str, set[str]]:
@@ -69,7 +89,8 @@ def _split_locked_look(look: str, changing: set[str]) -> tuple[str, list[tuple[s
     for clause in re.split(r'[，,。；;、\n]+', look):
         clause = clause.strip()
         if clause:
-            wearable = next((item for item in changing if clause.endswith(item)), None)
+            worn = {match[1] for pattern in (_WEARABLE_AT_OPENING, _WEARABLE_ON_BODY) for match in pattern.finditer(clause)}
+            wearable = next((item for item in changing if clause.endswith(item) or item in worn), None)
             if wearable:
                 mutable.append((wearable, clause))
             else:

@@ -137,7 +137,7 @@ class Journal:
             return self.steps[key]
         if self.committed_cny() + estimate > self.cap:
             raise ExperimentError(f"budget_exhausted: {key} would exceed the ¥{self.cap} run limit")
-        self.steps[key] = {"status": "submission_unknown", "estimate_cny": str(estimate), "actual_cny": None}
+        self.steps[key] = {"status": "reserved", "estimate_cny": str(estimate), "actual_cny": None}
         self.save()
         return self.steps[key]
 

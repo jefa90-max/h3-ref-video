@@ -189,13 +189,14 @@ def _clean_scene_text(scene: str) -> str:
 
 
 def compile_prompt(film: dict, seg: dict, pics: list[dict], count: int, *,
-                   compositions: dict[str, dict] | None = None, shot_state_note: str | None = None) -> str:
+                   compositions: dict[str, dict] | None = None, shot_state_note: str | None = None,
+                   scope_wearables: bool = True) -> str:
     """The segment's prompt in Chinese, written the way you would for Seedance; rewrite.py turns it into H3's format."""
     frame_pic_numbers = {p["shot"]: idx for idx, p in enumerate(pics, 1) if p["kind"] == "frame"}
     compositions = {key: value for key, value in (compositions or {}).items()
                     if key in {_frame_key(seg['idx'], p['shot']) for p in pics if p['kind'] == 'frame'}}
     v2_covered = {c['name'] for comp in compositions.values() if comp.get('version') == 2 for c in comp['characters']}
-    changing = staging.changing_wearables(film)
+    changing = staging.changing_wearables(film) if scope_wearables else {}
     v3_looks: dict[str, str] = {}
     comp_looks: dict[str, str] = {}
     for comp in compositions.values():
@@ -525,6 +526,27 @@ def segment_prompt_text(record: dict, automatic: str) -> str:
     return override.get('text', automatic) if override.get('format') == 'source' else automatic
 
 
+def cached_segment_source(record, source, reference, n_pictures, *, legacy_source):
+    """Return the source paired with a reusable cached rewrite, including pre-wearable jobs."""
+    saved, h3 = record.get('zh'), record.get('h3')
+    if not saved or not h3 or record.get('h3_source', saved) != saved:
+        return None
+    if record.get('h3_reference_version') and record['h3_reference_version'] != reference:
+        return None
+    if saved != source and (record.get('prompt_override') or saved != legacy_source()):
+        return None
+    if 'subject_definitions:' in h3 and rewrite.cached_problems(h3, n_pictures):
+        return None
+    return saved
+
+
+def segment_resume_prompt(record, script, segment, pictures, count, compositions, reference):
+    source = segment_prompt_text(record, compile_prompt(script, segment, pictures, count, compositions=compositions))
+    cached = cached_segment_source(record, source, reference, len(pictures), legacy_source=lambda: compile_prompt(
+        script, segment, pictures, count, compositions=compositions, scope_wearables=False))
+    return cached or source, cached is not None
+
+
 def frozen_segment(record: dict) -> bool:
     return bool(record.get('task') or record.get('submission_unknown') or record.get('terminal_failed')
                 or record.get('attempt_blocked')
@@ -549,12 +571,10 @@ def stage_prompts(job: Job, film: dict, segs: list[dict], pics: dict):
             (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(rec.get('zh') or '', encoding='utf-8')
             (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec.get('h3') or '', encoding='utf-8')
             return
-        zh = segment_prompt_text(rec, compile_prompt(film, seg, pics[i], len(segs), compositions=compositions))
         paths = _picture_paths(job, seg, pics[i])
         reference = reference_version(paths) if all(path.is_file() for path in paths) else None
-        if (rec.get('h3') and rec.get('zh') == zh and rec.get('h3_source', rec.get('zh')) == zh
-                and (not rec.get('h3_reference_version') or rec['h3_reference_version'] == reference)
-                and ('subject_definitions:' not in rec['h3'] or not rewrite.cached_problems(rec['h3'], len(pics[i])))):
+        zh, cached = segment_resume_prompt(rec, film, seg, pics[i], len(segs), compositions, reference)
+        if cached:
             (job.dir / 'prompts' / f'seg{i + 1}.zh.txt').write_text(zh, encoding='utf-8')
             (job.dir / 'prompts' / f'seg{i + 1}.h3.txt').write_text(rec['h3'], encoding='utf-8')
             if 'unapplied_edit' in rec:

@@ -67,8 +67,6 @@ def normalize_speech(raw) -> str:
 
 
 def _timestamp(raw, field, index, strict, limit):
-    if raw is None:
-        return None
     if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
         try:
             value = float(raw)
@@ -94,8 +92,10 @@ def _normalized_shots(shots, *, strict, normalized_times=False):
     for index, shot in enumerate(shots):
         if not isinstance(shot, dict) or not _text(shot.get("action")).strip():
             continue
-        start = _timestamp(shot.get("start"), "start", index, strict, limit)
-        end = _timestamp(shot.get("end"), "end", index, strict, limit)
+        start, end = shot.get("start"), shot.get("end")
+        if start is not None and end is not None:
+            start = _timestamp(start, "start", index, strict, limit)
+            end = _timestamp(end, "end", index, strict, limit)
         default = start is None or end is None
         duration = 2.0 if default else max(0.5, end - start)
         next_time = round(time + duration, 2)

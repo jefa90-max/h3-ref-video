@@ -28,6 +28,7 @@ class PromptExperimentTests(unittest.TestCase):
             path = Path(directory) / "ab_state.json"
             journal = Journal(path, "run", "fingerprint", money("1"), resume=False)
             journal.reserve("one", money("0.6"))
+            journal.update("one", status="submission_unknown")
             resumed = Journal(path, "run", "fingerprint", money("1"), resume=True)
             with self.assertRaisesRegex(ExperimentError, "submission_unknown"):
                 resumed.reserve("one", money("0.6"))

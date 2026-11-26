@@ -196,6 +196,8 @@ class Run:
         self.prompt_lengths[key] = len(prompt)
 
     def text(self, key, stage, request, send, stub):
+        from h3ref import rewrite
+
         estimate = self.price(stage)
         self.describe(key, request)
         if self.dry_run:
@@ -207,11 +209,15 @@ class Run:
             raise ExperimentError(f"secret_in_request: {key}")
         request_sha = text_sha256(request)
         step = self.journal.reserve(key, estimate)
-        if step["status"] == "done":
+        if step["status"] in ("done", "invalid_response"):
             self.check_output(path, step, request_sha)
             return read_json(path)
-        self.journal.update(key, request_sha256=request_sha)
-        result = send()
+        self.journal.update(key, status="submission_unknown", request_sha256=request_sha)
+        try:
+            result = send()
+        except rewrite.RewriteResponseError:
+            # Cache the missing text so downstream validation can reject it without a second call.
+            result = None
         # Never put provider credentials into prompts or reproducibility artifacts.
         content = json.dumps(result, ensure_ascii=False)
         if self.redact(content) != content:
@@ -219,6 +225,15 @@ class Run:
         write_json(path, result)
         self.journal.update(key, status="done", output_sha256=file_sha256(path))
         return result
+
+    def reject_completed_text(self, key, error):
+        if self.dry_run:
+            return False
+        status = self.journal.steps.get(key, {}).get("status")
+        if status == "done":
+            detail = " ".join(self.redact(error).split())[:300]
+            self.journal.update(key, status="invalid_response", validation_error=detail)
+        return status in ("done", "invalid_response")
 
     def check_output(self, path, step, request_sha):
         if step.get("request_sha256") != request_sha:
@@ -256,7 +271,9 @@ class Run:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         def record(**fields):
-            if fields.get("task_failed"):
+            if fields.get("submission_unknown"):
+                self.journal.update(key, status="submission_unknown")
+            elif fields.get("task_failed"):
                 self.journal.update(key, status="failed", moderation_failed=bool(fields.get("moderation_error")))
             elif fields.get("task"):
                 self.journal.update(key, status="submitted", task=fields["task"])
@@ -309,6 +326,7 @@ class Run:
         if not task:
             names = backend.upload_many(references, **endpoint) if is_comfy else [backend.upload(path) for path in references]
             graph = backend.graph(prompt, names, seconds, aspect, seed)
+            self.journal.update(key, status="submission_unknown")
             try:
                 task = backend.submit(graph, **endpoint)
             except backend.SubmissionRejected:
@@ -366,8 +384,16 @@ def stage_composition(run, key, provider, script, shot, history, rules):
     # Composition uses written appearance descriptions, with no need for local image paths.
     source = {**script, "cast": [{k: v for k, v in person.items() if k != "picture"}
                                   for person in script.get("cast", ())]}
-    return frames.describe_composition(source, shot, previous_composition=previous, locked_looks=locked,
-                                       rules_override=rules, infer=infer, max_retries=0)
+    try:
+        composition = frames.describe_composition(source, shot, previous_composition=previous, locked_looks=locked,
+                                                  rules_override=rules, infer=infer, max_retries=0)
+        if composition.get("version") != 3:
+            raise frames.CompositionFormatError(f"composition_version: {key} needs a composition v3 response")
+        return composition
+    except frames.CompositionFormatError as exc:
+        if not run.reject_completed_text(key, exc):
+            raise
+        return None
 
 
 def run_side(run, case, variant, resolved, seed):
@@ -402,8 +428,8 @@ def run_side(run, case, variant, resolved, seed):
             if arm in variants.COMPOSITION_ARMS:
                 previous = stage_composition(run, f"{stem}/compose-{number}", provider, script, shot,
                                              (previous, locked), options.get("composition_rules"))
-                if previous.get("version") != 3:
-                    raise ExperimentError(f"composition_version: {stem} needs a composition v3 response")
+                if previous is None:
+                    return run.result(f"{provider}/{variant}", stem, [path for path in image_paths if path], expected=expected)
                 for character in previous["characters"]:
                     locked.setdefault(character["name"], character["locked_look"])
                 composition[f"s1-{number}"] = previous
@@ -433,14 +459,23 @@ def run_side(run, case, variant, resolved, seed):
         n_images = len(inputs)
         aspect, seconds = script["aspect"], segment["seconds"]
 
+        rewrite_key = f"{stem}/rewrite"
+
         def infer(request):
             send = (lambda: rewrite._claude(request)) if provider == "claude" else (lambda: rewrite._llm(request, tries=1))
-            return run.text(f"{stem}/rewrite", f"rewrite.{provider}", request, send,
+            return run.text(rewrite_key, f"rewrite.{provider}", request, send,
                             lambda: variants.stub_rewrite(n_images, aspect))
 
-        prompt = rewrite.rewrite(source, n_images, seconds, aspect, max_retries=0, infer=infer, rewriter_override=provider,
-                                 rules_override=options.get("rules_override"), guide_override=run.guide,
-                                 examples_override=options.get("examples_override"))
+        try:
+            prompt = rewrite.rewrite(source, n_images, seconds, aspect, max_retries=0, infer=infer, rewriter_override=provider,
+                                     rules_override=options.get("rules_override"), guide_override=run.guide,
+                                     examples_override=options.get("examples_override"))
+        except rewrite.RewriteFatalError:
+            raise
+        except rewrite.RewriteError as exc:
+            if not run.reject_completed_text(rewrite_key, exc):
+                raise
+            return run.result(f"{provider}/{variant}", stem, [path for path in image_paths if path], expected=expected)
         matched_seed = int(fingerprint([seed, arm, identity, provider])[:8], 16)
         video = run.video(f"{stem}/video", prompt, inputs, seconds, aspect, matched_seed)
         if video:
