@@ -15,10 +15,11 @@ VISIBILITY = ('visible', 'cropped', 'occluded', 'offscreen')
 _WEARABLE_NAMES = r'眼镜|墨镜|毛巾|外套|夹克|大衣|围巾|口罩|头盔|帽子'
 _WEARABLE_REMOVAL = re.compile(r'(?:摘下|脱下|扯下|取下|解下|拿下|摘掉|脱掉)[^，,。！？；;]{0,24}?('
                                + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
-_WEARABLE_AT_OPENING = re.compile(r'(?:戴着|佩戴|穿着|身穿|围着|挂着|系着)[^，,。！？；;]{0,20}?('
+_WEARABLE_AT_OPENING = re.compile(r'(?:戴着|佩戴|穿着|身穿|穿(?!过|越|行|梭)|围着|挂着|系着)[^，,。！？；;]{0,20}?('
                                  + _WEARABLE_NAMES + r')(?!框|片|盒|架)')
 _NEGATED_STATE = ('未', '没', '没有', '不', '别', '不要')
 _COMPLETED_STATE = ('已', '已经', '早已', '刚', '刚刚', '先前')
+_SUBJECT_PRONOUN = re.compile(r'^\s*(?:[^，,]{1,16}[，,]\s*)?[他她](?!们|人)')
 
 _V3_LOC_PREFIX = (
     r'(?:在|于)?(?:画面|镜头|前景|中景|背景|后景|远景|近景)?'
@@ -38,10 +39,17 @@ def is_structured(composition: object) -> bool:
 def _actor_sentences(film: dict, action: str):
     names = {alias: actor['name'] for actor in film.get('cast') or []
              for alias in (actor['name'], *(actor.get('aliases') or [])) if alias}
+    previous_actor = None
     for sentence in re.split(r'[。！？；;\n]', action):
+        if not sentence.strip():
+            continue
         actors = {name for alias, name in names.items() if alias in sentence}
+        actor = previous_actor if not actors and _SUBJECT_PRONOUN.match(sentence) else None
+        previous_actor = None
         if len(actors) == 1:
-            yield actors.pop(), sentence
+            actor = previous_actor = actors.pop()
+        if actor:
+            yield actor, sentence
 
 
 def changing_wearables(film: dict) -> dict[str, set[str]]:
