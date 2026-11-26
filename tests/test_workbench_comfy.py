@@ -174,6 +174,15 @@ class WorkbenchComfyTest(unittest.TestCase):
             self.assertEqual(disk_env.get("COLAB_GPU"), "H100")
             self.assertTrue(body["keys"]["COMFYUI_API_KEY"])
 
+            res_1088 = client.post(
+                "/api/config",
+                headers=headers,
+                json={"COMFYUI_RESOLUTION": "1088p", "COMFYUI_UPSCALE": "0", "persist": True},
+            )
+            self.assertEqual(res_1088.status_code, 200)
+            self.assertEqual(res_1088.get_json()["COMFYUI_RESOLUTION"], "1088p")
+            self.assertEqual(config.read_env_file(env_path).get("COMFYUI_RESOLUTION"), "1088p")
+
             for bad_payload in (
                 {"COMFYUI_UPSCALE": "ultra", "persist": False},
                 {"COMFYUI_RESOLUTION": "1080p", "persist": False},

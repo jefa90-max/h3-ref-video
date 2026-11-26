@@ -1,9 +1,10 @@
 """ComfyUI remote backend: MiniMax H3 reference-to-video workflow (workflows/comfy-h3-ref2va.json).
 
 Uploads reference images with pure ASCII content-hash filenames (<sha256[:16]><ext>), builds a dynamic 1..9 image
-API prompt graph with selectable 768p/544p native dimensions, optional 2x RealESRGAN_x2plus upscaling, and preset-locked
-step/LoRA pairs, submits to /prompt, polls /history/{prompt_id} + /queue (failing fast if missing twice
-consecutively after an instance restart), and downloads completed videos via /view with tunnel authentication headers.
+API prompt graph with selectable 768p/1088p (544p pass-1 + 3D latent upscale & 6-step refine) or 544p native
+dimensions, optional 2x RealESRGAN_x2plus upscaling, and preset-locked step/LoRA pairs, submits to /prompt, polls
+/history/{prompt_id} + /queue (failing fast if missing twice consecutively after an instance restart), and downloads
+completed videos via /view with tunnel authentication headers.
 """
 from __future__ import annotations
 
@@ -21,8 +22,15 @@ from .i18n import message
 
 SAVE, PROMPT, DURATION, LENGTH, SIZE, SAMPLER, STEPS, SEED, CLIP = "92", "138", "132", "131", "136", "123", "124", "129", "128"
 LORA, ENABLE_LORA, FULL_STEPS, TURBO_STEPS, SWITCH_MODEL, SWITCH_STEPS = "145", "146", "143", "144", "141", "142"
-VAE_DECODE, CREATE_VIDEO, UPSCALE_LOADER, UPSCALE_IMAGE, EASYCACHE, SPARSE_ATTN = "122", "130", "154", "155", "156", "157"
+VAE_DECODE, VAE_DECODE_AUDIO, CREATE_VIDEO, UPSCALE_LOADER, UPSCALE_IMAGE, EASYCACHE, SPARSE_ATTN = (
+    "122", "121", "130", "154", "155", "156", "157"
+)
+REFINE_STEPS, REFINE_SEED, REFINE_UPSCALER = "158", "159", "160"
 UPSCALE_MODEL_NAME = "RealESRGAN_x2plus.pth"
+LATENT_UPSCALE_MODEL_NAME = "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+REFINE_DEFAULT_STEPS = 6
+REFINE_DEFAULT_DENOISE = 0.4
+REFINE_SEED_OFFSET = 1000003
 IMAGES = ["137", "139", "147", "148", "149", "150", "151", "152", "153"]
 NODE_TYPES = {
     SAVE: "SaveVideo",
@@ -41,11 +49,15 @@ NODE_TYPES = {
     SWITCH_MODEL: "ComfySwitchNode",
     SWITCH_STEPS: "ComfySwitchNode",
     VAE_DECODE: "VAEDecode",
+    VAE_DECODE_AUDIO: "VAEDecodeAudio",
     CREATE_VIDEO: "CreateVideo",
     UPSCALE_LOADER: "UpscaleModelLoader",
     UPSCALE_IMAGE: "ImageUpscaleWithModel",
     EASYCACHE: "EasyCache",
     SPARSE_ATTN: "BlockSparseAttention",
+    REFINE_STEPS: "BasicScheduler",
+    REFINE_SEED: "RandomNoise",
+    REFINE_UPSCALER: "MinimaxH3LatentUpscaler3DRefineHandoff",
     **{n: "LoadImage" for n in IMAGES},
 }
 NODE_STAGE_KEYS = {
@@ -56,6 +68,7 @@ NODE_STAGE_KEYS = {
     "145": "load_lora",
     "136": "encode_prompt",
     "125": "sampling",
+    REFINE_UPSCALER: "refine_latent",
     "122": "decode_video",
     "121": "decode_audio",
     "154": "load_upscaler",
@@ -287,10 +300,12 @@ def graph(
     vcfg = config.video_settings() if (preset is None or upscale is None or resolution is None) else None
     resolution_name = (resolution if resolution is not None else vcfg["comfyui_resolution"]).strip().lower()
     if resolution_name not in config.COMFY_RESOLUTIONS:
-        raise ValueError(f"COMFYUI_RESOLUTION={resolution_name!r} (768p | 544p)")
+        raise ValueError(f"COMFYUI_RESOLUTION={resolution_name!r} (768p | 1088p | 544p)")
     sizes = config.COMFY_RESOLUTIONS[resolution_name]
     if aspect not in sizes:
         raise ValueError(f"画幅只支持 {', '.join(sizes)}")
+    use_latent_refine = resolution_name in config.COMFY_LATENT_REFINE_RESOLUTIONS
+    pass1_sizes = config.COMFY_RESOLUTIONS["544p"] if use_latent_refine else sizes
     preset_name = (preset if preset is not None else vcfg["comfyui_preset"]).strip().lower()
     if preset_name not in config.COMFY_PRESETS:
         raise ValueError(f"COMFYUI_PRESET={preset_name!r} (4step | 8step | full20)")
@@ -301,7 +316,7 @@ def graph(
     g[SAVE]["inputs"]["filename_prefix"] = f"video/MiniMax_H3_{uuid.uuid4().hex[:12]}"
     g[PROMPT]["inputs"]["value"] = prompt
     g[DURATION]["inputs"]["value"] = max(float(config.MIN_SECONDS), min(float(config.MAX_SECONDS), float(seconds)))
-    g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = sizes[aspect]
+    g[SIZE]["inputs"]["width"], g[SIZE]["inputs"]["height"] = pass1_sizes[aspect]
     g[SEED]["inputs"]["noise_seed"] = int(seed)
     g[SAMPLER]["inputs"]["sampler_name"] = preset_cfg["sampler"]
     g[STEPS]["inputs"]["scheduler"] = preset_cfg["scheduler"]
@@ -331,6 +346,35 @@ def graph(
         g[SWITCH_MODEL]["inputs"]["on_true"] = model_ref
         g[SWITCH_MODEL]["inputs"]["on_false"] = model_ref
         g.pop(LORA, None)
+
+    if use_latent_refine:
+        # Pass 2 always uses the base (or sparse-attention) UNET without EasyCache or Turbo LoRA.
+        pass2_model_ref = [SPARSE_ATTN, 0] if (not preset_cfg["enable_lora"] and SPARSE_ATTN in g) else ["127", 0]
+        target_w, target_h = sizes[aspect]
+        g[REFINE_STEPS]["inputs"]["model"] = pass2_model_ref
+        g[REFINE_STEPS]["inputs"]["scheduler"] = "beta"
+        g[REFINE_STEPS]["inputs"]["steps"] = REFINE_DEFAULT_STEPS
+        g[REFINE_STEPS]["inputs"]["denoise"] = REFINE_DEFAULT_DENOISE
+        g[REFINE_SEED]["inputs"]["noise_seed"] = int(seed) + REFINE_SEED_OFFSET
+        g[REFINE_UPSCALER]["inputs"]["model_name"] = LATENT_UPSCALE_MODEL_NAME
+        g[REFINE_UPSCALER]["inputs"]["mode"] = "target dimensions"
+        g[REFINE_UPSCALER]["inputs"]["width"] = target_w
+        g[REFINE_UPSCALER]["inputs"]["height"] = target_h
+        g[REFINE_UPSCALER]["inputs"]["align"] = 32
+        g[REFINE_UPSCALER]["inputs"]["keep_proportion"] = True
+        g[REFINE_UPSCALER]["inputs"]["lock_audio"] = True
+        g[REFINE_UPSCALER]["inputs"]["precision"] = "bf16"
+        g[REFINE_UPSCALER]["inputs"]["offload_after_upscale"] = False
+        g[REFINE_UPSCALER]["inputs"]["model"] = pass2_model_ref
+        g[REFINE_UPSCALER]["inputs"]["positive"] = [SIZE, 0]
+        g[VAE_DECODE]["inputs"]["samples"] = [REFINE_UPSCALER, 0]
+        g[VAE_DECODE_AUDIO]["inputs"]["samples"] = [REFINE_UPSCALER, 0]
+    else:
+        g[VAE_DECODE]["inputs"]["samples"] = ["125", 0]
+        g[VAE_DECODE_AUDIO]["inputs"]["samples"] = ["125", 0]
+        g.pop(REFINE_STEPS, None)
+        g.pop(REFINE_SEED, None)
+        g.pop(REFINE_UPSCALER, None)
 
     if use_upscale:
         g[UPSCALE_LOADER]["inputs"]["model_name"] = UPSCALE_MODEL_NAME

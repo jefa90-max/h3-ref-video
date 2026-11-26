@@ -947,12 +947,13 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.ok(freshMessages.comfyPresetFull20.includes("EasyCache") && !freshMessages.comfyPresetFull20.includes("544p"));
   assert.ok(zhFresh.comfyPresetFull20.includes("EasyCache") && !zhFresh.comfyPresetFull20.includes("544p"));
   assert.ok(freshMessages.comfyResolution768p.includes("768×1344") && zhFresh.comfyResolution768p.includes("768×1344"));
+  assert.ok(freshMessages.comfyResolution1088p.includes("1088×1920") && zhFresh.comfyResolution1088p.includes("1088×1920"));
   assert.ok(freshMessages.comfyResolution544p.includes("544×960") && zhFresh.comfyResolution544p.includes("544×960"));
 
-  // Submit COMFYUI_API_KEY, 8step preset, 544p resolution, COMFYUI_UPSCALE = "1", COLAB_GPU = "H100", and COLAB_AUTO_START = "0"
+  // Submit COMFYUI_API_KEY, 8step preset, 1088p resolution, COMFYUI_UPSCALE = "0", COLAB_GPU = "H100", and COLAB_AUTO_START = "0"
   $("comfy-key").value = "ck-secret-42";
   $("comfy-preset").value = "8step";
-  $("comfy-resolution").value = "544p";
+  $("comfy-resolution").value = "1088p";
   $("comfy-upscale").value = "1";
   $("colab-gpu").value = "H100";
   $("colab-auto-start").value = "0";
@@ -962,7 +963,7 @@ test("common.js switches VIDEO_PROVIDER to comfyui, computes configReady, and se
   assert.equal(postedPayload.VIDEO_PROVIDER, "comfyui");
   assert.equal(postedPayload.COMFYUI_API_KEY, "ck-secret-42");
   assert.equal(postedPayload.COMFYUI_PRESET, "8step");
-  assert.equal(postedPayload.COMFYUI_RESOLUTION, "544p");
+  assert.equal(postedPayload.COMFYUI_RESOLUTION, "1088p");
   assert.equal(postedPayload.COMFYUI_UPSCALE, "1");
   assert.equal(postedPayload.COLAB_GPU, "H100");
   assert.equal(postedPayload.COLAB_AUTO_START, "0");

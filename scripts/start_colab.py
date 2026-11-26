@@ -54,16 +54,25 @@ CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/l
 TRYCLOUDFLARE_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 COMFY_LOG_FILE = Path("/tmp/comfyui.log")
 
+LATENT_UPSCALER_MODEL_REL = "latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+LATENT_UPSCALER_REPO_URL = "https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus.git"
+LATENT_UPSCALER_NODE_DIR_NAME = "Comfyui_Minimax_h3_latent_Upscaler"
+
 MODEL_FILES = [
     "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "vae/minimax_h3_video_vae_fp16.safetensors",
     "vae/minimax_h3_audio_vae_fp32.safetensors",
     "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
     "upscale_models/RealESRGAN_x2plus.pth",
+    LATENT_UPSCALER_MODEL_REL,
     "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
 ]
 AUTO_DOWNLOAD_MODELS = {
     "upscale_models/RealESRGAN_x2plus.pth": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+    LATENT_UPSCALER_MODEL_REL: (
+        "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/"
+        "minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+    ),
     "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors": (
         "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/"
         "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
@@ -897,6 +906,20 @@ def run_supervisor(*, skip_comfy_check: bool = False) -> None:
         _cleanup_pid_file()
 
 
+def ensure_latent_upscaler_node() -> None:
+    node_dir = LOCAL / "custom_nodes" / LATENT_UPSCALER_NODE_DIR_NAME
+    if (node_dir / "__init__.py").is_file():
+        return
+    node_dir.parent.mkdir(parents=True, exist_ok=True)
+    if node_dir.exists():
+        shutil.rmtree(node_dir)
+    print(f"[start_colab] Cloning {LATENT_UPSCALER_NODE_DIR_NAME} custom node...", flush=True)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", LATENT_UPSCALER_REPO_URL, str(node_dir)],
+        check=True,
+    )
+
+
 def ensure_comfyui_code() -> None:
     reqs_marker = LOCAL / ".h3_reqs_installed"
     if not (LOCAL / "main.py").exists():
@@ -905,6 +928,7 @@ def ensure_comfyui_code() -> None:
             ["git", "clone", "--depth", "1", "https://github.com/Comfy-Org/ComfyUI.git", str(LOCAL)],
             check=True,
         )
+    ensure_latent_upscaler_node()
     if not reqs_marker.exists() and (LOCAL / "requirements.txt").is_file():
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "-r", str(LOCAL / "requirements.txt")],

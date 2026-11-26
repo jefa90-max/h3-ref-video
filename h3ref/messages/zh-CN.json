@@ -88,6 +88,7 @@
   "comfy_stage_load_images": "读取参考图",
   "comfy_stage_encode_prompt": "编码提示词与参考图",
   "comfy_stage_sampling": "扩散采样",
+  "comfy_stage_refine_latent": "3D 潜空间超分二采",
   "comfy_stage_decode_video": "解码视频帧",
   "comfy_stage_decode_audio": "解码音频",
   "comfy_stage_load_upscaler": "加载超分模型",
