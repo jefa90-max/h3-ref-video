@@ -26,4 +26,5 @@ if __name__ == "__main__":
                     webbrowser.open(url)
                 server.serve_forever()
         finally:
+            app.extensions["colab_runtime"].close()
             app.extensions["jobs"].close()

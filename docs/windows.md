@@ -5,17 +5,19 @@
 ## 使用
 
 1. 将整个 ZIP 解压到自己有写入权限的目录，例如 `D:\工具\H3 工作台`。请先解压，不能直接在压缩包里双击。
-2. 双击 `start-windows.cmd`。首次会下载固定版本的 Python、FFmpeg、curl，校验 SHA-256，创建 `.venv` 并安装依赖。总下载量约 150 MB，请等待安装结束。
+2. 双击 `start-windows.cmd`。首次会下载固定版本的 Python、FFmpeg、curl，校验 SHA-256，创建 `.venv` 并安装工作台依赖及 `google-colab-cli`（总下载量约 190 MB，请等待安装结束）。
 3. 脚本打开浏览器并启动 `http://127.0.0.1:7860`。使用期间保留控制台窗口；结束后按 Ctrl+C。之后仍双击同一个文件，已安装的环境会复用。
 4. 在工作台配置自己的视频后端与 API Key。视频后端默认可选 **ComfyUI（Colab / 远端自建）** 或 **RunningHub 云端**；页面默认选中“真实生成”，如需无费用试用，请手动切换到“离线演示”。此发布包不含开发者的密钥、历史任务或生成素材。
 5. 在输出目录区域选择电脑上的文件夹。设置保存在本机；每个新任务创建按时间命名的子目录，原任务续跑继续使用原目录。
 
 英文安装日志：在该目录的命令提示符中运行 `start-windows.cmd -Language en`。界面语言仍由网页中的语言选择控制。
 
-## ComfyUI / Colab 模式说明（Windows 零额外依赖出片）
+## ComfyUI / Colab 模式说明（含自动安装与跨电脑授权）
 
-- **直连远端或本机 ComfyUI（无需额外安装任何 CLI）**：只要远端 Colab 或自建机器上的 ComfyUI 隧道已开启，在工作台环境配置中选择 `ComfyUI`，填写 `COMFYUI_URL`（如 `https://xxx.ngrok-free.dev`，支持英文逗号/换行填写多节点并行出片）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填；本机 `http://127.0.0.1:8188` 可留空），按需选择采样预设（默认 `full20`，可选 `8step` / `4step`）、分辨率档位（默认 `768p`，可选 `544p`）与 2× 超分（默认关闭），保存后即可直接上传参考图、生成视频并自动下载成片。发布包内置的 Python 与专用 curl 已完整支持中文/空格路径参考图上传（自动转为 ASCII 哈希文件名）及隧道鉴权下载。
-- **可选：在 Windows 上启用 Colab 一键启停按钮**：如需直接在工作台顶部卡片点击「一键启动 Colab GPU（默认 G4，可选 A100 / H100） / + 启动第 2 节点 / 终止实例」，可在项目虚拟环境中额外安装 `.venv\Scripts\pip install google-colab-cli` 并运行一次 `colab sessions` 完成首次 Google 账号登录（注：`google-colab-cli` 官方目前仅正式支持 Linux/macOS，Windows 下为可选实验用法）。若本机遇到 Windows 凭据管理器（Credential Locker）OAuth JSON 长度限制报错，可在 `.env` 中设置 `COLAB_AUTH=adc` 改用 Google Cloud Application Default Credentials，或直接在浏览器手动运行 Colab 中的 `scripts/start_colab.py` 后由 Windows 工作台直连隧道。
+- **直连远端或本机 ComfyUI**：只要远端 Colab 或自建机器上的 ComfyUI 隧道已开启，在工作台环境配置中选择 `ComfyUI`，填写 `COMFYUI_URL`（如 `https://xxx.ngrok-free.dev`，支持英文逗号/换行填写多节点并行出片）与 `COMFYUI_API_KEY`（公网 HTTPS 隧道必填；本机 `http://127.0.0.1:8188` 可留空），按需选择采样预设（默认 `full20`，可选 `8step` / `4step`）、分辨率档位（默认 `768p` 3D 潜空间二采，可选 `1088p` 3D 潜空间二采或 `544p` 单采快速档）与 2× 超分（默认关闭），保存后即可直接上传参考图、生成视频并自动下载成片。发布包内置的 Python 标准库 HTTP 传输已完整支持中文/空格路径参考图上传（自动转为 ASCII 哈希文件名）、系统代理动态读取及隧道鉴权下载。
+- **自动安装 Colab CLI 与网页端跨电脑 Google 授权**：`start-windows.cmd` 会自动在项目虚拟环境中安装 `google-colab-cli`（`.venv\Scripts\colab.exe`，若首次网络波动失败则给出黄色警告并继续启动工作台，下次启动自动重试）。未登录时，工作台顶部状态卡片会自动显示「登录 Google 账号」：
+  1. **首次账号登录（一次性）**：点击「登录 Google 账号」获取授权链接，可点「复制链接」发到另一台电脑（如你的 Mac）浏览器打开并同意，再把 Google 页面显示的授权码粘贴回 Windows 工作台提交即可。授权令牌保存在 Windows 凭据管理器中（注：请仅在受信任的个人设备上授权，避免将 Google 账号长期凭据留在他人电脑上）。若遇凭据管理器保存失败警告，可在 `.env` 中设置 `COLAB_AUTH=adc` 改用 Google Cloud ADC。
+  2. **新实例挂载 Google Drive（每次新建实例 1 次）**：点击「一键启动 Colab GPU（默认 G4，可选 A100 / H100）」后，状态卡片同样会给出可一键复制的 Drive 授权链接；在任意电脑登录同一 Google 账号打开并点允许后，回 Windows 工作台点「我已完成授权，继续启动」即可。
 
 ## 安装位置与失败处理
 
@@ -34,7 +36,7 @@
 
 - Python 3.13.17 x64：[官方 Windows 发布清单](https://www.python.org/ftp/python/3.13.17/windows-3.13.17.json)。完整运行时约 31 MB；包含 `Lib/venv`、`Lib/ensurepip`、pip 和 `vcruntime140*.dll`。
 - FFmpeg 9.0.2 essentials：[Gyan Windows 构建](https://www.gyan.dev/ffmpeg/builds/)及[对应 SHA-256](https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256)。Gyan 是 [FFmpeg 官网列出的 Windows 二进制提供方](https://ffmpeg.org/download.html)。解压时保留许可证文件。
-- curl 8.23.0_8：[curl 官方 Windows 构建](https://curl.se/windows/)。项目的下载流程使用较新的 curl 参数，因此安装包使用项目专用 curl，不依赖旧 Windows 自带的版本。
+- curl 8.23.0_8：[curl 官方 Windows 构建](https://curl.se/windows/)。安装包当前仍保留该工具供命令行手动诊断；工作台自身的上传与下载已改用内置 Python `urllib.request`（OpenSSL）执行，不依赖系统 `curl.exe`。
 - Python 依赖从 PyPI 获取，遵循仓库 `requirements-web.txt` 和 `requirements.txt`。当前 [Flask](https://pypi.org/project/Flask/) 和 [Pillow](https://pypi.org/project/Pillow/) 支持 Python 3.13；后续启动在依赖声明未变化时不会联网重新安装。
 
 ## 验证边界
