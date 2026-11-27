@@ -1442,9 +1442,43 @@ class ColabRuntimeTest(unittest.TestCase):
             mgr._cli_auth = colab_runtime._CliAuthState()
             mgr._cli_auth.active_state = "awaiting_cli_auth"
             mgr._cli_auth.auth_url = None
-            mgr._cli_auth.proc = MagicMock(poll=MagicMock(return_value=None), stdin=MagicMock())
+            mgr._cli_auth.proc = MagicMock(pid=None, poll=MagicMock(return_value=None), stdin=MagicMock())
             with self.assertRaises(ValueError):
                 mgr.submit_cli_auth_code("4/0A-no-url-yet", env)
+
+    def test_kill_process_tree_ignores_non_int_and_unsafe_pids(self):
+        # On Linux glibc, os.killpg(1, SIGKILL) executes kill(-1, SIGKILL) and kills
+        # every process owned by the current user (including the CI runner when a
+        # MagicMock's default __index__() == 1 leaks into _kill_process_tree).
+        with patch.object(colab_runtime.os, "name", "posix"), \
+             patch.object(colab_runtime.os, "getpgrp", return_value=7777, create=True), \
+             patch.object(colab_runtime.os, "killpg", create=True) as killpg_mock:
+            unsafe_procs = [
+                MagicMock(),  # implicit MagicMock .pid with int(.pid) == 1
+                SimpleNamespace(pid=None, kill=MagicMock()),
+                SimpleNamespace(pid=False, kill=MagicMock()),
+                SimpleNamespace(pid=True, kill=MagicMock()),
+                SimpleNamespace(pid=-1, kill=MagicMock()),
+                SimpleNamespace(pid=0, kill=MagicMock()),
+                SimpleNamespace(pid=1, kill=MagicMock()),
+                SimpleNamespace(pid=7777, kill=MagicMock()),  # caller's own pgrp
+            ]
+            for proc in unsafe_procs:
+                colab_runtime._kill_process_tree(proc)
+                proc.kill.assert_called_once()
+            killpg_mock.assert_not_called()
+
+            safe_proc = SimpleNamespace(pid=99999, kill=MagicMock())
+            colab_runtime._kill_process_tree(safe_proc)
+            killpg_mock.assert_called_once_with(99999, colab_runtime.signal.SIGKILL)
+            safe_proc.kill.assert_called_once()
+
+        with patch.object(colab_runtime.os, "name", "nt"), \
+             patch.object(colab_runtime.subprocess, "run") as run_mock:
+            for proc in (MagicMock(), SimpleNamespace(pid=1, kill=MagicMock()), SimpleNamespace(pid=0, kill=MagicMock())):
+                colab_runtime._kill_process_tree(proc)
+                proc.kill.assert_called_once()
+            run_mock.assert_not_called()
 
 
 if __name__ == "__main__":
