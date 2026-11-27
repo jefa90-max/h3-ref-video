@@ -1452,7 +1452,8 @@ class ColabRuntimeTest(unittest.TestCase):
         # MagicMock's default __index__() == 1 leaks into _kill_process_tree).
         with patch.object(colab_runtime.os, "name", "posix"), \
              patch.object(colab_runtime.os, "getpgrp", return_value=7777, create=True), \
-             patch.object(colab_runtime.os, "killpg", create=True) as killpg_mock:
+             patch.object(colab_runtime.os, "killpg", create=True) as killpg_mock, \
+             patch.object(colab_runtime.signal, "SIGKILL", 9, create=True):
             unsafe_procs = [
                 MagicMock(),  # implicit MagicMock .pid with int(.pid) == 1
                 SimpleNamespace(pid=None, kill=MagicMock()),
@@ -1470,7 +1471,7 @@ class ColabRuntimeTest(unittest.TestCase):
 
             safe_proc = SimpleNamespace(pid=99999, kill=MagicMock())
             colab_runtime._kill_process_tree(safe_proc)
-            killpg_mock.assert_called_once_with(99999, colab_runtime.signal.SIGKILL)
+            killpg_mock.assert_called_once_with(99999, 9)
             safe_proc.kill.assert_called_once()
 
         with patch.object(colab_runtime.os, "name", "nt"), \
