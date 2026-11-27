@@ -16,7 +16,9 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 from . import comfy, config, http
@@ -25,6 +27,9 @@ from .i18n import message, use_lang
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _ORIG_SLEEP = time.sleep
 DRIVE_AUTH_TIMEOUT_SEC = 600.0
+CLI_AUTH_TIMEOUT_SEC = 600.0
+CLI_AUTH_START_WAIT_SEC = 45.0
+CLI_AUTH_SUBMIT_TIMEOUT_SEC = 60.0
 SESSION_CACHE_TTL_SEC = 5.0
 CRASH_GRACE_SEC = 1.5
 DEFAULT_REQUEST_TIMEOUT_SEC = "90"
@@ -140,6 +145,17 @@ _STRIPPED_PROJECT_SECRETS = (
     "NGROK_AUTHTOKEN",
 )
 _URL_RE = re.compile(r"(https://accounts\.google\.com/\S+)")
+_OAUTH_TOKEN_RE = re.compile(
+    r"(?:ya29\.[^\s\"'&,}\\)]+|1//[^\s\"'&,}\\)]+|(?i:Bearer)\s+[^\s\"',}]+)"
+)
+_OAUTH_SECRET_FIELD_RE = re.compile(
+    r"(?i)(\b(?:access_token|refresh_token|client_secret|id_token)\b[\"']?\s*[:=]\s*[\"']?)[^\s\"',}&]+"
+)
+_CLI_AUTH_REQUIRED_MARKERS = (
+    "To authorize colab-cli",
+    "Enter the authorization code:",
+)
+_KEYRING_SAVE_WARNING_MARKER = "Could not save the OAuth token to the OS keyring"
 _SESSION_LINE_RE = re.compile(r"^\[(?P<name>[^\]]+)\]\s+(?P<endpoint>\S+)\s+\|\s+Hardware:\s*(?P<hardware>[^|]+)")
 _TUNNEL_READY_RE = re.compile(
     r"\[start_colab\]\s+(?:TUNNEL READY \(AUTH PROTECTED\)|Already online and auth-protected):\s*(https://\S+)"
@@ -420,11 +436,29 @@ def _popen_kwargs(environ=None, *, os_name: str | None = None) -> dict:
 def _kill_process_tree(proc) -> None:
     if proc is None:
         return
-    if os.name != "nt":
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    pid = getattr(proc, "pid", None)
+    valid_pid = isinstance(pid, int) and not isinstance(pid, bool) and pid > 1
+    if valid_pid:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW,
+                    timeout=5.0,
+                    check=False,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                # Guard against pid <= 1 (on Linux glibc, killpg(1, sig) calls kill(-1, sig)
+                # and kills every user process) and never signal our own process group.
+                if pid != os.getpgrp():
+                    os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
     try:
         proc.kill()
     except OSError:
@@ -606,11 +640,36 @@ def parse_sessions_output(output: str) -> dict:
     return {"named": named, "orphans": orphans}
 
 
+def _is_cli_auth_required_output(output: str) -> bool:
+    text = output or ""
+    return any(marker in text for marker in _CLI_AUTH_REQUIRED_MARKERS)
+
+
+class _CliAuthState:
+    def __init__(self):
+        self.auth_id: str = uuid.uuid4().hex[:12]
+        self.active_state: str | None = None
+        self.auth_url: str | None = None
+        self.error: str | None = None
+        self.keyring_warning: str | None = None
+        self.proc = None
+        self.thread: threading.Thread | None = None
+        self.cancel_event = threading.Event()
+        self.url_ready = threading.Event()
+        self.code_submitted = threading.Event()
+        self.done_event = threading.Event()
+        self.authenticated = False
+        self.already_authenticated = False
+        self.submitted_code: str | None = None
+        self.submit_timed_out = False
+
+
 class _SlotState:
     def __init__(self, now: float):
         self.active_state: str | None = None
         self.auth_url: str | None = None
         self.last_error: str | None = None
+        self.auth_required_error = False
         self.logs: list[str] = []
         self.drive_ack_event = threading.Event()
         self.cancel_event = threading.Event()
@@ -630,6 +689,7 @@ class ColabRuntimeManager:
         storage: Path,
         *,
         drive_auth_timeout: float = DRIVE_AUTH_TIMEOUT_SEC,
+        cli_auth_timeout: float = CLI_AUTH_TIMEOUT_SEC,
         crash_grace_sec: float = CRASH_GRACE_SEC,
         retry_delay_sec: float = 4.0,
         provision_retries: int = PROVISION_MAX_RETRIES,
@@ -643,6 +703,7 @@ class ColabRuntimeManager:
     ):
         self.storage = Path(storage)
         self.drive_auth_timeout = float(drive_auth_timeout)
+        self.cli_auth_timeout = float(cli_auth_timeout)
         self.crash_grace_sec = float(crash_grace_sec)
         self.retry_delay_sec = float(retry_delay_sec)
         self.provision_retries = max(0, int(provision_retries))
@@ -659,6 +720,10 @@ class ColabRuntimeManager:
             "primary": _SlotState(now_init),
             "secondary": _SlotState(now_init),
         }
+        self._cli_auth = _CliAuthState()
+        self._cli_auth_starting = False
+        self._cli_auth_gen = 0
+        self._cli_auth_required_hint = False
         self._sessions_cache: tuple[float, dict] | None = None
         self._last_activity_at: float | None = None
         self._keepalive_stop = threading.Event()
@@ -1059,16 +1124,26 @@ class ColabRuntimeManager:
                 auth_mode,
                 ["sessions"],
                 environ=environ,
-                timeout=25.0,
+                timeout=45.0,
                 record_slot=False,
                 cancel_event=self._slot(normalize_slot(cancel_slot)).cancel_event,
             )
         else:
-            rc, out = self._run_command(colab_bin, auth_mode, ["sessions"], environ=environ, timeout=25.0, record_slot=False)
+            rc, out = self._run_command(colab_bin, auth_mode, ["sessions"], environ=environ, timeout=45.0, record_slot=False)
         if rc != 0:
-            return {"named": [], "orphans": [], "ok": False}
-        parsed = {**parse_sessions_output(out), "ok": True}
+            auth_required = auth_mode != "adc" and _is_cli_auth_required_output(out)
+            res = {"named": [], "orphans": [], "ok": False, "auth_required": auth_required}
+            if auth_required:
+                with self._lock:
+                    self._cli_auth_required_hint = True
+                    self._sessions_cache = (time.monotonic(), res)
+            elif auth_mode == "adc":
+                with self._lock:
+                    self._cli_auth_required_hint = False
+            return res
+        parsed = {**parse_sessions_output(out), "ok": True, "auth_required": False}
         with self._lock:
+            self._cli_auth_required_hint = False
             self._sessions_cache = (time.monotonic(), parsed)
         return parsed
 
@@ -1146,6 +1221,12 @@ class ColabRuntimeManager:
             s_active = "stopping" if self._is_stopping(s_slot) else s_slot.active_state
             p_auth_url, p_error, p_logs = p_slot.auth_url, p_slot.last_error, list(p_slot.logs[-15:])
             s_auth_url, s_error, s_logs = s_slot.auth_url, s_slot.last_error, list(s_slot.logs[-15:])
+            cli_auth_id = self._cli_auth.auth_id
+            cli_auth_state = self._cli_auth.active_state
+            cli_auth_url = self._cli_auth.auth_url
+            cli_auth_error = self._cli_auth.error
+            cli_auth_keyring_warning = self._cli_auth.keyring_warning
+            cli_auth_hint_initial = self._cli_auth_required_hint
 
         primary_url = self._primary_url(settings, sec_url)
         p_node = probed_by_url.get(primary_url) if primary_url else None
@@ -1155,13 +1236,33 @@ class ColabRuntimeManager:
         s_online = bool(s_node["online"]) if s_node is not None else False
         s_auth_failed = bool(s_node.get("auth_failed")) if s_node is not None else False
 
-        need_sessions = cli_available and (
+        is_adc = settings["colab_auth"] == "adc"
+        if is_adc and cli_auth_hint_initial:
+            with self._lock:
+                self._cli_auth_required_hint = False
+            cli_auth_hint_initial = False
+
+        cli_auth_active = cli_auth_state in ("awaiting_cli_auth", "verifying_cli_auth")
+        need_sessions = cli_available and not cli_auth_active and (
             (not probe.get("online") and not probe.get("auth_failed") and p_active not in transitional_states)
             or (bool(sec_url) and not s_online and not s_auth_failed and s_active not in transitional_states)
             or (bool(s_error) and not s_online and s_active not in transitional_states)
             or (bool(primary_url) and not p_online and p_active not in transitional_states and s_online)
+            or (cli_auth_hint_initial and not is_adc and p_active not in transitional_states)
         )
-        sessions = self._query_sessions(colab_bin, settings["colab_auth"], environ=env_copy) if need_sessions else {"named": [], "orphans": [], "ok": True}
+        sessions = self._query_sessions(colab_bin, settings["colab_auth"], environ=env_copy) if need_sessions else {"named": [], "orphans": [], "ok": False, "auth_required": False}
+        with self._lock:
+            cli_auth_hint = self._cli_auth_required_hint
+        cli_auth_required = (not is_adc) and (
+            bool(sessions.get("auth_required")) or (cli_available and not cli_auth_active and cli_auth_hint)
+        )
+        cli_auth_info = {
+            "state": cli_auth_state or ("required" if cli_auth_required else "idle"),
+            "auth_id": cli_auth_id if cli_auth_active else None,
+            "auth_url": cli_auth_url if cli_auth_state == "awaiting_cli_auth" else None,
+            "error": cli_auth_error,
+            "keyring_warning": cli_auth_keyring_warning,
+        }
         primary_session = self._session_name(settings, "primary")
         secondary_session = self._session_name(settings, "secondary")
         has_primary_session = any(s["name"] == primary_session for s in sessions["named"])
@@ -1172,11 +1273,12 @@ class ColabRuntimeManager:
         if (
             saved_sec
             and sec_url
+            and need_sessions
             and s_active not in transitional_states
             and not s_online
             and not s_auth_failed
             and cli_available
-            and sessions.get("ok", True)
+            and sessions.get("ok") is True
             and not has_secondary_session
         ):
             if self._clear_remembered_node_if_match("secondary", sec_url):
@@ -1189,10 +1291,12 @@ class ColabRuntimeManager:
         if p_online and p_active != "stopping":
             with self._lock:
                 self._slots["primary"].last_error = None
+                self._slots["primary"].auth_required_error = False
             p_error = None
         if s_online and s_active != "stopping":
             with self._lock:
                 self._slots["secondary"].last_error = None
+                self._slots["secondary"].auth_required_error = False
             s_error = None
 
         def _build_managed_entry(
@@ -1287,6 +1391,7 @@ class ColabRuntimeManager:
             "online_count": online_count,
             "total_count": total_count,
             "managed_nodes": managed_nodes,
+            "cli_auth": cli_auth_info,
         }
         all_devices = [d for n in online_nodes_list for d in (n.get("devices") or [])] or list(probe.get("devices") or [])
 
@@ -1359,6 +1464,23 @@ class ColabRuntimeManager:
                 "logs": p_logs,
             }
 
+        if cli_auth_active or cli_auth_required:
+            return {
+                "state": cli_auth_state if cli_auth_active else "cli_auth_required",
+                "provider": settings["provider"],
+                "comfyui_url": settings["comfyui_url"],
+                **node_meta,
+                "session": primary_session,
+                "gpu": settings["colab_gpu"],
+                "cli_available": True,
+                "has_session": False,
+                "devices": [],
+                "auth_url": cli_auth_url if cli_auth_state == "awaiting_cli_auth" else None,
+                "error": cli_auth_error,
+                "orphan_sessions": [],
+                "logs": p_logs,
+            }
+
         if sessions["orphans"]:
             return {
                 "state": "orphan_warning",
@@ -1406,6 +1528,372 @@ class ColabRuntimeManager:
             "orphan_sessions": [],
             "logs": p_logs or s_logs,
         }
+
+    def _reset_cli_auth(self, *, kill_proc: bool = True, expected: _CliAuthState | None = None) -> None:
+        with self._lock:
+            ca = self._cli_auth
+            if expected is not None and ca is not expected:
+                ca = expected
+            ca.cancel_event.set()
+            proc = ca.proc
+            thread = ca.thread
+            ca.active_state = None
+            ca.auth_url = None
+            ca.proc = None
+        if kill_proc and proc is not None:
+            _kill_process_tree(proc)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._lock:
+            ca.submitted_code = None
+
+    def close(self) -> None:
+        self.stop_keepalive_monitor()
+        with self._lock:
+            self._cli_auth_gen += 1
+        self._reset_cli_auth(kill_proc=True)
+
+    def start_cli_auth(self, environ=None, *, restart: bool = False) -> dict:
+        if os.environ.get("H3_WORKBENCH_WORKER") == "1":
+            raise RuntimeUnavailableError(message("colab_worker_forbidden"))
+        env_copy = dict(os.environ if environ is None else environ)
+        settings = config.video_settings(env_copy)
+        colab_bin = find_colab_bin(env_copy)
+        if not colab_bin:
+            raise RuntimeUnavailableError(message("colab_cli_missing"))
+        auth_mode = settings["colab_auth"]
+        if auth_mode == "adc":
+            raise ValueError(message("colab_cli_auth_adc_unsupported"))
+
+        existing_url: str | None = None
+        existing_warning: str | None = None
+        existing_auth_id: str | None = None
+        start_gen = 0
+        with self._lock:
+            cur = self._cli_auth
+            if self._cli_auth_starting or cur.active_state == "verifying_cli_auth":
+                raise RuntimeBusyError(message("colab_busy"))
+            if (
+                not restart
+                and cur.active_state == "awaiting_cli_auth"
+                and cur.auth_url
+                and cur.proc is not None
+                and cur.proc.poll() is None
+            ):
+                existing_url = cur.auth_url
+                existing_warning = cur.keyring_warning
+                existing_auth_id = cur.auth_id
+            else:
+                self._cli_auth_starting = True
+                start_gen = self._cli_auth_gen
+        if existing_url is not None:
+            return {
+                "started": True,
+                "already_authenticated": False,
+                "auth_id": existing_auth_id,
+                "auth_url": existing_url,
+                "keyring_warning": existing_warning,
+                "status": self.status(env_copy),
+            }
+
+        ca = _CliAuthState()
+        try:
+            self._reset_cli_auth(kill_proc=True)
+            with self._lock:
+                if self._cli_auth_gen != start_gen:
+                    raise RuntimeError(message("colab_cli_auth_failed", reason="login cancelled"))
+            argv = _build_argv(colab_bin, auth_mode, ["sessions"])
+            kwargs = _popen_kwargs(env_copy)
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                **kwargs,
+            )
+            ca.proc = proc
+            ca.active_state = "awaiting_cli_auth"
+            with self._lock:
+                cancelled_during_spawn = self._cli_auth_gen != start_gen
+                if not cancelled_during_spawn:
+                    self._cli_auth = ca
+                    self._sessions_cache = None
+            if cancelled_during_spawn:
+                _kill_process_tree(proc)
+                for stream in (proc.stdin, proc.stdout):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+                raise RuntimeError(message("colab_cli_auth_failed", reason="login cancelled"))
+
+            def _scrub_code(text: str, code_val: str | None) -> str:
+                out = text
+                if code_val and len(code_val) >= 6:
+                    quoted = urllib.parse.quote(code_val, safe="")
+                    for variant in (
+                        code_val,
+                        quoted,
+                        quoted.lower(),
+                        code_val.replace("/", "\\/"),
+                    ):
+                        if variant and variant in out:
+                            out = out.replace(variant, "[REDACTED]")
+                out = _OAUTH_TOKEN_RE.sub("[REDACTED]", out)
+                out = _OAUTH_SECRET_FIELD_RE.sub(r"\1[REDACTED]", out)
+                return out
+
+            def _watch() -> None:
+                collected: list[str] = []
+                collected_chars = 0
+                saw_keyring_warning = False
+                timed_out = False
+                code_snapshot: str | None = None
+
+                def _handle_chunk(chunk: str) -> None:
+                    nonlocal collected_chars, saw_keyring_warning
+                    if _KEYRING_SAVE_WARNING_MARKER in chunk:
+                        saw_keyring_warning = True
+                    if len(chunk) > 65536:
+                        chunk = chunk[-65536:]
+                    collected.append(chunk)
+                    collected_chars += len(chunk)
+                    while collected_chars > 65536 and len(collected) > 1:
+                        dropped = collected.pop(0)
+                        collected_chars -= len(dropped)
+                    m = _URL_RE.search(chunk)
+                    if m:
+                        should_signal = False
+                        with self._lock:
+                            if self._cli_auth is ca and not ca.code_submitted.is_set() and not ca.cancel_event.is_set():
+                                ca.auth_url = m.group(1).strip()
+                                ca.active_state = "awaiting_cli_auth"
+                                should_signal = True
+                        if should_signal:
+                            ca.url_ready.set()
+
+                def _read_stdout() -> None:
+                    buf = ""
+                    try:
+                        while True:
+                            ch = proc.stdout.read(1)
+                            if not ch:
+                                if buf:
+                                    _handle_chunk(buf)
+                                break
+                            buf += ch
+                            if ch == "\n" or "Enter the authorization code:" in buf or len(buf) >= 8192:
+                                _handle_chunk(buf)
+                                buf = ""
+                    except Exception:
+                        pass
+
+                rt = threading.Thread(target=_read_stdout, daemon=True)
+                rt.start()
+                try:
+                    deadline = time.monotonic() + self.cli_auth_timeout
+                    extended_for_submit = False
+                    while proc.poll() is None:
+                        if ca.submitted_code and code_snapshot is None:
+                            code_snapshot = ca.submitted_code
+                        if ca.code_submitted.is_set() and not extended_for_submit:
+                            extended_for_submit = True
+                            submit_window = min(CLI_AUTH_SUBMIT_TIMEOUT_SEC, max(5.0, self.cli_auth_timeout))
+                            deadline = max(deadline, time.monotonic() + submit_window + 5.0)
+                        if ca.cancel_event.is_set():
+                            _kill_process_tree(proc)
+                            break
+                        if time.monotonic() >= deadline:
+                            timed_out = True
+                            _kill_process_tree(proc)
+                            break
+                        time.sleep(0.05)
+                    if ca.submitted_code and code_snapshot is None:
+                        code_snapshot = ca.submitted_code
+                    try:
+                        rc = proc.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        _kill_process_tree(proc)
+                        rc = -9
+                    rt.join(timeout=2.0)
+                    raw_out = _scrub_code("".join(collected), code_snapshot or ca.submitted_code)
+                    with use_lang(env_copy.get("H3_LANG")):
+                        with self._lock:
+                            if self._cli_auth is ca:
+                                ca.proc = None
+                                ca.active_state = None
+                                ca.auth_url = None
+                                self._sessions_cache = None
+                                if ca.cancel_event.is_set():
+                                    if not ca.submit_timed_out:
+                                        ca.error = None
+                                elif timed_out:
+                                    ca.error = message("colab_cli_auth_timeout", seconds=int(self.cli_auth_timeout))
+                                elif rc == 0:
+                                    ca.authenticated = True
+                                    ca.already_authenticated = not ca.code_submitted.is_set()
+                                    ca.error = None
+                                    self._cli_auth_required_hint = False
+                                    for slot_st in self._slots.values():
+                                        if slot_st.auth_required_error:
+                                            slot_st.last_error = None
+                                            slot_st.auth_required_error = False
+                                    if saw_keyring_warning or _KEYRING_SAVE_WARNING_MARKER in raw_out:
+                                        ca.keyring_warning = message("colab_cli_auth_keyring_warning")
+                                    else:
+                                        ca.keyring_warning = None
+                                else:
+                                    lower_out = raw_out.lower()
+                                    if "invalid_grant" in lower_out or "malformed auth code" in lower_out:
+                                        ca.error = message("colab_cli_auth_invalid_code")
+                                    else:
+                                        clean_tail = _strip_rich_traceback_frames(raw_out)[-240:] or f"exit {rc}"
+                                        ca.error = message("colab_cli_auth_failed", reason=clean_tail)
+                finally:
+                    try:
+                        if proc.poll() is None:
+                            _kill_process_tree(proc)
+                    except Exception:
+                        pass
+                    for stream in (proc.stdin, proc.stdout):
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except OSError:
+                                pass
+                    with self._lock:
+                        if self._cli_auth is ca and ca.active_state is not None:
+                            ca.proc = None
+                            ca.active_state = None
+                            ca.auth_url = None
+                            self._sessions_cache = None
+                            if not ca.error and not ca.cancel_event.is_set():
+                                ca.error = message("colab_cli_auth_failed", reason="login watcher aborted")
+                        ca.submitted_code = None
+                    ca.done_event.set()
+
+            wt = threading.Thread(target=_watch, name="colab-cli-auth", daemon=True)
+            ca.thread = wt
+            wt.start()
+
+            wait_deadline = time.monotonic() + min(CLI_AUTH_START_WAIT_SEC, max(1.0, self.cli_auth_timeout))
+            while time.monotonic() < wait_deadline:
+                if ca.url_ready.is_set() or ca.done_event.is_set():
+                    break
+                time.sleep(0.02)
+            if not ca.url_ready.is_set() and not ca.done_event.is_set():
+                self._reset_cli_auth(kill_proc=True, expected=ca)
+                raise RuntimeError(message("colab_cli_auth_failed", reason="timed out waiting for authorization URL"))
+        finally:
+            with self._lock:
+                self._cli_auth_starting = False
+
+        if ca.url_ready.is_set() and not ca.done_event.is_set():
+            with self._lock:
+                url = ca.auth_url if self._cli_auth is ca else None
+                auth_id = ca.auth_id if self._cli_auth is ca else None
+            if url:
+                return {
+                    "started": True,
+                    "already_authenticated": False,
+                    "auth_id": auth_id,
+                    "auth_url": url,
+                    "keyring_warning": None,
+                    "status": self.status(env_copy),
+                }
+        if ca.done_event.is_set():
+            if ca.authenticated and ca.already_authenticated:
+                return {
+                    "started": False,
+                    "already_authenticated": True,
+                    "auth_id": None,
+                    "auth_url": None,
+                    "keyring_warning": ca.keyring_warning,
+                    "status": self.status(env_copy),
+                }
+            raise RuntimeError(ca.error or message("colab_cli_auth_failed", reason="login process exited"))
+        self._reset_cli_auth(kill_proc=True, expected=ca)
+        raise RuntimeError(message("colab_cli_auth_failed", reason="timed out waiting for authorization URL"))
+
+    def submit_cli_auth_code(self, code: str, environ=None, *, auth_id: str | None = None) -> dict:
+        if os.environ.get("H3_WORKBENCH_WORKER") == "1":
+            raise RuntimeUnavailableError(message("colab_worker_forbidden"))
+        env_copy = dict(os.environ if environ is None else environ)
+        if not isinstance(code, str):
+            raise ValueError(message("colab_cli_auth_code_invalid"))
+        cleaned = code.strip()
+        if not cleaned or "\0" in cleaned or "\n" in cleaned or "\r" in cleaned or len(cleaned) > 2048:
+            raise ValueError(message("colab_cli_auth_code_invalid"))
+
+        with self._lock:
+            if self._cli_auth_starting:
+                raise RuntimeBusyError(message("colab_busy"))
+            ca = self._cli_auth
+            if (
+                (auth_id and ca.auth_id != auth_id)
+                or ca.active_state != "awaiting_cli_auth"
+                or not ca.auth_url
+                or ca.proc is None
+                or ca.proc.poll() is not None
+                or ca.proc.stdin is None
+            ):
+                raise ValueError(message("colab_cli_auth_not_waiting"))
+            ca.active_state = "verifying_cli_auth"
+            ca.submitted_code = cleaned
+            ca.code_submitted.set()
+            stdin_pipe = ca.proc.stdin
+        try:
+            stdin_pipe.write(cleaned + "\n")
+            stdin_pipe.flush()
+            stdin_pipe.close()
+        except (OSError, ValueError) as exc:
+            self._reset_cli_auth(kill_proc=True, expected=ca)
+            raise ValueError(message("colab_cli_auth_not_waiting")) from exc
+
+        wait_timeout = min(CLI_AUTH_SUBMIT_TIMEOUT_SEC, max(5.0, self.cli_auth_timeout))
+        finished = ca.done_event.wait(timeout=wait_timeout)
+        if not finished:
+            err = message("colab_cli_auth_submit_timeout", seconds=int(wait_timeout))
+            with self._lock:
+                if self._cli_auth is ca:
+                    ca.submit_timed_out = True
+                    ca.error = err
+            self._reset_cli_auth(kill_proc=True, expected=ca)
+            return {
+                "accepted": False,
+                "authenticated": False,
+                "error": err,
+                "keyring_warning": None,
+                "status": self.status(env_copy),
+            }
+        return {
+            "accepted": bool(ca.authenticated),
+            "authenticated": bool(ca.authenticated),
+            "error": ca.error,
+            "keyring_warning": ca.keyring_warning,
+            "status": self.status(env_copy),
+        }
+
+    def cancel_cli_auth(self, environ=None, *, auth_id: str | None = None) -> dict:
+        env_copy = dict(os.environ if environ is None else environ)
+        with self._lock:
+            if auth_id and (self._cli_auth_starting or self._cli_auth.auth_id != auth_id):
+                stale = True
+            else:
+                stale = False
+                self._cli_auth_gen += 1
+        if stale:
+            return {"cancelled": False, "stale": True, "status": self.status(env_copy)}
+        self._reset_cli_auth(kill_proc=True)
+        with self._lock:
+            self._cli_auth.error = None
+            self._sessions_cache = None
+        return {"cancelled": True, "stale": False, "status": self.status(env_copy)}
 
     def submit_drive_authorized(self, *, slot: str | None = None) -> dict:
         candidates = [normalize_slot(slot)] if slot is not None else ["primary", "secondary"]
@@ -1577,6 +2065,10 @@ class ColabRuntimeManager:
                 if st.cancel_event.is_set():
                     return
                 if sessions.get("ok") is False:
+                    if sessions.get("auth_required"):
+                        with self._lock:
+                            st.auth_required_error = True
+                        raise RuntimeError(message("colab_cli_auth_required"))
                     raise RuntimeError(message("colab_start_failed", reason="colab sessions query failed"))
                 has_target = any(s["name"] == session_name for s in sessions["named"])
                 if not has_target and sessions["orphans"]:
@@ -1813,6 +2305,7 @@ class ColabRuntimeManager:
                             if st.cancel_event.is_set():
                                 return
                             st.last_error = None
+                            st.auth_required_error = False
                             st.active_state = None
                             self._sessions_cache = None
                             st.last_keepalive_at = now_ts
@@ -1826,6 +2319,8 @@ class ColabRuntimeManager:
             with self._lock:
                 if not st.cancel_event.is_set():
                     st.last_error = str(exc)
+                else:
+                    st.auth_required_error = False
                 st.active_state = None
                 st.auth_url = None
                 self._sessions_cache = None
@@ -1845,7 +2340,7 @@ class ColabRuntimeManager:
         st = self._slot(slot_name)
         already_active = False
         with self._lock:
-            if self._is_stopping(st):
+            if self._is_stopping(st) or self._cli_auth_starting or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth"):
                 raise RuntimeBusyError(message("colab_busy"))
             if st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
@@ -1873,7 +2368,7 @@ class ColabRuntimeManager:
                     return self.status(env_copy)
 
         with self._lock:
-            if self._is_stopping(st):
+            if self._is_stopping(st) or self._cli_auth_starting or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth"):
                 raise RuntimeBusyError(message("colab_busy"))
             if st.starting or st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
@@ -1886,7 +2381,7 @@ class ColabRuntimeManager:
 
         owns_starting = False
         with self._lock:
-            if self._is_stopping(st):
+            if self._is_stopping(st) or self._cli_auth_starting or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth"):
                 raise RuntimeBusyError(message("colab_busy"))
             if st.starting or st.active_state in ("provisioning", "awaiting_drive_auth", "starting_comfy"):
                 already_active = True
@@ -1935,10 +2430,11 @@ class ColabRuntimeManager:
                 daemon=True,
             )
             with self._lock:
-                if self._is_stopping(st):
+                if self._is_stopping(st) or self._cli_auth_starting or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth"):
                     raise RuntimeBusyError(message("colab_busy"))
                 st.cancel_event.clear()
                 st.last_error = None
+                st.auth_required_error = False
                 st.auth_url = None
                 st.logs.clear()
                 st.active_state = "provisioning"
@@ -2024,7 +2520,16 @@ class ColabRuntimeManager:
         with self._lock:
             if local_busy:
                 self._last_activity_at = current
-            if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+            if (
+                self._is_stopping(st)
+                or st.starting
+                or st.active_state is not None
+                or st.active_proc is not None
+                or st.keepalive_in_flight
+                or (self._cli_auth_required_hint and settings["colab_auth"] != "adc")
+                or self._cli_auth_starting
+                or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth")
+            ):
                 return False
             if (current - st.last_keepalive_at) < self.keepalive_interval_sec:
                 return False
@@ -2059,13 +2564,30 @@ class ColabRuntimeManager:
 
         session_name = self._session_name(settings, slot_name)
         with self._lock:
-            if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None or st.keepalive_in_flight:
+            if (
+                self._is_stopping(st)
+                or st.starting
+                or st.active_state is not None
+                or st.active_proc is not None
+                or st.keepalive_in_flight
+                or (self._cli_auth_required_hint and settings["colab_auth"] != "adc")
+                or self._cli_auth_starting
+                or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth")
+            ):
                 return False
             st.keepalive_in_flight = True
         try:
             with runtime_file_lock(self.storage, slot=slot_name):
                 with self._lock:
-                    if self._is_stopping(st) or st.starting or st.active_state is not None or st.active_proc is not None:
+                    if (
+                        self._is_stopping(st)
+                        or st.starting
+                        or st.active_state is not None
+                        or st.active_proc is not None
+                        or (self._cli_auth_required_hint and settings["colab_auth"] != "adc")
+                        or self._cli_auth_starting
+                        or self._cli_auth.active_state in ("awaiting_cli_auth", "verifying_cli_auth")
+                    ):
                         return False
                     st.cancel_event.clear()
                 rc, out = self._run_cmd_for_slot(
@@ -2088,9 +2610,13 @@ class ColabRuntimeManager:
                         slot=slot_name,
                     )
                     return True
+                auth_needed = settings["colab_auth"] != "adc" and _is_cli_auth_required_output(out)
                 detail = (out.strip() or f"exit {rc}")[-200:]
                 with self._lock:
                     st.last_keepalive_fail_at = current
+                    if auth_needed:
+                        self._cli_auth_required_hint = True
+                        self._sessions_cache = None
                     if "appears to be lost" in out:
                         self._sessions_cache = None
                         if (
@@ -2347,6 +2873,11 @@ class ColabRuntimeManager:
                         slot=slot_name,
                     )
                     if rc != 0:
+                        if _is_cli_auth_required_output(out):
+                            with self._lock:
+                                self._cli_auth_required_hint = True
+                                self._sessions_cache = None
+                            raise RuntimeError(message("colab_cli_auth_required"))
                         raise RuntimeError(out.strip()[-240:] or f"colab stop exit {rc}")
                     stop_succeeded = True
                     if slot_name == "secondary":

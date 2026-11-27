@@ -205,6 +205,9 @@ h3{font-size:14px;font-weight:650}
 .runtime-node-action{margin-left:auto;padding:2px 8px;font-size:12px}
 .runtime-subbox{margin:12px 0 0}
 .runtime-subbox .runtime-actions{margin-top:9px}
+.runtime-auth-url{width:100%;margin-top:8px;font-family:var(--mono);font-size:12px;background:var(--surface);color:var(--ink)}
+.runtime-cli-auth-form{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+.runtime-cli-auth-form input{flex:1 1 260px;font-family:var(--mono);font-size:12px}
 .runtime-logs{margin-top:12px;font-size:12px}
 .runtime-logs summary{cursor:pointer;color:var(--accent)}
 .runtime-logs[open] summary{margin-bottom:8px}

@@ -135,7 +135,7 @@ def create_app(storage=None, env_path=None):
     orig_jobs_close = jobs.close
 
     def close_with_runtime():
-        runtime.stop_keepalive_monitor()
+        runtime.close()
         orig_jobs_close()
 
     jobs.close = close_with_runtime
@@ -220,8 +220,12 @@ def create_app(storage=None, env_path=None):
         cleaned = dict(payload)
         if isinstance(cleaned.get("error"), str):
             cleaned["error"] = jobs.redact(cleaned["error"])
+        if isinstance(cleaned.get("keyring_warning"), str):
+            cleaned["keyring_warning"] = jobs.redact(cleaned["keyring_warning"])
         if isinstance(cleaned.get("logs"), list):
             cleaned["logs"] = [jobs.redact(str(line)) for line in cleaned["logs"]]
+        if isinstance(cleaned.get("cli_auth"), dict):
+            cleaned["cli_auth"] = redact_runtime_payload(cleaned["cli_auth"])
         if isinstance(cleaned.get("status"), dict):
             cleaned["status"] = redact_runtime_payload(cleaned["status"])
         if isinstance(cleaned.get("managed_nodes"), list):
@@ -258,7 +262,11 @@ def create_app(storage=None, env_path=None):
             origin = request.headers.get("Origin")
             if request.headers.get("X-Workbench") != "1" or (origin and origin != request.host_url.rstrip("/")):
                 raise InputError("origin")
-            if request.path.startswith("/api/jobs") or request.path in ("/api/runtime/start", "/api/runtime/drive-ack"):
+            if (
+                request.path.startswith("/api/jobs")
+                or request.path in ("/api/runtime/start", "/api/runtime/drive-ack")
+                or request.path.startswith("/api/runtime/cli-auth/")
+            ):
                 runtime.mark_local_activity()
 
     @app.after_request
@@ -582,6 +590,66 @@ def create_app(storage=None, env_path=None):
             ack = runtime.submit_drive_authorized() if slot is None else runtime.submit_drive_authorized(slot=slot)
             ack["status"] = runtime.status(current_env)
             return jsonify(redact_runtime_payload(ack))
+
+    @app.post("/api/runtime/cli-auth/start")
+    def runtime_cli_auth_start():
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            invalid("runtime", values, "object")
+        restart = values.get("restart", False)
+        if not isinstance(restart, bool):
+            invalid("restart", restart, "choice")
+        lang = language()
+        with jobs.lock:
+            current_env = {**env, "H3_LANG": lang}
+        with use_lang(lang):
+            try:
+                res = runtime.start_cli_auth(current_env, restart=restart)
+            except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError, RuntimeError) as exc:
+                raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+            return jsonify(redact_runtime_payload(res))
+
+    @app.post("/api/runtime/cli-auth/submit")
+    def runtime_cli_auth_submit():
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict):
+            invalid("runtime", "[REDACTED]", "object")
+        raw_code = values.get("code")
+        if not isinstance(raw_code, str):
+            invalid("code", "[REDACTED]", "text")
+        raw_auth_id = values.get("auth_id")
+        if raw_auth_id is not None and not isinstance(raw_auth_id, str):
+            invalid("auth_id", raw_auth_id, "text")
+        auth_id = raw_auth_id.strip() if isinstance(raw_auth_id, str) and raw_auth_id.strip() else None
+        lang = language()
+        with jobs.lock:
+            current_env = {**env, "H3_LANG": lang}
+        with use_lang(lang):
+            try:
+                res = runtime.submit_cli_auth_code(raw_code, current_env, auth_id=auth_id)
+            except (ValueError, colab_runtime.RuntimeBusyError, colab_runtime.RuntimeUnavailableError) as exc:
+                raise InputError("comfy_runtime_action", detail=str(exc)) from exc
+            return jsonify(redact_runtime_payload(res))
+
+    @app.post("/api/runtime/cli-auth/cancel")
+    def runtime_cli_auth_cancel():
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            invalid("runtime", values, "object")
+        raw_auth_id = values.get("auth_id")
+        if raw_auth_id is not None and not isinstance(raw_auth_id, str):
+            invalid("auth_id", raw_auth_id, "text")
+        auth_id = raw_auth_id.strip() if isinstance(raw_auth_id, str) and raw_auth_id.strip() else None
+        lang = language()
+        with jobs.lock:
+            current_env = {**env, "H3_LANG": lang}
+        with use_lang(lang):
+            res = runtime.cancel_cli_auth(current_env, auth_id=auth_id)
+            return jsonify(redact_runtime_payload(res))
 
     @app.post("/api/runtime/stop")
     def runtime_stop():

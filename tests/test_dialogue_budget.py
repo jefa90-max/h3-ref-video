@@ -8,8 +8,10 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 from h3ref import film
+from scripts import package_windows
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -331,3 +333,23 @@ finally:
                 film.run(job, None, "none")
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual((job / "run.log").read_text().count("Wait here for the next train."), 2)
+
+    def test_windows_package_bundles_documented_dialogue_budget_example(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = package_windows.build_package(ROOT, root / "bundle.zip")
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(root / "extracted")
+            extracted_repo = root / "extracted" / "h3-ref-video"
+            completed = subprocess.run(
+                [sys.executable, "h3ref.py", "preflight", "--film", "examples/dialogue-budget.json", "--json"],
+                cwd=extracted_repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["status"], "partial")
+            self.assertEqual(payload["meta"]["checked_shots"], 3)
+

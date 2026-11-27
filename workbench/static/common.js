@@ -12,7 +12,10 @@ let renderPage = () => {};
 let llmProvider = null;
 let llmDrafts = {};
 let runtimePollTimer = null;
+let runtimeStatusSeq = 0;
 let runtimeRefreshInFlight = null;
+let runtimeRefreshInFlightSeq = 0;
+let cliAuthCancelling = false;
 
 function t(key, values = {}) {
   return (state.messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
@@ -115,7 +118,7 @@ function clearRuntimePoll() {
   runtimePollTimer = null;
 }
 
-const RUNTIME_TRANSITIONAL = ["provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"];
+const RUNTIME_TRANSITIONAL = ["awaiting_cli_auth", "verifying_cli_auth", "provisioning", "awaiting_drive_auth", "starting_comfy", "stopping"];
 
 function isTransitionalState(st) {
   return RUNTIME_TRANSITIONAL.includes(st);
@@ -131,7 +134,7 @@ function scheduleRuntimePoll(statusObj) {
   if (!statusObj) return;
   const managedTransitional = Array.isArray(statusObj.managed_nodes)
     && statusObj.managed_nodes.some((m) => m && isTransitionalState(m.state));
-  if (!isTransitionalState(statusObj.state) && !managedTransitional) {
+  if (!isTransitionalState(statusObj.state) && !managedTransitional && !isTransitionalState(statusObj.cli_auth?.state)) {
     return;
   }
   if (typeof setTimeout === "function") {
@@ -255,7 +258,7 @@ function renderRuntimeStatus() {
   badge.className = "status-badge";
   if (st === "online") badge.classList.add("succeeded");
   else if (isTransitionalState(st)) badge.classList.add("running");
-  else if (["error", "orphan_warning"].includes(st)) badge.classList.add("failed");
+  else if (["error", "orphan_warning", "cli_auth_required"].includes(st)) badge.classList.add("failed");
   $("runtime-start").textContent = t("runtimeStartGpu", { gpu });
 
   const configuredUrl = statusObj.comfyui_url || state.config?.COMFYUI_URL || "";
@@ -263,6 +266,10 @@ function renderRuntimeStatus() {
   const totalCount = Number.isFinite(statusObj.total_count) ? statusObj.total_count : nodes.length;
   const onlineCount = Number.isFinite(statusObj.online_count) ? statusObj.online_count : nodes.filter((n) => n.online).length;
   const isMultiNode = totalCount > 1;
+  const cliAuth = statusObj.cli_auth || {};
+  const cliAuthState = cliAuth.state || "idle";
+  const cliAuthPending = st === "awaiting_cli_auth" || st === "verifying_cli_auth" || ["awaiting_cli_auth", "verifying_cli_auth"].includes(cliAuthState);
+  const cliAuthRequired = st === "cli_auth_required" || cliAuthState === "required";
   if (st === "online") {
     if (isMultiNode) {
       const concurrency = state.config?.effective_comfyui_concurrency || onlineCount;
@@ -283,6 +290,14 @@ function renderRuntimeStatus() {
     }
   } else if (st === "cli_unavailable") {
     $("runtime-detail").textContent = t("runtimeDetailCliUnavailable");
+  } else if (st === "cli_auth_required") {
+    $("runtime-detail").textContent = cliAuth.error
+      ? t("runtimeDetailError", { error: cliAuth.error })
+      : t("runtimeDetailCliAuthRequired");
+  } else if (st === "awaiting_cli_auth") {
+    $("runtime-detail").textContent = t("runtimeDetailCliAuthPending");
+  } else if (st === "verifying_cli_auth") {
+    $("runtime-detail").textContent = t("runtimeDetailCliAuthVerifying");
   } else if (st === "provisioning") {
     $("runtime-detail").textContent = t("runtimeDetailProvisioning", { gpu });
   } else if (st === "awaiting_drive_auth") {
@@ -304,6 +319,39 @@ function renderRuntimeStatus() {
     showMessage(t("runtimeSecondaryReadyNotice", { url: secondary.url }));
   } else if (state.watchingSecondaryStart && secondary && ["error", "offline"].includes(secondary.state)) {
     state.watchingSecondaryStart = false;
+  }
+
+  const cliAuthUrl = cliAuth.auth_url || (st === "awaiting_cli_auth" ? statusObj.auth_url : null) || "";
+  if ($("runtime-cli-auth-start")) {
+    $("runtime-cli-auth-start").hidden = !(Boolean(statusObj.cli_available) && cliAuthRequired && !cliAuthPending);
+    $("runtime-cli-auth-start").disabled = state.runtimeBusy;
+  }
+  if ($("runtime-cli-auth-box")) {
+    $("runtime-cli-auth-box").hidden = !cliAuthPending;
+    if ($("runtime-cli-auth-text")) {
+      $("runtime-cli-auth-text").textContent = t(
+        st === "verifying_cli_auth" || cliAuthState === "verifying_cli_auth"
+          ? "runtimeDetailCliAuthVerifying"
+          : "runtimeDetailCliAuthPending",
+      );
+    }
+    if ($("runtime-cli-auth-url")) {
+      if ($("runtime-cli-auth-url").value !== cliAuthUrl) $("runtime-cli-auth-url").value = cliAuthUrl;
+      $("runtime-cli-auth-url").hidden = !cliAuthUrl;
+    }
+    if ($("runtime-cli-auth-link")) {
+      $("runtime-cli-auth-link").href = cliAuthUrl || "#";
+      $("runtime-cli-auth-link").hidden = !cliAuthUrl;
+    }
+    if ($("runtime-cli-auth-copy")) {
+      $("runtime-cli-auth-copy").hidden = !cliAuthUrl;
+      $("runtime-cli-auth-copy").disabled = state.runtimeBusy || !cliAuthUrl;
+    }
+    const verifying = st === "verifying_cli_auth" || cliAuthState === "verifying_cli_auth";
+    if ($("runtime-cli-auth-refresh")) $("runtime-cli-auth-refresh").disabled = state.runtimeBusy || verifying;
+    if ($("runtime-cli-auth-code")) $("runtime-cli-auth-code").disabled = state.runtimeBusy || verifying;
+    if ($("runtime-cli-auth-submit")) $("runtime-cli-auth-submit").disabled = state.runtimeBusy || verifying || !cliAuthUrl;
+    if ($("runtime-cli-auth-cancel")) $("runtime-cli-auth-cancel").disabled = cliAuthCancelling;
   }
 
   let authSlot = null;
@@ -329,14 +377,27 @@ function renderRuntimeStatus() {
   if (awaitingAuth && authUrl) {
     $("runtime-drive-link").href = authUrl;
     $("runtime-drive-link").hidden = false;
+    if ($("runtime-drive-url")) {
+      if ($("runtime-drive-url").value !== authUrl) $("runtime-drive-url").value = authUrl;
+      $("runtime-drive-url").hidden = false;
+    }
+    if ($("runtime-drive-copy")) {
+      $("runtime-drive-copy").hidden = false;
+      $("runtime-drive-copy").disabled = state.runtimeBusy;
+    }
   } else {
     $("runtime-drive-link").hidden = true;
+    if ($("runtime-drive-url")) {
+      $("runtime-drive-url").value = "";
+      $("runtime-drive-url").hidden = true;
+    }
+    if ($("runtime-drive-copy")) $("runtime-drive-copy").hidden = true;
   }
   $("runtime-drive-ack").disabled = state.runtimeBusy || !awaitingAuth;
 
   const primaryTransitional = isTransitionalState(primaryState);
   const secondaryTransitional = Boolean(secondary && isTransitionalState(secondary.state));
-  const cliReady = Boolean(statusObj.cli_available);
+  const cliReady = Boolean(statusObj.cli_available) && !cliAuthRequired && !cliAuthPending;
   const primaryOnline = primary ? Boolean(primary.online) : st === "online";
   const primaryUrl = primary ? (primary.url || "") : configuredUrl;
   $("runtime-refresh").disabled = state.runtimeBusy;
@@ -362,17 +423,25 @@ function renderRuntimeStatus() {
 
 async function refreshRuntimeStatus() {
   if ((state.config?.VIDEO_PROVIDER || "runninghub") !== "comfyui") return;
-  if (runtimeRefreshInFlight) return runtimeRefreshInFlight;
-  runtimeRefreshInFlight = (async () => {
+  if (runtimeRefreshInFlight && runtimeRefreshInFlightSeq === runtimeStatusSeq) {
+    return runtimeRefreshInFlight;
+  }
+  const seq = runtimeStatusSeq;
+  const current = (async () => {
     const statusObj = await request("/api/runtime/status");
+    if (seq !== runtimeStatusSeq) return;
     state.runtimeStatus = statusObj;
     renderRuntimeStatus();
     scheduleRuntimePoll(statusObj);
   })();
+  runtimeRefreshInFlight = current;
+  runtimeRefreshInFlightSeq = seq;
   try {
-    await runtimeRefreshInFlight;
+    await current;
   } finally {
-    runtimeRefreshInFlight = null;
+    if (runtimeRefreshInFlight === current) {
+      runtimeRefreshInFlight = null;
+    }
   }
 }
 
@@ -507,21 +576,32 @@ $("llm-provider").addEventListener("change", () => {
 });
 
 $("runtime-refresh").addEventListener("click", async () => {
+  const seq = runtimeStatusSeq;
   state.runtimeBusy = true;
   renderRuntimeStatus();
   try { await refreshRuntimeStatus(); }
-  catch (error) { showError(error); }
-  finally { state.runtimeBusy = false; renderRuntimeStatus(); }
+  catch (error) {
+    if (seq === runtimeStatusSeq) showError(error);
+  }
+  finally {
+    if (seq === runtimeStatusSeq && !cliAuthCancelling) state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
 });
 
 async function submitRuntimeStart(slot = "primary") {
+  let seq = ++runtimeStatusSeq;
+  clearRuntimePoll();
   state.runtimeBusy = true;
   $("runtime-confirm").hidden = true;
   clearNotices();
   renderRuntimeStatus();
   try {
     const payload = slot === "primary" ? {} : { slot };
-    state.runtimeStatus = await post("/api/runtime/start", payload);
+    const statusObj = await post("/api/runtime/start", payload);
+    if (seq !== runtimeStatusSeq) return;
+    seq = ++runtimeStatusSeq;
+    state.runtimeStatus = statusObj;
     if (slot === "secondary") state.watchingSecondaryStart = true;
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
@@ -529,9 +609,12 @@ async function submitRuntimeStart(slot = "primary") {
     showMessage(t(slot === "secondary" ? "runtimeSecondaryStartedNotice" : "runtimeStartedNotice", { gpu }));
   } catch (error) {
     if (slot === "secondary") state.watchingSecondaryStart = false;
-    showError(error);
+    if (seq === runtimeStatusSeq) {
+      showError(error);
+      scheduleRuntimePoll(state.runtimeStatus);
+    }
   } finally {
-    state.runtimeBusy = false;
+    if (seq === runtimeStatusSeq) state.runtimeBusy = false;
     renderRuntimeStatus();
   }
 }
@@ -546,13 +629,196 @@ if ($("runtime-start-secondary")) {
   });
 }
 
+async function copyAuthLink(url, inputEl) {
+  if (!url) return;
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(url);
+      showMessage(t("runtimeAuthLinkCopied"));
+      return;
+    }
+  } catch {
+    // Fall through to input selection fallback
+  }
+  if (inputEl && typeof inputEl.select === "function") {
+    inputEl.select();
+    try {
+      if (typeof document.execCommand === "function" && document.execCommand("copy")) {
+        showMessage(t("runtimeAuthLinkCopied"));
+        return;
+      }
+    } catch {
+      // Fall through to manual copy notice
+    }
+  }
+  showError(t("runtimeAuthLinkCopyFailed"));
+}
+
+async function startCliAuthFlow(restart = false) {
+  let seq = ++runtimeStatusSeq;
+  clearRuntimePoll();
+  if (restart) {
+    if ($("runtime-cli-auth-code")) $("runtime-cli-auth-code").value = "";
+    if (state.runtimeStatus?.cli_auth) state.runtimeStatus.cli_auth.auth_id = null;
+  }
+  state.runtimeBusy = true;
+  clearNotices();
+  renderRuntimeStatus();
+  try {
+    const res = await post("/api/runtime/cli-auth/start", restart ? { restart: true } : {});
+    if (seq !== runtimeStatusSeq) return;
+    seq = ++runtimeStatusSeq;
+    if (res.status) state.runtimeStatus = res.status;
+    renderRuntimeStatus();
+    scheduleRuntimePoll(state.runtimeStatus);
+    if (res.already_authenticated) {
+      if (res.keyring_warning) showError(res.keyring_warning);
+      else showMessage(t("runtimeCliAuthAlreadyReady"));
+    }
+  } catch (error) {
+    if (seq === runtimeStatusSeq) {
+      showError(error);
+      await refreshRuntimeStatus().catch(() => {
+        if (seq === runtimeStatusSeq) scheduleRuntimePoll(state.runtimeStatus);
+      });
+    }
+  } finally {
+    if (seq === runtimeStatusSeq && !cliAuthCancelling) state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
+}
+
+async function submitCliAuthCode() {
+  const input = $("runtime-cli-auth-code");
+  const code = (input?.value || "").trim();
+  if (!code) {
+    showError(t("runtimeCliAuthCodeEmpty"));
+    return;
+  }
+  const authId = state.runtimeStatus?.cli_auth?.auth_id || "";
+  let seq = ++runtimeStatusSeq;
+  clearRuntimePoll();
+  state.runtimeBusy = true;
+  clearNotices();
+  renderRuntimeStatus();
+  try {
+    const payload = authId ? { code, auth_id: authId } : { code };
+    const res = await post("/api/runtime/cli-auth/submit", payload);
+    if (seq !== runtimeStatusSeq) return;
+    seq = ++runtimeStatusSeq;
+    if (input) input.value = "";
+    if (res.status) state.runtimeStatus = res.status;
+    renderRuntimeStatus();
+    scheduleRuntimePoll(state.runtimeStatus);
+    if (res.authenticated) {
+      if (res.keyring_warning) showError(res.keyring_warning);
+      else showMessage(t("runtimeCliAuthSuccess"));
+    } else {
+      showError(res.error || t("runtimeDetailError", { error: "cli_auth_failed" }));
+    }
+  } catch (error) {
+    if (seq === runtimeStatusSeq) {
+      if (input) input.value = "";
+      showError(error);
+      await refreshRuntimeStatus().catch(() => {
+        if (seq === runtimeStatusSeq) scheduleRuntimePoll(state.runtimeStatus);
+      });
+    }
+  } finally {
+    if (seq === runtimeStatusSeq && !cliAuthCancelling) state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
+}
+
+async function cancelCliAuthFlow() {
+  if (cliAuthCancelling) return;
+  const authId = state.runtimeStatus?.cli_auth?.auth_id || "";
+  let seq = ++runtimeStatusSeq;
+  clearRuntimePoll();
+  cliAuthCancelling = true;
+  state.runtimeBusy = true;
+  clearNotices();
+  renderRuntimeStatus();
+  try {
+    const payload = authId ? { auth_id: authId } : {};
+    const res = await post("/api/runtime/cli-auth/cancel", payload);
+    if (seq !== runtimeStatusSeq) return;
+    seq = ++runtimeStatusSeq;
+    if ($("runtime-cli-auth-code")) $("runtime-cli-auth-code").value = "";
+    if (res.status) state.runtimeStatus = res.status;
+    renderRuntimeStatus();
+    scheduleRuntimePoll(state.runtimeStatus);
+    if (!res.stale) showMessage(t("runtimeCliAuthCancelled"));
+  } catch (error) {
+    if (seq === runtimeStatusSeq) {
+      showError(error);
+      scheduleRuntimePoll(state.runtimeStatus);
+    }
+  } finally {
+    cliAuthCancelling = false;
+    if (seq === runtimeStatusSeq) state.runtimeBusy = false;
+    renderRuntimeStatus();
+  }
+}
+
+if ($("runtime-cli-auth-start")) {
+  $("runtime-cli-auth-start").addEventListener("click", async () => {
+    await startCliAuthFlow(false);
+  });
+}
+
+if ($("runtime-cli-auth-refresh")) {
+  $("runtime-cli-auth-refresh").addEventListener("click", async () => {
+    await startCliAuthFlow(true);
+  });
+}
+
+if ($("runtime-cli-auth-code")) {
+  $("runtime-cli-auth-code").addEventListener("keydown", async (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (!$("runtime-cli-auth-submit")?.disabled) await submitCliAuthCode();
+    }
+  });
+}
+
+if ($("runtime-cli-auth-submit")) {
+  $("runtime-cli-auth-submit").addEventListener("click", async () => {
+    await submitCliAuthCode();
+  });
+}
+
+if ($("runtime-cli-auth-cancel")) {
+  $("runtime-cli-auth-cancel").addEventListener("click", async () => {
+    await cancelCliAuthFlow();
+  });
+}
+
+if ($("runtime-cli-auth-copy")) {
+  $("runtime-cli-auth-copy").addEventListener("click", async () => {
+    const url = $("runtime-cli-auth-url")?.value || "";
+    await copyAuthLink(url, $("runtime-cli-auth-url"));
+  });
+}
+
+if ($("runtime-drive-copy")) {
+  $("runtime-drive-copy").addEventListener("click", async () => {
+    const url = $("runtime-drive-url")?.value || $("runtime-drive-link")?.href || "";
+    await copyAuthLink(url, $("runtime-drive-url"));
+  });
+}
+
 $("runtime-drive-ack").addEventListener("click", async () => {
+  let seq = ++runtimeStatusSeq;
+  clearRuntimePoll();
   state.runtimeBusy = true;
   clearNotices();
   renderRuntimeStatus();
   try {
     const payload = state.runtimeAuthSlot === "secondary" ? { slot: "secondary" } : {};
     const res = await post("/api/runtime/drive-ack", payload);
+    if (seq !== runtimeStatusSeq) return;
+    seq = ++runtimeStatusSeq;
     if (res.status) state.runtimeStatus = res.status;
     if (res.accepted === false) {
       showError(t("runtimeDetailError", { error: res.state || "drive_ack_rejected" }));
@@ -560,14 +826,19 @@ $("runtime-drive-ack").addEventListener("click", async () => {
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
   } catch (error) {
-    showError(error);
+    if (seq === runtimeStatusSeq) {
+      showError(error);
+      scheduleRuntimePoll(state.runtimeStatus);
+    }
   } finally {
-    state.runtimeBusy = false;
+    if (seq === runtimeStatusSeq) state.runtimeBusy = false;
     renderRuntimeStatus();
   }
 });
 
 async function submitRuntimeStop(force, slot = "primary") {
+  let seq = ++runtimeStatusSeq;
+  clearRuntimePoll();
   state.runtimeBusy = true;
   $("runtime-confirm").hidden = true;
   clearNotices();
@@ -575,6 +846,8 @@ async function submitRuntimeStop(force, slot = "primary") {
   try {
     const payload = slot === "primary" ? { force } : { force, slot };
     const res = await post("/api/runtime/stop", payload);
+    if (seq !== runtimeStatusSeq) return;
+    seq = ++runtimeStatusSeq;
     if (res.status) state.runtimeStatus = res.status;
     if (res.confirmation_required) {
       state.runtimeStopSlot = slot;
@@ -590,9 +863,14 @@ async function submitRuntimeStop(force, slot = "primary") {
     renderRuntimeStatus();
     scheduleRuntimePoll(state.runtimeStatus);
   } catch (error) {
-    showError(error);
+    if (seq === runtimeStatusSeq) {
+      showError(error);
+      await refreshRuntimeStatus().catch(() => {
+        if (seq === runtimeStatusSeq) scheduleRuntimePoll(state.runtimeStatus);
+      });
+    }
   } finally {
-    state.runtimeBusy = false;
+    if (seq === runtimeStatusSeq) state.runtimeBusy = false;
     renderRuntimeStatus();
   }
 }

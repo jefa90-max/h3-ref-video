@@ -66,7 +66,8 @@ def upload(path: Path) -> str:
     """The file name RunningHub gives an uploaded input; it goes into a LoadImage node as it is."""
     key = config.rh_key()
     out = http.upload(config.RH_BASE + "/task/openapi/upload", key, path, {"apiKey": key, "fileType": "input"})
-    if out.get("code") != 0 or not (out.get("data") or {}).get("fileName"):
+    status = out.get("_http_status")
+    if (isinstance(status, int) and status >= 400) or out.get("code") != 0 or not (out.get("data") or {}).get("fileName"):
         raise RuntimeError("upload to RunningHub failed: " + json.dumps(out, ensure_ascii=False).replace(key, "[key]")[:200])
     return out["data"]["fileName"]
 

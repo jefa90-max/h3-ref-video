@@ -26,6 +26,7 @@
         </div>
         <div class="button-row runtime-actions">
           <button id="runtime-refresh" type="button" class="button text-button" data-i18n="runtimeRefresh"></button>
+          <button id="runtime-cli-auth-start" type="button" class="button" data-i18n="runtimeCliAuthStart" hidden></button>
           <button id="runtime-start" type="button" class="button secondary" data-i18n="runtimeStart"></button>
           <button id="runtime-start-secondary" type="button" class="button secondary" data-i18n="runtimeStartSecondary" hidden></button>
           <button id="runtime-stop" type="button" class="button secondary" data-i18n="runtimeStop"></button>
@@ -33,10 +34,26 @@
       </div>
       <p id="runtime-detail" class="hint"></p>
       <ul id="runtime-nodes" class="runtime-nodes" hidden></ul>
+      <div id="runtime-cli-auth-box" class="notice warning runtime-subbox" hidden>
+        <p id="runtime-cli-auth-text" class="hint" data-i18n="runtimeDetailCliAuthPending"></p>
+        <input id="runtime-cli-auth-url" class="runtime-auth-url" type="text" readonly spellcheck="false" data-i18n-aria="runtimeAuthUrlLabel" hidden>
+        <div class="button-row runtime-actions">
+          <a id="runtime-cli-auth-link" class="button secondary" target="_blank" rel="noopener noreferrer" data-i18n="runtimeOpenCliAuth" hidden></a>
+          <button id="runtime-cli-auth-copy" type="button" class="button secondary" data-i18n="runtimeCopyAuthLink" hidden></button>
+          <button id="runtime-cli-auth-refresh" type="button" class="button text-button" data-i18n="runtimeCliAuthRestart"></button>
+        </div>
+        <div class="runtime-cli-auth-form">
+          <input id="runtime-cli-auth-code" type="text" autocomplete="off" spellcheck="false" data-i18n-aria="runtimeCliAuthCodeLabel" data-i18n-placeholder="runtimeCliAuthCodePlaceholder">
+          <button id="runtime-cli-auth-submit" type="button" class="button" data-i18n="runtimeCliAuthSubmit"></button>
+          <button id="runtime-cli-auth-cancel" type="button" class="button secondary" data-i18n="runtimeCancelStop"></button>
+        </div>
+      </div>
       <div id="runtime-drive-box" class="notice warning runtime-subbox" hidden>
         <p id="runtime-drive-text" class="hint" data-i18n="runtimeDetailDriveAuth"></p>
+        <input id="runtime-drive-url" class="runtime-auth-url" type="text" readonly spellcheck="false" data-i18n-aria="runtimeAuthUrlLabel" hidden>
         <div class="button-row runtime-actions">
           <a id="runtime-drive-link" class="button secondary" target="_blank" rel="noopener noreferrer" data-i18n="runtimeOpenDriveAuth" hidden></a>
+          <button id="runtime-drive-copy" type="button" class="button secondary" data-i18n="runtimeCopyAuthLink" hidden></button>
           <button id="runtime-drive-ack" type="button" class="button primary" data-i18n="runtimeConfirmDriveAuth"></button>
         </div>
       </div>

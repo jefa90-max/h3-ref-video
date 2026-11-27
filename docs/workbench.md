@@ -28,7 +28,7 @@ Windows 使用 `python -m venv .venv` 创建环境，再运行 `.venv\Scripts\py
 
 ## 配置真实 key
 
-打开「环境与密钥」，选择视频生成后端（`ComfyUI` 或 `RunningHub`）并填写对应参数与 `APIMART_API_KEY`，默认勾选保存到本机 `.env`，点击保存；保存后立即用于后续任务，服务重启也会沿用。选择 `ComfyUI` 时填写 `COMFYUI_URL`（支持英文逗号或换行填写多节点并发）、`COMFYUI_API_KEY`（公网 HTTPS 隧道必填，本机 HTTP 可留空）及可选的 `COMFYUI_CONCURRENCY`、`COMFYUI_PRESET`（默认 `full20`，可选 `8step` / `4step`）、`COMFYUI_RESOLUTION`（默认 `768p` 3D 潜空间二采，可选 `1088p` 3D 潜空间二采或 `544p` 单采快速档）、`COMFYUI_UPSCALE`（默认关闭）、`COLAB_GPU`（默认 `G4`，可选 `A100` / `H100`）、`COLAB_AUTO_START`（默认关闭）；页面顶部提供 ComfyUI / Colab 运行状态卡片用于只读探活、按需一键启动主节点及第 2 节点、确认 Google Drive 授权与带在途保护的终止实例。选择 `RunningHub` 时填写 `RUNNINGHUB_API_KEY`。不勾选保存则只存当前服务内存。空白 key 保持已有值，已保存的 key 不回传浏览器。`.env` 已被 git 忽略，支持 POSIX 权限的平台使用 0600；key 不写入浏览器存储或任务 JSON。也可预先按 `.env.example` 手动配置；已 export 的环境变量在启动时优先于 .env。
+打开「环境与密钥」，选择视频生成后端（`ComfyUI` 或 `RunningHub`）并填写对应参数与 `APIMART_API_KEY`，默认勾选保存到本机 `.env`，点击保存；保存后立即用于后续任务，服务重启也会沿用。选择 `ComfyUI` 时填写 `COMFYUI_URL`（支持英文逗号或换行填写多节点并发）、`COMFYUI_API_KEY`（公网 HTTPS 隧道必填，本机 HTTP 可留空）及可选的 `COMFYUI_CONCURRENCY`、`COMFYUI_PRESET`（默认 `full20`，可选 `8step` / `4step`）、`COMFYUI_RESOLUTION`（默认 `768p` 3D 潜空间二采，可选 `1088p` 3D 潜空间二采或 `544p` 单采快速档）、`COMFYUI_UPSCALE`（默认关闭）、`COLAB_GPU`（默认 `G4`，可选 `A100` / `H100`）、`COLAB_AUTO_START`（默认关闭）；页面顶部提供 ComfyUI / Colab 运行状态卡片用于只读探活、网页端 Google 账号登录授权（支持跨电脑复制链接）、按需一键启动主节点及第 2 节点、确认 Google Drive 授权与带在途保护的终止实例。选择 `RunningHub` 时填写 `RUNNINGHUB_API_KEY`。不勾选保存则只存当前服务内存。空白 key 保持已有值，已保存的 key 不回传浏览器。`.env` 已被 git 忽略，支持 POSIX 权限的平台使用 0600；key 不写入浏览器存储或任务 JSON。也可预先按 `.env.example` 手动配置；已 export 的环境变量在启动时优先于 .env。
 
 工作台固定 `H3_REWRITER=llm`，不探测或运行 Claude。选择「文字模型服务」后，分别填写「构图规划模型」和「提示词改写模型」的模型 ID，两项可不同；保存后用于新启动的任务，已有模型产物继续复用，正在运行的子进程不变。
 

@@ -705,6 +705,14 @@ class WorkbenchComfyTest(unittest.TestCase):
         ):
             self.assertIn(expected, files)
             self.assertTrue(files[expected].is_file())
+        self.assertIn("requirements-colab.txt", files)
+        self.assertTrue(files["requirements-colab.txt"].is_file())
+        ps1 = (config.ROOT / "scripts" / "windows-start.ps1").read_text(encoding="utf-8")
+        self.assertIn("requirements-colab.txt", ps1)
+        self.assertIn("colab-cli.sha256", ps1)
+        zh_win = json.loads((config.ROOT / "scripts" / "messages" / "windows-zh-CN.json").read_text(encoding="utf-8"))
+        en_win = json.loads((config.ROOT / "scripts" / "messages" / "windows-en.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(zh_win.keys()), set(en_win.keys()))
 
     # Value: protects=workbench live_progress projection and ComfyUI segment metadata cleanup on reconciliation; fails_when=Jobs.snapshot leaks live_progress after completion, segments.view exposes non-pending live_progress, or preview_reconciled_segments drops provider/comfyui_url on terminal failure or leaves stale comfyui_key_fp/comfyui_url on reset; why_new=no Python workbench test previously asserted live_progress projection or ComfyUI metadata reconciliation; seam=none; no_claim=does not test browser DOM rendering
     def test_workbench_snapshot_and_segment_reconcile_live_progress_and_comfy_metadata(self):
@@ -899,6 +907,103 @@ class WorkbenchComfyTest(unittest.TestCase):
             start_mock2.assert_not_called()
             launch_mock.assert_not_called()
             self.assertFalse(jobs.snapshot(job_id)["review"]["complete"])
+
+    def test_workbench_cli_auth_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_file = root / ".env"
+            env_file.write_text(
+                "VIDEO_PROVIDER=comfyui\nCOMFYUI_URL=https://demo.ngrok-free.dev\nCOMFYUI_API_KEY=k-secret\n",
+                encoding="utf-8",
+            )
+            app = server.create_app(root / ".workbench", env_file)
+            self.addCleanup(app.extensions["jobs"].close)
+            self.addCleanup(app.extensions["colab_runtime"].close)
+            client = app.test_client()
+            headers = {"X-Workbench": "1", "Accept-Language": "en"}
+            runtime = app.extensions["colab_runtime"]
+
+            with mock.patch.object(
+                runtime,
+                "start_cli_auth",
+                return_value={
+                    "started": True,
+                    "already_authenticated": False,
+                    "auth_url": "https://accounts.google.com/o/oauth2/auth?client_id=test",
+                    "status": {"state": "awaiting_cli_auth", "cli_available": True},
+                },
+            ) as start_mock:
+                r1 = client.post("/api/runtime/cli-auth/start", headers=headers, json={"restart": True})
+            self.assertEqual(r1.status_code, 200)
+            self.assertEqual(r1.get_json()["auth_url"], "https://accounts.google.com/o/oauth2/auth?client_id=test")
+            start_mock.assert_called_once()
+            self.assertTrue(start_mock.call_args.kwargs.get("restart"))
+
+            with mock.patch.object(
+                runtime,
+                "submit_cli_auth_code",
+                return_value={"accepted": True, "authenticated": True, "status": {"state": "offline", "cli_available": True}},
+            ) as submit_mock:
+                r2 = client.post("/api/runtime/cli-auth/submit", headers=headers, json={"code": "4/0A-secret", "auth_id": "sess-123"})
+            self.assertEqual(r2.status_code, 200)
+            self.assertTrue(r2.get_json()["authenticated"])
+            submit_mock.assert_called_once()
+            self.assertEqual(submit_mock.call_args.kwargs.get("auth_id"), "sess-123")
+
+            r_bad = client.post("/api/runtime/cli-auth/submit", headers=headers, json={"code": 123})
+            self.assertEqual(r_bad.status_code, 400)
+            self.assertNotIn("123", r_bad.get_json()["error"])
+
+            r_bad_root = client.post("/api/runtime/cli-auth/submit", headers=headers, json="4/0A-top-level-secret")
+            self.assertEqual(r_bad_root.status_code, 400)
+            self.assertNotIn("4/0A-top-level-secret", r_bad_root.get_json()["error"])
+
+            with mock.patch.object(
+                runtime,
+                "cancel_cli_auth",
+                return_value={"cancelled": True, "stale": False, "status": {"state": "cli_auth_required", "cli_available": True}},
+            ) as cancel_mock:
+                r3 = client.post("/api/runtime/cli-auth/cancel", headers=headers, json={"auth_id": "sess-123"})
+            self.assertEqual(r3.status_code, 200)
+            self.assertTrue(r3.get_json()["cancelled"])
+            self.assertEqual(cancel_mock.call_args.kwargs.get("auth_id"), "sess-123")
+
+            # Redacts COMFYUI_API_KEY in keyring_warning/cli_auth.error and rejects non-bool restart / missing CSRF
+            r_csrf = client.post("/api/runtime/cli-auth/start", json={})
+            self.assertEqual(r_csrf.status_code, 400)
+            r_bad_restart = client.post("/api/runtime/cli-auth/start", headers=headers, json={"restart": "yes"})
+            self.assertEqual(r_bad_restart.status_code, 400)
+            with mock.patch.object(
+                runtime,
+                "submit_cli_auth_code",
+                return_value={
+                    "accepted": False,
+                    "authenticated": False,
+                    "keyring_warning": "warn k-secret",
+                    "status": {"state": "cli_auth_required", "cli_auth": {"error": "err k-secret"}},
+                },
+            ):
+                r_red = client.post("/api/runtime/cli-auth/submit", headers=headers, json={"code": "abc"})
+            self.assertEqual(r_red.status_code, 200)
+            self.assertNotIn("k-secret", json.dumps(r_red.get_json()))
+
+            # Packaging/bootstrap invariants: upper bound in requirements-colab.txt and try/catch + reuse import check in ps1
+            req_colab = (config.ROOT / "requirements-colab.txt").read_text(encoding="utf-8")
+            self.assertIn("<0.9", req_colab)
+            ps1 = (config.ROOT / "scripts" / "windows-start.ps1").read_text(encoding="utf-8")
+            self.assertIn("colab-cli.sha256", ps1)
+            colab_idx = ps1.index("$colabRequirements =")
+            colab_block = ps1[colab_idx:ps1.index("ffmpeg.exe", colab_idx)]
+            self.assertLess(colab_block.index("try {"), colab_block.index("Get-FileHash"))
+            self.assertGreaterEqual(colab_block.count("import colab_cli.cli"), 2)
+            self.assertIn("--force-reinstall", colab_block)
+            self.assertIn("Remove-Item -LiteralPath $colabStamp", colab_block)
+            # Even when colabStamp is absent (e.g., after offline retry or missing colab.exe), script falls back to --force-reinstall
+            self.assertGreaterEqual(colab_block.count("--force-reinstall"), 2)
+            # Constrains colab-cli install against requirements-web.txt and recovers Flask + dependencies.sha256 in catch
+            self.assertGreaterEqual(colab_block.count("'-c', $webRequirements"), 2)
+            self.assertIn("import flask, PIL; from workbench.server import create_app", colab_block)
+            self.assertIn("Remove-Item -LiteralPath $dependencyStamp", colab_block)
 
 
 if __name__ == "__main__":

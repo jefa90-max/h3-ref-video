@@ -2,6 +2,7 @@
 import io
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -977,6 +978,508 @@ class ColabRuntimeTest(unittest.TestCase):
                 mgr3._worker_thread.join(timeout=5.0)
             self.assertEqual(attempts3["n"], 1)
             self.assertIn("Backend rejected accelerator", mgr3._last_error or "")
+
+    def test_cli_auth_detection_and_cross_device_code_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            storage = root / ".workbench"
+            marker = root / "logged_in"
+            fake_cli = root / "fake_colab.py"
+            fake_cli.write_text(
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "marker = Path(os.environ['FAKE_COLAB_MARKER'])\n"
+                "if marker.exists():\n"
+                "    print('[colab] No active sessions found on server.')\n"
+                "    sys.exit(0)\n"
+                "print('To authorize colab-cli, visit this URL in any browser:\\n', file=sys.stderr, flush=True)\n"
+                "print('  https://accounts.google.com/o/oauth2/auth?client_id=test&token_usage=remote\\n', file=sys.stderr, flush=True)\n"
+                "sys.stdout.write('Enter the authorization code: ')\n"
+                "sys.stdout.flush()\n"
+                "code = sys.stdin.readline().strip()\n"
+                "if not code:\n"
+                "    print('EOFError: EOF when reading a line', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "if code == 'valid-code-secret-999':\n"
+                "    if os.environ.get('FAKE_KEYRING_WARN') == '1':\n"
+                "        print('Warning: Could not save the OAuth token to the OS keyring (limit)', file=sys.stderr)\n"
+                "    marker.write_text('ok', encoding='utf-8')\n"
+                "    print('[colab] No active sessions found on server.')\n"
+                "    sys.exit(0)\n"
+                "print(f'invalid_grant for {code}', file=sys.stderr)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            fake_bin = self._write_fake_colab_wrapper(root, fake_cli)
+
+            mgr = colab_runtime.ColabRuntimeManager(storage, cli_auth_timeout=10.0)
+            self.addCleanup(mgr.close)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://demo.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret",
+                "COLAB_BIN": str(fake_bin),
+                "FAKE_COLAB_MARKER": str(marker),
+                "H3_LANG": "en",
+            }
+            with patch.object(colab_runtime, "probe_comfyui", return_value={"online": False, "configured": True, "nodes": [], "online_count": 0, "total_count": 1}):
+                st0 = mgr.status(env)
+                self.assertEqual(st0["state"], "cli_auth_required")
+                self.assertEqual(st0["cli_auth"]["state"], "required")
+
+                # ADC mode rejects web OAuth code flow
+                with self.assertRaises(ValueError):
+                    mgr.start_cli_auth({**env, "COLAB_AUTH": "adc"})
+
+                # Start OAuth flow -> returns URL without leaking secrets
+                started = mgr.start_cli_auth(env)
+                self.assertTrue(started["started"])
+                self.assertFalse(started["already_authenticated"])
+                self.assertEqual(
+                    started["auth_url"],
+                    "https://accounts.google.com/o/oauth2/auth?client_id=test&token_usage=remote",
+                )
+                self.assertEqual(started["status"]["state"], "awaiting_cli_auth")
+
+                # Submitting wrong code fails cleanly and NEVER leaks the submitted code
+                bad = mgr.submit_cli_auth_code("wrong-secret-code-123", env)
+                self.assertFalse(bad["accepted"])
+                self.assertFalse(bad["authenticated"])
+                self.assertNotIn("wrong-secret-code-123", bad["error"] or "")
+
+                # Restart, cancel cleanly
+                started2 = mgr.start_cli_auth(env, restart=True)
+                self.assertTrue(started2["started"])
+                cancelled = mgr.cancel_cli_auth(env)
+                self.assertTrue(cancelled["cancelled"])
+                self.assertEqual(cancelled["status"]["state"], "cli_auth_required")
+
+                # Start again and submit valid code with keyring warning check
+                started3 = mgr.start_cli_auth({**env, "FAKE_KEYRING_WARN": "1"})
+                self.assertTrue(started3["started"])
+                ok = mgr.submit_cli_auth_code("valid-code-secret-999", {**env, "FAKE_KEYRING_WARN": "1"})
+                self.assertTrue(ok["accepted"])
+                self.assertTrue(ok["authenticated"])
+                self.assertTrue(ok["keyring_warning"])
+                self.assertEqual(ok["status"]["state"], "offline")
+
+                # Starting again when already logged in reports already_authenticated
+                again = mgr.start_cli_auth(env)
+                self.assertFalse(again["started"])
+                self.assertTrue(again["already_authenticated"])
+
+    @staticmethod
+    def _write_fake_colab_wrapper(root: Path, script_path: Path) -> Path:
+        if os.name == "nt":
+            wrapper = root / "colab.cmd"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{script_path}" %*\r\n', encoding="utf-8")
+            return wrapper
+        wrapper = root / "colab"
+        wrapper.write_text(f"#!/bin/sh\nexec {sys.executable!r} {str(script_path)!r} \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def test_cli_auth_review_regressions_lock_secondary_node_concurrency_deadline_and_scrubbing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            storage = root / ".workbench"
+            marker = root / "logged_in"
+            pids_file = root / "pids.txt"
+            fake_cli = root / "fake_colab_edge.py"
+            fake_cli.write_text(
+                "import os, sys, time, urllib.parse\n"
+                "from pathlib import Path\n"
+                "with open(os.environ['PIDS_FILE'], 'a', encoding='utf-8') as fh:\n"
+                "    fh.write(f'{os.getpid()}\\n')\n"
+                "marker = Path(os.environ['FAKE_COLAB_MARKER'])\n"
+                "if marker.exists():\n"
+                "    print('[colab] No active sessions found on server.')\n"
+                "    sys.exit(0)\n"
+                "delay = float(os.environ.get('START_DELAY', '0'))\n"
+                "if delay:\n"
+                "    time.sleep(delay)\n"
+                "print('To authorize colab-cli, visit:', file=sys.stderr, flush=True)\n"
+                "print('  https://accounts.google.com/o/oauth2/auth?x=edge', file=sys.stderr, flush=True)\n"
+                "sys.stdout.write('Enter the authorization code: ')\n"
+                "sys.stdout.flush()\n"
+                "code = sys.stdin.readline().strip()\n"
+                "if not code:\n"
+                "    sys.exit(1)\n"
+                "verify_delay = float(os.environ.get('VERIFY_DELAY', '0'))\n"
+                "if verify_delay:\n"
+                "    time.sleep(verify_delay)\n"
+                "if code == '4/0A-good-code':\n"
+                "    marker.write_text('ok', encoding='utf-8')\n"
+                "    print('[colab] No active sessions found on server.')\n"
+                "    sys.exit(0)\n"
+                "enc = urllib.parse.quote(code, safe='')\n"
+                "print(f'HTTP error body code={enc} raw={code} access_token=ya29.secret_tok', file=sys.stderr)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            fake_bin = self._write_fake_colab_wrapper(root, fake_cli)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://primary.ngrok-free.dev,https://sec-ephem.trycloudflare.com",
+                "COMFYUI_API_KEY": "k-secret",
+                "COLAB_BIN": str(fake_bin),
+                "FAKE_COLAB_MARKER": str(marker),
+                "PIDS_FILE": str(pids_file),
+                "H3_LANG": "en",
+            }
+            mgr = colab_runtime.ColabRuntimeManager(storage, cli_auth_timeout=10.0)
+            self.addCleanup(mgr.close)
+            mgr._set_remembered_node(
+                "secondary",
+                {"url": "https://sec-ephem.trycloudflare.com", "session": "h3-comfy-2"},
+            )
+            removed_urls = []
+            mgr.set_url_change_callback(lambda slot, old, new: removed_urls.append((slot, old, new)))
+
+            offline_probe = {
+                "online": False, "configured": True, "devices": [], "nodes": [],
+                "online_count": 0, "total_count": 2,
+            }
+
+            # 1) Active CLI auth status() must NOT wipe remembered secondary node when sessions query is skipped
+            with patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe):
+                mgr.start_cli_auth(env)
+                st = mgr.status(env)
+            self.assertEqual(st["state"], "awaiting_cli_auth")
+            self.assertEqual((mgr.remembered_node("secondary") or {}).get("url"), "https://sec-ephem.trycloudflare.com")
+            self.assertEqual(removed_urls, [])
+
+            # 2) Reusing active awaiting_cli_auth via start_cli_auth(restart=False) must release self._lock before probe_comfyui
+            lock_free = []
+            def probe_checks_lock(*_a, **_kw):
+                def check():
+                    got = mgr._lock.acquire(blocking=False)
+                    if got:
+                        mgr._lock.release()
+                    lock_free.append(got)
+                t = threading.Thread(target=check)
+                t.start()
+                t.join(2.0)
+                return offline_probe
+
+            with patch.object(colab_runtime, "probe_comfyui", side_effect=probe_checks_lock):
+                reused = mgr.start_cli_auth(env, restart=False)
+            self.assertTrue(reused["started"])
+            self.assertEqual(lock_free, [True])
+
+            # 3) Generic failure echoes URL-encoded %2F code and OAuth tokens -> both must be scrubbed
+            bad = mgr.submit_cli_auth_code("4/0A-secret-code", env)
+            self.assertFalse(bad["authenticated"])
+            self.assertNotIn("4/0A-secret-code", bad["error"] or "")
+            self.assertNotIn("4%2F0A-secret-code", bad["error"] or "")
+            self.assertNotIn("ya29.secret_tok", bad["error"] or "")
+
+            # 4) Concurrent start_cli_auth() must serialize without leaking orphan subprocesses or returning auth_url=None
+            pids_file.write_text("", encoding="utf-8")
+            slow_env = {**env, "START_DELAY": "0.15"}
+            barrier = threading.Barrier(2)
+            concurrent_results = []
+            def worker():
+                barrier.wait()
+                try:
+                    concurrent_results.append(("ok", mgr.start_cli_auth(slow_env)))
+                except Exception as exc:
+                    concurrent_results.append(("err", exc))
+            with patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe):
+                t1 = threading.Thread(target=worker)
+                t2 = threading.Thread(target=worker)
+                t1.start(); t2.start()
+                t1.join(5.0); t2.join(5.0)
+                spawned = [int(x) for x in pids_file.read_text(encoding="utf-8").splitlines() if x.strip()]
+                mgr.cancel_cli_auth(env)
+            self.assertEqual(sorted(k for k, _ in concurrent_results), ["err", "ok"])
+            for kind, val in concurrent_results:
+                if kind == "ok":
+                    self.assertTrue(val["auth_url"])
+                else:
+                    self.assertIsInstance(val, colab_runtime.RuntimeBusyError)
+            self.assertEqual(len(spawned), 1, f"Expected serialized single spawn, got pids={spawned}")
+
+            # 5) Calling start_cli_auth(restart=False) during verifying_cli_auth must raise RuntimeBusyError,
+            #    deadline must extend past short cli_auth_timeout after submit, and stale slot auth_required error must clear
+            mgr_short = colab_runtime.ColabRuntimeManager(root / ".wb2", cli_auth_timeout=0.35)
+            self.addCleanup(mgr_short.close)
+            mgr_short._slots["primary"].last_error = colab_runtime.message("colab_cli_auth_required")
+            mgr_short._slots["primary"].auth_required_error = True
+            verify_env = {**env, "VERIFY_DELAY": "0.5"}
+            with patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe):
+                mgr_short.start_cli_auth(verify_env)
+                submit_out = {}
+                def do_submit():
+                    submit_out["res"] = mgr_short.submit_cli_auth_code("4/0A-good-code", verify_env)
+                st_thread = threading.Thread(target=do_submit)
+                st_thread.start()
+                deadline_wait = time.monotonic() + 2.0
+                while time.monotonic() < deadline_wait:
+                    if mgr_short._cli_auth.active_state == "verifying_cli_auth":
+                        break
+                    # gstack-timing-ok: polling worker thread transition into verifying_cli_auth within 2s timeout
+                    time.sleep(0.01)
+                with self.assertRaises(colab_runtime.RuntimeBusyError):
+                    mgr_short.start_cli_auth(verify_env, restart=False)
+                st_thread.join(5.0)
+            self.assertTrue(submit_out["res"]["authenticated"])
+            self.assertEqual(submit_out["res"]["status"]["state"], "offline")
+            self.assertIsNone(mgr_short._slots["primary"].last_error)
+
+            # 6) Timeout constants must exceed google-colab-cli's 30s KEYRING_TIMEOUT_SECONDS
+            self.assertGreaterEqual(colab_runtime.CLI_AUTH_START_WAIT_SEC, 40.0)
+            self.assertGreaterEqual(colab_runtime.CLI_AUTH_SUBMIT_TIMEOUT_SEC, 60.0)
+
+            # 7) Windows _kill_process_tree invokes taskkill /T /F /PID
+            fake_proc = MagicMock(pid=43210)
+            with patch.object(colab_runtime.os, "name", "nt"), \
+                 patch.object(colab_runtime.subprocess, "run") as run_mock:
+                colab_runtime._kill_process_tree(fake_proc)
+            run_mock.assert_called_once()
+            cmd_args = run_mock.call_args.args[0]
+            self.assertEqual(cmd_args[:4], ["taskkill", "/T", "/F", "/PID"])
+            self.assertEqual(cmd_args[4], "43210")
+
+    def test_pass2_cli_auth_cancel_during_spawn_short_code_scrub_and_stop_auth_required(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_cli = root / "fake_colab_p2.py"
+            fake_cli.write_text(
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "if 'stop' in args:\n"
+                "    print('To authorize colab-cli, visit: https://accounts.google.com/o/oauth2/auth?stop=1', file=sys.stderr)\n"
+                "    print('EOFError: EOF when reading a line', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "print('To authorize colab-cli: https://accounts.google.com/o/oauth2/auth?p2=1', file=sys.stderr, flush=True)\n"
+                "sys.stdout.write('Enter the authorization code: ')\n"
+                "sys.stdout.flush()\n"
+                "code = sys.stdin.readline().strip()\n"
+                "print('OAuth error: invalid_grant: malformed auth code', file=sys.stderr)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            fake_bin = self._write_fake_colab_wrapper(root, fake_cli)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://primary.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret",
+                "COLAB_BIN": str(fake_bin),
+                "H3_LANG": "en",
+            }
+            mgr = colab_runtime.ColabRuntimeManager(root / ".workbench", cli_auth_timeout=10.0)
+            self.addCleanup(mgr.close)
+            offline_probe = {"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}
+
+            # 1) cancel_cli_auth() called while start_cli_auth() is inside subprocess.Popen must kill spawned proc and not resurrect state
+            orig_popen = colab_runtime.subprocess.Popen
+            entered_popen = threading.Event()
+            release_popen = threading.Event()
+            spawned_procs = []
+
+            def delayed_popen(*args, **kwargs):
+                proc = orig_popen(*args, **kwargs)
+                if not spawned_procs:
+                    spawned_procs.append(proc)
+                    entered_popen.set()
+                    release_popen.wait(timeout=5.0)
+                return proc
+
+            start_outcome = {}
+            def run_start():
+                try:
+                    start_outcome["res"] = mgr.start_cli_auth(env)
+                except Exception as exc:
+                    start_outcome["err"] = exc
+
+            with patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe), \
+                 patch.object(colab_runtime.subprocess, "Popen", side_effect=delayed_popen):
+                t = threading.Thread(target=run_start)
+                t.start()
+                self.assertTrue(entered_popen.wait(timeout=3.0))
+                mgr.cancel_cli_auth(env)
+                release_popen.set()
+                t.join(timeout=5.0)
+            self.assertIn("err", start_outcome, f"Cancelled start_cli_auth must not succeed: {start_outcome}")
+            self.assertIsNone(mgr._cli_auth.active_state)
+            self.assertEqual(len(spawned_procs), 1)
+            self.assertIsNotNone(spawned_procs[0].poll(), "Spawned proc must be terminated after cancel-during-spawn")
+
+            # 2) Short mis-pasted code 'a' must NOT corrupt 'invalid_grant' classification
+            with colab_runtime.use_lang("en"):
+                with patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe):
+                    mgr.start_cli_auth(env)
+                    bad_short = mgr.submit_cli_auth_code("a", env)
+                self.assertEqual(bad_short["error"], colab_runtime.message("colab_cli_auth_invalid_code"))
+                self.assertNotIn("[REDACTED]", bad_short["error"] or "")
+
+                # 3) Online ComfyUI + expired CLI token during stop() must surface colab_cli_auth_required and expose cli_auth.state='required'
+                online_probe = {
+                    "online": True, "configured": True, "devices": [{"name": "G4"}],
+                    "nodes": [{"url": "https://primary.ngrok-free.dev", "online": True, "auth_failed": False, "devices": [{"name": "G4"}]}],
+                    "online_count": 1, "total_count": 1,
+                }
+                with patch.object(colab_runtime, "probe_comfyui", return_value=online_probe), \
+                     patch.object(colab_runtime, "probe_remote_queue_count", return_value=0):
+                    with self.assertRaises(RuntimeError) as stop_err:
+                        mgr.stop(environ=env, force=True)
+                    self.assertEqual(str(stop_err.exception), colab_runtime.message("colab_cli_auth_required"))
+                    st_after = mgr.status(env)
+                self.assertEqual(st_after["state"], "online")
+                self.assertEqual(st_after["cli_auth"]["state"], "required")
+
+    def test_ship_pass1_auth_id_sticky_hint_keepalive_start_race_and_scrubbing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "logged_in"
+            fake_cli = root / "fake_colab_p1.py"
+            fake_cli.write_text(
+                "import os, sys, urllib.parse\n"
+                "from pathlib import Path\n"
+                "marker = Path(os.environ['FAKE_COLAB_MARKER'])\n"
+                "args = sys.argv[1:]\n"
+                "if 'exec' in args:\n"
+                "    if not marker.exists():\n"
+                "        print('To authorize colab-cli, visit: https://accounts.google.com/o/oauth2/auth?ka=1', file=sys.stderr)\n"
+                "        print('Enter the authorization code:', file=sys.stderr)\n"
+                "        sys.exit(1)\n"
+                "    print('keepalive')\n"
+                "    sys.exit(0)\n"
+                "if marker.exists():\n"
+                "    print('[colab] No active sessions found on server.')\n"
+                "    sys.exit(0)\n"
+                "print('To authorize colab-cli: https://accounts.google.com/o/oauth2/auth?tab=1', file=sys.stderr, flush=True)\n"
+                "sys.stdout.write('Enter the authorization code: ')\n"
+                "sys.stdout.flush()\n"
+                "code = sys.stdin.readline().strip()\n"
+                "if not code:\n"
+                "    sys.exit(1)\n"
+                "low_enc = urllib.parse.quote(code, safe='').lower()\n"
+                "print(f'oauth err lower={low_enc}', file=sys.stderr)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            fake_bin = self._write_fake_colab_wrapper(root, fake_cli)
+            env = {
+                "VIDEO_PROVIDER": "comfyui",
+                "COMFYUI_URL": "https://primary.ngrok-free.dev",
+                "COMFYUI_API_KEY": "k-secret",
+                "COLAB_BIN": str(fake_bin),
+                "FAKE_COLAB_MARKER": str(marker),
+                "H3_LANG": "en",
+            }
+            offline_probe = {"online": False, "configured": True, "devices": [], "nodes": [], "online_count": 0, "total_count": 1}
+            online_probe = {
+                "online": True, "configured": True, "devices": [{"name": "G4"}],
+                "nodes": [{"url": "https://primary.ngrok-free.dev", "online": True, "auth_failed": False, "devices": [{"name": "G4"}]}],
+                "online_count": 1, "total_count": 1,
+            }
+            mgr = colab_runtime.ColabRuntimeManager(root / ".workbench", cli_auth_timeout=10.0)
+            self.addCleanup(mgr.close)
+
+            # 1) Cross-tab auth_id guards stale submit and stale cancel after restart; start_async rejected during active CLI auth
+            with patch.object(colab_runtime, "probe_comfyui", return_value=offline_probe):
+                s1 = mgr.start_cli_auth(env)
+                id1 = s1["auth_id"]
+                self.assertTrue(id1)
+                self.assertEqual(s1["status"]["cli_auth"]["auth_id"], id1)
+                with self.assertRaises(colab_runtime.RuntimeBusyError):
+                    mgr.start_async(env)
+
+                s2 = mgr.start_cli_auth(env, restart=True)
+                id2 = s2["auth_id"]
+                self.assertNotEqual(id1, id2)
+
+                # Stale tab cancel must NOT kill active session id2
+                stale_cancel = mgr.cancel_cli_auth(env, auth_id=id1)
+                self.assertFalse(stale_cancel["cancelled"])
+                self.assertTrue(stale_cancel["stale"])
+                self.assertEqual(mgr._cli_auth.auth_id, id2)
+                self.assertEqual(mgr._cli_auth.active_state, "awaiting_cli_auth")
+
+                # Stale tab submit must raise ValueError without consuming id2's process
+                with self.assertRaises(ValueError):
+                    mgr.submit_cli_auth_code("4/0A-stale", env, auth_id=id1)
+                self.assertEqual(mgr._cli_auth.active_state, "awaiting_cli_auth")
+
+                # Malformed codes rejected (empty, NUL, newline, >2048)
+                for bad_code in ("", "   ", "a\nb", "a\x00b", "x" * 2049):
+                    with self.assertRaises(ValueError):
+                        mgr.submit_cli_auth_code(bad_code, env, auth_id=id2)
+
+                # Lowercase percent-encoded auth code (%2f) must be scrubbed from failure output
+                bad_res = mgr.submit_cli_auth_code("4/0A-LowerScrub", env, auth_id=id2)
+                self.assertFalse(bad_res["authenticated"])
+                self.assertNotIn("4%2f0a-lowerscrub", (bad_res["error"] or "").lower())
+
+            # 2) Unauthenticated keepalive detects OAuth prompt, sets _cli_auth_required_hint, and skips subsequent keepalive calls
+            with patch.object(colab_runtime, "probe_comfyui", return_value=online_probe), \
+                 patch.object(colab_runtime, "probe_remote_queue_count", return_value=1):
+                mgr._cli_auth_required_hint = False
+                mgr._slots["primary"].last_keepalive_at = 0.0
+                mgr._slots["primary"].last_keepalive_fail_at = None
+                self.assertFalse(mgr.maybe_send_kernel_keepalive(env, now=1000.0, force_busy=True))
+                self.assertTrue(mgr._cli_auth_required_hint)
+
+                with patch.object(mgr, "_run_cmd_for_slot", side_effect=AssertionError("keepalive must skip while cli_auth_required_hint is set")):
+                    self.assertFalse(mgr.maybe_send_kernel_keepalive(env, now=2000.0, force_busy=True))
+
+                # 3) Switching to COLAB_AUTH=adc must clear sticky cli_auth_required state
+                st_adc = mgr.status({**env, "COLAB_AUTH": "adc"})
+                self.assertEqual(st_adc["cli_auth"]["state"], "idle")
+
+                # 4) Online node with sticky cli_auth_required_hint re-queries sessions and clears once terminal login completes
+                mgr._cli_auth_required_hint = True
+                mgr._sessions_cache = None
+                marker.write_text("ok", encoding="utf-8")
+                st_recovered = mgr.status(env)
+                self.assertEqual(st_recovered["state"], "online")
+                self.assertEqual(st_recovered["cli_auth"]["state"], "idle")
+                self.assertFalse(mgr._cli_auth_required_hint)
+
+            # 4) submit_cli_auth_code() must reject submission if auth_url was never emitted
+            mgr._cli_auth = colab_runtime._CliAuthState()
+            mgr._cli_auth.active_state = "awaiting_cli_auth"
+            mgr._cli_auth.auth_url = None
+            mgr._cli_auth.proc = MagicMock(pid=None, poll=MagicMock(return_value=None), stdin=MagicMock())
+            with self.assertRaises(ValueError):
+                mgr.submit_cli_auth_code("4/0A-no-url-yet", env)
+
+    def test_kill_process_tree_ignores_non_int_and_unsafe_pids(self):
+        # On Linux glibc, os.killpg(1, SIGKILL) executes kill(-1, SIGKILL) and kills
+        # every process owned by the current user (including the CI runner when a
+        # MagicMock's default __index__() == 1 leaks into _kill_process_tree).
+        with patch.object(colab_runtime.os, "name", "posix"), \
+             patch.object(colab_runtime.os, "getpgrp", return_value=7777, create=True), \
+             patch.object(colab_runtime.os, "killpg", create=True) as killpg_mock, \
+             patch.object(colab_runtime.signal, "SIGKILL", 9, create=True):
+            unsafe_procs = [
+                MagicMock(),  # implicit MagicMock .pid with int(.pid) == 1
+                SimpleNamespace(pid=None, kill=MagicMock()),
+                SimpleNamespace(pid=False, kill=MagicMock()),
+                SimpleNamespace(pid=True, kill=MagicMock()),
+                SimpleNamespace(pid=-1, kill=MagicMock()),
+                SimpleNamespace(pid=0, kill=MagicMock()),
+                SimpleNamespace(pid=1, kill=MagicMock()),
+                SimpleNamespace(pid=7777, kill=MagicMock()),  # caller's own pgrp
+            ]
+            for proc in unsafe_procs:
+                colab_runtime._kill_process_tree(proc)
+                proc.kill.assert_called_once()
+            killpg_mock.assert_not_called()
+
+            safe_proc = SimpleNamespace(pid=99999, kill=MagicMock())
+            colab_runtime._kill_process_tree(safe_proc)
+            killpg_mock.assert_called_once_with(99999, 9)
+            safe_proc.kill.assert_called_once()
+
+        with patch.object(colab_runtime.os, "name", "nt"), \
+             patch.object(colab_runtime.subprocess, "run") as run_mock:
+            for proc in (MagicMock(), SimpleNamespace(pid=1, kill=MagicMock()), SimpleNamespace(pid=0, kill=MagicMock())):
+                colab_runtime._kill_process_tree(proc)
+                proc.kill.assert_called_once()
+            run_mock.assert_not_called()
 
 
 if __name__ == "__main__":

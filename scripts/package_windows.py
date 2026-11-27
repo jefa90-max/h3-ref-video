@@ -7,8 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FILES = (
-    "h3ref.py", "workbench.py", "requirements.txt", "requirements-web.txt", ".env.example", "LICENSE",
-    "start-windows.cmd", "examples/film.example.json", "docs/windows.md", "docs/workbench.md", "docs/vendor-plyr.md",
+    "h3ref.py", "workbench.py", "requirements.txt", "requirements-web.txt", "requirements-colab.txt",
+    ".env.example", "LICENSE", "start-windows.cmd",
+    "examples/film.example.json", "examples/dialogue-budget.json",
+    "docs/windows.md", "docs/workbench.md", "docs/vendor-plyr.md",
     "scripts/start_colab.py", "scripts/windows-start.ps1", "scripts/windows-runtime.json",
     "scripts/messages/windows-zh-CN.json", "scripts/messages/windows-en.json",
 )

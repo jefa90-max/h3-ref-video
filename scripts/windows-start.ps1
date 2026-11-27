@@ -134,10 +134,85 @@ try {
         Invoke-CheckedCommand $venvPython @('-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '-r', (Join-Path $projectRoot 'requirements-web.txt'))
         Invoke-CheckedCommand $venvPython @('-c', 'import flask, PIL; from workbench.server import create_app')
         [IO.File]::WriteAllText($dependencyStamp, $dependencyFingerprint)
+        $staleColabStamp = Join-Path $runtimeRoot 'colab-cli.sha256'
+        if (Test-Path -LiteralPath $staleColabStamp -PathType Leaf) {
+            Remove-Item -LiteralPath $staleColabStamp -Force -ErrorAction SilentlyContinue
+        }
     }
     else {
         Write-Host (Get-Message 'dependencies_reused')
         Invoke-CheckedCommand $venvPython @('-c', 'import flask, PIL; from workbench.server import create_app')
+    }
+    $colabRequirements = Join-Path $projectRoot 'requirements-colab.txt'
+    if (Test-Path -LiteralPath $colabRequirements -PathType Leaf) {
+        try {
+            $colabExecutable = Join-Path $venvRoot 'Scripts/colab.exe'
+            $colabStamp = Join-Path $runtimeRoot 'colab-cli.sha256'
+            $colabFingerprint = $pythonRuntime + "`n" + (Get-FileHash -LiteralPath $colabRequirements -Algorithm SHA256).Hash
+            $colabReady = (Test-Path -LiteralPath $colabExecutable -PathType Leaf) -and (Test-Path -LiteralPath $colabStamp -PathType Leaf)
+            if ($colabReady) {
+                $colabReady = (Get-Content -LiteralPath $colabStamp -Raw -Encoding UTF8) -eq $colabFingerprint
+            }
+            $colabForceReinstall = $false
+            if ($colabReady) {
+                try {
+                    Invoke-CheckedCommand $venvPython @('-c', 'import colab_cli.cli')
+                    Write-Host (Get-Message 'colab_cli_reused')
+                }
+                catch {
+                    $colabReady = $false
+                    $colabForceReinstall = $true
+                    if (Test-Path -LiteralPath $colabStamp -PathType Leaf) {
+                        Remove-Item -LiteralPath $colabStamp -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            if (-not $colabReady) {
+                Write-Host (Get-Message 'installing_colab_cli')
+                $webRequirements = Join-Path $projectRoot 'requirements-web.txt'
+                $colabPipArgs = @('-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '-c', $webRequirements)
+                if ($colabForceReinstall) {
+                    $colabPipArgs += '--force-reinstall'
+                }
+                $colabPipArgs += @('-r', $colabRequirements)
+                Invoke-CheckedCommand $venvPython $colabPipArgs
+                $colabInstallHealthy = (Test-Path -LiteralPath $colabExecutable -PathType Leaf)
+                if ($colabInstallHealthy) {
+                    try {
+                        Invoke-CheckedCommand $venvPython @('-c', 'import colab_cli.cli')
+                    }
+                    catch {
+                        $colabInstallHealthy = $false
+                    }
+                }
+                if (-not $colabInstallHealthy -and -not $colabForceReinstall) {
+                    Invoke-CheckedCommand $venvPython @('-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '--force-reinstall', '-c', $webRequirements, '-r', $colabRequirements)
+                }
+                if (-not (Test-Path -LiteralPath $colabExecutable -PathType Leaf)) {
+                    throw (Get-Message 'runtime_incomplete' @($colabExecutable))
+                }
+                Invoke-CheckedCommand $venvPython @('-c', 'import colab_cli.cli')
+                [IO.File]::WriteAllText($colabStamp, $colabFingerprint)
+            }
+        }
+        catch {
+            $colabErr = $_.Exception.Message
+            if ($colabStamp -and (Test-Path -LiteralPath $colabStamp -PathType Leaf)) {
+                Remove-Item -LiteralPath $colabStamp -Force -ErrorAction SilentlyContinue
+            }
+            try {
+                Invoke-CheckedCommand $venvPython @('-c', 'import flask, PIL; from workbench.server import create_app')
+            }
+            catch {
+                if (Test-Path -LiteralPath $dependencyStamp -PathType Leaf) {
+                    Remove-Item -LiteralPath $dependencyStamp -Force -ErrorAction SilentlyContinue
+                }
+                Invoke-CheckedCommand $venvPython @('-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '-r', (Join-Path $projectRoot 'requirements-web.txt'))
+                Invoke-CheckedCommand $venvPython @('-c', 'import flask, PIL; from workbench.server import create_app')
+                [IO.File]::WriteAllText($dependencyStamp, $dependencyFingerprint)
+            }
+            Write-Host (Get-Message 'colab_cli_failed' @($colabErr)) -ForegroundColor Yellow
+        }
     }
     Invoke-CheckedCommand (Join-Path $ffmpegRuntime 'bin/ffmpeg.exe') @('-version')
     Invoke-CheckedCommand (Join-Path $ffmpegRuntime 'bin/ffprobe.exe') @('-version')
