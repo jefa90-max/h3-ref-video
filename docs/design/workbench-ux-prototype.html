@@ -1,0 +1,1683 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>[运行中 18/36] 三块钱的牛肉骨 · H3 工作台原型</title>
+<style>
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --bg: #f3f5f2;
+  --surface: #ffffff;
+  --surface-alt: #f8faf7;
+  --wash: #edf5ef;
+  --ink: #203831;
+  --muted: #52655a;
+  --subtle: #74877c;
+  --accent: #237b60;
+  --accent-hover: #1c664f;
+  --accent-soft: #e6f3ec;
+  --border: #dfe5de;
+  --border-strong: #cdd7cd;
+  --warn-ink: #815a1c;
+  --warn-bg: #fff8e8;
+  --warn-border: #eddcb3;
+  --err-ink: #9b3d22;
+  --err-bg: #fff1eb;
+  --err-border: #f0cfc2;
+  --term-bg: #1e3127;
+  --term-bar: #18281f;
+  --term-ink: #d4e3d2;
+  --term-muted: #7f9d87;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --topbar-h: 54px;
+  --console-h: 230px;
+  --radius: 10px;
+  --shadow-sm: 0 1px 2px rgba(24, 42, 33, .05);
+  --shadow-md: 0 8px 24px rgba(20, 40, 30, .12);
+  --shadow-lg: 0 18px 44px rgba(16, 34, 25, .18);
+  color: var(--ink);
+  background: var(--bg);
+  font-size: 14px;
+  line-height: 1.55;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding-top: var(--topbar-h); padding-bottom: calc(var(--console-h) + 28px); min-height: 100vh; }
+body.console-collapsed { --console-h: 38px; }
+body.console-expanded { --console-h: 62vh; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .5; }
+[hidden] { display: none !important; }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* Top Navigation Bar */
+.topbar {
+  position: fixed; top: 0; left: 0; right: 0; height: var(--topbar-h); z-index: 40;
+  background: rgba(249, 251, 248, .94); backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 0 20px;
+}
+.topbar-left, .topbar-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink); margin-right: 6px; }
+.brand-mark { font-size: 20px; font-weight: 800; letter-spacing: -1px; display: inline-flex; align-items: baseline; }
+.brand-dot { width: 5px; height: 5px; border-radius: 2px; background: #5da65c; margin-left: 2px; }
+.brand-name { font-size: 12px; font-weight: 600; color: var(--muted); border-left: 1px solid var(--border-strong); padding-left: 10px; white-space: nowrap; }
+
+.nav-pills { display: inline-flex; background: #eaf0e9; padding: 3px; border-radius: 8px; gap: 2px; }
+.nav-pill {
+  border: 0; background: transparent; color: var(--muted); font-size: 13px; font-weight: 600;
+  padding: 5px 12px; border-radius: 6px; transition: background .15s, color .15s; white-space: nowrap;
+}
+.nav-pill:hover { color: var(--ink); }
+.nav-pill.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-sm); }
+
+/* Dropdowns & Pills */
+.rel { position: relative; }
+.chip-btn {
+  display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 11px;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--surface);
+  font-size: 12px; font-weight: 600; color: var(--ink); white-space: nowrap; transition: border-color .15s, background .15s;
+}
+.chip-btn:hover { border-color: var(--border-strong); background: var(--surface-alt); }
+.chip-btn.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: #94a39a; }
+.dot.online { background: #2d9d62; box-shadow: 0 0 0 3px rgba(45, 157, 98, .18); }
+.dot.warn { background: #d48a1c; box-shadow: 0 0 0 3px rgba(212, 138, 28, .2); }
+.dot.err { background: #cc4c2c; box-shadow: 0 0 0 3px rgba(204, 76, 44, .18); }
+.dot.pulse { animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.85); } }
+.badge-dot { width: 7px; height: 7px; border-radius: 50%; background: #d97706; position: absolute; top: 5px; right: 5px; }
+
+/* Popover Panels */
+.popover {
+  position: absolute; top: calc(100% + 8px); right: 0; width: 390px; max-width: calc(100vw - 24px);
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px;
+  box-shadow: var(--shadow-lg); padding: 14px; z-index: 60;
+}
+.popover.left { right: auto; left: 0; width: 410px; }
+.popover-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.popover-head strong { font-size: 13px; }
+.popover-section { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; }
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 34px; padding: 0 13px; border-radius: 7px; font-size: 13px; font-weight: 600;
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink);
+  white-space: nowrap; text-decoration: none; transition: all .15s;
+}
+.btn:hover:not(:disabled) { background: var(--surface-alt); border-color: #aebdb0; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-ink); }
+.btn.warn:hover:not(:disabled) { background: #fdf0d2; }
+.btn.danger { background: var(--err-bg); border-color: var(--err-border); color: var(--err-ink); }
+.btn.danger:hover:not(:disabled) { background: #fde2d8; }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--muted); padding: 0 8px; }
+.btn.ghost:hover:not(:disabled) { background: var(--wash); color: var(--ink); }
+.btn.sm { height: 28px; padding: 0 10px; font-size: 12px; border-radius: 6px; }
+.btn.lg { height: 42px; padding: 0 18px; font-size: 14px; }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.between { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.muted { color: var(--muted); font-size: 12px; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* Status Badges */
+.status {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; white-space: nowrap; background: #edf1ec; color: var(--muted);
+}
+.status.running { background: #e3f5ea; color: #1c6b45; }
+.status.pausing { background: var(--warn-bg); color: var(--warn-ink); }
+.status.paused { background: #eef2ff; color: #364ea8; }
+.status.stopped { background: #f3f1ee; color: #6b5f52; }
+.status.succeeded { background: #e3f5ea; color: #1c6b45; }
+.status.failed { background: var(--err-bg); color: var(--err-ink); }
+.tag { font-size: 11px; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--border); color: var(--muted); background: var(--surface-alt); }
+.tag.live { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-ink); }
+
+/* Prototype Scenario Switcher Banner */
+.proto-bar {
+  background: #233a2e; color: #e2eee0; padding: 7px 20px; font-size: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+}
+.proto-bar-label { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.proto-tag { background: #36624b; color: #d5f5e0; padding: 1px 7px; border-radius: 4px; font-size: 11px; }
+.proto-scenarios { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.proto-btn {
+  border: 1px solid #3f614f; background: rgba(255,255,255,.06); color: #d6e7d5;
+  padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+}
+.proto-btn:hover { background: rgba(255,255,255,.14); }
+.proto-btn.active { background: #52a376; border-color: #52a376; color: #0e2418; }
+
+/* Main Container */
+.shell { max-width: 1400px; margin: 0 auto; padding: 16px 20px 24px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); }
+
+/* Sticky Command Bar (Results Page) */
+.command-bar {
+  position: sticky; top: var(--topbar-h); z-index: 30;
+  background: rgba(255, 255, 255, .96); backdrop-filter: blur(10px);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  box-shadow: 0 4px 16px rgba(24, 42, 33, .07);
+  padding: 12px 16px; margin-bottom: 14px;
+}
+.cmd-top { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.cmd-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.cmd-title { font-size: 16px; font-weight: 700; margin: 0; letter-spacing: -.2px; }
+.cmd-metrics { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); padding-left: 10px; border-left: 1px solid var(--border); flex-wrap: wrap; }
+.cmd-metrics b { color: var(--ink); font-family: var(--mono); }
+.cmd-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* Live Concurrent Progress Strip inside Command Bar */
+.live-strip {
+  margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px;
+}
+.live-item {
+  background: var(--wash); border: 1px solid #d3e5d7; border-radius: 8px; padding: 8px 11px;
+}
+.live-item.pausing { background: var(--warn-bg); border-color: var(--warn-border); }
+.live-item-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; margin-bottom: 5px; }
+.live-item-head strong { color: var(--ink); font-weight: 600; }
+.bar-track { height: 5px; background: rgba(35, 123, 96, .16); border-radius: 999px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width .35s ease; }
+.bar-fill.indet { width: 35%; animation: slide 1.5s ease-in-out infinite; }
+@keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+
+/* Notice Strip */
+.notice {
+  padding: 9px 13px; border-radius: 8px; font-size: 12px; display: flex; align-items: center;
+  justify-content: space-between; gap: 12px; margin-bottom: 12px;
+}
+.notice.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-ink); }
+.notice.info { background: #eef4fa; border: 1px solid #d0dfef; color: #244a75; }
+.notice.err { background: var(--err-bg); border: 1px solid var(--err-border); color: var(--err-ink); }
+
+/* Pinned Final Video Banner */
+.final-banner { margin-bottom: 14px; overflow: hidden; }
+.final-banner-head {
+  padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: linear-gradient(90deg, #f3f9f5, #ffffff); border-bottom: 1px solid var(--border);
+}
+.final-banner-body { padding: 14px 16px; display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(240px, 1fr); gap: 18px; align-items: center; }
+.video-mock {
+  position: relative; aspect-ratio: 16 / 9; max-height: 290px; width: 100%;
+  background: linear-gradient(135deg, #1b2e24 0%, #2a4938 55%, #16241d 100%);
+  border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; padding: 14px; color: #e4f0e3;
+}
+.video-mock-center { margin: auto; text-align: center; }
+.play-circle {
+  width: 52px; height: 52px; border-radius: 50%; background: rgba(35, 123, 96, .92);
+  border: 2px solid rgba(255,255,255,.7); color: #fff; font-size: 18px; display: inline-flex;
+  align-items: center; justify-content: center; margin-bottom: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.3);
+}
+.video-controls {
+  display: flex; align-items: center; gap: 10px; font-size: 11px; font-family: var(--mono);
+  background: rgba(0,0,0,.38); padding: 6px 10px; border-radius: 6px;
+}
+.video-scrubber { flex: 1; height: 4px; background: rgba(255,255,255,.25); border-radius: 999px; overflow: hidden; }
+.video-scrubber > i { display: block; width: 38%; height: 100%; background: #6fd3a2; }
+
+/* Result Tabs */
+.tabs-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  border-bottom: 1px solid var(--border); margin-bottom: 14px; flex-wrap: wrap;
+}
+.tabs { display: flex; gap: 4px; }
+.tab-btn {
+  border: 0; border-bottom: 2px solid transparent; background: transparent; padding: 10px 16px;
+  font-size: 13px; font-weight: 600; color: var(--muted); display: inline-flex; align-items: center; gap: 7px;
+}
+.tab-btn:hover { color: var(--ink); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-count { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 999px; background: #eaf0e9; color: var(--muted); }
+.tab-btn.active .tab-count { background: var(--accent-soft); color: var(--accent); }
+
+/* Toolbar inside Tabs */
+.sub-toolbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+}
+.filter-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.filter-pill {
+  border: 1px solid var(--border); background: var(--surface-alt); color: var(--muted);
+  font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+}
+.filter-pill:hover { border-color: var(--border-strong); color: var(--ink); }
+.filter-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.filter-pill.err-pill { color: var(--err-ink); border-color: var(--err-border); background: var(--err-bg); }
+.filter-pill.err-pill.active { background: var(--err-ink); border-color: var(--err-ink); color: #fff; }
+
+/* Storyboard Compact Grid (4 columns desktop) */
+.frame-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.frame-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 9px; overflow: hidden;
+  transition: transform .12s, border-color .15s, box-shadow .15s; cursor: pointer; display: flex; flex-direction: column;
+}
+.frame-card:hover { border-color: #9dc2ad; box-shadow: 0 4px 14px rgba(35, 123, 96, .1); transform: translateY(-1px); }
+.frame-card.has-error { border-color: #e6b4a1; background: #fffbf9; }
+.frame-card.has-draft { border-color: #e5cb8d; }
+.frame-thumb {
+  position: relative; aspect-ratio: 16 / 10; background: #e8efe9; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.frame-thumb svg { width: 100%; height: 100%; display: block; }
+.frame-badges { position: absolute; top: 7px; left: 7px; right: 7px; display: flex; justify-content: space-between; align-items: flex-start; gap: 4px; pointer-events: none; }
+.frame-id { background: rgba(20, 38, 29, .78); color: #fff; font-family: var(--mono); font-size: 11px; padding: 2px 7px; border-radius: 5px; }
+.frame-body { padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
+.frame-caption { font-size: 12px; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.45; }
+.frame-meta { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--subtle); margin-top: auto; padding-top: 4px; }
+
+/* Storyboard Carousel (Large Review Mode) */
+.carousel-wrap { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(320px, 1fr); gap: 16px; align-items: start; }
+.carousel-stage { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.carousel-img { aspect-ratio: 16 / 10; background: #e6eee8; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+.carousel-img svg { width: 100%; height: 100%; }
+.carousel-inspector { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; display: grid; gap: 12px; }
+textarea, input[type="text"], input[type="password"], input[type="number"], select {
+  width: 100%; border: 1px solid var(--border-strong); border-radius: 7px; padding: 8px 10px;
+  background: var(--surface); font-size: 13px; color: var(--ink);
+}
+textarea { resize: vertical; line-height: 1.6; }
+.ref-chip-list { display: flex; gap: 6px; flex-wrap: wrap; }
+.ref-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--surface-alt); font-size: 12px;
+}
+.ref-chip .mini-av { width: 20px; height: 20px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; color: #fff; }
+
+/* Segment Cards (2 columns) */
+.seg-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.seg-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.seg-card.active-gen { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(35, 123, 96, .12); }
+.seg-video-box {
+  aspect-ratio: 16 / 9; max-height: 210px; border-radius: 8px; background: #1e3127; color: #d4e3d2;
+  display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 14px; text-align: center; gap: 8px;
+}
+.seg-video-box.ready { background: linear-gradient(135deg, #21372c, #2e5240); justify-content: space-between; align-items: stretch; }
+.seg-prompt-box { border-top: 1px solid var(--border); padding-top: 10px; }
+.seg-prompt-box summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--accent); }
+
+/* Report & Artifacts Tab */
+.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+.kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; }
+.kpi-card small { display: block; color: var(--muted); font-size: 12px; }
+.kpi-card strong { display: block; font-size: 22px; font-family: var(--mono); color: var(--ink); margin-top: 3px; }
+.artifact-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.artifact-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 11px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-alt);
+  font-size: 12px; font-family: var(--mono); text-decoration: none; color: var(--ink);
+}
+.artifact-item:hover { border-color: var(--accent); background: var(--wash); }
+
+/* Create Page: Left Editor + Right Sticky Launchpad */
+.create-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; align-items: start; }
+.launchpad { position: sticky; top: calc(var(--topbar-h) + 14px); display: grid; gap: 14px; }
+.card-pad { padding: 16px 18px; }
+.section-title { font-size: 14px; font-weight: 700; margin: 0; }
+.summary-strip {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  padding: 7px 11px; border-radius: 7px; background: var(--wash); border: 1px solid #d5e5d8;
+  font-size: 12px; margin-top: 8px;
+}
+.dropzone {
+  border: 1.5px dashed #adc4b0; border-radius: 9px; background: #f8fbf7; padding: 12px 14px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 10px 0;
+}
+.dropzone:hover { border-color: var(--accent); background: var(--wash); }
+
+/* Compact 2-Col Cast Cards */
+.cast-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.cast-card {
+  border: 1px solid var(--border); border-radius: 9px; padding: 10px; background: var(--surface-alt);
+  display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; align-items: center;
+}
+.cast-card.uploaded { background: var(--surface); border-color: #c5decb; }
+.cast-card.missing { border-color: var(--warn-border); background: #fffdf7; }
+.cast-thumb {
+  width: 64px; height: 76px; border-radius: 6px; border: 1px dashed var(--border-strong);
+  background: var(--wash); display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--muted); text-align: center; overflow: hidden;
+}
+.cast-card.uploaded .cast-thumb { border-style: solid; border-color: #b7d6bf; }
+.cast-info { min-width: 0; display: grid; gap: 4px; }
+.cast-name { font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.cast-desc { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mode-box { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--warn-border); background: var(--warn-bg); }
+.mode-box.demo { border-color: var(--border); background: var(--surface-alt); }
+
+/* History List */
+.history-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border-radius: 7px; border: 1px solid transparent; background: var(--surface-alt);
+  transition: all .12s; cursor: pointer;
+}
+.history-item:hover { background: var(--wash); border-color: #cfe0d2; }
+.history-item.current { background: var(--accent-soft); border-color: #9ecbb3; }
+.history-main { min-width: 0; flex: 1; }
+.history-title { font-size: 12px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-sub { font-size: 11px; color: var(--muted); }
+
+/* Right Slide-over Settings Drawer */
+.backdrop { position: fixed; inset: 0; background: rgba(16, 30, 22, .35); z-index: 70; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 520px; max-width: 94vw; z-index: 80;
+  background: var(--surface); box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
+}
+.drawer-head { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.drawer-tabs { display: flex; gap: 4px; padding: 10px 20px 0; border-bottom: 1px solid var(--border); background: var(--surface-alt); }
+.drawer-body { padding: 18px 20px; overflow: auto; flex: 1; display: grid; gap: 14px; align-content: start; }
+.drawer-foot { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: var(--surface-alt); }
+.field { display: grid; gap: 5px; }
+.field label { font-size: 12px; font-weight: 600; color: var(--ink); display: flex; justify-content: space-between; }
+.field-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+/* Modal Dialog (Stop Confirmation) */
+.modal {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 90;
+  width: 480px; max-width: calc(100vw - 28px); background: var(--surface);
+  border-radius: 12px; box-shadow: var(--shadow-lg); border: 1px solid var(--border-strong); padding: 20px;
+}
+.modal h3 { margin: 0 0 8px; font-size: 16px; }
+.modal-check {
+  display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px; border-radius: 8px;
+  background: var(--surface-alt); border: 1px solid var(--border); margin: 12px 0; font-size: 12px; cursor: pointer;
+}
+.modal-check input { width: 16px; height: 16px; margin-top: 2px; flex: none; accent-color: var(--accent); }
+
+/* Dockable Bottom Console */
+.console {
+  position: fixed; left: 0; right: 0; bottom: 0; height: var(--console-h); z-index: 45;
+  background: var(--term-bg); color: var(--term-ink); border-top: 1px solid #324d3d;
+  display: flex; flex-direction: column; box-shadow: 0 -6px 24px rgba(10, 22, 16, .22);
+}
+.console-resize {
+  height: 5px; cursor: ns-resize; background: transparent; position: absolute; top: -3px; left: 0; right: 0;
+}
+.console-resize:hover { background: rgba(93, 196, 138, .45); }
+.console-bar {
+  height: 38px; flex: none; background: var(--term-bar); border-bottom: 1px solid #2b4234;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 14px;
+}
+.console-tabs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; }
+.console-tab {
+  border: 0; background: transparent; color: #9ab3a1; font-size: 12px; font-weight: 600;
+  padding: 5px 10px; border-radius: 6px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+}
+.console-tab:hover { color: #e2f1e1; background: rgba(255,255,255,.06); }
+.console-tab.active { background: #2c4637; color: #ffffff; }
+.console-preview {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 11px; color: #9fc0a8;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 8px;
+}
+.console-tools { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; flex-wrap: nowrap; }
+input.console-search {
+  width: 168px; min-width: 100px; flex: 0 1 168px; height: 26px; padding: 2px 9px; font-size: 11px; border-radius: 5px;
+  border: 1px solid #365242; background: #132019; color: #e2efe0;
+}
+input.console-search::placeholder { color: #6e8d77; }
+.cbtn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  height: 26px; padding: 0 9px; border-radius: 5px; border: 1px solid #355041;
+  background: transparent; color: #bad0be; font-size: 11px; font-weight: 600;
+  white-space: nowrap; flex-shrink: 0; line-height: 1;
+}
+.cbtn:hover { background: #294133; color: #fff; }
+.cbtn.active { background: #8e3b23; border-color: #b45335; color: #fff; }
+.cbtn.err-badge { background: rgba(204, 76, 44, .22); border-color: rgba(235, 114, 82, .45); color: #ffb9a5; }
+.console-body {
+  flex: 1; overflow: auto; padding: 8px 16px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.65;
+}
+body.console-collapsed .console-body, body.console-collapsed .console-expanded-only { display: none; }
+body:not(.console-collapsed) .console-collapsed-only { display: none; }
+.log-line { display: flex; gap: 10px; padding: 1px 0; }
+.log-ts { color: var(--term-muted); flex: none; }
+.log-tag { flex: none; padding: 0 5px; border-radius: 3px; font-size: 11px; background: rgba(111, 211, 162, .12); color: #8be0b4; }
+.log-line.warn .log-tag { background: rgba(245, 188, 66, .18); color: #fbd276; }
+.log-line.warn .log-msg { color: #f7dba0; }
+.log-line.error .log-tag { background: rgba(235, 96, 65, .22); color: #ffa690; }
+.log-line.error .log-msg { color: #ffc1b0; }
+
+/* Floating Toasts */
+.toast-stack {
+  position: fixed; right: 18px; bottom: calc(var(--console-h) + 14px); z-index: 85;
+  display: grid; gap: 8px; width: 340px; max-width: calc(100vw - 24px); pointer-events: none;
+}
+.toast {
+  pointer-events: auto; background: #1e3328; color: #edf7ec; border: 1px solid #355846;
+  border-radius: 9px; padding: 10px 13px; box-shadow: var(--shadow-md); font-size: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  animation: toastIn .18s ease-out;
+}
+.toast.err { background: #4a2015; border-color: #7c3523; color: #ffe5dd; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+@media (max-width: 1100px) {
+  .frame-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .create-layout { grid-template-columns: 1fr; }
+  .launchpad { position: static; }
+}
+@media (max-width: 780px) {
+  .frame-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .seg-grid, .cast-grid, .carousel-wrap, .final-banner-body, .kpi-grid, .artifact-grid { grid-template-columns: 1fr; }
+  .brand-name { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ==================== TOP GLOBAL BAR ==================== -->
+<header class="topbar">
+  <div class="topbar-left">
+    <a class="brand" href="#top" onclick="event.preventDefault(); switchPage('results')">
+      <span class="brand-mark">H3<span class="brand-dot"></span></span>
+      <span class="brand-name">视频自动生成工作台</span>
+    </a>
+    <nav class="nav-pills" aria-label="主导航">
+      <button id="nav-create" class="nav-pill" type="button" onclick="switchPage('create')">＋ 新建任务</button>
+      <button id="nav-results" class="nav-pill active" type="button" onclick="switchPage('results')">当前任务</button>
+    </nav>
+    <div class="rel">
+      <button id="history-trigger" class="chip-btn" type="button" onclick="togglePopover('history-pop')">
+        <span>历史任务 (4)</span><span>▾</span>
+      </button>
+      <div id="history-pop" class="popover left" hidden>
+        <div class="popover-head">
+          <strong>快速切换历史任务</strong>
+          <button class="btn ghost sm" type="button" onclick="showToast('已刷新任务列表')">刷新</button>
+        </div>
+        <div id="history-pop-list" style="display:grid;gap:6px"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="rel">
+      <button id="runtime-trigger" class="chip-btn" type="button" onclick="togglePopover('runtime-pop')">
+        <span id="runtime-dot" class="dot online"></span>
+        <span id="runtime-pill-text">Colab 2/2 在线 · 队列 2</span>
+        <span>▾</span>
+      </button>
+      <div id="runtime-pop" class="popover" hidden>
+        <div class="popover-head">
+          <strong>ComfyUI · Colab 远端算力池</strong>
+          <div class="row">
+            <button class="btn ghost sm" type="button" onclick="showToast('已完成 2 个节点探活')">探活刷新</button>
+            <button class="btn sm" type="button" onclick="toggleDriveAuthDemo()">演示授权提醒</button>
+          </div>
+        </div>
+        <div id="drive-auth-demo" class="notice warn" hidden style="margin-bottom:10px;display:grid;gap:6px">
+          <span>节点 2 需要授权挂载 Google Drive 读取权重：</span>
+          <div class="row">
+            <button class="btn sm" type="button" onclick="showToast('已复制 Google Drive 授权链接')">复制授权链接</button>
+            <button class="btn primary sm" type="button" onclick="toggleDriveAuthDemo(); showToast('已确认 Drive 授权，节点 2 继续启动')">我已完成授权</button>
+          </div>
+        </div>
+        <div style="display:grid;gap:8px">
+          <div class="panel" style="padding:9px 11px;background:var(--surface-alt)">
+            <div class="between">
+              <div class="row"><span class="status succeeded">主节点 · 在线</span><strong class="mono" style="font-size:12px">gpu1.ngrok.dev</strong></div>
+              <button class="btn danger sm" type="button" onclick="showToast('已发送主节点停止检查')">终止</button>
+            </div>
+            <div class="muted" style="margin-top:4px">RTX PRO 6000 96GB · 显存 42.1/96 GB · 队列 1 · 空闲 60 分钟自动释放</div>
+          </div>
+          <div class="panel" style="padding:9px 11px;background:var(--surface-alt)">
+            <div class="between">
+              <div class="row"><span class="status succeeded">节点 2 · 在线</span><strong class="mono" style="font-size:12px">fast-node.trycloudflare.com</strong></div>
+              <button class="btn danger sm" type="button" onclick="showToast('已发送节点 2 停止请求')">停止</button>
+            </div>
+            <div class="muted" style="margin-top:4px">RTX PRO 6000 96GB · 显存 39.8/96 GB · 队列 1 · 随机隧道</div>
+          </div>
+        </div>
+        <div class="popover-section between">
+          <span class="muted">并行分发：最多 2 路独立视频段</span>
+          <button class="btn ghost sm" type="button" onclick="openConsoleTab('colab1'); closePopovers()">查看节点启动日志 →</button>
+        </div>
+      </div>
+    </div>
+
+    <button class="chip-btn rel" type="button" onclick="openSettings()">
+      <span>⚙ 环境设置</span>
+      <span class="badge-dot" title="演示提示点"></span>
+    </button>
+    <button id="lang-btn" class="chip-btn" type="button" onclick="toggleLang()">简体中文</button>
+  </div>
+</header>
+
+<!-- ==================== PROTOTYPE SCENARIO BAR ==================== -->
+<div class="proto-bar">
+  <div class="proto-bar-label">
+    <span class="proto-tag">静态交互原型</span>
+    <span>点击右侧按钮可即时体验不同任务阶段、暂停/停止流转、创建页自动配图、底部统一日志抽屉：</span>
+  </div>
+  <div class="proto-scenarios">
+    <button class="proto-btn active" data-sc="running_video" onclick="applyScenario('running_video')">① 视频并发运行中</button>
+    <button class="proto-btn" data-sc="running_frames" onclick="applyScenario('running_frames')">② 分镜生图运行中</button>
+    <button class="proto-btn" data-sc="review_failed" onclick="applyScenario('review_failed')">③ 审图(含2失败)</button>
+    <button class="proto-btn" data-sc="review_ready" onclick="applyScenario('review_ready')">④ 审图就绪待出片</button>
+    <button class="proto-btn" data-sc="need_assemble" onclick="applyScenario('need_assemble')">⑤ 改段后待重拼</button>
+    <button class="proto-btn" data-sc="done" onclick="applyScenario('done')">⑥ 全部成片完成</button>
+  </div>
+</div>
+
+<!-- ==================== MAIN CONTENT ==================== -->
+<main class="shell">
+
+  <!-- ==================== PAGE 1: RESULTS WORKSPACE ==================== -->
+  <section id="page-results">
+
+    <!-- Sticky Command Bar: ALL primary controls live right here -->
+    <section class="command-bar" aria-label="任务指挥栏">
+      <div class="cmd-top">
+        <div class="cmd-info">
+          <h1 class="cmd-title" id="cmd-title">《人间善意：三块钱的牛肉骨》</h1>
+          <span id="cmd-status" class="status running"><span class="dot online pulse"></span>正在运行</span>
+          <span class="tag">整条片 · shot</span>
+          <span class="tag live">真实生成 · ComfyUI 768p</span>
+          <div class="cmd-metrics">
+            <span>分镜 <b id="m-frames">36/36</b></span>
+            <span>视频段 <b id="m-clips">5/8</b></span>
+            <span>已产生费用 <b id="m-cost">¥4.68</b></span>
+          </div>
+        </div>
+        <div class="cmd-actions" id="cmd-actions"></div>
+      </div>
+      <div id="cmd-live-strip" class="live-strip"></div>
+    </section>
+
+    <!-- Context Notice (paused / stopped / dirty) -->
+    <div id="ctx-notice" class="notice info" hidden></div>
+
+    <!-- Pinned Final Video Banner (shown at top when film.mp4 exists!) -->
+    <section id="final-banner" class="panel final-banner" hidden>
+      <div class="final-banner-head">
+        <div class="row">
+          <strong style="font-size:13px">最终成片 · film.mp4</strong>
+          <span id="final-ver-badge" class="status succeeded">当前成片</span>
+          <span class="muted mono">01:36 · 768×1344 · 8 段已拼接</span>
+        </div>
+        <div class="row">
+          <button class="btn primary sm" type="button" onclick="showToast('开始下载 film.mp4')">⬇ 下载完整视频</button>
+          <button class="btn sm" type="button" onclick="showToast('已在系统文件管理器打开：jobs/2026-11-26_牛肉骨')">📂 打开文件夹</button>
+          <button id="toggle-final-btn" class="btn ghost sm" type="button" onclick="toggleFinalVideo()">收起预览 ▴</button>
+        </div>
+      </div>
+      <div id="final-banner-body" class="final-banner-body">
+        <div class="video-mock">
+          <div class="between" style="font-size:11px;opacity:.85"><span>Plyr 本地播放器</span><span class="mono">film.mp4</span></div>
+          <div class="video-mock-center">
+            <button class="play-circle" type="button" onclick="showToast('播放成片预览')">▶</button>
+            <div style="font-size:12px">《人间善意：三块钱的牛肉骨》完整成片</div>
+          </div>
+          <div class="video-controls">
+            <span>00:36 / 01:36</span>
+            <div class="video-scrubber"><i></i></div>
+            <span>1.0× · 🔊 · ⛶</span>
+          </div>
+        </div>
+        <div style="display:grid;gap:8px">
+          <div style="font-size:13px;font-weight:700">成片摘要</div>
+          <div class="muted">置顶展示，不再压在全部视频片段分页最底下；审完片可一键收起，留出完整审片空间。</div>
+          <div class="row" style="margin-top:4px">
+            <span class="tag">分镜 36 张 · ¥4.68</span>
+            <span class="tag">ComfyUI 视频 · ¥0.00</span>
+            <span class="tag">GPU 总耗时 19.4 分钟</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3-Tab Navigation -->
+    <div class="tabs-bar">
+      <div class="tabs" role="tablist">
+        <button id="rtab-frames" class="tab-btn active" type="button" onclick="switchResultTab('frames')">
+          分镜图 <span class="tab-count" id="tc-frames">36</span>
+        </button>
+        <button id="rtab-segments" class="tab-btn" type="button" onclick="switchResultTab('segments')">
+          视频片段 <span class="tab-count" id="tc-segments">5/8</span>
+        </button>
+        <button id="rtab-report" class="tab-btn" type="button" onclick="switchResultTab('report')">
+          报告与文件 <span class="tab-count">54</span>
+        </button>
+      </div>
+      <div class="muted" id="tab-right-tip">提示：点任意分镜图直接切到大图模式审阅与改词；主操作按钮常驻顶部指挥栏</div>
+    </div>
+
+    <!-- TAB 1: STORYBOARD -->
+    <div id="rpanel-frames">
+      <div class="sub-toolbar">
+        <div class="filter-pills">
+          <button class="filter-pill active" data-ff="all" onclick="setFrameFilter('all')">全部 (8 示意)</button>
+          <button class="filter-pill" data-ff="ok" onclick="setFrameFilter('ok')">正常 (5)</button>
+          <button class="filter-pill err-pill" data-ff="failed" onclick="setFrameFilter('failed')">失败 / 审拦截 (2)</button>
+          <button class="filter-pill" data-ff="draft" onclick="setFrameFilter('draft')">有未应用草稿 (1)</button>
+        </div>
+        <div class="row">
+          <div class="nav-pills">
+            <button id="fv-grid" class="nav-pill active" type="button" onclick="setFrameView('grid')">网格</button>
+            <button id="fv-carousel" class="nav-pill" type="button" onclick="setFrameView('carousel')">大图 (←/→)</button>
+          </div>
+          <span class="muted mono">第 1 / 3 页</span>
+          <button class="btn sm" type="button" disabled>上一页</button>
+          <button class="btn sm" type="button" onclick="showToast('已切换到第 2 页')">下一页</button>
+        </div>
+      </div>
+
+      <!-- Grid Mode -->
+      <div id="frame-grid" class="frame-grid"></div>
+
+      <!-- Carousel Mode -->
+      <div id="frame-carousel" class="carousel-wrap" hidden>
+        <div class="carousel-stage">
+          <div class="between" style="margin-bottom:10px">
+            <strong id="car-title">第 1 段 · 镜头 1 (s1-1)</strong>
+            <div class="row">
+              <button class="btn sm" type="button" onclick="stepCarousel(-1)">← 上一张</button>
+              <span id="car-pos" class="muted mono">1 / 8</span>
+              <button class="btn sm" type="button" onclick="stepCarousel(1)">下一张 →</button>
+              <button class="btn ghost sm" type="button" onclick="setFrameView('grid')">返回网格</button>
+            </div>
+          </div>
+          <div id="car-img" class="carousel-img"></div>
+        </div>
+        <div class="carousel-inspector">
+          <div class="between">
+            <strong style="font-size:13px">分镜提示词与角色参考图</strong>
+            <span id="car-status" class="status succeeded">已生成 · ¥0.13</span>
+          </div>
+          <div id="car-error-box" class="notice err" hidden style="margin:0"></div>
+          <div class="field">
+            <label>这张图的生成提示词</label>
+            <textarea id="car-prompt" rows="7" oninput="markFrameDraft()"></textarea>
+          </div>
+          <div class="field">
+            <label>本次生成参考图 <span class="muted">总表固定 · 角色可增删</span></label>
+            <div class="ref-chip-list" id="car-refs"></div>
+          </div>
+          <div class="row">
+            <button class="btn primary" type="button" onclick="regenCurrentFrame()">仅重生成这张图 · 付费</button>
+            <button class="btn sm" type="button" onclick="showToast('已打开已导入角色选择器')">＋ 添加已导入角色</button>
+          </div>
+          <div class="muted">改图后仅标脏对应段落，不会自动重生成其他分镜；全部满意后直接点顶部吸顶栏的「确认并生成视频」。</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: VIDEO SEGMENTS -->
+    <div id="rpanel-segments" hidden>
+      <div class="sub-toolbar" style="background:#fffaf0;border-color:var(--warn-border)">
+        <div class="row">
+          <button class="btn sm" type="button" onclick="showToast('已触发：补齐 2 段未转化英文提示词（仅文字模型，不生视频）')">补齐未转化英文提示词 (2) · 付费</button>
+          <button class="btn sm" type="button" onclick="showToast('已触发：全部重新转化为英文提示词')">全部重新转化 · 付费</button>
+        </div>
+        <span class="muted" style="color:var(--warn-ink)">仅更新并保存六段式英文提示词，不会触发视频扣费生成</span>
+      </div>
+      <div id="seg-grid" class="seg-grid"></div>
+    </div>
+
+    <!-- TAB 3: REPORT & FILES -->
+    <div id="rpanel-report" hidden>
+      <div class="kpi-grid">
+        <div class="kpi-card"><small>分镜图支出</small><strong>¥4.68</strong><span class="muted">36 张 · APIMart GPT Image</span></div>
+        <div class="kpi-card"><small>视频生成支出</small><strong>¥0.00</strong><span class="muted">ComfyUI 自有 / Colab GPU</span></div>
+        <div class="kpi-card"><small>GPU 累计推理</small><strong>19.4 分钟</strong><span class="muted">双节点并行 · 平均 2.4 分/段</span></div>
+        <div class="kpi-card"><small>本地输出目录</small><strong style="font-size:13px;margin-top:8px">jobs/2026-11-26_牛肉骨</strong><button class="btn sm" style="margin-top:6px" type="button" onclick="showToast('已在 Finder / 资源管理器打开任务目录')">📂 打开本地文件夹</button></div>
+      </div>
+      <div class="panel card-pad" style="margin-bottom:14px">
+        <div class="between" style="margin-bottom:10px">
+          <strong class="section-title">运行报告 (report.md)</strong>
+          <button class="btn sm" type="button" onclick="showToast('已复制 report.md 内容')">复制报告</button>
+        </div>
+        <pre class="mono" style="margin:0;font-size:12px;background:var(--surface-alt);padding:12px;border-radius:8px;border:1px solid var(--border);overflow:auto"># 人间善意：三块钱的牛肉骨
+成片 `film.mp4`，96.0 秒，8 段，分镜图模式 shot。
+花费：分镜图 36 张 ¥4.68，H3 生成 ¥0.00（ComfyUI 双节点），合计 ¥4.68；GPU 19.4 分钟。
+| 段 | 秒 | 参考图 | 费用 | GPU 秒 | 节点 |
+| 1 | 0–12 | 5 | ¥0.000 | 142s | gpu1.ngrok.dev |
+| 2 | 12–24 | 6 | ¥0.000 | 138s | fast-node.trycloudflare.com |</pre>
+      </div>
+      <div class="panel card-pad">
+        <div class="between" style="margin-bottom:10px">
+          <strong class="section-title">产物文件 (点击下载 / 预览)</strong>
+          <span class="muted">已自动隐藏内部 state.json 等工作文件</span>
+        </div>
+        <div class="artifact-grid">
+          <a class="artifact-item" href="#dl" onclick="event.preventDefault();showToast('下载 film.mp4')"><span>🎬 film.mp4</span><span class="muted">24.8 MB</span></a>
+          <a class="artifact-item" href="#dl" onclick="event.preventDefault();showToast('查看 report.md')"><span>📄 report.md</span><span class="muted">2.4 KB</span></a>
+          <a class="artifact-item" href="#dl" onclick="event.preventDefault();showToast('查看 plan.json')"><span>🧩 plan.json</span><span class="muted">11.2 KB</span></a>
+          <a class="artifact-item" href="#dl" onclick="event.preventDefault();showToast('下载 clips/seg1.mp4')"><span>🎞 clips/seg1.mp4</span><span class="muted">3.1 MB</span></a>
+          <a class="artifact-item" href="#dl" onclick="event.preventDefault();showToast('下载 clips/seg2.mp4')"><span>🎞 clips/seg2.mp4</span><span class="muted">3.3 MB</span></a>
+          <a class="artifact-item" href="#dl" onclick="event.preventDefault();showToast('查看 prompts/seg1.h3.txt')"><span>📝 prompts/seg1.h3.txt</span><span class="muted">1.8 KB</span></a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== PAGE 2: CREATE WORKSPACE ==================== -->
+  <section id="page-create" hidden>
+    <div class="create-layout">
+      <!-- Left Main Composition Column -->
+      <div style="display:grid;gap:14px">
+        <section class="panel card-pad">
+          <div class="between" style="margin-bottom:12px">
+            <div class="nav-pills">
+              <button class="nav-pill active" type="button" onclick="showToast('当前为「整条片」流程')">整条片（分镜 → 审图 → 视频）</button>
+              <button class="nav-pill" type="button" onclick="showToast('切换到「一条片段 (5-15秒)」模式')">一条片段（5–15 秒）</button>
+            </div>
+            <div class="row">
+              <button class="btn sm" type="button" onclick="showToast('导入 .json / .txt 脚本')">导入脚本</button>
+              <button class="btn sm" type="button" onclick="showToast('已格式化 JSON')">格式化</button>
+              <button class="btn ghost sm" type="button" onclick="showToast('下载 film.example.json')">下载示例</button>
+            </div>
+          </div>
+
+          <textarea id="create-json" class="mono" rows="8" spellcheck="false" style="font-size:12px;background:#fbfcfa">{
+  "title": "人间善意：三块钱的牛肉骨",
+  "aspect": "9:16",
+  "speech": "zh",
+  "look": "写实国风电影感，自然清晨光线",
+  "cast": [
+    { "name": "张大妈", "look": "六十岁左右慈祥老人，棉布围裙" },
+    { "name": "梁先生", "look": "中年肉铺老板，深色工装短袖" },
+    { "name": "周悦悦", "look": "八岁小女孩，扎双马尾" },
+    { "name": "周铁林", "look": "四十岁工人父亲，灰蓝外套" }
+  ],
+  "shots": [ "... 共 12 个镜头，总时长 28 秒 ..." ]
+}</textarea>
+
+          <div class="summary-strip">
+            <div class="row">
+              <strong style="color:var(--accent)">✓ 脚本有效</strong>
+              <span class="mono">12 镜 · 28s · 预计 3 段 · 4 角色 + 总表</span>
+              <span class="muted">· 草稿已自动暂存</span>
+            </div>
+            <button class="btn warn sm" type="button" onclick="togglePreflightBox()">⚠ 1 条台词预检提醒 ▾</button>
+          </div>
+
+          <div id="preflight-box" class="notice warn" hidden style="margin-top:10px;margin-bottom:0">
+            <span>第 5 镜 · 19 字，估算约 4.2s / 原镜长 3.0s。建议缩短台词或拆到相邻镜头。</span>
+            <button class="btn sm" type="button" onclick="showToast('已定位到 JSON 第 5 镜台词位置')">定位到脚本</button>
+          </div>
+        </section>
+
+        <!-- Compact Reference Image Manager -->
+        <section class="panel card-pad">
+          <div class="between">
+            <div>
+              <h2 class="section-title">参考图清单（紧凑网格 · 省 65% 滚动高度）</h2>
+              <div class="muted" id="cast-summary-line">共 4 个角色 + 1 张总表 · 当前已上传 1/5（模型单段上限 9 张）</div>
+            </div>
+            <button class="btn sm" type="button" onclick="showToast('已展开多角色合图建组选择器')">＋ 新建多角色合图</button>
+          </div>
+
+          <!-- Smart Batch Dropzone -->
+          <div class="dropzone">
+            <div>
+              <strong style="font-size:13px">📥 拖放或批量选择多张图片，按文件名自动匹配角色</strong>
+              <div class="muted">例如 `张大妈四视图设定图.png`、`梁先生三视图.png` 将自动绑定到对应角色，不用逐个点 6 次弹窗</div>
+            </div>
+            <button class="btn primary sm" type="button" onclick="simulateAutoMatch()">✨ 演示一键批量自动匹配</button>
+          </div>
+
+          <div id="cast-grid" class="cast-grid"></div>
+        </section>
+      </div>
+
+      <!-- Right Sticky Launchpad -->
+      <aside class="launchpad">
+        <section class="panel card-pad" style="display:grid;gap:12px">
+          <div class="between">
+            <h2 class="section-title">启动控制台</h2>
+            <span class="muted">常驻吸顶 · 随时发车</span>
+          </div>
+
+          <div class="field">
+            <label>分镜图模式</label>
+            <select>
+              <option>shot · 每个镜头一张（推荐）</option>
+              <option>first · 每段首镜头一张</option>
+              <option>none · 不生成分镜图</option>
+            </select>
+          </div>
+
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;cursor:pointer">
+            <input type="checkbox" checked style="width:15px;height:15px;margin-top:2px;accent-color:var(--accent)">
+            <span>使用文字模型精简优化分镜提示词（机位构图 + 角色外貌跨镜锁定）</span>
+          </label>
+
+          <div class="field">
+            <label>成果保存文件夹</label>
+            <div class="row" style="flex-wrap:nowrap">
+              <input type="text" readonly value="/Users/qiaoyu/projects/h3-ref-video/jobs" class="mono" style="font-size:11px">
+              <button class="btn sm" type="button" onclick="showToast('打开系统文件夹选择器')">选择</button>
+            </div>
+          </div>
+
+          <div id="launch-mode-box" class="mode-box">
+            <div class="between" style="margin-bottom:6px">
+              <strong style="font-size:12px">运行模式</strong>
+              <div class="nav-pills" style="background:rgba(0,0,0,.07)">
+                <button id="m-demo" class="nav-pill" type="button" style="padding:3px 9px;font-size:11px" onclick="setCreateMode(true)">离线演示</button>
+                <button id="m-live" class="nav-pill active" type="button" style="padding:3px 9px;font-size:11px" onclick="setCreateMode(false)">真实生成</button>
+              </div>
+            </div>
+            <div id="launch-mode-hint" class="muted" style="color:var(--warn-ink)">将调用真实画图/视频模型；先生成分镜图并停下审图，确认后才生成视频。</div>
+          </div>
+
+          <div id="launch-missing" class="muted" style="color:var(--err-ink)">尚缺 4 张参考图：张大妈、梁先生、周悦悦、周铁林</div>
+
+          <button id="launch-btn" class="btn primary lg" type="button" disabled onclick="launchDemoJob()">
+            生成分镜并进入审核 ↗
+          </button>
+        </section>
+
+        <section class="panel card-pad">
+          <div class="between" style="margin-bottom:8px">
+            <strong class="section-title">最近任务</strong>
+            <span class="muted">显示剧本名，一目了然</span>
+          </div>
+          <div id="create-history-list" style="display:grid;gap:6px"></div>
+        </section>
+      </aside>
+    </div>
+  </section>
+
+</main>
+
+<!-- ==================== RIGHT SETTINGS DRAWER ==================== -->
+<div id="drawer-backdrop" class="backdrop" hidden onclick="closeSettings()"></div>
+<aside id="settings-drawer" class="drawer" hidden aria-label="环境与 API 配置">
+  <div class="drawer-head">
+    <div>
+      <strong style="font-size:15px">环境与 API 配置</strong>
+      <div class="muted">分组管理 · 不再霸占每个工作页顶部</div>
+    </div>
+    <button class="btn ghost sm" type="button" onclick="closeSettings()">✕ 关闭</button>
+  </div>
+  <div class="drawer-tabs">
+    <button class="tab-btn active" data-st="video" onclick="switchSettingsTab('video')">视频后端</button>
+    <button class="tab-btn" data-st="llm" onclick="switchSettingsTab('llm')">文字与构图模型</button>
+    <button class="tab-btn" data-st="env" onclick="switchSettingsTab('env')">图片与本地环境</button>
+  </div>
+  <div class="drawer-body">
+    <div id="st-video" style="display:grid;gap:12px">
+      <div class="field">
+        <label>视频生成后端</label>
+        <select><option>ComfyUI（Colab / 远端自建）</option><option>RunningHub 云端</option></select>
+      </div>
+      <div class="field">
+        <label>COMFYUI_URL（支持逗号/换行多节点并行）</label>
+        <textarea rows="2" class="mono">https://gpu1.ngrok.dev, https://fast-node.trycloudflare.com</textarea>
+      </div>
+      <div class="field-2col">
+        <div class="field"><label>COMFYUI_API_KEY <span class="muted">已配置</span></label><input type="password" placeholder="留空保留现有 key"></div>
+        <div class="field"><label>并发上限</label><input type="number" placeholder="自动等于节点数 (2)"></div>
+      </div>
+      <div class="field-2col">
+        <div class="field"><label>采样预设</label><select><option>full20 · 20 步原生（推荐）</option><option>8step · 8 步 LoRA</option><option>4step · 4 步草稿</option></select></div>
+        <div class="field"><label>输出分辨率</label><select><option>768p · 3D 潜空间二采（推荐）</option><option>1088p · 真 1080p</option><option>544p · 快速档</option></select></div>
+      </div>
+      <div class="field-2col">
+        <div class="field"><label>Colab GPU 规格</label><select><option>G4 · RTX PRO 6000 96GB</option><option>A100 · 80GB</option><option>H100 · 80GB</option></select></div>
+        <div class="field"><label>Colab 按需自动拉起</label><select><option>关闭 · 仅手动点击启动</option><option>开启 · 进入视频阶段自动拉起</option></select></div>
+      </div>
+    </div>
+
+    <div id="st-llm" hidden style="display:grid;gap:12px">
+      <div class="field"><label>文字模型服务</label><select><option>APIMart / 自定义兼容服务</option><option>Gemini 官方</option></select></div>
+      <div class="field-2col">
+        <div class="field"><label>构图规划模型</label><input type="text" value="deepseek-v4-pro" class="mono"></div>
+        <div class="field"><label>提示词改写模型</label><input type="text" value="deepseek-v4-pro" class="mono"></div>
+      </div>
+      <div class="field"><label>OpenAI 兼容接口地址</label><input type="text" value="https://api.apimart.ai/v1" class="mono"></div>
+      <div class="field"><label>LLM_API_KEY <span class="muted">留空沿用 APIMart</span></label><input type="password" placeholder="可选，留空沿用现有 key"></div>
+    </div>
+
+    <div id="st-env" hidden style="display:grid;gap:12px">
+      <div class="field"><label>APIMART_API_KEY（分镜画图必需） <span class="muted">已配置</span></label><input type="password" placeholder="留空保留现有 key"></div>
+      <div class="panel" style="padding:12px;background:var(--surface-alt);display:grid;gap:8px">
+        <strong style="font-size:12px">本机运行时检测</strong>
+        <div class="row">
+          <span class="status succeeded">Python 3.12.7 · 可用</span>
+          <span class="status succeeded">ffmpeg · 可用</span>
+          <span class="status succeeded">ffprobe · 可用</span>
+          <span class="status succeeded">colab-cli · 已登录</span>
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px">
+        <input type="checkbox" checked style="width:15px;height:15px;accent-color:var(--accent)">
+        <span>保存到本机 .env（权限 0600，不入 Git）</span>
+      </label>
+    </div>
+  </div>
+  <div class="drawer-foot">
+    <button class="btn sm" type="button" onclick="showToast('已重新检查本地环境状态')">重新检查</button>
+    <div class="row">
+      <button class="btn sm" type="button" onclick="closeSettings()">取消</button>
+      <button class="btn primary sm" type="button" onclick="closeSettings(); showToast('配置已保存到本机 .env，新任务生效')">保存配置</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ==================== STOP CONFIRMATION MODAL ==================== -->
+<div id="stop-backdrop" class="backdrop" hidden onclick="closeStopModal()"></div>
+<div id="stop-modal" class="modal" hidden role="dialog" aria-modal="true">
+  <h3>确认立即停止当前任务？</h3>
+  <p class="muted" style="font-size:13px;line-height:1.65;color:var(--ink)">
+    点击确认后，本地任务将<strong>立即停止</strong>并释放工作台锁定，<strong>不再提交任何新的镜头或视频段</strong>。
+  </p>
+  <div class="notice info" style="margin:10px 0">
+    <span><strong>保护说明：</strong>无论 ComfyUI、RunningHub 还是 APIMart，远端正在执行中的任务<strong>不会被取消</strong>，原始任务号（task_id）会完整保留。后续点击「继续任务」时将优先取回已生成结果，<strong>绝不重复扣费</strong>。</span>
+  </div>
+  <div class="between" style="margin-top:14px">
+    <button class="btn" type="button" onclick="closeStopModal()">取消</button>
+    <div class="row">
+      <button class="btn warn" type="button" onclick="closeStopModal(); triggerPause()">改用「暂停后续」</button>
+      <button class="btn danger" type="button" onclick="confirmHardStop()">确认立即停止</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== UNIFIED DOCKABLE BOTTOM CONSOLE ==================== -->
+<section class="console" aria-label="统一日志与监控控制台">
+  <div class="console-resize" id="console-resize" title="上下拖动调整日志高度"></div>
+  <div class="console-bar">
+    <div class="console-tabs">
+      <button class="console-tab active" data-ctab="job" onclick="openConsoleTab('job')">
+        <span id="c-job-dot" class="dot online pulse"></span> 当前任务日志
+      </button>
+      <button class="console-tab" data-ctab="colab1" onclick="openConsoleTab('colab1')">
+        <span class="dot online"></span> Colab 主节点
+      </button>
+      <button class="console-tab" data-ctab="colab2" onclick="openConsoleTab('colab2')">
+        <span class="dot online"></span> Colab 节点 2
+      </button>
+    </div>
+    <div id="console-preview" class="console-preview console-collapsed-only">14:22:08 progress seg6 扩散采样 14/20 (70%) · 节点 gpu1 · 显存 42.1/96.0 GB</div>
+    <div class="console-tools">
+      <input id="console-search" class="console-search console-expanded-only" type="text" placeholder="搜索日志关键词…" oninput="renderConsole()">
+      <button id="c-err-filter" class="cbtn err-badge" type="button" onclick="toggleConsoleErrFilter()">⚠ 错误/警告 (2)</button>
+      <button class="cbtn console-expanded-only" type="button" onclick="copyConsole()">复制</button>
+      <button id="c-size-btn" class="cbtn console-expanded-only" type="button" onclick="toggleConsoleExpand()">⤢ 半屏</button>
+      <button id="c-toggle-btn" class="cbtn" type="button" onclick="toggleConsoleCollapse()">▾ 收起</button>
+    </div>
+  </div>
+  <div id="console-body" class="console-body"></div>
+</section>
+
+<!-- ==================== FLOATING TOAST STACK ==================== -->
+<div id="toast-stack" class="toast-stack"></div>
+
+<script>
+"use strict";
+
+/* -------------------- MOCK DATA -------------------- */
+const HISTORY = [
+  { id: "20261126-a1", title: "人间善意：三块钱的牛肉骨", meta: "整条片 · 真实 · 分镜 36/36 · 片段 5/8", status: "running", statusText: "正在运行", current: true },
+  { id: "20261125-b2", title: "深夜便利店的最后一碗热汤", meta: "整条片 · 真实 · 全部完成 · ¥3.10", status: "succeeded", statusText: "已完成", current: false },
+  { id: "20261124-c3", title: "雨夜诊所对白测试 (6镜)", meta: "整条片 · 真实 · 已暂停 (4/6 镜)", status: "paused", statusText: "已暂停", current: false },
+  { id: "20261123-d4", title: "离线流程验证示例", meta: "一条片段 · 演示 · 已完成", status: "succeeded", statusText: "已完成", current: false },
+];
+
+const FRAMES = [
+  { key: "s1-1", seg: 1, shot: 1, status: "ok", cost: "¥0.13", color: "#5e8f77", title: "菜市场清晨摊位全景，蒸汽升腾，梁先生正在整理案板", prompt: "一张竖屏电影剧照，清晨菜市场肉铺全景，阳光斜射。梁先生站在木案后侧身整理，张大妈牵着周悦悦在画面右侧驻足观望。", refs: ["场景/道具总表", "梁先生", "张大妈", "周悦悦"] },
+  { key: "s1-2", seg: 1, shot: 2, status: "ok", cost: "¥0.13", color: "#4e7c85", title: "张大妈犹豫地掏出三枚一元硬币，近景特写", prompt: "近景，张大妈粗糙的双手捧着三枚一元硬币递向案板，眼神局促却温和，背景虚化为热闹摊位。", refs: ["场景/道具总表", "张大妈"] },
+  { key: "s2-1", seg: 2, shot: 1, status: "failed", cost: "—", color: "#9b4d3a", error: "内容审核未通过（敏感词拦截），已停止自动重试。请微调提示词后手动重出。", title: "梁先生举起剁骨刀切下一大块带肉牛骨", prompt: "中景，梁先生手持厚重菜刀稳稳切下新鲜牛骨，案板上摆放油纸袋，神色沉静自然。", refs: ["场景/道具总表", "梁先生"] },
+  { key: "s2-2", seg: 2, shot: 2, status: "draft", cost: "¥0.13", color: "#8c7b48", title: "梁先生顺手多放了两块精瘦牛肉进袋（有未应用草稿）", prompt: "特写，梁先生悄悄多夹了两块带筋牛肉放进牛皮纸袋，脸上露出不动声色的微笑。[草稿：把纸袋改为透明食品袋]", refs: ["场景/道具总表", "梁先生"] },
+  { key: "s3-1", seg: 3, shot: 1, status: "ok", cost: "¥0.13", color: "#687f5a", title: "周悦悦踮脚接过沉甸甸的袋子，眼睛发亮", prompt: "中近景，八岁女孩周悦悦双手抱住沉甸甸的纸袋抬头微笑，站在张大妈身侧。", refs: ["场景/道具总表", "周悦悦", "张大妈"] },
+  { key: "s3-2", seg: 3, shot: 2, status: "failed", cost: "—", color: "#9b5d44", error: "APIMart 网关超时（原任务已明确失败，未产生有效图片，可安全重出）。", title: "两人转身离开摊位，背影融进晨光人流", prompt: "远景跟拍，张大妈牵着周悦悦的背影沿着清晨菜市场小巷走远，晨光勾勒轮廓。", refs: ["场景/道具总表", "张大妈", "周悦悦"] },
+  { key: "s4-1", seg: 4, shot: 1, status: "ok", cost: "¥0.13", color: "#546f87", title: "简陋出租屋灶台前，炖汤热气袅袅升起", prompt: "室内暖调中景，老旧铝锅在煤气灶上冒着热气，周铁林疲惫地推门进屋。", refs: ["场景/道具总表", "周铁林"] },
+  { key: "s4-2", seg: 4, shot: 2, status: "ok", cost: "¥0.13", color: "#6c5d82", title: "三年后重逢，周铁林带礼盒回到老肉铺致谢", prompt: "三年后晴朗午后，周铁林穿着整洁衬衫拎着水果礼盒走近肉铺，与梁先生握手微笑。", refs: ["场景/道具总表", "周铁林", "梁先生"] },
+];
+
+const SEGMENTS = [
+  { num: 1, time: "0–12s", shots: 4, state: "ready", node: "gpu1.ngrok.dev", gpuSec: "142s", cost: "¥0.00", zh: "清晨菜市场肉铺开场，张大妈带着小悦悦买三块钱牛肉骨...", h3: "subject_definitions:\n<Subject 1> Zhang Dama from <Picture 2>..." },
+  { num: 2, time: "12–24s", shots: 5, state: "ready", node: "fast-node", gpuSec: "138s", cost: "¥0.00", zh: "梁先生默默多切了两块好肉装进袋子，小悦悦开心接过...", h3: "subject_definitions:\n<Subject 1> Mr. Liang from <Picture 2>..." },
+  { num: 3, time: "24–36s", shots: 4, state: "ready", node: "gpu1.ngrok.dev", gpuSec: "151s", cost: "¥0.00", zh: "出租屋里热气腾腾的牛肉汤端上桌，周铁林眼眶微红...", h3: "subject_definitions:\n<Subject 1> Zhou Tielin from <Picture 2>..." },
+  { num: 4, time: "36–48s", shots: 5, state: "ready", node: "fast-node", gpuSec: "145s", cost: "¥0.00", zh: "时光转场，三年后新开的餐馆窗明几净...", h3: "subject_definitions:\n<Subject 1> Zhou Yueyue from <Picture 2>..." },
+  { num: 5, time: "48–60s", shots: 4, state: "ready", node: "gpu1.ngrok.dev", gpuSec: "139s", cost: "¥0.00", zh: "周铁林提着谢礼重回老菜市场，寻找当年那位肉铺老板...", h3: "subject_definitions:\n<Subject 1> Zhou Tielin from <Picture 2>..." },
+  { num: 6, time: "60–72s", shots: 5, state: "running", progress: 70, step: "14/20", node: "gpu1.ngrok.dev", vram: "42.1/96 GB", elapsed: "01:42", zh: "两位老友隔着案板相视一笑，镜头缓慢拉远...", h3: "subject_definitions:\n<Subject 1> Mr. Liang from <Picture 2>..." },
+  { num: 7, time: "72–84s", shots: 5, state: "running", progress: 25, step: "编码参考图", node: "fast-node", vram: "39.8/96 GB", elapsed: "00:34", zh: "小悦悦把画好的感谢卡递给梁先生...", h3: "subject_definitions:\n<Subject 1> Zhou Yueyue from <Picture 2>..." },
+  { num: 8, time: "84–96s", shots: 4, state: "waiting", node: "—", zh: "菜市场人来人往的温暖清晨尾声，字幕渐显...", h3: "" },
+];
+
+const CAST_SLOTS = [
+  { id: "board", name: "场景／道具总表", required: false, desc: "菜市场肉铺、出租屋灶台、礼盒参考", file: "人间善意：三块钱的牛肉骨.png", color: "#4e7c67" },
+  { id: "cast:0", name: "角色 · 张大妈", required: true, desc: "六十岁左右慈祥老人，棉布围裙", file: null, color: "#806652" },
+  { id: "cast:1", name: "角色 · 梁先生", required: true, desc: "中年肉铺老板，深色工装短袖", file: null, color: "#4b6982" },
+  { id: "cast:2", name: "角色 · 周悦悦", required: true, desc: "八岁小女孩，扎双马尾", file: null, color: "#875f78" },
+  { id: "cast:3", name: "角色 · 周铁林", required: true, desc: "四十岁工人父亲，灰蓝外套", file: null, color: "#5e6e58" },
+];
+
+const LOGS = {
+  job: [
+    { ts: "14:12:03", level: "info", tag: "plan", msg: "8 segments · 96.0s · 36 shots · shot mode" },
+    { ts: "14:15:40", level: "warn", tag: "preflight", msg: "[WARN] shot#5 台词 19 字，估算 4.2s / 原镜长 3.0s" },
+    { ts: "14:16:12", level: "error", tag: "frame", msg: "s2-1 内容审核未通过，已保留失败记录并继续其余分镜" },
+    { ts: "14:18:55", level: "info", tag: "pool", msg: "ComfyUI 节点池就绪：2/2 在线（gpu1.ngrok.dev, fast-node.trycloudflare.com）" },
+    { ts: "14:20:26", level: "info", tag: "submitted", msg: "seg6 -> node gpu1.ngrok.dev (prompt_id=8f31a9c2)" },
+    { ts: "14:21:34", level: "info", tag: "submitted", msg: "seg7 -> node fast-node.trycloudflare.com (prompt_id=4b12e07a)" },
+    { ts: "14:22:08", level: "info", tag: "progress", msg: "seg6 扩散采样 14/20 (70%) · 节点 gpu1 · 显存 42.1/96.0 GB · 01:42" },
+    { ts: "14:22:10", level: "info", tag: "progress", msg: "seg7 编码提示词与参考图 · 节点 fast-node · 显存 39.8/96.0 GB · 00:34" },
+  ],
+  colab1: [
+    { ts: "14:01:12", level: "info", tag: "colab-1", msg: "Provisioning G4 (RTX PRO 6000 Blackwell 96GB)..." },
+    { ts: "14:02:45", level: "info", tag: "colab-1", msg: "[start_colab] Models synced to local SSD (40.2 GB)" },
+    { ts: "14:03:20", level: "info", tag: "colab-1", msg: "[start_colab] TUNNEL READY (AUTH PROTECTED): https://gpu1.ngrok.dev" },
+  ],
+  colab2: [
+    { ts: "14:05:10", level: "info", tag: "colab-2", msg: "Provisioning secondary G4 node (ephemeral cloudflared tunnel)..." },
+    { ts: "14:06:02", level: "warn", tag: "colab-2", msg: "等待 Google Drive 挂载授权（已完成确认）" },
+    { ts: "14:08:11", level: "info", tag: "colab-2", msg: "[start_colab] TUNNEL READY: https://fast-node.trycloudflare.com" },
+  ],
+};
+
+/* -------------------- APP STATE -------------------- */
+const app = {
+  page: "results",
+  scenario: "running_video",
+  resultTab: "segments",
+  frameFilter: "all",
+  frameView: "grid",
+  carouselIdx: 0,
+  consoleTab: "job",
+  consoleErrOnly: false,
+  finalCollapsed: false,
+  createDemo: false,
+  pauseTimer: null,
+};
+
+/* -------------------- SVG MOCK ARTWORK -------------------- */
+function frameArtwork(frame) {
+  const isErr = frame.status === "failed";
+  const bg = isErr ? "#4a2720" : frame.color;
+  return `<svg viewBox="0 0 320 200" xmlns="http://www.w3.org/2000/svg">
+    <defs><linearGradient id="g-${frame.key}" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="${bg}"/><stop offset="100%" stop-color="#1b2b23"/>
+    </linearGradient></defs>
+    <rect width="320" height="200" fill="url(#g-${frame.key})"/>
+    <circle cx="95" cy="78" r="24" fill="rgba(255,255,255,.16)"/>
+    <path d="M55 170 C60 118, 130 118, 135 170 Z" fill="rgba(255,255,255,.14)"/>
+    <circle cx="215" cy="86" r="20" fill="rgba(255,255,255,.12)"/>
+    <path d="M180 170 C185 126, 245 126, 250 170 Z" fill="rgba(255,255,255,.1)"/>
+    <rect x="0" y="168" width="320" height="32" fill="rgba(0,0,0,.32)"/>
+    <text x="14" y="188" fill="#e6f2e5" font-size="11" font-family="monospace">${isErr ? "✕ 生成失败 · 点击进大图修正" : "分镜首帧预览 · " + frame.key}</text>
+  </svg>`;
+}
+
+/* -------------------- RENDERING -------------------- */
+function renderScenario() {
+  const sc = app.scenario;
+  document.querySelectorAll(".proto-btn").forEach(b => b.classList.toggle("active", b.dataset.sc === sc));
+
+  const statusEl = document.getElementById("cmd-status");
+  const actionsEl = document.getElementById("cmd-actions");
+  const liveEl = document.getElementById("cmd-live-strip");
+  const noticeEl = document.getElementById("ctx-notice");
+  const finalBanner = document.getElementById("final-banner");
+  const finalVer = document.getElementById("final-ver-badge");
+
+  noticeEl.hidden = true;
+  liveEl.hidden = true;
+  liveEl.innerHTML = "";
+  finalBanner.hidden = true;
+
+  if (sc === "running_video") {
+    document.title = "[视频 5/8 · 70%] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status running";
+    statusEl.innerHTML = '<span class="dot online pulse"></span>视频生成中';
+    document.getElementById("m-frames").textContent = "36/36";
+    document.getElementById("m-clips").textContent = "5/8";
+    actionsEl.innerHTML = `
+      <button class="btn warn" type="button" onclick="triggerPause()">⏸ 暂停后续</button>
+      <button class="btn danger" type="button" onclick="openStopModal()">⏹ 立即停止</button>`;
+    liveEl.hidden = false;
+    liveEl.innerHTML = `
+      <div class="live-item">
+        <div class="live-item-head"><strong>第 6 段 · 扩散采样 14/20 (70%)</strong><span class="mono muted">gpu1 · 显存 42.1/96 GB · 01:42</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width:70%"></div></div>
+      </div>
+      <div class="live-item">
+        <div class="live-item-head"><strong>第 7 段 · 编码参考图与提示词</strong><span class="mono muted">fast-node · 显存 39.8/96 GB · 00:34</span></div>
+        <div class="bar-track"><div class="bar-fill indet"></div></div>
+      </div>`;
+  } else if (sc === "running_frames") {
+    document.title = "[分镜 18/36] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status running";
+    statusEl.innerHTML = '<span class="dot online pulse"></span>分镜生成中';
+    document.getElementById("m-frames").textContent = "18/36";
+    document.getElementById("m-clips").textContent = "0/8";
+    actionsEl.innerHTML = `
+      <button class="btn warn" type="button" onclick="triggerPause()">⏸ 暂停后续</button>
+      <button class="btn danger" type="button" onclick="openStopModal()">⏹ 立即停止</button>`;
+    liveEl.hidden = false;
+    liveEl.innerHTML = `
+      <div class="live-item">
+        <div class="live-item-head"><strong>分镜批量生成 · 已完成 18 / 36 张 (50%)</strong><span class="mono muted">4 路并发 · 构图规划第 22 镜 · 预计剩余 3 分钟</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width:50%"></div></div>
+      </div>`;
+  } else if (sc === "pausing") {
+    document.title = "[正在暂停…] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status pausing";
+    statusEl.innerHTML = '<span class="dot warn pulse"></span>等待在途收尾…';
+    actionsEl.innerHTML = `
+      <button class="btn warn" type="button" disabled>⏸ 已停止派发新任务…</button>
+      <button class="btn danger" type="button" onclick="openStopModal()">不等了，立即停止</button>`;
+    liveEl.hidden = false;
+    liveEl.innerHTML = `
+      <div class="live-item pausing">
+        <div class="live-item-head"><strong>正在等待当前 2 个在途任务落盘保存，剩余任务不会提交…</strong><span class="mono">将在约 3 秒后演示完成暂停</span></div>
+        <div class="bar-track"><div class="bar-fill indet" style="background:#d48a1c"></div></div>
+      </div>`;
+  } else if (sc === "paused") {
+    document.title = "[已暂停] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status paused";
+    statusEl.textContent = "⏸ 已暂停";
+    actionsEl.innerHTML = `
+      <button class="btn primary" type="button" onclick="resumeFromStop()">▶ 继续剩余任务</button>
+      <button class="btn sm" type="button" onclick="switchPage('create')">去新建其他任务</button>`;
+    noticeEl.hidden = false;
+    noticeEl.className = "notice info";
+    noticeEl.innerHTML = `<span><strong>任务已优雅暂停：</strong>之前在途的成果已完整保存落盘，后续未开始项未产生任何费用。工作台已解锁，你可修改单镜/单段提示词或随时点击「继续剩余任务」。</span>`;
+  } else if (sc === "stopped") {
+    document.title = "[已停止] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status stopped";
+    statusEl.textContent = "⏹ 已停止";
+    actionsEl.innerHTML = `
+      <button class="btn primary" type="button" onclick="resumeFromStop()">▶ 继续任务（复用原任务号）</button>
+      <button class="btn sm" type="button" onclick="switchPage('create')">去新建其他任务</button>`;
+    noticeEl.hidden = false;
+    noticeEl.className = "notice warn";
+    noticeEl.innerHTML = `<span><strong>已立即停止本地任务：</strong>不会继续派发后续项。原有在途任务号（如 seg6/seg7）已完整保留，后续点击「继续任务」将优先拉取已生成结果，不重复提交扣费。</span>`;
+  } else if (sc === "review_failed") {
+    document.title = "[2 张分镜失败待处理] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status failed";
+    statusEl.textContent = "待处理 2 张失败分镜";
+    document.getElementById("m-frames").textContent = "34/36";
+    document.getElementById("m-clips").textContent = "0/8";
+    actionsEl.innerHTML = `
+      <button class="btn warn" type="button" onclick="setFrameFilter('failed'); switchResultTab('frames')">仅看 2 张失败分镜</button>
+      <button class="btn primary" type="button" disabled title="处理全部失败分镜后可确认">确认全部分镜并生成视频</button>`;
+    noticeEl.hidden = false;
+    noticeEl.className = "notice err";
+    noticeEl.innerHTML = `<span>有 <strong>2 张</strong> 分镜生成失败（成功图片均已保留）。点击「仅看 2 张失败分镜」直接定位修改重出，全部补齐后顶部主按钮自动点亮。</span>`;
+  } else if (sc === "review_ready") {
+    document.title = "[待审图确认] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status pausing";
+    statusEl.textContent = "等待统一确认";
+    document.getElementById("m-frames").textContent = "36/36";
+    document.getElementById("m-clips").textContent = "0/8";
+    actionsEl.innerHTML = `
+      <button class="btn" type="button" onclick="setFrameView('carousel'); switchResultTab('frames')">大图快速过审 (←/→)</button>
+      <button class="btn primary" type="button" onclick="applyScenario('running_video'); showToast('已确认全部 36 张分镜，开始生成视频！')">确认全部分镜并生成视频 ↗</button>`;
+  } else if (sc === "need_assemble") {
+    document.title = "[待重新拼接] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status pausing";
+    statusEl.textContent = "片段已更新 · 待拼接";
+    document.getElementById("m-frames").textContent = "36/36";
+    document.getElementById("m-clips").textContent = "8/8";
+    actionsEl.innerHTML = `
+      <button class="btn primary" type="button" onclick="applyScenario('done'); showToast('本机 FFmpeg 重新拼接完成，film.mp4 已更新！')">重新拼接完整视频（免费·本机）</button>`;
+    finalBanner.hidden = false;
+    finalVer.className = "status pausing";
+    finalVer.textContent = "旧版成片 · 尚未包含第 2 段修改";
+  } else if (sc === "done") {
+    document.title = "[已完成] 三块钱的牛肉骨 · H3";
+    statusEl.className = "status succeeded";
+    statusEl.textContent = "✓ 全部完成";
+    document.getElementById("m-frames").textContent = "36/36";
+    document.getElementById("m-clips").textContent = "8/8";
+    actionsEl.innerHTML = `
+      <button class="btn" type="button" onclick="showToast('已在系统文件管理器打开：jobs/2026-11-26_牛肉骨')">📂 打开输出目录</button>
+      <button class="btn primary" type="button" onclick="showToast('开始下载 film.mp4')">⬇ 下载完整视频</button>`;
+    finalBanner.hidden = false;
+    finalVer.className = "status succeeded";
+    finalVer.textContent = "当前最新成片";
+  }
+  renderSegments();
+}
+
+function renderFrames() {
+  const grid = document.getElementById("frame-grid");
+  const list = FRAMES.filter(f => app.frameFilter === "all" || f.status === app.frameFilter);
+  grid.innerHTML = list.map((f) => {
+    const idx = FRAMES.indexOf(f);
+    const badge = f.status === "failed"
+      ? '<span class="status failed">✕ 失败</span>'
+      : f.status === "draft"
+      ? '<span class="status pausing">● 有草稿</span>'
+      : '<span class="status succeeded">✓ 已出</span>';
+    return `<article class="frame-card ${f.status === "failed" ? "has-error" : ""} ${f.status === "draft" ? "has-draft" : ""}" onclick="openFrameCarousel(${idx})">
+      <div class="frame-thumb">
+        ${frameArtwork(f)}
+        <div class="frame-badges"><span class="frame-id">段${f.seg}·镜${f.shot}</span>${badge}</div>
+      </div>
+      <div class="frame-body">
+        <div class="frame-caption">${f.title}</div>
+        <div class="frame-meta"><span>参考图 ${f.refs.length} 张</span><span class="mono">${f.cost} · 点此审图 →</span></div>
+      </div>
+    </article>`;
+  }).join("");
+  renderCarousel();
+}
+
+function renderCarousel() {
+  const f = FRAMES[app.carouselIdx];
+  document.getElementById("car-title").textContent = `第 ${f.seg} 段 · 镜头 ${f.shot} (${f.key})`;
+  document.getElementById("car-pos").textContent = `${app.carouselIdx + 1} / ${FRAMES.length}`;
+  document.getElementById("car-img").innerHTML = frameArtwork(f);
+  document.getElementById("car-prompt").value = f.prompt;
+  const st = document.getElementById("car-status");
+  const errBox = document.getElementById("car-error-box");
+  if (f.status === "failed") {
+    st.className = "status failed"; st.textContent = "生成失败";
+    errBox.hidden = false; errBox.textContent = f.error;
+  } else if (f.status === "draft") {
+    st.className = "status pausing"; st.textContent = "有未应用草稿";
+    errBox.hidden = true;
+  } else {
+    st.className = "status succeeded"; st.textContent = `已生成 · ${f.cost}`;
+    errBox.hidden = true;
+  }
+  const palette = ["#237b60", "#557187", "#8c6b48", "#7d5575"];
+  document.getElementById("car-refs").innerHTML = f.refs.map((r, i) => `
+    <span class="ref-chip">
+      <span class="mini-av" style="background:${palette[i % palette.length]}">${i + 1}</span>
+      <span>${r}</span>
+      ${i === 0 ? '<span class="muted" style="font-size:10px">固定</span>' : `<button type="button" class="btn ghost sm" style="height:18px;padding:0 4px" onclick="showToast('已从草稿移除角色：${r}')">×</button>`}
+    </span>`).join("");
+}
+
+function renderSegments() {
+  const grid = document.getElementById("seg-grid");
+  const isRunning = app.scenario === "running_video" || app.scenario === "pausing";
+  grid.innerHTML = SEGMENTS.map(s => {
+    const live = isRunning && s.state === "running";
+    const ready = s.state === "ready" || app.scenario === "done" || app.scenario === "need_assemble";
+    const badge = live ? `<span class="status running">推理中 · ${s.step}</span>`
+      : ready ? `<span class="status succeeded">可预览</span>`
+      : `<span class="status">等待中</span>`;
+    const media = ready ? `
+      <div class="seg-video-box ready">
+        <div class="between" style="font-size:11px;opacity:.8"><span>seg${s.num}.mp4</span><span class="mono">${s.gpuSec || "140s"} · ${s.node}</span></div>
+        <div style="margin:auto"><button class="play-circle" style="width:42px;height:42px;font-size:15px" type="button" onclick="showToast('播放第 ${s.num} 段视频')">▶</button></div>
+        <div class="video-controls"><span>00:00 / 00:12</span><div class="video-scrubber"><i style="width:0%"></i></div><span>🔊</span></div>
+      </div>` : live ? `
+      <div class="seg-video-box">
+        <strong style="font-size:13px">${s.step === "编码参考图" ? "编码提示词与参考图" : "扩散采样 " + s.step + " (" + s.progress + "%)"}</strong>
+        <div style="width:82%" class="bar-track"><div class="bar-fill ${s.step === "编码参考图" ? "indet" : ""}" style="width:${s.progress}%"></div></div>
+        <span class="mono" style="font-size:11px;color:#9fc0a8">节点 ${s.node} · 显存 ${s.vram} · 已耗时 ${s.elapsed}</span>
+      </div>` : `
+      <div class="seg-video-box" style="background:var(--wash);color:var(--muted)">
+        <span>${app.scenario === "paused" || app.scenario === "stopped" ? "任务已暂停/停止，未提交此段" : "排队等待空余 GPU 节点"}</span>
+      </div>`;
+    return `<article class="seg-card ${live ? "active-gen" : ""}">
+      <div class="between">
+        <div class="row"><strong style="font-size:14px">第 ${s.num} 段</strong><span class="muted mono">${s.time} · ${s.shots} 镜</span></div>
+        <div class="row">${ready ? `<span class="tag mono">${s.cost || "¥0.00"}</span>` : ""}${badge}</div>
+      </div>
+      ${media}
+      <div class="between">
+        <div class="row">
+          ${ready ? `<button class="btn sm" type="button" onclick="showToast('下载 seg${s.num}.mp4')">⬇ 下载</button>` : ""}
+          <button class="btn sm" type="button" ${isRunning ? "disabled" : ""} onclick="showToast('已重新提交第 ${s.num} 段视频生成')">重新生成此段</button>
+        </div>
+        <span class="muted mono" style="font-size:11px">${s.h3 ? "H3 英文词已就绪" : "待转英文词"}</span>
+      </div>
+      <details class="seg-prompt-box">
+        <summary>查看 / 编辑提示词（源词 / H3 六段式）</summary>
+        <div style="display:grid;gap:8px;margin-top:8px">
+          <textarea rows="3" style="font-size:12px">${s.zh}</textarea>
+          <div class="row">
+            <button class="btn sm" type="button" ${isRunning ? "disabled" : ""} onclick="showToast('已仅转化第 ${s.num} 段英文提示词')">仅转英文提示词</button>
+            <button class="btn primary sm" type="button" ${isRunning ? "disabled" : ""} onclick="showToast('已应用提示词并重生成第 ${s.num} 段')">保存并重生成此段</button>
+          </div>
+        </div>
+      </details>
+    </article>`;
+  }).join("");
+}
+
+function renderCastSlots() {
+  const grid = document.getElementById("cast-grid");
+  const uploadedCount = CAST_SLOTS.filter(s => s.file).length;
+  const missing = CAST_SLOTS.filter(s => s.required && !s.file);
+  document.getElementById("cast-summary-line").textContent = `共 4 个角色 + 1 张总表 · 当前已上传 ${uploadedCount}/${CAST_SLOTS.length}（模型单段上限 9 张）`;
+  document.getElementById("launch-missing").hidden = missing.length === 0 || app.createDemo;
+  document.getElementById("launch-missing").textContent = `尚缺 ${missing.length} 张必需参考图：${missing.map(m => m.name.replace("角色 · ", "")).join("、")}`;
+  document.getElementById("launch-btn").disabled = !app.createDemo && missing.length > 0;
+
+  grid.innerHTML = CAST_SLOTS.map((s, idx) => `
+    <article class="cast-card ${s.file ? "uploaded" : s.required ? "missing" : ""}">
+      <div class="cast-thumb" style="${s.file ? `background:${s.color};color:#fff` : ""}">
+        ${s.file ? `<span>${s.name.slice(-2)}<br><small style="opacity:.8">已传</small></span>` : "拖放<br>图片"}
+      </div>
+      <div class="cast-info">
+        <div class="cast-name">
+          <span>${s.name}</span>
+          <span class="status ${s.file ? "succeeded" : s.required ? "pausing" : ""}">${s.file ? "已上传" : s.required ? "待上传" : "可选"}</span>
+        </div>
+        <div class="cast-desc" title="${s.desc}">${s.file ? "📎 " + s.file : s.desc}</div>
+        <div class="row" style="margin-top:2px">
+          <button class="btn sm" type="button" onclick="uploadSingleCast(${idx})">${s.file ? "替换" : "上传图片"}</button>
+          ${s.file ? `<button class="btn ghost sm" type="button" onclick="removeSingleCast(${idx})">移除</button>` : ""}
+        </div>
+      </div>
+    </article>`).join("");
+}
+
+function renderHistoryLists() {
+  const html = HISTORY.map((h, i) => `
+    <div class="history-item ${h.current ? "current" : ""}" onclick="selectHistoryJob(${i})">
+      <div class="history-main">
+        <div class="history-title">${h.title}</div>
+        <div class="history-sub">${h.meta}</div>
+      </div>
+      <div class="row" style="gap:4px">
+        <span class="status ${h.status}">${h.statusText}</span>
+        ${!h.current ? `<button class="btn ghost sm" title="删除记录" onclick="event.stopPropagation(); deleteHistory(${i})">🗑</button>` : ""}
+      </div>
+    </div>`).join("");
+  document.getElementById("history-pop-list").innerHTML = html;
+  document.getElementById("create-history-list").innerHTML = html;
+}
+
+function renderConsole() {
+  const q = (document.getElementById("console-search").value || "").trim().toLowerCase();
+  const list = LOGS[app.consoleTab] || [];
+  const filtered = list.filter(l => (!app.consoleErrOnly || l.level !== "info") && (!q || l.msg.toLowerCase().includes(q) || l.tag.toLowerCase().includes(q)));
+  const body = document.getElementById("console-body");
+  body.innerHTML = filtered.length ? filtered.map(l => `
+    <div class="log-line ${l.level}">
+      <span class="log-ts">${l.ts}</span>
+      <span class="log-tag">${l.tag}</span>
+      <span class="log-msg">${l.msg}</span>
+    </div>`).join("") : '<div class="muted" style="color:var(--term-muted)">无匹配日志行</div>';
+  body.scrollTop = body.scrollHeight;
+  const last = (LOGS.job || []).slice(-1)[0];
+  if (last) document.getElementById("console-preview").textContent = `${last.ts} [${last.tag}] ${last.msg}`;
+}
+
+function appendLog(tab, level, tag, msg) {
+  const now = new Date();
+  const ts = now.toTimeString().slice(0, 8);
+  LOGS[tab].push({ ts, level, tag, msg });
+  renderConsole();
+}
+
+/* -------------------- INTERACTIONS -------------------- */
+function switchPage(page) {
+  app.page = page;
+  document.getElementById("page-results").hidden = page !== "results";
+  document.getElementById("page-create").hidden = page !== "create";
+  document.getElementById("nav-results").classList.toggle("active", page === "results");
+  document.getElementById("nav-create").classList.toggle("active", page === "create");
+  closePopovers();
+}
+
+function switchResultTab(tab) {
+  app.resultTab = tab;
+  for (const name of ["frames", "segments", "report"]) {
+    document.getElementById(`rtab-${name}`).classList.toggle("active", name === tab);
+    document.getElementById(`rpanel-${name}`).hidden = name !== tab;
+  }
+}
+
+function applyScenario(sc) {
+  clearTimeout(app.pauseTimer);
+  app.scenario = sc;
+  if (app.page !== "results") switchPage("results");
+  if (sc === "running_frames" || sc === "review_failed" || sc === "review_ready") switchResultTab("frames");
+  else if (sc === "running_video" || sc === "need_assemble" || sc === "done") switchResultTab("segments");
+  renderScenario();
+}
+
+function triggerPause() {
+  clearTimeout(app.pauseTimer);
+  app.scenario = "pausing";
+  appendLog("job", "warn", "control", "收到「暂停后续」指令：不再派发新镜头/新段，等待当前在途任务落盘…");
+  renderScenario();
+  showToast("已请求暂停后续：等待当前在途项收尾保存…");
+  app.pauseTimer = setTimeout(() => {
+    if (app.scenario !== "pausing") return;
+    app.scenario = "paused";
+    appendLog("job", "info", "control", "在途任务已全部落盘，任务安全进入 paused 状态（未开始项未计费）。");
+    renderScenario();
+    showToast("任务已安全暂停，随时可点击「继续剩余任务」");
+  }, 2600);
+}
+
+function openStopModal() {
+  document.getElementById("stop-backdrop").hidden = false;
+  document.getElementById("stop-modal").hidden = false;
+}
+function closeStopModal() {
+  document.getElementById("stop-backdrop").hidden = true;
+  document.getElementById("stop-modal").hidden = true;
+}
+function confirmHardStop() {
+  closeStopModal();
+  clearTimeout(app.pauseTimer);
+  app.scenario = "stopped";
+  appendLog("job", "warn", "control", "收到「立即停止」指令：本地任务已停止且不再提交新项；远端在途任务未取消，task_id 已完整保留。");
+  renderScenario();
+  showToast("已立即停止本地任务（原在途任务号已保留，不重复扣费）");
+}
+function resumeFromStop() {
+  app.scenario = "running_video";
+  appendLog("job", "info", "resume", "从断点恢复执行：优先复用已保存 task_id，继续未完成段落。");
+  renderScenario();
+  showToast("已恢复运行，正在续接原任务进度");
+}
+
+function setFrameFilter(f) {
+  app.frameFilter = f;
+  document.querySelectorAll(".filter-pill").forEach(p => p.classList.toggle("active", p.dataset.ff === f));
+  renderFrames();
+}
+function setFrameView(v) {
+  app.frameView = v;
+  document.getElementById("fv-grid").classList.toggle("active", v === "grid");
+  document.getElementById("fv-carousel").classList.toggle("active", v === "carousel");
+  document.getElementById("frame-grid").hidden = v !== "grid";
+  document.getElementById("frame-carousel").hidden = v !== "carousel";
+}
+function openFrameCarousel(idx) {
+  app.carouselIdx = idx;
+  setFrameView("carousel");
+  renderCarousel();
+}
+function stepCarousel(dir) {
+  app.carouselIdx = (app.carouselIdx + dir + FRAMES.length) % FRAMES.length;
+  renderCarousel();
+}
+function markFrameDraft() {
+  FRAMES[app.carouselIdx].prompt = document.getElementById("car-prompt").value;
+  if (FRAMES[app.carouselIdx].status === "ok") FRAMES[app.carouselIdx].status = "draft";
+}
+function regenCurrentFrame() {
+  const f = FRAMES[app.carouselIdx];
+  f.status = "ok"; f.cost = "¥0.13"; f.error = "";
+  appendLog("job", "info", "frame", `单镜重生成 ${f.key} 完成（¥0.13），其它分镜保持不变`);
+  renderFrames();
+  showToast(`分镜 ${f.key} 已重新生成并更新`);
+}
+
+function toggleFinalVideo() {
+  app.finalCollapsed = !app.finalCollapsed;
+  document.getElementById("final-banner-body").hidden = app.finalCollapsed;
+  document.getElementById("toggle-final-btn").textContent = app.finalCollapsed ? "展开预览 ▾" : "收起预览 ▴";
+}
+
+function simulateAutoMatch() {
+  const files = {
+    "cast:0": "张大妈四视图设定图.png",
+    "cast:1": "梁先生角色设定与三视图.png",
+    "cast:2": "周悦悦成长角色设定.png",
+    "cast:3": "周铁林初遇与三年后定妆.png",
+  };
+  CAST_SLOTS.forEach(s => { if (files[s.id]) s.file = files[s.id]; });
+  renderCastSlots();
+  showToast("✨ 已按文件名自动匹配并绑定 4 位角色参考图，右侧启动按钮已就绪！");
+}
+function uploadSingleCast(idx) {
+  CAST_SLOTS[idx].file = CAST_SLOTS[idx].name.replace("角色 · ", "") + "_参考图.png";
+  renderCastSlots();
+  showToast(`已更新 ${CAST_SLOTS[idx].name} 参考图`);
+}
+function removeSingleCast(idx) {
+  CAST_SLOTS[idx].file = null;
+  renderCastSlots();
+}
+function setCreateMode(demo) {
+  app.createDemo = demo;
+  document.getElementById("m-demo").classList.toggle("active", demo);
+  document.getElementById("m-live").classList.toggle("active", !demo);
+  document.getElementById("launch-mode-box").classList.toggle("demo", demo);
+  document.getElementById("launch-mode-hint").textContent = demo
+    ? "离线演示模式：不联网、不扣费，缺图自动使用占位图。"
+    : "将调用真实画图/视频模型；先生成分镜图并停下审图，确认后才生成视频。";
+  renderCastSlots();
+}
+function togglePreflightBox() {
+  const el = document.getElementById("preflight-box");
+  el.hidden = !el.hidden;
+}
+function launchDemoJob() {
+  applyScenario("running_frames");
+  showToast("任务已启动！顶部指挥栏和底部控制台可随时查看进度或暂停。");
+}
+
+function selectHistoryJob(idx) {
+  HISTORY.forEach((h, i) => h.current = i === idx);
+  document.getElementById("cmd-title").textContent = `《${HISTORY[idx].title}》`;
+  renderHistoryLists();
+  closePopovers();
+  switchPage("results");
+  if (HISTORY[idx].status === "succeeded") applyScenario("done");
+  else if (HISTORY[idx].status === "paused") applyScenario("paused");
+  else applyScenario("running_video");
+  showToast(`已切换到任务：${HISTORY[idx].title}`);
+}
+function deleteHistory(idx) {
+  const name = HISTORY[idx].title;
+  HISTORY.splice(idx, 1);
+  renderHistoryLists();
+  showToast(`已移除任务记录：${name}（本地磁盘文件已保留）`);
+}
+
+/* Popovers, Drawer, Console, Toast */
+function togglePopover(id) {
+  const target = document.getElementById(id);
+  const willOpen = target.hidden;
+  closePopovers();
+  if (willOpen) target.hidden = false;
+}
+function closePopovers() {
+  ["history-pop", "runtime-pop"].forEach(id => document.getElementById(id).hidden = true);
+}
+function toggleDriveAuthDemo() {
+  const el = document.getElementById("drive-auth-demo");
+  el.hidden = !el.hidden;
+  document.getElementById("runtime-dot").className = el.hidden ? "dot online" : "dot warn pulse";
+  document.getElementById("runtime-pill-text").textContent = el.hidden ? "Colab 2/2 在线 · 队列 2" : "Colab 等待 Drive 授权";
+}
+function openSettings() {
+  closePopovers();
+  document.getElementById("drawer-backdrop").hidden = false;
+  document.getElementById("settings-drawer").hidden = false;
+}
+function closeSettings() {
+  document.getElementById("drawer-backdrop").hidden = true;
+  document.getElementById("settings-drawer").hidden = true;
+}
+function switchSettingsTab(tab) {
+  document.querySelectorAll("[data-st]").forEach(b => b.classList.toggle("active", b.dataset.st === tab));
+  ["video", "llm", "env"].forEach(t => document.getElementById(`st-${t}`).hidden = t !== tab);
+}
+
+function openConsoleTab(tab) {
+  app.consoleTab = tab;
+  document.body.classList.remove("console-collapsed");
+  document.getElementById("c-toggle-btn").textContent = "▾ 收起";
+  document.querySelectorAll(".console-tab").forEach(b => b.classList.toggle("active", b.dataset.ctab === tab));
+  renderConsole();
+}
+function toggleConsoleCollapse() {
+  const collapsed = document.body.classList.toggle("console-collapsed");
+  document.body.classList.remove("console-expanded");
+  document.getElementById("c-toggle-btn").textContent = collapsed ? "▲ 展开" : "▾ 收起";
+  document.getElementById("c-size-btn").textContent = "⤢ 半屏";
+}
+function toggleConsoleExpand() {
+  document.body.classList.remove("console-collapsed");
+  const exp = document.body.classList.toggle("console-expanded");
+  document.getElementById("c-size-btn").textContent = exp ? "⤡ 常规" : "⤢ 半屏";
+}
+function toggleConsoleErrFilter() {
+  app.consoleErrOnly = !app.consoleErrOnly;
+  document.getElementById("c-err-filter").classList.toggle("active", app.consoleErrOnly);
+  if (document.body.classList.contains("console-collapsed")) toggleConsoleCollapse();
+  renderConsole();
+}
+function copyConsole() {
+  const text = (LOGS[app.consoleTab] || []).map(l => `${l.ts} [${l.tag}] ${l.msg}`).join("\n");
+  navigator.clipboard?.writeText(text).catch(() => {});
+  showToast("已复制当前控制台日志到剪贴板");
+}
+function toggleLang() {
+  const btn = document.getElementById("lang-btn");
+  btn.textContent = btn.textContent === "简体中文" ? "English" : "简体中文";
+  showToast(`界面语言切换示意：${btn.textContent}（正式实现将完整同步中英 JSON 词典）`);
+}
+
+function showToast(msg, isErr = false) {
+  const stack = document.getElementById("toast-stack");
+  const t = document.createElement("div");
+  t.className = `toast ${isErr ? "err" : ""}`;
+  t.innerHTML = `<span>${msg}</span><button type="button" class="cbtn" style="border:0;color:inherit" onclick="this.parentElement.remove()">✕</button>`;
+  stack.append(t);
+  setTimeout(() => t.remove(), 4200);
+}
+
+// Drag-resize bottom console
+(function initResize() {
+  const handle = document.getElementById("console-resize");
+  let dragging = false;
+  handle.addEventListener("mousedown", (e) => { dragging = true; e.preventDefault(); });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    document.body.classList.remove("console-collapsed", "console-expanded");
+    const h = Math.max(110, Math.min(window.innerHeight * 0.75, window.innerHeight - e.clientY));
+    document.documentElement.style.setProperty("--console-h", h + "px");
+  });
+  window.addEventListener("mouseup", () => { dragging = false; });
+})();
+
+// Close popovers on outside click & keyboard arrows in carousel
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".rel")) closePopovers();
+});
+document.addEventListener("keydown", (e) => {
+  if (app.page === "results" && app.resultTab === "frames" && app.frameView === "carousel") {
+    if (e.target.closest("input, textarea, select")) return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); stepCarousel(-1); }
+    if (e.key === "ArrowRight") { e.preventDefault(); stepCarousel(1); }
+  }
+});
+
+/* Initial render */
+renderHistoryLists();
+renderFrames();
+renderCastSlots();
+renderScenario();
+renderConsole();
+</script>
+</body>
+</html>
