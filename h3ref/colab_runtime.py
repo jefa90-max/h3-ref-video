@@ -436,23 +436,29 @@ def _popen_kwargs(environ=None, *, os_name: str | None = None) -> dict:
 def _kill_process_tree(proc) -> None:
     if proc is None:
         return
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
-                timeout=5.0,
-                check=False,
-            )
-        except Exception:
-            pass
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    pid = getattr(proc, "pid", None)
+    valid_pid = isinstance(pid, int) and not isinstance(pid, bool) and pid > 1
+    if valid_pid:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW,
+                    timeout=5.0,
+                    check=False,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                # Guard against pid <= 1 (on Linux glibc, killpg(1, sig) calls kill(-1, sig)
+                # and kills every user process) and never signal our own process group.
+                if pid != os.getpgrp():
+                    os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
     try:
         proc.kill()
     except OSError:
